@@ -1,5 +1,24 @@
 module DynamicObjects
+export DynamicObject, update, cached, update_cached
 import Serialization
+
+"""
+    DynamicObject{T}
+
+This is my documentation
+
+
+```jldoctest
+a = 1
+b = 2
+a + b
+
+# output
+
+3
+```
+
+"""
 struct DynamicObject{T}
     nt::NamedTuple
     DynamicObject{T}(nt::NamedTuple) where T = new(nt)
@@ -61,6 +80,5 @@ end
 update_cached(what, args...) = merge(what, (;zip(args, cached.([what], args))...))
 # Plots.plot!(p, what) = Plots.plot()
 # Plots.plot(what::DynamicObject{T}) where T = Plots.plot!(Plots.plot(), what)
-export DynamicObject, update, cached, update_cached
 
 end

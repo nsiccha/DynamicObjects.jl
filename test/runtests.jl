@@ -1,5 +1,5 @@
-using DynamicObjects
-using Test
+using Test, Documenter, DynamicObjects
+doctest(DynamicObjects)
 
 Rectangle = DynamicObject{:rectangle}
 rectangle(height, width) = Rectangle((height=height, width=width))
