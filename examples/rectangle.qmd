@@ -1,0 +1,18 @@
+---
+jupyter: julia-1.8
+execute:
+  freeze: auto
+  cache: true
+  daemon: 999999
+---
+
+```{julia}
+using DynamicObject
+
+Rectangle = DynamicObject{:rectangle}
+Rectangle(height::Number, width::Number) = Rectangle((height=height, width=width))
+area(what::Rectangle) = what.height * what.width
+
+rect = Rectangle(10, 20)
+print("A $(rect) has an area of $(rect.area).")
+```

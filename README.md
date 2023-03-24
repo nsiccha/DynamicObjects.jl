@@ -2,10 +2,10 @@
 
 Implements a dynamic object type with caching.
 
-```{.julia}
+```julia
 using DynamicObject
 
-Rectangle = DynamicObject{:rectangle}
+Rectangle = Object{:rectangle}
 Rectangle(height, width) = Rectangle((height=height, width=width))
 area(what::Rectangle) = what.height * what.width
 

@@ -1,11 +1,11 @@
 module DynamicObject
 import Serialization
-struct DynamicObject{T}
+struct Object{T}
     nt::NamedTuple
-    DynamicObject{T}(nt::NamedTuple) where T = new(nt)
+    Object{T}(nt::NamedTuple) where T = new(nt)
 end
-Base.propertynames(value::DynamicObject) = propertynames(value.nt)
-function Base.getproperty(value::DynamicObject, name::Symbol)
+Base.propertynames(value::Object) = propertynames(value.nt)
+function Base.getproperty(value::Object, name::Symbol)
     if name == :nt
         getfield(value, name)
     else
@@ -16,29 +16,29 @@ function Base.getproperty(value::DynamicObject, name::Symbol)
         end
     end
 end
-# DynamicObject{T}(nt::NamedTuple) where T = DynamicObject{T}(g.nt)
-DynamicObject{T}(g::DynamicObject) where T = DynamicObject{T}(g.nt)
-DynamicObject{T}(;kwargs...) where T = DynamicObject{T}((;kwargs...))
+# Object{T}(nt::NamedTuple) where T = Object{T}(g.nt)
+Object{T}(g::Object) where T = Object{T}(g.nt)
+Object{T}(;kwargs...) where T = Object{T}((;kwargs...))
 
-# DynamicObject{T}() where T = DynamicObject{T}(NamedTuple())
+# Object{T}() where T = Object{T}(NamedTuple())
 # default(g, name) = missing
-# getprop(g, name, def=default(DynamicObject, name)) = hasproperty(g, name) ? getproperty(g, name) : def
-Base.merge(g::DynamicObject, args...) = typeof(g)(merge(g.nt, args...))
-Base.length(g::DynamicObject) = 1
-Base.size(g::DynamicObject) = ()
-Base.getindex(g::DynamicObject, i) = g
-Base.iterate(g::DynamicObject) = iterate([g])
-# Base.merge(g::DynamicObject, arg1::DynamicObject, args...) = typeof(g)(merge(g.nt, arg1.nt, args...))
+# getprop(g, name, def=default(Object, name)) = hasproperty(g, name) ? getproperty(g, name) : def
+Base.merge(g::Object, args...) = typeof(g)(merge(g.nt, args...))
+Base.length(g::Object) = 1
+Base.size(g::Object) = ()
+Base.getindex(g::Object, i) = g
+Base.iterate(g::Object) = iterate([g])
+# Base.merge(g::Object, arg1::Object, args...) = typeof(g)(merge(g.nt, arg1.nt, args...))
 # igetproperty(obj, sym) = getproperty(obj, sym)
 # igetproperty(obj, sym, args...) = igetproperty(getproperty(obj, sym), args...)
 update(what; kwargs...) = merge(what, (;kwargs...))
 update(what, args...) = merge(what, (;zip(args, getproperty.([what], args))...))
 # update_default(what, args...) = update(wha)
 
-# G = DynamicObject
-Base.hash(g::DynamicObject) = Base.hash(repr(g))
+# G = Object
+Base.hash(g::Object) = Base.hash(repr(g))
 
-function cached(g::DynamicObject, key)
+function cached(g::Object, key)
     if hasproperty(g, key)
         # println("LOADING FROM OBJECT")
         getproperty(g, key)
@@ -60,7 +60,7 @@ function cached(g::DynamicObject, key)
 end
 update_cached(what, args...) = merge(what, (;zip(args, cached.([what], args))...))
 # Plots.plot!(p, what) = Plots.plot()
-# Plots.plot(what::DynamicObject{T}) where T = Plots.plot!(Plots.plot(), what)
-export DynamicObject, update, cached, update_cached
+# Plots.plot(what::Object{T}) where T = Plots.plot!(Plots.plot(), what)
+export Object, update, cached, update_cached
 
 end
