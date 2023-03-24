@@ -1,4 +1,4 @@
-name = "Guard"
+name = "DynamicObject"
 uuid = "23d02862-63fe-4c6e-8fdb-1d52cbbd39d5"
 authors = ["Niko Siccha <nikolassiccha@gmail.com> and contributors"]
 version = "0.1.0"
