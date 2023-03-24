@@ -1,0 +1,3 @@
+var documenterSearchIndex = {"docs":
+[{"location":"#DynamicObjects.jl","page":"DynamicObjects.jl","title":"DynamicObjects.jl","text":"","category":"section"},{"location":"","page":"DynamicObjects.jl","title":"DynamicObjects.jl","text":"Documentation for DynamicObjects.jl","category":"page"},{"location":"","page":"DynamicObjects.jl","title":"DynamicObjects.jl","text":"DynamicObject{T}","category":"page"},{"location":"#DynamicObjects.DynamicObject","page":"DynamicObjects.jl","title":"DynamicObjects.DynamicObject","text":"DynamicObject{T}\n\nThis is my documentation\n\na = 1\nb = 2\na + b\n\n# output\n\n3\n\n\n\n\n\n","category":"type"}]
+}
