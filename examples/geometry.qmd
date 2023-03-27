@@ -23,7 +23,7 @@ println("A $(circ) has an area of $(circ.area).")
 
 
 @dynamic_object Rectangle height width unit
-Rectangle(1, 2, 3)
+Rectangle(1, 2, "cm")
 ```
 ```{julia}
 Rectangle(1, 2)
