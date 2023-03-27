@@ -20,4 +20,11 @@ println("A $(rect) has an area of $(rect.area).")
 area(what::Circle) = what.radius^2 * pi 
 circ = Circle(20)
 println("A $(circ) has an area of $(circ.area).")      
+
+
+@dynamic_object Rectangle height width unit
+Rectangle(1, 2, 3)
+```
+```{julia}
+Rectangle(1, 2)
 ```       

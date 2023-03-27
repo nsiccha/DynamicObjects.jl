@@ -32,7 +32,7 @@ defining attributes `height` and `width` and defines a constructor
 Rectangle(height, width; kwargs...) = DynamicObject{:Rectangle}((height=height, width=with, kwargs...))
 ```
 
-This dynamic type can be used in functions definitions as 
+This dynamic type can be used in function definitions as 
 ```
 area(what::Rectangle) = what.height * what.width
 ```
