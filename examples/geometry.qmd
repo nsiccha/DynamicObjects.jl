@@ -10,7 +10,9 @@ execute:
 ```{julia}
 using DynamicObjects
 
-
+"""
+A fancy rectangle
+"""
 @dynamic_object Rectangle height width  
 area(what::Rectangle) = what.height * what.width
 rect = Rectangle(10, 20)     
@@ -22,9 +24,9 @@ circ = Circle(20)
 println("A $(circ) has an area of $(circ.area).")      
 
 
-@dynamic_object Rectangle height width unit
-Rectangle(1, 2, "cm")
+# @dynamic_object Rectangle height width unit
+# Rectangle(1, 2, "cm")
 ```
 ```{julia}
-Rectangle(1, 2)
+print(Docs.getdoc(Rectangle))
 ```       

@@ -5,6 +5,9 @@ Implements a dynamic object type with convenient/confusing `.`-syntax and cachin
 ```julia
 using DynamicObjects
 
+"""
+A fancy rectangle.
+"""
 @dynamic_object Rectangle height width  
 area(what::Rectangle) = what.height * what.width
 

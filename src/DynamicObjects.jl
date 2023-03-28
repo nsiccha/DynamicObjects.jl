@@ -45,7 +45,7 @@ macro dynamic_object(name, args...)
     argnames = get_arg_symbol.(args)
     aargs = [esc(:($(arg)=$(arg))) for arg in argnames]
     quote
-        $ename = DynamicObject{$sname}
+        Base.@__doc__ $ename = DynamicObject{$sname}
         $DynamicObject{$sname}($(eargs...); $kwargs...) = DynamicObject{$sname}((
             $(aargs...), $kwargs...
         ))
