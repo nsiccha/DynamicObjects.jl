@@ -13,20 +13,15 @@ using DynamicObjects
 """
 A fancy rectangle
 """
-@dynamic_object Rectangle height width  
+@dynamic_object Rectangle height::Number width=1  
 area(what::Rectangle) = what.height * what.width
-rect = Rectangle(10, 20)     
+rect = Rectangle(10)     
 println("A $(rect) has an area of $(rect.area).")           
 
 @dynamic_object Circle radius::Number
 area(what::Circle) = what.radius^2 * pi 
 circ = Circle(20)
 println("A $(circ) has an area of $(circ.area).")      
-
-
-# @dynamic_object Rectangle height width unit
-# Rectangle(1, 2, "cm")
 ```
 ```{julia}
-print(Docs.getdoc(Rectangle))
-```       
+```         

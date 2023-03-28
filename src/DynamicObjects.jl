@@ -13,7 +13,13 @@ struct DynamicObject{T}
     DynamicObject{T}(nt::NamedTuple) where T = new(nt)
 end
 esc_arg(arg::Symbol) = esc(arg)
-esc_arg(arg::Expr) = arg.head == :(=) ? :($(esc(arg.args[1]))=$(arg.args[2])) : esc(arg)
+function esc_arg(arg::Expr) 
+    if arg.head == :(=)
+        Expr(:kw, esc(arg.args[1]), esc(arg.args[2]))
+    else
+        esc(arg)
+    end
+end
 get_arg_symbol(arg::Symbol) = arg
 get_arg_symbol(arg::Expr) = arg.head == :(=) ? get_arg_symbol(arg.args[1]) : arg.args[1]
 
@@ -23,7 +29,7 @@ get_arg_symbol(arg::Expr) = arg.head == :(=) ? get_arg_symbol(arg.args[1]) : arg
 Defines a DynamicObject:
 
 ```
-@@dynamic_object Rectangle height width
+@dynamic_object Rectangle height width
 ```
 
 defines a dynamic type called `Rectangle = DynamicObject{:Rectangle}` with
@@ -37,6 +43,7 @@ This dynamic type can be used in function definitions as
 area(what::Rectangle) = what.height * what.width
 ```
 """
+
 macro dynamic_object(name, args...)
     sname = QuoteNode(name)
     ename = esc(name)
