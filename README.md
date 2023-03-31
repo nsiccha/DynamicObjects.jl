@@ -1,6 +1,6 @@
 # DynamicObjects.jl
 
-Implements a dynamic object type with convenient/confusing `.`-syntax and caching.
+Implements a dynamic object type which can be redefined with convenient/confusing `.`-syntax and caching.
 
 ```julia
 using DynamicObjects

@@ -43,7 +43,6 @@ This dynamic type can be used in function definitions as
 area(what::Rectangle) = what.height * what.width
 ```
 """
-
 macro dynamic_object(name, args...)
     sname = QuoteNode(name)
     ename = esc(name)
