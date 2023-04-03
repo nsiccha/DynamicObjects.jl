@@ -16,3 +16,9 @@ end
     @test Foo.area(Foo.rect) == 200
     @test_broken Foo.rect.area == 200
 end
+
+module FooBar
+# ISSUE: this does not work without explicitly importing AbstractDynamicObject
+    using DynamicObjects: @dynamic_type, AbstractDynamicObject
+    @dynamic_type MyType
+end
