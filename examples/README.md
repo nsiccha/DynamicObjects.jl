@@ -1,0 +1,1 @@
+Find rendered quarto notebooks with examples at [https://nsiccha.github.io/examples/DynamicObjects.jl/](https://nsiccha.github.io/examples/DynamicObjects.jl/).

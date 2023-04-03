@@ -14,7 +14,7 @@ end
 
 @testset "DynamicObjects.jl" begin
     @test Foo.area(Foo.rect) == 200
-    @test_broken Foo.rect.area == 200
+    @test Foo.rect.area == 200
 end
 
 module This_module_ensures_that_we_can_use_dynamic_type_by_itself

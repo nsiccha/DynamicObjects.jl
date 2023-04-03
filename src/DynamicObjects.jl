@@ -63,32 +63,36 @@ abstract type AbstractDynamicObject end
 
 macro dynamic_type(name)
     ename, ebase = ename_and_ebase(name, AbstractDynamicObject)
-    NT = esc(:NamedTuple)
-    Base = esc(:Base)
     quote
         Base.@__doc__ struct $ename{T} <: $ebase
-            nt::$NT
+            nt::NamedTuple
             # $ename{T}(nt::$NT) where T = new(nt)
         end
-        $Base.propertynames(what::$ename) = propertynames(what.nt)
-        function $Base.getproperty(what::$ename, name::Symbol)
+        Base.propertynames(what::$ename) = propertynames(what.nt)
+        function Base.getproperty(what::$ename, name::Symbol)
             if name == :nt
                 getfield(what, name)
             else
                 if hasproperty(what.nt, name)
                     getproperty(what.nt, name)
+                elseif isdefined($__module__, name)
+                    getproperty($__module__, name)(what)
+                elseif isdefined(Main, name)
+                    # Should this actually be done? 
+                    getproperty(Main, name)(what)
                 else
-                    getfield(Main, name)(what)
+                    # Should this be a different error?
+                    throw(DomainError(name, "Can't resolve attribute $(name). Looked in $($__module__) and Main."))
                 end
             end
         end
         $ename{T}(what::$ename) where T = $ename{T}(what.nt)
         $ename{T}(;kwargs...) where T = $ename{T}((;kwargs...))
-        $Base.show(io::IO, what::$ename{T}) where T = print(io, T, what.nt)
-        $Base.merge(what::$ename, args...) = typeof(what)(merge(what.nt, args...))
+        Base.show(io::IO, what::$ename{T}) where T = print(io, T, what.nt)
+        Base.merge(what::$ename, args...) = typeof(what)(merge(what.nt, args...))
         update(what::$ename; kwargs...) = merge(what, (;kwargs...))
         update(what::$ename, args...) = merge(what, (;zip(args, getproperty.([what], args))...))
-        $Base.hash(what::$ename{T}, h::Int=0) where T = hash((what.nt, T, h))
+        Base.hash(what::$ename{T}, h::Int=0) where T = hash((what.nt, T, h))
     end
 end
 
