@@ -29,9 +29,9 @@ module This_module_ensures_that_we_can_use_dynamic_object_by_itself
 end
 
 @testset "definitions inside modules" begin
-    #@test isabstracttype(This_module_ensures_that_we_can_use_dynamic_type_by_itself.MyType)
+    @test_broken isabstracttype(This_module_ensures_that_we_can_use_dynamic_type_by_itself.MyType)
     @test This_module_ensures_that_we_can_use_dynamic_type_by_itself.MyType <: AbstractDynamicObject
 
     @test This_module_ensures_that_we_can_use_dynamic_object_by_itself.MyObject <: AbstractDynamicObject
-    #@test This_module_ensures_that_we_can_use_dynamic_object_by_itself.obj isa DynamicObject
+    @test_broken This_module_ensures_that_we_can_use_dynamic_object_by_itself.obj isa DynamicObject
 end
