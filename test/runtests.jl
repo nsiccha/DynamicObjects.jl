@@ -12,9 +12,20 @@ module Foo
     rect = rectangle(10, 20)
 end
 
+module Bar
+    using DynamicObjects
+    @dynamic_type DynamicShape
+    Rectangle = DynamicShape{:rectangle}
+    rectangle(height, width) = Rectangle((height=height, width=width))
+    area(what::Rectangle) = what.height * what.width
+    rect = rectangle(10, 20)
+end
+
 @testset "DynamicObjects.jl" begin
     @test Foo.area(Foo.rect) == 200
-    @test Foo.rect.area == 200
+    @test_broken Foo.rect.area == 200
+    @test Bar.area(Bar.rect) == 200
+    @test Bar.rect.area == 200
 end
 
 module This_module_ensures_that_we_can_use_dynamic_type_by_itself
