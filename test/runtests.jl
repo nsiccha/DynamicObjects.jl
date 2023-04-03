@@ -17,8 +17,21 @@ end
     @test_broken Foo.rect.area == 200
 end
 
-module FooBar
-# ISSUE: this does not work without explicitly importing AbstractDynamicObject
-    using DynamicObjects: @dynamic_type, AbstractDynamicObject
+module This_module_ensures_that_we_can_use_dynamic_type_by_itself
+    using DynamicObjects: @dynamic_type
     @dynamic_type MyType
+end
+
+module This_module_ensures_that_we_can_use_dynamic_object_by_itself
+    using DynamicObjects: @dynamic_object
+    @dynamic_object MyObject param
+    #obj = MyObject(42)
+end
+
+@testset "definitions inside modules" begin
+    #@test isabstracttype(This_module_ensures_that_we_can_use_dynamic_type_by_itself.MyType)
+    @test This_module_ensures_that_we_can_use_dynamic_type_by_itself.MyType <: AbstractDynamicObject
+
+    @test This_module_ensures_that_we_can_use_dynamic_object_by_itself.MyObject <: AbstractDynamicObject
+    #@test This_module_ensures_that_we_can_use_dynamic_object_by_itself.obj isa DynamicObject
 end

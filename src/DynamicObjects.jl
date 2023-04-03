@@ -40,7 +40,7 @@ area(what::Rectangle) = what.height * what.width
 """
 macro dynamic_object(name, args...)
     sname = get_sname(name)
-    ename, ebase = ename_and_ebase(name, :DynamicObject)
+    ename, ebase = ename_and_ebase(name, DynamicObject)
     # ename = esc(name)
     eargs = esc_arg.(args)
     kwargs = esc(:kwargs) 
@@ -56,13 +56,13 @@ end
 
 get_sname(name::Symbol) = QuoteNode(name)
 get_sname(name::Expr) = QuoteNode(name.args[1])
-ename_and_ebase(name::Symbol, default) = esc(name), esc(default)
+ename_and_ebase(name::Symbol, default) = esc(name), default
 ename_and_ebase(name::Expr, default) = esc.(name.args)
 
 abstract type AbstractDynamicObject end
 
 macro dynamic_type(name)
-    ename, ebase = ename_and_ebase(name, :AbstractDynamicObject)
+    ename, ebase = ename_and_ebase(name, AbstractDynamicObject)
     NT = esc(:NamedTuple)
     Base = esc(:Base)
     quote
