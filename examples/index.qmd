@@ -1,0 +1,32 @@
+---
+title: Geometry example
+jupyter: julia-1.8
+execute:
+  daemon: 999999
+---
+
+```{julia}
+using DynamicObjects
+
+"""
+A common base type for shapes.
+"""
+@dynamic_type DynamicShape
+
+description(what::DynamicShape) = "A $(what) has an area of $(what.area)."
+
+"""
+A fancy rectangle.
+"""
+@dynamic_object Rectangle <: DynamicShape height::Number width=1  
+area(what::Rectangle) = what.height * what.width
+
+"""
+A boring circle.
+"""
+@dynamic_object Circle <: DynamicShape radius::Number
+area(what::Circle) = what.radius^2 * pi 
+
+println(Rectangle(10).description)
+println(Circle(20).description)
+```

@@ -1,0 +1,10 @@
+project:
+  title: "Examples for DynamicObjects.jl"
+  type: website
+  output-dir: ../docs/quarto
+website:
+  sidebar:
+    style: "docked"
+    contents: auto
+execute:
+  freeze: auto
