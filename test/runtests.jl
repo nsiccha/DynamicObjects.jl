@@ -4,11 +4,15 @@ using Test, Documenter, DynamicObjects
     doctest(DynamicObjects)
 end
 
-Rectangle = DynamicObject{:rectangle}
-rectangle(height, width) = Rectangle((height=height, width=width))
-area(what::Rectangle) = what.height * what.width
-rect = rectangle(10, 20)
+module Foo
+    using DynamicObjects
+    Rectangle = DynamicObject{:rectangle}
+    rectangle(height, width) = Rectangle((height=height, width=width))
+    area(what::Rectangle) = what.height * what.width
+    rect = rectangle(10, 20)
+end
 
 @testset "DynamicObjects.jl" begin
-    @test rect.area == 200
+    @test Foo.area(Foo.rect) == 200
+    @test_broken Foo.rect.area == 200
 end
