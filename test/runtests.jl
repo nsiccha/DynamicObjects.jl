@@ -1,5 +1,8 @@
 using Test, Documenter, DynamicObjects
-doctest(DynamicObjects)
+
+@testset "doctest" begin
+    doctest(DynamicObjects)
+end
 
 Rectangle = DynamicObject{:rectangle}
 rectangle(height, width) = Rectangle((height=height, width=width))
