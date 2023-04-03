@@ -35,3 +35,8 @@ end
     @test This_module_ensures_that_we_can_use_dynamic_object_by_itself.MyObject <: AbstractDynamicObject
     @test_broken This_module_ensures_that_we_can_use_dynamic_object_by_itself.obj isa DynamicObject
 end
+
+@testset "zero-argument types" begin
+    @dynamic_object ZeroObject
+    @test_broken ZeroObject()
+end
