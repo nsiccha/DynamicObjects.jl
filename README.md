@@ -2,6 +2,8 @@
 
 Implements a dynamic object type which can be redefined with convenient/confusing `.`-syntax and caching.
 
+See [https://nsiccha.github.io/examples/DynamicObjects.jl/](https://nsiccha.github.io/examples/DynamicObjects.jl/) for examples.
+
 ```julia
 using DynamicObjects
 
@@ -21,5 +23,4 @@ A Rectangle(height = 10, width = 20) has an area of 200.
 
 ## To add/fix:
 
-* Inheritance (e.g. `@dynamic_object Rectangle <: Polygon height width`)
 * Defining a single argument type without a type on that argument (e.g. `@dynamic_object Circle radius`)
