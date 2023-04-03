@@ -24,8 +24,8 @@ end
 
 module This_module_ensures_that_we_can_use_dynamic_object_by_itself
     using DynamicObjects: @dynamic_object
-    @dynamic_object MyObject param
-    #obj = MyObject(42)
+    @dynamic_object MyObject param param2  # currently infinite recursion for single-argument
+    obj = MyObject(42, 123)
 end
 
 @testset "definitions inside modules" begin
@@ -33,7 +33,7 @@ end
     @test This_module_ensures_that_we_can_use_dynamic_type_by_itself.MyType <: AbstractDynamicObject
 
     @test This_module_ensures_that_we_can_use_dynamic_object_by_itself.MyObject <: AbstractDynamicObject
-    @test_broken This_module_ensures_that_we_can_use_dynamic_object_by_itself.obj isa DynamicObject
+    @test This_module_ensures_that_we_can_use_dynamic_object_by_itself.obj isa DynamicObject
 end
 
 @testset "zero-argument types" begin
