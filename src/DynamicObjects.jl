@@ -61,6 +61,14 @@ ename_and_ebase(name::Expr, default) = esc.(name.args)
 
 abstract type AbstractDynamicObject end
 
+persistent_hash(what, h) = hash(what, h)
+# https://github.com/JuliaLang/julia/blob/master/base/namedtuple.jl#L253
+persistent_hash(x::NamedTuple, h) = xor(objectid(_nt_names(x)), persistent_hash(Tuple(x), h))
+# https://github.com/JuliaLang/julia/blob/master/base/tuple.jl#L510
+persistent_hash(x::Tuple, h) = hash(persistent_hash.(x, h), h)
+# ?
+persistent_hash(x::AbstractArray, h) = hash(persistent_hash.(x, h), h)
+
 macro dynamic_type(name)
     ename, ebase = ename_and_ebase(name, AbstractDynamicObject)
     quote
@@ -92,7 +100,7 @@ macro dynamic_type(name)
         Base.merge(what::$ename, args...) = typeof(what)(merge(what.nt, args...))
         update(what::$ename; kwargs...) = merge(what, (;kwargs...))
         update(what::$ename, args...) = merge(what, (;zip(args, getproperty.([what], args))...))
-        Base.hash(what::$ename{T}, h::Int=0) where T = hash((what.nt, T, h))
+        Base.hash(what::$ename{T}, h::Int=0) where T = persistent_hash((what.nt, T), h)
     end
 end
 
