@@ -100,7 +100,7 @@ macro dynamic_type(name)
         Base.merge(what::$ename, args...) = typeof(what)(merge(what.nt, args...))
         update(what::$ename; kwargs...) = merge(what, (;kwargs...))
         update(what::$ename, args...) = merge(what, (;zip(args, getproperty.([what], args))...))
-        Base.hash(what::$ename{T}, h::Int=0) where T = persistent_hash((what.nt, T), h)
+        Base.hash(what::$ename{T}, h::UInt=UInt(0)) where T = persistent_hash((what.nt, T), h)
     end
 end
 
