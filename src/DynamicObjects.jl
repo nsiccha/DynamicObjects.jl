@@ -63,7 +63,7 @@ abstract type AbstractDynamicObject end
 
 persistent_hash(what, h) = hash(what, h)
 # https://github.com/JuliaLang/julia/blob/master/base/namedtuple.jl#L253
-persistent_hash(x::NamedTuple, h) = xor(objectid(_nt_names(x)), persistent_hash(Tuple(x), h))
+persistent_hash(x::NamedTuple, h) = xor(objectid(Base._nt_names(x)), persistent_hash(Tuple(x), h))
 # https://github.com/JuliaLang/julia/blob/master/base/tuple.jl#L510
 persistent_hash(x::Tuple, h) = hash(persistent_hash.(x, h), h)
 # ?
