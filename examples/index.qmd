@@ -29,5 +29,5 @@ area(what::Circle) = what.radius^2 * pi
 
 println(Rectangle(10).description)
 println(Circle(20).description)
-Circle(20) 
-``` 
+Circle(20)  
+```  
