@@ -71,6 +71,7 @@ persistent_hash(x::AbstractArray, h) = hash(persistent_hash.(x, h), h)
 
 macro dynamic_type(name)
     ename, ebase = ename_and_ebase(name, AbstractDynamicObject)
+    eupdate = esc(:update)
     quote
         Base.@__doc__ struct $ename{T} <: $ebase
             nt::NamedTuple
@@ -98,8 +99,8 @@ macro dynamic_type(name)
         $ename{T}(;kwargs...) where T = $ename{T}((;kwargs...))
         Base.show(io::IO, what::$ename{T}) where T = print(io, T, what.nt)
         Base.merge(what::$ename, args...) = typeof(what)(merge(what.nt, args...))
-        update(what::$ename; kwargs...) = merge(what, (;kwargs...))
-        update(what::$ename, args...) = merge(what, (;zip(args, getproperty.([what], args))...))
+        $eupdate(what::$ename; kwargs...) = merge(what, (;kwargs...))
+        $eupdate(what::$ename, args...) = merge(what, (;zip(args, getproperty.([what], args))...))
         Base.hash(what::$ename{T}, h::UInt=UInt(0)) where T = persistent_hash((what.nt, T), h)
     end
 end
