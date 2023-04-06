@@ -141,26 +141,26 @@ The type is inefficient computationally, but can enable more efficient prototypi
 # Base.hash(what::DynamicObject{T}, h::Int=0) where T = Base.hash((what.nt, T, h))
 
 
-# function cached(what::DynamicObject, key)
-#     if hasproperty(what, key)
-#         # println("LOADING FROM DynamicObject")
-#         getproperty(what, key)
-#     else
-#         if !isdir("cache")
-#             mkdir("cache")
-#         end
-#         file_name = "cache/$(key)_$(what.hash)"
-#         if isfile(file_name)
-#             # println("LOADING FROM FILE!")
-#             Serialization.deserialize(file_name)
-#         else
-#             # println("COMPUTING")
-#             rv = getproperty(what, key)
-#             Serialization.serialize(file_name, rv)
-#             rv
-#         end
-#     end
-# end
+function cached(what, key)
+    if hasproperty(what, key)
+        # println("LOADING FROM DynamicObject")
+        getproperty(what, key)
+    else
+        if !isdir("cache")
+            mkdir("cache")
+        end
+        file_name = "cache/$(key)_$(typeof(what))_$(what.hash)"
+        if isfile(file_name)
+            # println("LOADING FROM FILE!")
+            Serialization.deserialize(file_name)
+        else
+            # println("COMPUTING")
+            rv = getproperty(what, key)
+            Serialization.serialize(file_name, rv)
+            rv
+        end
+    end
+end
 
 # DynamicObject{T}() where T = DynamicObject{T}(NamedTuple())
 # default(what, name) = missing
