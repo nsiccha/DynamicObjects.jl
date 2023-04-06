@@ -154,7 +154,7 @@ function cached(what, key)
             # println("LOADING FROM FILE!")
             Serialization.deserialize(file_name)
         else
-            # println("COMPUTING")
+            println("Writing result to $(file_name)!")
             rv = getproperty(what, key)
             Serialization.serialize(file_name, rv)
             rv
