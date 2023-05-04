@@ -1,7 +1,7 @@
 name = "DynamicObjects"
 uuid = "23d02862-63fe-4c6e-8fdb-1d52cbbd39d5"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com> and contributors"]
-version = "0.1.5"
+version = "0.1.6"
 
 [deps]
 Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
