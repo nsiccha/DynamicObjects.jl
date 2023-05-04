@@ -31,5 +31,9 @@ println(Rectangle(10).description)
 println(Circle(20).description)
 Circle(20)  
 
-DynamicObjects.cached(Circle(20), :area)
+Circle(20).cached_area
+
+Circle(20) |> update(:area) |> cached(:description) 
+Circle(20) |> update(:area) |> cached(:description) 
+
 ```  

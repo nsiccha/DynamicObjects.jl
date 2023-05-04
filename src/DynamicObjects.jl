@@ -1,5 +1,5 @@
 module DynamicObjects
-export AbstractDynamicObject, DynamicObject, @dynamic_object, @dynamic_type#, update, cached, 
+export AbstractDynamicObject, DynamicObject, @dynamic_object, @dynamic_type, update, cached
 import Serialization
 
 
@@ -89,6 +89,8 @@ macro dynamic_type(name)
                 elseif isdefined(Main, name)
                     # Should this actually be done? 
                     getproperty(Main, name)(what)
+                elseif startswith(String(name), "cached_")
+                    DynamicObjects.cached(what, Symbol(String(name)[8:end]))
                 else
                     # Should this be a different error?
                     throw(DomainError(name, "Can't resolve attribute $(name). Looked in $($__module__) and Main."))
@@ -99,13 +101,14 @@ macro dynamic_type(name)
         $ename{T}(;kwargs...) where T = $ename{T}((;kwargs...))
         Base.show(io::IO, what::$ename{T}) where T = print(io, T, what.nt)
         Base.merge(what::$ename, args...) = typeof(what)(merge(what.nt, args...))
-        DynamicObjects.update(what::$ename; kwargs...) = merge(what, (;kwargs...))
-        DynamicObjects.update(what::$ename, args...) = merge(what, (;zip(args, getproperty.([what], args))...))
+        # DynamicObjects.update(what::$ename; kwargs...) = merge(what, (;kwargs...))
+        DynamicObjects.update(what::$ename, args::Symbol...; kwargs...) = merge(what, (;kwargs...), (;zip(args, getproperty.([what], args))...))
         Base.hash(what::$ename{T}, h::UInt=UInt(0)) where T = persistent_hash((what.nt, T), h)
     end
 end
 
-update(what::AbstractDynamicObject) = what
+# update(what::AbstractDynamicObject) = what
+update(args::Symbol...; kwargs...) = what->update(what, args...; kwargs...)
 
 """
     DynamicObject{T}
@@ -141,26 +144,31 @@ The type is inefficient computationally, but can enable more efficient prototypi
 # Base.hash(what::DynamicObject{T}, h::Int=0) where T = Base.hash((what.nt, T, h))
 
 
-function cached(what, key)
+get_cache_path() = get(ENV, "DYNAMIC_CACHE", "cache")
+set_cache_path!(path::AbstractString) = (ENV["DYNAMIC_CACHE"] = path)
+get_cache_path(key::Symbol, what) = joinpath(get_cache_path(), "$(key)_$(typeof(what))_$(what.hash)")
+# get_cache_verbosity() = get(ENV, "DYNAMIC_CACHE_VERBOSITY", 0)
+# set_cache_verbosity!(path::AbstractString) = (ENV["DYNAMIC_CACHE_VERBOSITY"] = path)
+
+function cached(what, key::Symbol)
     if hasproperty(what, key)
         # println("LOADING FROM DynamicObject")
         getproperty(what, key)
     else
-        if !isdir("cache")
-            mkdir("cache")
-        end
-        file_name = "cache/$(key)_$(typeof(what))_$(what.hash)"
+        mkpath(get_cache_path())
+        file_name = get_cache_path(key, what)
         if isfile(file_name)
             # println("LOADING FROM FILE!")
             Serialization.deserialize(file_name)
         else
-            println("Writing result to $(file_name)!")
+            # println("Writing result to $(file_name)!")
             rv = getproperty(what, key)
             Serialization.serialize(file_name, rv)
             rv
         end
     end
 end
+cached(key::Symbol) = x->cached(x, key)
 
 # DynamicObject{T}() where T = DynamicObject{T}(NamedTuple())
 # default(what, name) = missing
