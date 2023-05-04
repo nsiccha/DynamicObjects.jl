@@ -36,4 +36,8 @@ Circle(20).cached_area
 Circle(20) |> update(:area) |> cached(:description) 
 Circle(20) |> update(:area) |> cached(:description) 
 
+# unpack(Circle(20))
+DynamicObjects.unpack(Circle(20)) |> println
+DynamicObjects.unpack(Rectangle(10, 20)) |> println
+DynamicObjects.unpack(Rectangle(10, 20), :height) |> println
 ```  

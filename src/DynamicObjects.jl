@@ -1,5 +1,5 @@
 module DynamicObjects
-export AbstractDynamicObject, DynamicObject, @dynamic_object, @dynamic_type, update, cached
+export AbstractDynamicObject, DynamicObject, @dynamic_object, @dynamic_type, update, cached, unpack
 import Serialization
 
 
@@ -51,6 +51,7 @@ macro dynamic_object(name, args...)
         $ebase{$sname}($(eargs...); $kwargs...) = $ebase{$sname}((
             $(aargs...), $kwargs...
         ))
+        DynamicObjects.unpack(what::$ename) = DynamicObjects.unpack(what::$ename, $argnames...)
     end
 end
 
@@ -103,11 +104,12 @@ macro dynamic_type(name)
         Base.merge(what::$ename, args...) = typeof(what)(merge(what.nt, args...))
         # DynamicObjects.update(what::$ename; kwargs...) = merge(what, (;kwargs...))
         DynamicObjects.update(what::$ename, args::Symbol...; kwargs...) = merge(what, (;kwargs...), (;zip(args, getproperty.([what], args))...))
-        Base.hash(what::$ename{T}, h::UInt=UInt(0)) where T = persistent_hash((what.nt, T), h)
+        Base.hash(what::$ename{T}, h::UInt=UInt(0)) where T = DynamicObjects.persistent_hash((what.nt, T), h)
     end
 end
 
 # update(what::AbstractDynamicObject) = what
+unpack(what, args::Symbol...) = getproperty.([what], args)
 update(args::Symbol...; kwargs...) = what->update(what, args...; kwargs...)
 
 """
