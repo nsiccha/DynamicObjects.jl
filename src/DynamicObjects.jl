@@ -62,7 +62,9 @@ ename_and_ebase(name::Expr, default) = esc.(name.args)
 
 abstract type AbstractDynamicObject end
 
-persistent_hash(what, h) = hash(what, h)
+# persistent_hash(what, h) = hash(what, h)
+persistent_hash(what, h) = hash(persistent_hash_attributes(what), h)
+persistent_hash_attributes(what) = what
 # https://github.com/JuliaLang/julia/blob/master/base/namedtuple.jl#L253
 persistent_hash(x::NamedTuple, h) = xor(objectid(Base._nt_names(x)), persistent_hash(Tuple(x), h))
 # https://github.com/JuliaLang/julia/blob/master/base/tuple.jl#L510
