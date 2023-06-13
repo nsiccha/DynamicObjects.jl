@@ -152,7 +152,7 @@ get_cache_path() = get(ENV, "DYNAMIC_CACHE", "cache")
 set_cache_path!(path::AbstractString) = (ENV["DYNAMIC_CACHE"] = path)
 get_cache_path(key::Symbol, what) = joinpath(get_cache_path(), "$(key)_$(typeof(what))_$(what.hash)")
 read_cache(what, key::Symbol) = Serialization.deserialize(get_cache_path(key, what))
-write_cache(what, key::Symbol, rv) = Serialization.serialize(file_name, rv)(get_cache_path(key, what), rv)
+write_cache(what, key::Symbol, rv) = Serialization.serialize(get_cache_path(key, what), rv)
 # get_cache_verbosity() = get(ENV, "DYNAMIC_CACHE_VERBOSITY", 0)
 # set_cache_verbosity!(path::AbstractString) = (ENV["DYNAMIC_CACHE_VERBOSITY"] = path)
 
