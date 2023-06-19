@@ -156,19 +156,17 @@ write_cache(what, key::Symbol, rv) = Serialization.serialize(get_cache_path(key,
 # get_cache_verbosity() = get(ENV, "DYNAMIC_CACHE_VERBOSITY", 0)
 # set_cache_verbosity!(path::AbstractString) = (ENV["DYNAMIC_CACHE_VERBOSITY"] = path)
 
-function cached(what, key::Symbol)
+function cached(what, key::Symbol, no_disk=false)
     if hasproperty(what, key)
         # println("LOADING FROM DynamicObject")
         getproperty(what, key)
     else
         mkpath(get_cache_path())
         file_name = get_cache_path(key, what)
-        if isfile(file_name)
+        if !no_disk && isfile(file_name)
             # println("LOADING FROM FILE!")
             Serialization.deserialize(file_name)
         else
-            # println("Writing result to $(file_name)!")
-            
             rv = getproperty(what, key)
             Serialization.serialize(file_name, rv)
             rv
