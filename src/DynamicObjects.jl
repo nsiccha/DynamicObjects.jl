@@ -1,5 +1,5 @@
 module DynamicObjects
-export AbstractDynamicObject, DynamicObject, @dynamic_object, @dynamic_type, update, cached, unpack
+export AbstractDynamicObject, DynamicObject, @dynamic_object, @dynamic_type, @static_type, update, cached, unpack
 import Serialization
 
 
@@ -192,5 +192,38 @@ cached(key::Symbol) = x->cached(x, key)
 # update_cached(what, args...) = merge(what, (;zip(args, cached.([what], args))...))
 # Plots.plot!(p, what) = Plots.plot()
 # Plots.plot(what::DynamicObject{T}) where T = Plots.plot!(Plots.plot(), what)
+
+subexpressions(lhs) = [lhsi for lhsi in lhs if !isa(lhsi, LineNumberNode)]
+compare_expression(lhs, rhs) = "$lhs::$(typeof(lhs)) " * (lhs == rhs ? "==" : "!=") * " $rhs::$(typeof(rhs))"
+compare_expressions(lhs, rhs) = compare_expression(lhs, rhs)
+compare_expressions(lhs::AbstractVector, rhs::AbstractVector) = begin
+  lhs = subexpressions(lhs)
+  rhs = subexpressions(rhs)
+  length(lhs) == length(rhs) ? join(compare_expressions.(lhs, rhs), "\n") : compare_expression(lhs, rhs)
+end
+compare_expressions(lhs::Expr, rhs::Expr) = replace(
+  compare_expressions(lhs.head, rhs.head) * "\n" * compare_expressions(lhs.args, rhs.args),
+  "\n"=>"\n|"
+)
+collect_types(expr) = Dict()
+collect_types(expr::Expr) = expr.head == Symbol("::") ? Dict(expr.args[1]=>expr.args[2]) : merge(collect_types.(expr.args)...)
+strip_type(expr::Expr) = expr.head == Symbol("::") ? expr.args[1] : expr
+
+macro static_type(f)
+  @assert f.head == :function
+  struct_sig = f.args[1].args[1] 
+  struct_name = struct_sig.args[1]
+  struct_fields = f.args[end].args[end]
+  struct_expr = Expr(:struct, false, struct_sig, Expr(:block, struct_fields.args...))
+
+  func_sig = Expr(:call, esc(struct_name), f.args[1].args[2:end]...)
+  return_expr = Expr(:call, esc(struct_name), strip_type.(f.args[end].args[end].args)...)
+  func_body_expr = Expr(:block, f.args[end].args[1:end-1]..., return_expr)
+  func_expr = Expr(:function, func_sig, func_body_expr)
+  quote
+    $struct_expr
+    $func_expr
+  end
+end
 
 end

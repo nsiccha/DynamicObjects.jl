@@ -2,4 +2,8 @@
 *.html
 *_files
 .vscode
-/.luarc.json
+.luarc.json
+cache
+_freeze
+.quarto/
+*.ipynb
