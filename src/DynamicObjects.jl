@@ -208,6 +208,7 @@ compare_expressions(lhs::Expr, rhs::Expr) = replace(
 collect_types(expr) = Dict()
 collect_types(expr::Expr) = expr.head == Symbol("::") ? Dict(expr.args[1]=>expr.args[2]) : merge(collect_types.(expr.args)...)
 strip_type(expr::Expr) = expr.head == Symbol("::") ? expr.args[1] : expr
+# strip_type(expr::Symbol) = expr
 base_and_f(f::Expr) = f.head == :function ? (Any, f) : (f.args[2], f.args[1]) 
 
 macro static_type(f)
