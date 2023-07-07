@@ -210,20 +210,20 @@ collect_types(expr::Expr) = expr.head == Symbol("::") ? Dict(expr.args[1]=>expr.
 strip_type(expr::Expr) = expr.head == Symbol("::") ? expr.args[1] : expr
 
 macro static_type(f)
-  @assert f.head == :function
-  struct_sig = f.args[1].args[1] 
-  struct_name = struct_sig.args[1]
-  struct_fields = f.args[end].args[end]
-  struct_expr = Expr(:struct, false, struct_sig, Expr(:block, struct_fields.args...))
-
-  func_sig = Expr(:call, esc(struct_name), f.args[1].args[2:end]...)
-  return_expr = Expr(:call, esc(struct_name), strip_type.(f.args[end].args[end].args)...)
-  func_body_expr = Expr(:block, f.args[end].args[1:end-1]..., return_expr)
-  func_expr = Expr(:function, func_sig, func_body_expr)
-  quote
-    $struct_expr
-    $func_expr
-  end
+    @assert f.head == :function
+    struct_sig = f.args[1].args[1] 
+    struct_name = struct_sig.args[1]
+    struct_fields = f.args[end].args[end]
+    struct_expr = Expr(:struct, false, struct_sig, Expr(:block, struct_fields.args...))
+  
+    func_sig = Expr(:call, struct_name, f.args[1].args[2:end]...)
+    return_expr = Expr(:call, struct_name, strip_type.(f.args[end].args[end].args)...)
+    func_body_expr = Expr(:block, f.args[end].args[1:end-1]..., return_expr)
+    func_expr = Expr(:function, func_sig, func_body_expr) |> esc
+    quote
+      $struct_expr
+      $func_expr
+    end
 end
 
 end
