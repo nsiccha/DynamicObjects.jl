@@ -1,11 +1,10 @@
 ---
 title: Geometry example
-jupyter: julia-1.8
-execute:
-  daemon: 999999
 ---
 
 ```{julia}
+using Pkg
+Pkg.activate(".")
 using DynamicObjects
 
 """
@@ -41,3 +40,10 @@ DynamicObjects.unpack(Circle(20)) |> println
 DynamicObjects.unpack(Rectangle(10, 20)) |> println
 DynamicObjects.unpack(Rectangle(10, 20), :height) |> println
 ```  
+```{julia}
+@static_type function HSGP{T}(boundary_factor, n_functions, x) 
+  X = cos.((1:n_functions) .* x')
+  boundary_factor::T, n_functions::Int64, x::Vector{T}, X::Matrix{T}
+end
+HSGP(1.5, 10, collect(range(0, 1, 20)))
+```
