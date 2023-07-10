@@ -7,3 +7,4 @@ cache
 _freeze
 .quarto/
 *.ipynb
+/.luarc.json
