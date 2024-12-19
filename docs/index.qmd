@@ -1,0 +1,217 @@
+---
+title: "Example: Evaluating AD performance"
+---
+
+See [https://nsiccha.github.io/StanBlocks.jl/performance.html#visualization](https://nsiccha.github.io/StanBlocks.jl/performance.html#visualization) for the full performance evaluation. 
+
+```{julia}
+#| code-fold: true
+#| code-summary: "Setup code not using DynamicObjects.jl"
+ 
+cd(dirname(Base.active_project()))
+using PosteriorDB, StanLogDensityProblems, LogDensityProblems, Logging, Random, StanBlocks, Statistics, LinearAlgebra, Chairmarks, Pkg, OnlineStats, Distributions, BridgeStan, Enzyme, Mooncake
+const BRIDGESTAN_VERSION = filter(x->x.second.name=="BridgeStan", Pkg.dependencies()) |> x->first(x)[2].version
+const ENZYME_VERSION = filter(x->x.second.name=="Enzyme", Pkg.dependencies()) |> x->first(x)[2].version
+const MOONCAKE_VERSION = filter(x->x.second.name=="Mooncake", Pkg.dependencies()) |> x->first(x)[2].version
+const pdb = PosteriorDB.database()
+adaptive_median(f; n=100) = median([f() for i in 1:n])
+nonzero(x) = x == zero(x) ? one(x) : x
+tune_evals(f; timing_target) = begin 
+    rng = Xoshiro(0)
+    @time rv = f(rng)
+    @time rv = f(rng)
+    count = 0
+    t0 = t1 = time_ns()
+    while t1 - t0 < timing_target
+        rv = f(rng)
+        t1 = time_ns()
+        count += 1
+    end
+    count 
+end
+struct RuntimeIterator{F,X,N}
+    f::F
+    x::X
+    n::N
+end
+Base.iterate(r::RuntimeIterator) = begin 
+    stats = @timed begin
+        rv = r.f(r.x)
+        Base.donotdelete(rv)
+        for i in 1:r.n-1
+            rv = r.f(r.x)
+            Base.donotdelete(rv)
+        end
+    end
+    (stats.time - stats.gctime) / r.n
+end
+adaptive_benchmark(fs::NamedTuple; n_evals, kwargs...) = NamedTuple{keys(fs)}(adaptive_mean(map(f->RuntimeIterator(f, Xoshiro(0), n_evals), values(fs)); kwargs...))
+adaptive_mean(itrs::Tuple; q=.01, kwargs...) = adaptive_mean(itrs, [UncertainMean(q) for itr in itrs]; kwargs...)
+call(f, x) = f(x)
+adaptive_mean(itrs::Tuple, ms::Vector; n_min=10, n_max=100, rtol=.01) = begin 
+    N = length(itrs)
+    vmeans = map(mean, ms)
+    perm = sortperm(vmeans)
+    draws = map(iterate, itrs)
+    n_start = 1+minimum(OnlineStats.nobs, ms)
+    n_start > 1 && display("Resuming at $n_start")
+    for i in n_start:n_max
+        draws = map(iterate, itrs)
+        map(OnlineStats.fit!, ms, draws)
+        i < n_min && continue
+        is_precise = all(m->Main.rtol(m) < rtol, ms)
+        !is_precise && continue
+        map!(mean, vmeans, ms)
+        sortperm!(perm, vmeans)
+        is_sorted = all(i->ms[perm[i-1]] < ms[perm[i]], 2:N)
+        !is_sorted && continue
+        display("Stopping early at i=$i")
+    end
+    ms
+end
+struct UncertainMean{V,Q}
+    var::V
+    qmul::Q
+end
+round2(x) = round(x; sigdigits=2)
+Base.show(io::IO, s::UncertainMean) = print(io, round2(mean(lower(s))), rtol(s) < .05 ? "" : " ± $(round2(atol(s)))", " (via ", OnlineStats.nobs(s), " evaluations)")
+Base.show(io::IO, ::MIME"text/plain", s::UncertainMean) = show(io, s)
+UncertainMean(q::Real) = UncertainMean(OnlineStats.Variance(), quantile(Normal(), 1-q))
+OnlineStats.fit!(s::UncertainMean, args...) = OnlineStats.fit!(s.var, args...)
+OnlineStats.nobs(s::UncertainMean) = OnlineStats.nobs(s.var)
+se(s::UncertainMean) = sqrt(var(s.var)/OnlineStats.nobs(s.var))
+Statistics.mean(s::UncertainMean) = mean(s.var)
+upper(s::UncertainMean) = mean(s) + atol(s)
+lower(s::UncertainMean) = mean(s) - atol(s)
+atol(s::UncertainMean) = s.qmul * se(s)
+rtol(s::UncertainMean) = atol(s) / abs(mean(s))
+Base.:isless(s1::UncertainMean, s2::UncertainMean) = upper(s1) < lower(s2) ? true : false
+allocations(f, x) = begin 
+    f(x)
+    @allocations f(x)
+end
+nothing
+```
+
+# Setup code using `@dynamicstruct`
+```{julia}
+using DynamicObjects
+@dynamicstruct struct PosteriorEvaluation
+    "Fixed properties are defined as standard fields and are immutable."
+    posterior_name::String
+    """
+    Dynamic properties are defined via assignment. Any fixed or dynamic property is directly accessible via its name.
+    Once an object's dynamic property gets accessed, it gets stored in a mutable NamedTuple belonging to that object. 
+    """
+    posterior = PosteriorDB.posterior(pdb, posterior_name)
+    """
+    We are using cached properties below, so we have to provide a base `cache_path`.
+    Cached properties will be written to and read from disk if available.
+    """
+    cache_path = joinpath("cache", posterior_name)
+    stan_path = PosteriorDB.path(PosteriorDB.implementation(PosteriorDB.model(posterior), "stan"))
+    stan_problem = with_logger(ConsoleLogger(stderr, Logging.Error)) do 
+        StanProblem(
+            stan_path, 
+            PosteriorDB.load(PosteriorDB.dataset(posterior), String);
+            nan_on_error=true
+        )
+    end
+    stan_lpdf = Base.Fix1(LogDensityProblems.logdensity, stan_problem)
+    julia_lpdf = StanBlocks.julia_implementation(posterior)
+    dimension = LogDensityProblems.dimension(stan_problem)
+    "x, g1 and g2 will be allocated only once per object."
+    x = zeros(dimension)
+    g1 = zeros(dimension)
+    g2 = zeros(dimension)
+    "Cached properties will be written to and read from disk if available."
+    @cached lpdf_difference = adaptive_median() do 
+        randn!(x)
+        (julia_lpdf(x)-stan_lpdf(x))
+    end
+    @cached lpdf_accuracy = adaptive_median() do 
+        randn!(x)
+        norm(julia_lpdf(x)-stan_lpdf(x)-lpdf_difference)/nonzero(norm(stan_lpdf(x)))
+    end
+    usable = !isnothing(lpdf_accuracy) && lpdf_accuracy <= (posterior_name in ("sir-sir","one_comp_mm_elim_abs-one_comp_mm_elim_abs", "soil_carbon-soil_incubation", "hudson_lynx_hare-lotka_volterra") ? 1e-4 : 1e-8)
+    timing_target = 3e4
+    @cached n_evals = tune_evals(bstan_lpdf; timing_target)
+    """
+    Use `let x=...` to prevent accessing the dynamic property `x`. 
+    `x` below does not refer to the object's property `object.x`.
+    Use `let julia_lpdf` or `let julia_lpdf=julia_lpdf` 
+    to capture `object.julia_lpdf` as the local variable `julia_lpdf`.
+    """
+    bjulia_lpdf = let x = zeros(dimension), julia_lpdf 
+        (rng) -> julia_lpdf(randn!(rng, x))
+    end
+    bstan_lpdf = let x = zeros(dimension), stan_lpdf 
+        (rng) -> stan_lpdf(randn!(rng, x))
+    end
+    @cached lpdf_comparison = merge(
+        adaptive_benchmark((;bstan_lpdf, bjulia_lpdf); n_evals),
+        (;BRIDGESTAN_VERSION)
+    )
+    stan_gradient! = let stan_problem, x=nothing
+        (x, g)->(BridgeStan.log_density_gradient!(stan_problem.model, x, g))
+    end
+    enzyme! = let julia_lpdf, x=nothing
+        (x, g)->(Enzyme.autodiff(
+            Enzyme.set_runtime_activity(Enzyme.ReverseWithPrimal), Enzyme.Const(julia_lpdf), 
+            Enzyme.Active, 
+            Enzyme.Duplicated(x, (g .= 0.))
+        )[2], g)
+    end
+    mooncake! = let julia_lpdf, x=nothing
+        rule = Mooncake.build_rrule(julia_lpdf, randn(e.dimension))
+        mooncake_lpdf = Mooncake.CoDual(julia_lpdf, zero_tangent(julia_lpdf))
+        (x,g)->(Mooncake.__value_and_gradient!!(
+            rule, mooncake_lpdf, Mooncake.CoDual(x, (g .= 0.))
+        )[1], g)
+    end
+    bstan_gradient! = let stan_gradient!, x=zeros(dimension), g=zeros(dimension) 
+        (rng) -> stan_gradient!(randn!(rng, x), g)
+    end
+    benzyme! = let enzyme!, x=zeros(dimension), g=zeros(dimension) 
+        (rng) -> enzyme!(randn!(rng, x), g)
+    end
+    bmooncake! = let mooncake!, x=zeros(dimension), g=zeros(dimension) 
+        (rng) -> mooncake!(randn!(rng, x), g)
+    end
+    @cached gradient_comparison = merge(
+        adaptive_benchmark((;bstan_gradient!, benzyme!, bmooncake!); n_evals),
+        (;BRIDGESTAN_VERSION, ENZYME_VERSION, MOONCAKE_VERSION)
+    )
+    @cached allocations = map(f->Main.allocations(f, Xoshiro(0)), (;bstan_lpdf, bjulia_lpdf, bstan_gradient!, benzyme!, bmooncake!))
+    @cached enzyme_accuracy = adaptive_median() do 
+        randn!(x)
+        stan_gradient!(x, g1)
+        enzyme!(x, g2)
+        norm(g1-g2)/nonzero(max(norm(g1),norm(g2)))
+    end
+    @cached mooncake_accuracy = adaptive_median() do 
+        randn!(x)
+        stan_gradient!(x, g1)
+        mooncake!(x, g2)
+        norm(g1-g2)/nonzero(max(norm(g1),norm(g2)))
+    end
+    info = (;posterior_name, dimension, lpdf_difference, lpdf_accuracy, usable, enzyme_accuracy, mooncake_accuracy, lpdf_comparison, gradient_comparison)
+end
+```
+# Using the defined dynamic struct
+
+```{julia}
+e = PosteriorEvaluation("diamonds-diamonds")
+```
+Accessing `e.info` the first time will compute and store the cached properties involved.
+```{julia}
+@time e.info
+```
+Accessing `e.info` the second time will retrieve `info` directly from `e`'s `NamedTuple` cache.
+```{julia}
+@time e.info
+```
+Accessing the `info` property of a new object (with the same cache path) the first time will compute `info` anew, but will read cached properties from disk if available.
+```{julia}
+@time PosteriorEvaluation("diamonds-diamonds").info 
+```

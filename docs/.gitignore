@@ -1,3 +1,11 @@
 build/
 site/
 quarto
+getopt
+os
+sys
+sysconfig
+*.quarto_ipynb
+cache
+/.quarto/
+_site

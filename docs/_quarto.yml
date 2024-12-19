@@ -1,0 +1,18 @@
+author: "Nikolas Siccha"
+project:
+  type: website
+website:
+  title: "DynamicObjects.jl"
+  navbar:
+    left:
+      - icon: github
+        href:  https://github.com/nsiccha/DynamicObjects.jl
+format: 
+    html:
+        page-layout: full
+        toc: true
+jupyter: julia-1.10
+execute:
+  echo: true
+  cache: true
+  daemon: 60000
