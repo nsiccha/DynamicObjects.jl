@@ -1,232 +1,137 @@
 module DynamicObjects
-export AbstractDynamicObject, DynamicObject, @dynamic_object, @dynamic_type, @static_type, update, cached, unpack
+export @dynamicstruct
 import Serialization
 
-
-esc_arg(arg::Symbol) = esc(arg)
-function esc_arg(arg::Expr) 
-    if arg.head == :(=)
-        # When parsing the macro argument, "default assignments" such as
-        # `param=42` are turned into `Expr(:(=), :param, 42)`. However, to
-        # specify default arguments to functions, this needs to be provided
-        # as `Expr(:kw, :param, 42)`:
-        Expr(:kw, esc(arg.args[1]), esc(arg.args[2]))
-    else
-        esc(arg)
-    end
+mutable struct Cache
+    cache::NamedTuple
 end
-get_arg_symbol(arg::Symbol) = arg
-get_arg_symbol(arg::Expr) = arg.head == :(=) ? get_arg_symbol(arg.args[1]) : arg.args[1]
-
-"""
-    @dynamic_object(name, args...)
-
-Defines a DynamicObject:
-
-```
-@dynamic_object Rectangle height width
-```
-
-defines a dynamic type called `Rectangle = DynamicObject{:Rectangle}` with
-defining attributes `height` and `width` and defines a constructor
-```
-Rectangle(height, width; kwargs...) = DynamicObject{:Rectangle}((height=height, width=with, kwargs...))
-```
-
-This dynamic type can be used in function definitions as 
-```
-area(what::Rectangle) = what.height * what.width
-```
-"""
-macro dynamic_object(name, args...)
-    sname = get_sname(name)
-    ename, ebase = ename_and_ebase(name, DynamicObject)
-    # ename = esc(name)
-    eargs = esc_arg.(args)
-    kwargs = esc(:kwargs) 
-    argnames = get_arg_symbol.(args)
-    aargs = [esc(:($(arg)=$(arg))) for arg in argnames]
-    quote
-        Base.@__doc__ $ename = $ebase{$sname}
-        $ebase{$sname}($(eargs...); $kwargs...) = $ebase{$sname}((
-            $(aargs...), $kwargs...
-        ))
-        DynamicObjects.unpack(what::$ename) = DynamicObjects.unpack(what::$ename, $argnames...)
-    end
-end
-
-get_sname(name::Symbol) = QuoteNode(name)
-get_sname(name::Expr) = QuoteNode(name.args[1])
-ename_and_ebase(name::Symbol, default) = esc(name), default
-ename_and_ebase(name::Expr, default) = esc.(name.args)
-
-abstract type AbstractDynamicObject end
-
-# persistent_hash(what, h) = hash(what, h)
-persistent_hash(what, h) = hash(persistent_hash_attributes(what), h)
-persistent_hash_attributes(what) = what
-# https://github.com/JuliaLang/julia/blob/master/base/namedtuple.jl#L253
-persistent_hash(x::NamedTuple, h) = xor(objectid(Base._nt_names(x)), persistent_hash(Tuple(x), h))
-# https://github.com/JuliaLang/julia/blob/master/base/tuple.jl#L510
-persistent_hash(x::Tuple, h) = hash(persistent_hash.(x, h), h)
-# ?
-persistent_hash(x::AbstractArray, h) = hash(persistent_hash.(x, h), h)
-
-macro dynamic_type(name)
-    ename, ebase = ename_and_ebase(name, AbstractDynamicObject)
-    # eupdate = esc(:update)
-    quote
-        Base.@__doc__ struct $ename{T} <: $ebase
-            nt::NamedTuple
-            # $ename{T}(nt::$NT) where T = new(nt)
-        end
-        Base.propertynames(what::$ename) = propertynames(what.nt)
-        function Base.getproperty(what::$ename, name::Symbol)
-            if name == :nt
-                getfield(what, name)
-            else
-                if hasproperty(what.nt, name)
-                    getproperty(what.nt, name)
-                elseif isdefined($__module__, name)
-                    getproperty($__module__, name)(what)
-                elseif isdefined(Main, name)
-                    # Should this actually be done? 
-                    getproperty(Main, name)(what)
-                elseif startswith(String(name), "cached_")
-                    DynamicObjects.cached(what, Symbol(String(name)[8:end]))
-                else
-                    # Should this be a different error?
-                    throw(DomainError(name, "Can't resolve attribute $(name). Looked in $($__module__) and Main."))
-                end
-            end
-        end
-        $ename{T}(what::$ename) where T = $ename{T}(what.nt)
-        $ename{T}(;kwargs...) where T = $ename{T}((;kwargs...))
-        Base.show(io::IO, what::$ename{T}) where T = print(io, T, what.nt)
-        Base.merge(what::$ename, args...) = typeof(what)(merge(what.nt, args...))
-        # DynamicObjects.update(what::$ename; kwargs...) = merge(what, (;kwargs...))
-        DynamicObjects.update(what::$ename, args::Symbol...; kwargs...) = merge(what, (;kwargs...), (;zip(args, getproperty.([what], args))...))
-        Base.hash(what::$ename{T}, h::UInt=UInt(0)) where T = DynamicObjects.persistent_hash((what.nt, T), h)
-    end
-end
-
-# update(what::AbstractDynamicObject) = what
-unpack(what, args::Symbol...) = getproperty.([what], args)
-update(args::Symbol...; kwargs...) = what->update(what, args...; kwargs...)
-
-"""
-    DynamicObject{T}
-
-A `DynamicObject` is a thin named wrapper around a generic NamedTuple which enables function overloading.
-The type is inefficient computationally, but can enable more efficient prototyping/development.
-"""
-@dynamic_type DynamicObject 
-# struct DynamicObject{T}
-#     nt::NamedTuple
-#     DynamicObject{T}(nt::NamedTuple) where T = new(nt)
-# end
-
-# Base.propertynames(value::DynamicObject) = propertynames(value.nt)
-# function Base.getproperty(value::DynamicObject, name::Symbol)
-#     if name == :nt
-#         getfield(value, name)
-#     else
-#         if hasproperty(value.nt, name)
-#             getproperty(value.nt, name)
-#         else
-#             getfield(Main, name)(value)
-#         end
-#     end
-# end
-# # DynamicObject{T}(nt::NamedTuple) where T = DynamicObject{T}(nt)
-# DynamicObject{T}(what::DynamicObject) where T = DynamicObject{T}(what.nt)
-# DynamicObject{T}(;kwargs...) where T = DynamicObject{T}((;kwargs...))
-# Base.show(io::IO, what::DynamicObject{T}) where T = print(io, T, what.nt)
-# Base.merge(what::DynamicObject, args...) = typeof(what)(merge(what.nt, args...))
-# update(what; kwargs...) = merge(what, (;kwargs...))
-# update(what, args...) = merge(what, (;zip(args, getproperty.([what], args))...))
-# Base.hash(what::DynamicObject{T}, h::Int=0) where T = Base.hash((what.nt, T, h))
-
-
-get_cache_path() = get(ENV, "DYNAMIC_CACHE", "cache")
-set_cache_path!(path::AbstractString) = (ENV["DYNAMIC_CACHE"] = path)
-get_cache_path(key::Symbol, what) = joinpath(get_cache_path(), "$(key)_$(typeof(what))_$(what.hash)")
-read_cache(what, key::Symbol) = Serialization.deserialize(get_cache_path(key, what))
-write_cache(what, key::Symbol, rv) = Serialization.serialize(get_cache_path(key, what), rv)
-# get_cache_verbosity() = get(ENV, "DYNAMIC_CACHE_VERBOSITY", 0)
-# set_cache_verbosity!(path::AbstractString) = (ENV["DYNAMIC_CACHE_VERBOSITY"] = path)
-
-function cached(what, key::Symbol, no_disk=false)
-    if hasproperty(what, key)
-        # println("LOADING FROM DynamicObject")
-        getproperty(what, key)
-    else
-        mkpath(get_cache_path())
-        file_name = get_cache_path(key, what)
-        if !no_disk && isfile(file_name)
-            # println("LOADING FROM FILE!")
-            Serialization.deserialize(file_name)
+Base.hasproperty(c::Cache, name::Symbol) = hasproperty(getfield(c, :cache), name)
+Base.getproperty(c::Cache, name::Symbol) = getfield(getfield(c, :cache), name)
+Base.setproperty!(c::Cache, name::Symbol, x) = setfield!(c, :cache, merge(getfield(c, :cache), (;name=>x)))
+getorcomputeproperty(o, name) = if hasfield(typeof(o), name)
+    getfield(o, name)
+elseif hasproperty(getfield(o, :cache), name)
+    getproperty(getfield(o, :cache), name)
+else
+    vname = Val(name)
+    rv = if iscached(o, vname)
+        cache_path = joinpath(o.cache_path, "$name.sjl")
+        mkpath(dirname(cache_path))
+        if isfile(cache_path)
+            Serialization.deserialize(cache_path)
         else
-            rv = getproperty(what, key)
-            Serialization.serialize(file_name, rv)
+            println("Generating $cache_path...")
+            rv = compute_property(o, vname) 
+            Serialization.serialize(cache_path, rv)
             rv
         end
+    else
+        compute_property(o, vname)
     end
+    setproperty!(getfield(o, :cache), name, rv)
+    rv
 end
-cached(key::Symbol) = x->cached(x, key)
-
-# DynamicObject{T}() where T = DynamicObject{T}(NamedTuple())
-# default(what, name) = missing
-# getprop(what, name, def=default(DynamicObject, name)) = hasproperty(what, name) ? getproperty(what, name) : def
-
-# Base.length(what::DynamicObject) = 1
-# Base.size(what::DynamicObject) = ()
-# Base.getindex(what::DynamicObject, i) = what
-# Base.iterate(what::DynamicObject) = iterate([what])
-# Base.merge(what::DynamicObject, arg1::DynamicObject, args...) = typeof(what)(merge(what.nt, arg1.nt, args...))
-# igetproperty(obj, sym) = getproperty(obj, sym)
-# igetproperty(obj, sym, args...) = igetproperty(getproperty(obj, sym), args...)
-# update_default(what, args...) = update(wha)
-
-# what = DynamicObject
-# update_cached(what, args...) = merge(what, (;zip(args, cached.([what], args))...))
-# Plots.plot!(p, what) = Plots.plot()
-# Plots.plot(what::DynamicObject{T}) where T = Plots.plot!(Plots.plot(), what)
-
-subexpressions(lhs) = [lhsi for lhsi in lhs if !isa(lhsi, LineNumberNode)]
-compare_expression(lhs, rhs) = "$lhs::$(typeof(lhs)) " * (lhs == rhs ? "==" : "!=") * " $rhs::$(typeof(rhs))"
-compare_expressions(lhs, rhs) = compare_expression(lhs, rhs)
-compare_expressions(lhs::AbstractVector, rhs::AbstractVector) = begin
-  lhs = subexpressions(lhs)
-  rhs = subexpressions(rhs)
-  length(lhs) == length(rhs) ? join(compare_expressions.(lhs, rhs), "\n") : compare_expression(lhs, rhs)
-end
-compare_expressions(lhs::Expr, rhs::Expr) = replace(
-  compare_expressions(lhs.head, rhs.head) * "\n" * compare_expressions(lhs.args, rhs.args),
-  "\n"=>"\n|"
-)
-collect_types(expr) = Dict()
-collect_types(expr::Expr) = expr.head == Symbol("::") ? Dict(expr.args[1]=>expr.args[2]) : merge(collect_types.(expr.args)...)
-strip_type(expr::Expr) = expr.head == Symbol("::") ? expr.args[1] : expr
-# strip_type(expr::Symbol) = expr
-base_and_f(f::Expr) = f.head == :function ? (Any, f) : (f.args[2], f.args[1]) 
-
-macro static_type(f)
-    base, f = base_and_f(f)
-    @assert f.head == :function
-    struct_sig = Expr(Symbol("<:"), f.args[1].args[1], base)
-    struct_name = f.args[1].args[1].args[1]
-    struct_fields = f.args[end].args[end]
-    struct_expr = Expr(:struct, false, struct_sig, Expr(:block, struct_fields.args...)) |> esc
-  
-    func_sig = Expr(:call, struct_name, f.args[1].args[2:end]...)
-    return_expr = Expr(:call, struct_name, strip_type.(f.args[end].args[end].args)...)
-    func_body_expr = Expr(:block, f.args[end].args[1:end-1]..., return_expr)
-    func_expr = Expr(:function, func_sig, func_body_expr) |> esc
-    quote
-      $struct_expr
-      $func_expr
+# replace_properties(e; properties) = e
+replace_properties(e::Symbol; properties) = e in properties ? :(o.$e) : e
+replace_properties(e::Expr; properties) = Expr(e.head, replace_properties.(e.args; properties)...)
+isfixed(kv::Pair) = isfixed(kv[2])
+isfixed(info::NamedTuple) = isnothing(info.rhs)
+walk_rhs(e; kwargs...) = e
+walk_rhs(e::Expr; dependent, properties) = if e.head == :let
+    locals = properties[dependent].locals
+    ls = Set{Symbol}()
+    !Meta.isexpr(e.args[1], :block) && (e.args[1] = Expr(:block, e.args[1]))
+    map!(e.args[1].args, e.args[1].args) do arg 
+        isa(arg, Symbol) && (arg = Expr(:(=), arg, arg))
+        @assert Meta.isexpr(arg, :(=))
+        name, rhs = arg.args[1], walk_rhs(arg.args[2]; dependent, properties)
+        name in locals || push!(ls, name)
+        push!(locals, name)
+        Expr(:(=), name, rhs)
     end
+    e.args[2] = walk_rhs(e.args[2]; dependent, properties)
+    for l in ls
+        delete!(locals, l)
+    end
+    e
+else
+    Expr(e.head, walk_rhs.(e.args; dependent, properties)...)
 end
-
+walk_rhs(e::Symbol; dependent, properties) = if e in keys(properties) && !(e in properties[dependent].locals)
+    isfixed(properties[e]) || push!(properties[dependent].dependson, e)
+    :(o.$e)
+else
+    e
+end
+function compute_property end
+iscached(o, v) = error()
+function utime end
+function isuptodate end
+macro dynamicstruct(expr)
+    @assert expr.head == :struct
+    mut, head, body = expr.args
+    type = head
+    Meta.isexpr(type, :(<:)) && (type = type.args[1])
+    Meta.isexpr(type, :(curly)) && (type = type.args[1])
+    @assert body.head == :block
+    lnn = nothing
+    oproperties = map(body.args) do arg
+        if isa(arg, LineNumberNode)
+            lnn = arg
+            return
+        end
+        macros = Set{Symbol}()
+        rhs = nothing
+        dependson = nothing
+        locals = nothing
+        while Meta.isexpr(arg, :macrocall)
+            push!(macros, arg.args[1])
+            arg = arg.args[end]
+        end
+        if Meta.isexpr(arg, :(=))
+            arg, rhs = arg.args
+            dependson = Set{Symbol}()
+            locals = Set{Symbol}()
+        end
+        name = if Meta.isexpr(arg, :(::))
+            arg.args[1]
+        else
+            arg
+        end
+        @assert !isnothing(rhs) || length(macros) == 0
+        name=>(;lhs=arg, macros, rhs, lnn, dependson, locals)
+    end |> filter(!isnothing)
+    properties = Dict(oproperties)
+    for (dependent, info) in properties
+        isfixed(info) && continue
+        properties[dependent] = merge(info, (;rhs=walk_rhs(info.rhs; dependent, properties)))
+    end
+    esc(Expr(:block, 
+        Expr(:struct, mut, head, Expr(:block, 
+            [info.lhs for (name,info) in oproperties if isfixed(info)]..., :(cache::DynamicObjects.Cache),
+            :($type(args...; kwargs...) = new(args..., DynamicObjects.Cache((;kwargs...))))
+        )),
+        quote
+            Base.getproperty(o::$type, name::Symbol) = DynamicObjects.getorcomputeproperty(o, name)
+            # Base.show(io::IO, o::$type) = 
+        end,
+        [
+            quote
+                # DynamicObjects.isuptodate(o::$type, ::Val{$(Meta.quot(name))}) = true
+                # DynamicObjects.utime(o::$type, ::Val{$(Meta.quot(name))}) = 0
+            end
+            for (name, info) in properties if isfixed(info)
+        ]...,
+        [
+            quote
+                DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}) = $(info.rhs)
+                DynamicObjects.iscached(o::$type, ::Val{$(Meta.quot(name))}) = $(Symbol("@cached") in info.macros)
+                # DynamicObjects.utime(o::$type, ::Val{$(Meta.quot(name))}) = max($([
+                #     :(DynamicObjects.utime(o, Val($(Meta.quot(dep))))) for dep in info.dependson
+                # ]...))
+            end
+            for (name, info) in properties if !isfixed(info)
+        ]...,
+    ))
+end
 end
