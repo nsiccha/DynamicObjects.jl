@@ -7,4 +7,7 @@ cache
 _freeze
 .quarto/
 *.ipynb
-/.luarc.json
+.luarc.json
+syssysconfig
+os
+getopt
