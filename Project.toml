@@ -1,10 +1,20 @@
 name = "DynamicObjects"
 uuid = "23d02862-63fe-4c6e-8fdb-1d52cbbd39d5"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com> and contributors"]
-version = "0.2.1"
+version = "0.3.0"
 
-[deps]
+[weakdeps]
 Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
+
+[extensions]
+SerializationExt = "Serialization"
+
+[extras]
+Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Serialization", "Test"]
 
 [compat]
 julia = "1"

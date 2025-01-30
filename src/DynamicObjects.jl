@@ -1,6 +1,8 @@
 module DynamicObjects
-export @dynamicstruct
-import Serialization
+export @dynamicstruct, @staticstruct
+
+serialize(args...; kwargs...) = error("Serialization requires loading e.g. Serialization.jl")
+deserialize(args...; kwargs...) = error("Serialization requires loading e.g. Serialization.jl")
 
 mutable struct Cache
     cache::NamedTuple
@@ -18,10 +20,10 @@ else
         cache_path = joinpath(o.cache_path, "$name.sjl")
         mkpath(dirname(cache_path))
         if isfile(cache_path)
-            rv = Serialization.deserialize(cache_path)
+            rv = deserialize(cache_path)
             if resumes(o, vname) || force
                 rv = compute_property(o, vname, rv)
-                Serialization.serialize(cache_path, rv)
+                serialize(cache_path, rv)
                 rv
             else
                 rv
@@ -29,7 +31,7 @@ else
         else
             println("Generating $cache_path...")
             rv = compute_property(o, vname) 
-            Serialization.serialize(cache_path, rv)
+            serialize(cache_path, rv)
             rv
         end
     else
@@ -147,4 +149,61 @@ macro dynamicstruct(expr)
         ]...,
     ))
 end
+
+ereplace(e::Expr; d) = e in keys(d) ? d[e] : Expr(e.head, ereplace.(e.args; d)...)
+ereplace(e; d) = e in keys(d) ? d[e] : e
+const self_symbol = gensym("self")
+const T_symbol = gensym("T")
+macro staticstruct(expr)
+    @assert expr.head == :struct
+    mut, head, body = expr.args
+    type, T = if Meta.isexpr(head, :(curly))
+        head.args[1], head.args[2:end]
+    else
+        @assert isa(head, Symbol)
+        head, []
+    end
+    @assert body.head == :block
+    names = []
+    sig = []
+    d = Dict{Symbol,Any}(:self=>self_symbol)
+    funcs = []
+    for i in eachindex(body.args)
+        arg = body.args[i]
+        isa(arg, LineNumberNode) && continue
+        lhs, rhs = if Meta.isexpr(arg, :(=))
+            arg.args
+        else
+            arg, nothing
+        end
+        if Meta.isexpr(lhs, :call)
+            insert!(lhs.args, 2, Expr(:(::), self_symbol, type))
+            push!(funcs, Expr(
+                :(=), 
+                lhs, 
+                ereplace(rhs; d)
+            ))
+            body.args[i] = nothing 
+            continue
+        end
+        name, typei = if Meta.isexpr(lhs, :(::))
+            lhs.args
+        else
+            push!(T, Symbol(T_symbol, i))
+            lhs, T[end]
+        end
+        body.args[i] = Expr(:(::), name, typei)
+        sigi = if isnothing(rhs)
+            body.args[i]
+        else
+            Expr(:kw, body.args[i], rhs)
+        end
+        push!(names, name)
+        d[name] = :($self_symbol.$name)
+        push!(sig, sigi)
+    end
+    push!(body.args, :($type($(sig...)) where {$(T...)} = new{$(T...)}($(names...))))
+    esc(Expr(:block, Expr(:struct, mut, Expr(:curly, type, T...), body), funcs...))
+end
+
 end
