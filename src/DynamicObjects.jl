@@ -46,7 +46,7 @@ else
     else
         compute_property(o, vname, indices...)
     end
-    setproperty!(getfield(o, :cache), name, rv)
+    length(indices) == 0 && setproperty!(getfield(o, :cache), name, rv)
     rv
 end
 isfixed(kv::Pair) = isfixed(kv[2])

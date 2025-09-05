@@ -33,5 +33,8 @@ using Test
     @test d1.ci[2] == 4
     @test isfile(joinpath(path, "ci_2.sjl"))
     @test d1.ci3[1,2,3] == 321
+    @test isa(d1.ci3, DynamicObjects.IndexableProperty)
+    @test d1.ci3[1,2,3] == 321
+    @test isa(d1.ci3, DynamicObjects.IndexableProperty)
     @test isfile(joinpath(path, "ci3_1_2_3.sjl"))
 end
