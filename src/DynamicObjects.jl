@@ -1,5 +1,5 @@
 module DynamicObjects
-export @dynamicstruct, @staticstruct
+export @dynamicstruct
 
 serialize(args...; kwargs...) = error("Serialization requires loading e.g. Serialization.jl")
 deserialize(args...; kwargs...) = error("Serialization requires loading e.g. Serialization.jl")
@@ -10,32 +10,41 @@ end
 Base.hasproperty(c::Cache, name::Symbol) = hasproperty(getfield(c, :cache), name)
 Base.getproperty(c::Cache, name::Symbol) = getfield(getfield(c, :cache), name)
 Base.setproperty!(c::Cache, name::Symbol, x) = setfield!(c, :cache, merge(getfield(c, :cache), (;name=>x)))
-getorcomputeproperty(o, name; force=false) = if hasfield(typeof(o), name)
+struct IndexableProperty{N,O}
+    o::O
+    cache::Dict
+    IndexableProperty(N,o,cache=Dict()) = new{N,typeof(o)}(o, cache)
+end
+Base.getindex((;o, cache)::IndexableProperty{name}, indices...) where {name} = get!(cache, indices) do
+    getorcomputeproperty(o, name, indices...)
+end
+getorcomputeproperty(o, name, indices...; force=false) = if hasfield(typeof(o), name)
+    @assert length(indices) == 0
     getfield(o, name)
-elseif hasproperty(getfield(o, :cache), name) && !force
+elseif length(indices) == 0 && hasproperty(getfield(o, :cache), name) && !force
     getproperty(getfield(o, :cache), name)
 else
     vname = Val(name)
-    rv = if iscached(o, vname)
-        cache_path = joinpath(o.cache_path, "$name.sjl")
+    rv = if iscached(o, vname, indices...)
+        cache_path = joinpath(o.cache_path, join((name, indices...), "_") * ".sjl")
         mkpath(dirname(cache_path))
         if isfile(cache_path)
             rv = deserialize(cache_path)
-            if resumes(o, vname) || force
-                rv = compute_property(o, vname, rv)
+            if resumes(o, vname, indices...) || force
+                rv = compute_property(o, vname, indices...; (name=>rv, )...)
                 serialize(cache_path, rv)
                 rv
             else
                 rv
             end
         else
-            println("Generating $cache_path...")
-            rv = compute_property(o, vname) 
+            @debug "Generating $cache_path..."
+            rv = compute_property(o, vname, indices...) 
             serialize(cache_path, rv)
             rv
         end
     else
-        compute_property(o, vname)
+        compute_property(o, vname, indices...)
     end
     setproperty!(getfield(o, :cache), name, rv)
     rv
@@ -75,8 +84,6 @@ end
 function compute_property end
 function iscached end
 function resumes end
-function utime end
-function isuptodate end
 function meta end
 macro dynamicstruct(expr)
     @assert expr.head == :struct
@@ -95,6 +102,7 @@ macro dynamicstruct(expr)
         rhs = nothing
         dependson = nothing
         locals = nothing
+        indices = tuple()
         while Meta.isexpr(arg, :macrocall)
             push!(macros, arg.args[1])
             arg = arg.args[end]
@@ -104,14 +112,19 @@ macro dynamicstruct(expr)
             dependson = Set{Symbol}()
             locals = Set{Symbol}()
         end
+        if Meta.isexpr(arg, :ref)
+            arg, indices... = arg.args
+            union!(locals, indices)
+        end
         name = if Meta.isexpr(arg, :(::))
             arg.args[1]
         else
             arg
         end
+        @assert isa(name, Symbol)
         !isnothing(locals) && push!(locals, name)
         @assert !isnothing(rhs) || length(macros) == 0
-        name=>(;lhs=arg, macros, rhs, lnn, dependson, locals)
+        name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices)
     end |> filter(!isnothing)
     properties = Dict(oproperties)
     for (dependent, info) in properties
@@ -127,83 +140,23 @@ macro dynamicstruct(expr)
             Base.hasproperty(o::$type, name::Symbol) = name in $(keys(properties))
             Base.getproperty(o::$type, name::Symbol) = DynamicObjects.getorcomputeproperty(o, name)
             DynamicObjects.meta(::Type{$type}) = $properties
-            # Base.show(io::IO, o::$type) = 
         end,
         [
             quote
-                # DynamicObjects.isuptodate(o::$type, ::Val{$(Meta.quot(name))}) = true
-                # DynamicObjects.utime(o::$type, ::Val{$(Meta.quot(name))}) = 0
-            end
-            for (name, info) in properties if isfixed(info)
-        ]...,
-        [
-            quote
-                DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}, $(name)=nothing) = $(info.rhs)
-                DynamicObjects.iscached(o::$type, ::Val{$(Meta.quot(name))}) = $(Symbol("@cached") in info.macros)
-                DynamicObjects.resumes(o::$type, ::Val{$(Meta.quot(name))}) = $(name in info.dependson)
-                # DynamicObjects.utime(o::$type, ::Val{$(Meta.quot(name))}) = max($([
-                #     :(DynamicObjects.utime(o, Val($(Meta.quot(dep))))) for dep in info.dependson
-                # ]...))
+                DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...); $(name)=nothing) = $(info.rhs)
+                DynamicObjects.iscached(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = $(Symbol("@cached") in info.macros)
+                DynamicObjects.resumes(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = $(name in info.dependson)
             end
             for (name, info) in properties if !isfixed(info)
         ]...,
+        [
+            quote
+                DynamicObjects.iscached(o::$type, ::Val{$(Meta.quot(name))}) = false
+                DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}) = DynamicObjects.IndexableProperty($(Meta.quot(name)), o)
+            end
+            for (name, info) in properties if length(info.indices) > 0
+        ]...,
     ))
-end
-
-ereplace(e::Expr; d) = e in keys(d) ? d[e] : Expr(e.head, ereplace.(e.args; d)...)
-ereplace(e; d) = e in keys(d) ? d[e] : e
-const self_symbol = gensym("self")
-const T_symbol = gensym("T")
-macro staticstruct(expr)
-    @assert expr.head == :struct
-    mut, head, body = expr.args
-    type, T = if Meta.isexpr(head, :(curly))
-        head.args[1], head.args[2:end]
-    else
-        @assert isa(head, Symbol)
-        head, []
-    end
-    @assert body.head == :block
-    names = []
-    sig = []
-    d = Dict{Symbol,Any}(:self=>self_symbol)
-    funcs = []
-    for i in eachindex(body.args)
-        arg = body.args[i]
-        isa(arg, LineNumberNode) && continue
-        lhs, rhs = if Meta.isexpr(arg, :(=))
-            arg.args
-        else
-            arg, nothing
-        end
-        if Meta.isexpr(lhs, :call)
-            insert!(lhs.args, 2, Expr(:(::), self_symbol, type))
-            push!(funcs, Expr(
-                :(=), 
-                lhs, 
-                ereplace(rhs; d)
-            ))
-            body.args[i] = nothing 
-            continue
-        end
-        name, typei = if Meta.isexpr(lhs, :(::))
-            lhs.args
-        else
-            push!(T, Symbol(T_symbol, i))
-            lhs, T[end]
-        end
-        body.args[i] = Expr(:(::), name, typei)
-        sigi = if isnothing(rhs)
-            body.args[i]
-        else
-            Expr(:kw, body.args[i], rhs)
-        end
-        push!(names, name)
-        d[name] = :($self_symbol.$name)
-        push!(sig, sigi)
-    end
-    push!(body.args, :($type($(sig...)) where {$(T...)} = new{$(T...)}($(names...))))
-    esc(Expr(:block, Expr(:struct, mut, Expr(:curly, type, T...), body), funcs...))
 end
 
 end

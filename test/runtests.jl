@@ -9,6 +9,10 @@ using Test
         b = 2*a
         @cached c = a*b 
         @cached d = isnothing(d) ? 1 : d+1
+        i[idx] = idx
+        @cached ci[idx] = idx ^ 2
+        @cached ci3[i, j, k] = i + 10*j + 100*k
+        # @cached rci[idx] = isnothing(rci) 
     end
     getb(x::D1) = x.b
     d1 = D1()
@@ -25,15 +29,9 @@ using Test
     d1 = D1()
     @test d1.d == 2
     @test isfile(joinpath(path, "d.sjl"))
-    @staticstruct struct S1
-        a=1
-        b=2*a
-        getb() = b
-        getb1() = self.b
-    end
-    t1 = S1()
-    @test 2*t1.a == t1.b == 2
-    @test getb(t1) == getb1(t1)
-    @inferred getb(t1)
-    @inferred getb1(t1)
+    @test d1.i[1] == 1
+    @test d1.ci[2] == 4
+    @test isfile(joinpath(path, "ci_2.sjl"))
+    @test d1.ci3[1,2,3] == 321
+    @test isfile(joinpath(path, "ci3_1_2_3.sjl"))
 end
