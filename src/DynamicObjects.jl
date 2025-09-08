@@ -4,51 +4,70 @@ export @dynamicstruct
 serialize(args...; kwargs...) = error("Serialization requires loading e.g. Serialization.jl")
 deserialize(args...; kwargs...) = error("Serialization requires loading e.g. Serialization.jl")
 
-mutable struct Cache
-    cache::NamedTuple
+struct PropertyCache{D<:AbstractDict{Symbol,Any}}
+    cache::D
+    PropertyCache(D, c::NamedTuple) = new{D{Symbol,Any}}(D{Symbol,Any}(pairs(c)))
 end
-Base.hasproperty(c::Cache, name::Symbol) = hasproperty(getfield(c, :cache), name)
-Base.getproperty(c::Cache, name::Symbol) = getfield(getfield(c, :cache), name)
-Base.setproperty!(c::Cache, name::Symbol, x) = setfield!(c, :cache, merge(getfield(c, :cache), (;name=>x)))
-struct IndexableProperty{N,O}
+Base.get!(f::Function, c::PropertyCache, key) = get!(f, c.cache, key)
+Base.get!(f::Function, ::PropertyCache, key, indices...) = f()
+struct IndexableProperty{N,O,D<:AbstractDict}
     o::O
-    cache::Dict
-    IndexableProperty(N,o,cache=Dict()) = new{N,typeof(o)}(o, cache)
+    cache::D
+    IndexableProperty(N,o,cache=Dict()) = new{N,typeof(o),typeof(cache)}(o, cache)
 end
+name(::IndexableProperty{N}) where {N} = N
 Base.getindex((;o, cache)::IndexableProperty{name}, indices...) where {name} = get!(cache, indices) do
     getorcomputeproperty(o, name, indices...)
 end
-getorcomputeproperty(o, name, indices...; force=false) = if hasfield(typeof(o), name)
+struct ThreadsafeDict{K,V} <: AbstractDict{K,V}
+    lock::ReentrantLock
+    cache::Dict{K,V}
+    tasks::Dict{K,Task}
+    ThreadsafeDict{K,V}(c) where {K,V} = new{K,V}(ReentrantLock(), Dict{K,V}(c), Dict{K,Task}())
+    ThreadsafeDict() = new{Any,Any}(ReentrantLock(), Dict{Any,Any}(), Dict{Any,Task}())
+end
+Base.get!(f::Function, c::ThreadsafeDict, key) = begin
+    rv = lock(c.lock) do
+        get(c.cache, key) do 
+            get!(c.tasks, key) do
+                Threads.@spawn begin 
+                    rv = f()
+                    lock(c.lock) do 
+                        c.cache[key] = rv
+                    end
+                    rv
+                end 
+            end
+        end
+    end
+    fetch(rv)
+end
+subcache(::PropertyCache{<:Dict}) = Dict()
+subcache(::PropertyCache{<:ThreadsafeDict}) = ThreadsafeDict()
+
+
+getorcomputeproperty(o, name, indices...) = if hasfield(typeof(o), name)
     @assert length(indices) == 0
     getfield(o, name)
-elseif length(indices) == 0 && hasproperty(getfield(o, :cache), name) && !force
-    getproperty(getfield(o, :cache), name)
 else
-    vname = Val(name)
-    rv = if iscached(o, vname, indices...)
-        cache_path = joinpath(o.cache_path, join((name, indices...), "_") * ".sjl")
-        mkpath(dirname(cache_path))
-        if isfile(cache_path)
-            rv = deserialize(cache_path)
-            if resumes(o, vname, indices...) || force
+    get!(getfield(o, :cache), name, indices...) do 
+        vname = Val(name)
+        if iscached(o, vname, indices...)
+            cache_path = joinpath(o.cache_path, join((name, indices...), "_") * ".sjl")
+            mkpath(dirname(cache_path))
+            rv = isfile(cache_path) ? deserialize(cache_path) : nothing
+            if !isfile(cache_path) || resumes(o, vname, indices...)
+                @debug "Generating $cache_path..."
                 rv = compute_property(o, vname, indices...; (name=>rv, )...)
                 serialize(cache_path, rv)
-                rv
-            else
-                rv
             end
-        else
-            @debug "Generating $cache_path..."
-            rv = compute_property(o, vname, indices...) 
-            serialize(cache_path, rv)
             rv
+        else
+            compute_property(o, vname, indices...)
         end
-    else
-        compute_property(o, vname, indices...)
     end
-    length(indices) == 0 && setproperty!(getfield(o, :cache), name, rv)
-    rv
 end
+    
 isfixed(kv::Pair) = isfixed(kv[2])
 isfixed(info::NamedTuple) = isnothing(info.rhs)
 walk_rhs(e; kwargs...) = e
@@ -85,7 +104,7 @@ function compute_property end
 function iscached end
 function resumes end
 function meta end
-macro dynamicstruct(expr)
+dynamicstruct(expr) = begin 
     @assert expr.head == :struct
     mut, head, body = expr.args
     type = head
@@ -133,8 +152,14 @@ macro dynamicstruct(expr)
     end
     esc(Expr(:block, 
         Expr(:struct, mut, head, Expr(:block, 
-            [info.lhs for (name,info) in oproperties if isfixed(info)]..., :(cache::DynamicObjects.Cache),
-            :($type(args...; kwargs...) = new(args..., DynamicObjects.Cache((;kwargs...))))
+            [info.lhs for (name,info) in oproperties if isfixed(info)]..., :(cache::DynamicObjects.PropertyCache),
+            :($type(args...; cache_type=:serial, kwargs...) = new(
+                args..., 
+                DynamicObjects.PropertyCache(
+                    get((;serial=Dict, parallel=DynamicObjects.ThreadsafeDict), cache_type, cache_type),
+                    (;kwargs...)
+                )
+            ))
         )),
         quote
             Base.hasproperty(o::$type, name::Symbol) = name in $(keys(properties))
@@ -152,11 +177,16 @@ macro dynamicstruct(expr)
         [
             quote
                 DynamicObjects.iscached(o::$type, ::Val{$(Meta.quot(name))}) = false
-                DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}) = DynamicObjects.IndexableProperty($(Meta.quot(name)), o)
+                DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}) = DynamicObjects.IndexableProperty($(Meta.quot(name)), o, DynamicObjects.subcache(o.cache))
             end
             for (name, info) in properties if length(info.indices) > 0
         ]...,
     ))
 end
+
+macro dynamicstruct(expr)
+    dynamicstruct(expr)
+end
+
 
 end
