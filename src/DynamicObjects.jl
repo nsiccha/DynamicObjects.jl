@@ -31,11 +31,11 @@ Base.get!(f::Function, c::ThreadsafeDict, key) = begin
         get(c.cache, key) do 
             get!(c.tasks, key) do
                 Threads.@spawn begin 
-                    rv = f()
+                    tmp = f()
                     lock(c.lock) do 
-                        c.cache[key] = rv
+                        c.cache[key] = tmp
                     end
-                    rv
+                    tmp
                 end 
             end
         end
