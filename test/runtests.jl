@@ -27,24 +27,23 @@ using Test
     @test hasproperty(serial_d1, :a) == hasproperty(serial_d1, :b) == true
     @test 2*serial_d1.a == serial_d1.b == 2
     @test_throws ErrorException @inferred getb(serial_d1)
-    @test !isfile(joinpath(path, "c.sjl"))
+    @test @cache_status(serial_d1.c) == :unstarted
     @test serial_d1.c == serial_d1.a * serial_d1.b
-    @test isfile(joinpath(path, "c.sjl"))
-    @test !isfile(joinpath(path, "d.sjl"))
+    @test @cache_status(serial_d1.c) == :ready
+    @test @cache_status(serial_d1.d) == :unstarted
     @test serial_d1.d == 1
-    @test isfile(joinpath(path, "d.sjl"))
+    @test @cache_status(serial_d1.d) == :ready
     @test serial_d1.d == 1
     serial_d1 = D1()
     @test serial_d1.d == 2
-    @test isfile(joinpath(path, "d.sjl"))
     @test serial_d1.i[1] == 1
+    @test @cache_status(serial_d1.ci[2]) == :unstarted
     @test serial_d1.ci[2] == 4
-    @test isfile(joinpath(path, "ci_2.sjl"))
+    @test @cache_status(serial_d1.ci[2]) == :ready
+    @test @cache_status(serial_d1.ci3[1,2,3]) == :unstarted
     @test serial_d1.ci3[1,2,3] == 321
     @test isa(serial_d1.ci3, DynamicObjects.IndexableProperty)
-    @test serial_d1.ci3[1,2,3] == 321
-    @test isa(serial_d1.ci3, DynamicObjects.IndexableProperty)
-    @test isfile(joinpath(path, "ci3_1_2_3.sjl"))
+    @test @cache_status(serial_d1.ci3[1,2,3]) == :ready
     @test Threads.nthreads() == 1 || length(unique(asyncmap(i->serial_d1.parallel_test, 1:10))) > 1
     parallel_d1 = D1(;cache_type=:parallel)
     @test length(unique(asyncmap(i->parallel_d1.parallel_test, 1:10))) == 1
