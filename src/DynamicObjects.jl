@@ -1,5 +1,5 @@
 module DynamicObjects
-export @dynamicstruct
+export @dynamicstruct, @cache_status, @is_cached
 
 serialize(args...; kwargs...) = error("Serialization requires loading e.g. Serialization.jl")
 deserialize(args...; kwargs...) = error("Serialization requires loading e.g. Serialization.jl")
@@ -45,7 +45,6 @@ end
 subcache(::PropertyCache{<:Dict}) = Dict()
 subcache(::PropertyCache{<:ThreadsafeDict}) = ThreadsafeDict()
 
-
 getorcomputeproperty(o, name, indices...) = if hasfield(typeof(o), name)
     @assert length(indices) == 0
     getfield(o, name)
@@ -53,10 +52,18 @@ else
     get!(getfield(o, :cache), name, indices...) do 
         vname = Val(name)
         if iscached(o, vname, indices...)
-            cache_path = joinpath(o.cache_path, join((name, indices...), "_") * ".sjl")
+            cache_path = get_cache_path(o, name, indices...)
             mkpath(dirname(cache_path))
-            rv = isfile(cache_path) ? deserialize(cache_path) : nothing
-            if !isfile(cache_path) || resumes(o, vname, indices...)
+            cache_status = get_cache_status(cache_path)
+            rv = if cache_status == :ready
+                deserialize(cache_path) 
+            elseif cache_status == :started
+                @warn "Cache file $cache_path exists but has size 0.\nAssuming a previous run failed."
+            else
+                touch(cache_path)
+                nothing
+            end
+            if cache_status != :ready || resumes(o, vname, indices...)
                 @debug "Generating $cache_path..."
                 rv = compute_property(o, vname, indices...; (name=>rv, )...)
                 serialize(cache_path, rv)
@@ -67,7 +74,30 @@ else
         end
     end
 end
-    
+get_cache_path(o, args...) = joinpath(o.cache_path, join(args, "_") * ".sjl")
+get_cache_status(o, args...) = get_cache_status(get_cache_path(o, args...)) 
+get_cache_status(cache_path::AbstractString) = begin
+    !isfile(cache_path) && return :unstarted
+    filesize(cache_path) == 0 && return :started
+    return :ready
+end
+cache_status_expr(x) = begin
+    x, indices = if Meta.isexpr(x, :ref)
+        x.args[1], x.args[2:end]
+    else
+        x, []
+    end
+    @assert Meta.isexpr(x, :.)
+    o, name = x.args
+    :($get_cache_status($(esc(o)), $(name), $(indices...)))
+end
+macro cache_status(x)
+    cache_status_expr(x)
+end
+macro is_cached(x) 
+    :($(cache_status_expr(x)) == :ready)
+end
+
 isfixed(kv::Pair) = isfixed(kv[2])
 isfixed(info::NamedTuple) = isnothing(info.rhs)
 walk_rhs(e; kwargs...) = e
