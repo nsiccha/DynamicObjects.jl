@@ -3,6 +3,12 @@ export @dynamicstruct, @cache_status, @is_cached
 
 serialize(args...; kwargs...) = error("Serialization requires loading e.g. Serialization.jl")
 deserialize(args...; kwargs...) = error("Serialization requires loading e.g. Serialization.jl")
+persistent_hash(args...; kwargs...) = error("Hashing requires loading e.g. SHA.jl")
+iscached(o, ::Val) = false
+compute_property(o, ::Val{:hash_fields}) = ntuple(Base.Fix1(getfield, o), fieldcount(typeof(o))-1)
+compute_property(o, ::Val{:hash}) = persistent_hash((typeof(o), o.hash_fields))
+compute_property(o, ::Val{:cache_base}) = "cache"
+compute_property(o, ::Val{:cache_path}) = joinpath(o.cache_base, o.hash)
 
 struct PropertyCache{D<:AbstractDict{Symbol,Any}}
     cache::D
