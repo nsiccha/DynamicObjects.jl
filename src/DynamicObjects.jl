@@ -148,7 +148,7 @@ function compute_property end
 function iscached end
 function resumes end
 function meta end
-dynamicstruct(expr) = begin 
+dynamicstruct(expr; docstring=nothing) = begin 
     @assert expr.head == :struct
     mut, head, body = expr.args
     type = head
@@ -156,9 +156,15 @@ dynamicstruct(expr) = begin
     Meta.isexpr(type, :(curly)) && (type = type.args[1])
     @assert body.head == :block
     lnn = nothing
+    doc = nothing
+    docs = []
     oproperties = map(body.args) do arg
         if isa(arg, LineNumberNode)
             lnn = arg
+            return
+        end
+        if isa(arg, String)
+            doc = arg
             return
         end
         macros = Set{Symbol}()
@@ -184,7 +190,9 @@ dynamicstruct(expr) = begin
         else
             arg
         end
-        @assert isa(name, Symbol)
+        @assert isa(name, Symbol) dump(name)
+        push!(docs, (name=>(doc, !isnothing(rhs))))
+        doc = nothing
         !isnothing(locals) && push!(locals, name)
         @assert !isnothing(rhs) || length(macros) == 0
         name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices)
@@ -194,17 +202,24 @@ dynamicstruct(expr) = begin
         isfixed(info) && continue
         properties[dependent] = merge(info, (;rhs=walk_rhs(info.rhs; dependent, properties)))
     end
+
+    docstring = something(docstring, "DynamicStruct `$type`.") * "\n\n" * join([
+        "* " * (isnothing(doc) ? "" : "$doc: ") * "`$name" * (hasrhs ? " = ..." : "") * "`"
+        for (name, (doc, hasrhs)) in docs
+    ], "\n")
+
+    struct_expr = Expr(:struct, mut, head, Expr(:block, 
+        [info.lhs for (name,info) in oproperties if isfixed(info)]..., :(cache::DynamicObjects.PropertyCache),
+        :($type(args...; cache_type=:serial, kwargs...) = new(
+            args..., 
+            DynamicObjects.PropertyCache(
+                get((;serial=Dict, parallel=DynamicObjects.ThreadsafeDict), cache_type, cache_type),
+                (;kwargs...)
+            )
+        ))
+    ))
     esc(Expr(:block, 
-        Expr(:struct, mut, head, Expr(:block, 
-            [info.lhs for (name,info) in oproperties if isfixed(info)]..., :(cache::DynamicObjects.PropertyCache),
-            :($type(args...; cache_type=:serial, kwargs...) = new(
-                args..., 
-                DynamicObjects.PropertyCache(
-                    get((;serial=Dict, parallel=DynamicObjects.ThreadsafeDict), cache_type, cache_type),
-                    (;kwargs...)
-                )
-            ))
-        )),
+        :(@doc $docstring $struct_expr),
         quote
             Base.hasproperty(o::$type, name::Symbol) = name in $(keys(properties))
             Base.getproperty(o::$type, name::Symbol) = DynamicObjects.getorcomputeproperty(o, name)
@@ -230,6 +245,9 @@ end
 
 macro dynamicstruct(expr)
     dynamicstruct(expr)
+end
+macro dynamicstruct(docstring, expr)
+    dynamicstruct(expr; docstring)
 end
 
 
