@@ -31,6 +31,10 @@ name(::IndexableProperty{N}) where {N} = N
 Base.getindex((;o, cache)::IndexableProperty{name}, indices...) where {name} = get!(cache, indices) do
     getorcomputeproperty(o, name, indices...)
 end
+(ip::IndexableProperty)(indices...) = begin 
+    getindex(ip, indices...)
+    pop!(ip.cache, indices)
+end
 struct ThreadsafeDict{K,V} <: AbstractDict{K,V}
     lock::ReentrantLock
     cache::Dict{K,V}
@@ -46,6 +50,7 @@ Base.get!(f::Function, c::ThreadsafeDict, key) = begin
                     tmp = f()
                     lock(c.lock) do 
                         c.cache[key] = tmp
+                        pop!(c.tasks, key)
                     end
                     tmp
                 end 
@@ -53,6 +58,11 @@ Base.get!(f::Function, c::ThreadsafeDict, key) = begin
         end
     end
     fetch(rv)
+end
+Base.pop!(c::ThreadsafeDict, key) = begin 
+    lock(c.lock) do 
+        pop!(c.cache, key)
+    end
 end
 subcache(::PropertyCache{<:Dict}) = Dict()
 subcache(::PropertyCache{<:ThreadsafeDict}) = ThreadsafeDict()
