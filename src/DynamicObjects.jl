@@ -31,7 +31,10 @@ name(::IndexableProperty{N}) where {N} = N
 Base.getindex((;o, cache)::IndexableProperty{name}, indices...) where {name} = get!(cache, indices) do
     getorcomputeproperty(o, name, indices...)
 end
-((;o, cache)::IndexableProperty)(indices...) = getorcomputeproperty(o, name, indices...)
+(ip::IndexableProperty)(indices...) = begin 
+    getindex(ip, indices...)
+    pop!(ip.cache, indices)
+end
 struct ThreadsafeDict{K,V} <: AbstractDict{K,V}
     lock::ReentrantLock
     cache::Dict{K,V}
