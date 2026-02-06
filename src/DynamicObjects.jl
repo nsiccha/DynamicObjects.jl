@@ -31,10 +31,7 @@ name(::IndexableProperty{N}) where {N} = N
 Base.getindex((;o, cache)::IndexableProperty{name}, indices...) where {name} = get!(cache, indices) do
     getorcomputeproperty(o, name, indices...)
 end
-(ip::IndexableProperty)(indices...) = begin 
-    getindex(ip, indices...)
-    pop!(ip.cache, indices)
-end
+((;o, cache)::IndexableProperty)(indices...) = getorcomputeproperty(o, name, indices...)
 struct ThreadsafeDict{K,V} <: AbstractDict{K,V}
     lock::ReentrantLock
     cache::Dict{K,V}
@@ -116,10 +113,10 @@ cache_status_expr(x) = begin
     :($get_cache_status($(esc(o)), $(name), $(indices...)))
 end
 macro cache_status(x)
-    cache_status_expr(x)
+    cache_status_expr(x) |> esc
 end
 macro is_cached(x) 
-    :($(cache_status_expr(x)) == :ready)
+    :($(cache_status_expr(x)) == :ready) |> esc
 end
 
 isfixed(kv::Pair) = isfixed(kv[2])
@@ -219,11 +216,11 @@ dynamicstruct(expr; docstring=nothing) = begin
     ], "\n")
 
     struct_expr = Expr(:struct, mut, head, Expr(:block, 
-        [info.lhs for (name,info) in oproperties if isfixed(info)]..., :(cache::DynamicObjects.PropertyCache),
+        [info.lhs for (name,info) in oproperties if isfixed(info)]..., :(cache::$PropertyCache),
         :($type(args...; cache_type=:serial, kwargs...) = new(
             args..., 
-            DynamicObjects.PropertyCache(
-                get((;serial=Dict, parallel=DynamicObjects.ThreadsafeDict), cache_type, cache_type),
+            $PropertyCache(
+                $get((;serial=$Dict, parallel=$ThreadsafeDict), cache_type, cache_type),
                 (;kwargs...)
             )
         ))
@@ -232,7 +229,7 @@ dynamicstruct(expr; docstring=nothing) = begin
         :(@doc $docstring $struct_expr),
         quote
             Base.hasproperty(o::$type, name::Symbol) = name in $(keys(properties))
-            Base.getproperty(o::$type, name::Symbol) = DynamicObjects.getorcomputeproperty(o, name)
+            Base.getproperty(o::$type, name::Symbol) = $getorcomputeproperty(o, name)
             DynamicObjects.meta(::Type{$type}) = $properties
         end,
         [
@@ -246,7 +243,7 @@ dynamicstruct(expr; docstring=nothing) = begin
         [
             quote
                 DynamicObjects.iscached(o::$type, ::Val{$(Meta.quot(name))}) = false
-                DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}) = DynamicObjects.IndexableProperty($(Meta.quot(name)), o, DynamicObjects.subcache(o.cache))
+                DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}) = $IndexableProperty($(Meta.quot(name)), o, $subcache(o.cache))
             end
             for (name, info) in properties if length(info.indices) > 0
         ]...,
