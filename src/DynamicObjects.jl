@@ -240,18 +240,23 @@ dynamicstruct(expr; docstring=nothing) = begin
                 DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...); $(name)=nothing) = $(info.rhs)
                 DynamicObjects.iscached(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = $(Symbol("@cached") in info.macros)
                 DynamicObjects.resumes(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = $(name in info.dependson)
-            end
+            end |> replacelnn(;info.lnn)
             for (name, info) in properties if !isfixed(info)
         ]...,
         [
             quote
                 DynamicObjects.iscached(o::$type, ::Val{$(Meta.quot(name))}) = false
                 DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}) = $IndexableProperty($(Meta.quot(name)), o, $subcache(o.cache))
-            end
+            end |> replacelnn(;info.lnn)
             for (name, info) in properties if length(info.indices) > 0
         ]...,
     ))
 end
+
+replacelnn(;lnn::LineNumberNode) = x->replacelnn(x;lnn)
+replacelnn(x::Expr; lnn::LineNumberNode) = Expr(x.head, replacelnn.(x.args; lnn)...)
+replacelnn(::LineNumberNode; lnn::LineNumberNode) = lnn
+replacelnn(x; lnn::LineNumberNode) = x
 
 macro dynamicstruct(expr)
     dynamicstruct(expr)
