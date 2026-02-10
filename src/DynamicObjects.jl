@@ -96,8 +96,8 @@ else
         end
     end
 end
-maybehash(x) = x
-maybehash(x::AbstractArray) = persistent_hash(x)
+maybehash(x::Number) = x
+maybehash(x) = persistent_hash(x)
 get_cache_path(o, args...) = joinpath(o.cache_path, join(map(maybehash, args), "_") * ".sjl")
 get_cache_status(o, args...) = get_cache_status(get_cache_path(o, args...)) 
 get_cache_status(cache_path::AbstractString) = begin
