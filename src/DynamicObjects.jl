@@ -113,7 +113,7 @@ cache_status_expr(x) = begin
     end
     @assert Meta.isexpr(x, :.)
     o, name = x.args
-    :($get_cache_status($(esc(o)), $(name), $(indices...)))
+    :($get_cache_status($o, $(name), $(indices...)))
 end
 macro cache_status(x)
     cache_status_expr(x) |> esc
