@@ -119,7 +119,7 @@ macro cache_status(x)
     cache_f_expr(x; f=get_cache_status) |> esc
 end
 macro is_cached(x) 
-    :($(cache_status_expr(x; f=get_cache_status)) == :ready) |> esc
+    :($(cache_f_expr(x; f=get_cache_status)) == :ready) |> esc
 end
 macro cache_path(x)
     cache_f_expr(x; f=get_cache_path) |> esc
