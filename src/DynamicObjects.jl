@@ -1,5 +1,5 @@
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached
+export @dynamicstruct, @cache_status, @is_cached, @cache_path
 
 import SHA, Serialization
 
@@ -105,7 +105,7 @@ get_cache_status(cache_path::AbstractString) = begin
     filesize(cache_path) == 0 && return :started
     return :ready
 end
-cache_status_expr(x) = begin
+cache_f_expr(x; f) = begin
     x, indices = if Meta.isexpr(x, :ref)
         x.args[1], x.args[2:end]
     else
@@ -113,13 +113,16 @@ cache_status_expr(x) = begin
     end
     @assert Meta.isexpr(x, :.)
     o, name = x.args
-    :($get_cache_status($o, $(name), $(indices...)))
+    :($f($o, $(name), $(indices...)))
 end
 macro cache_status(x)
-    cache_status_expr(x) |> esc
+    cache_f_expr(x; f=get_cache_status) |> esc
 end
 macro is_cached(x) 
-    :($(cache_status_expr(x)) == :ready) |> esc
+    :($(cache_status_expr(x; f=get_cache_status)) == :ready) |> esc
+end
+macro cache_path(x)
+    cache_f_expr(x; f=get_cache_path) |> esc
 end
 
 isfixed(kv::Pair) = isfixed(kv[2])
