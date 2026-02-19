@@ -224,6 +224,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
         name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices)
     end |> filter(!isnothing)
     properties = Dict(oproperties)
+    properties_with_indices = Set(first.(filter(((name, info),)->length(info.indices) > 0, oproperties)))
     # for (dependent, info) in properties
     #     isfixed(info) && continue
     #     properties[dependent] = merge(info, (;rhs=walk_rhs(info.rhs; dependent, properties)))
@@ -263,8 +264,8 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
             quote
                 DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}) = $IndexableProperty($(Meta.quot(name)), o, $subcache(o.cache))
                 DynamicObjects.iscached(o::$type, ::Val{$(Meta.quot(name))}) = false
-            end |> replacelnn(;info.lnn)
-            for (name, info) in oproperties if length(info.indices) > 0
+            end# |> replacelnn(;info.lnn)
+            for name in properties_with_indices#Set(first.(filter(oproperties))) if length(info.indices) > 0
         ]...,
     ))
 end
