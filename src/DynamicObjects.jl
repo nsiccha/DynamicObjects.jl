@@ -254,7 +254,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
         end,
         [
             quote
-                DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...); $(name)=$(length(info.indices) > 0 ? :(o.$name) : nothing)) = $(info.rhs)
+                DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...); $(name)=nothing) = $(walk_rhs(info.rhs; info.locals, properties))
                 DynamicObjects.iscached(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = $(Symbol("@cached") in info.macros)
                 DynamicObjects.resumes(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = false#$(name in info.dependson)
             end |> replacelnn(;info.lnn)
