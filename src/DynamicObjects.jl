@@ -28,11 +28,11 @@ struct IndexableProperty{N,O,D<:AbstractDict}
     IndexableProperty(N,o,cache=Dict()) = new{N,typeof(o),typeof(cache)}(o, cache)
 end
 name(::IndexableProperty{N}) where {N} = N
-Base.getindex((;o, cache)::IndexableProperty{name}, indices...) where {name} = get!(cache, indices) do
+Base.getindex((;o, cache)::IndexableProperty{name}, indices...; kwargs...) where {name} = get!(cache, indices; kwargs...) do
     getorcomputeproperty(o, name, indices...)
 end
-(ip::IndexableProperty)(indices...) = begin 
-    getindex(ip, indices...)
+(ip::IndexableProperty)(indices...; kwargs...) = begin 
+    getindex(ip, indices...; kwargs...)
     pop!(ip.cache, indices)
 end
 struct ThreadsafeDict{K,V} <: AbstractDict{K,V}
@@ -42,7 +42,7 @@ struct ThreadsafeDict{K,V} <: AbstractDict{K,V}
     ThreadsafeDict{K,V}(c) where {K,V} = new{K,V}(ReentrantLock(), Dict{K,V}(c), Dict{K,Task}())
     ThreadsafeDict() = new{Any,Any}(ReentrantLock(), Dict{Any,Any}(), Dict{Any,Task}())
 end
-Base.get!(f::Function, c::ThreadsafeDict, key) = begin
+Base.get!(f::Function, c::ThreadsafeDict, key; fetch=fetch) = begin
     rv = lock(c.lock) do
         get(c.cache, key) do 
             get!(c.tasks, key) do
@@ -161,7 +161,7 @@ function compute_property end
 function iscached end
 function resumes end
 function meta end
-dynamicstruct(expr; docstring=nothing) = begin 
+dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin 
     @assert expr.head == :struct
     mut, head, body = expr.args
     type = head
@@ -223,7 +223,7 @@ dynamicstruct(expr; docstring=nothing) = begin
 
     struct_expr = Expr(:struct, mut, head, Expr(:block, 
         [info.lhs for (name,info) in oproperties if isfixed(info)]..., :(cache::$PropertyCache),
-        :($type(args...; cache_type=:serial, kwargs...) = new(
+        :($type(args...; cache_type=$(Meta.quot(cache_type)), kwargs...) = new(
             args..., 
             $PropertyCache(
                 $get((;serial=$Dict, parallel=$ThreadsafeDict), cache_type, cache_type),
@@ -266,6 +266,9 @@ macro dynamicstruct(expr)
 end
 macro dynamicstruct(docstring, expr)
     dynamicstruct(expr; docstring)
+end
+macro dynamicstruct(docstring, cache_type, expr)
+    dynamicstruct(expr; docstring, cache_type)
 end
 
 
