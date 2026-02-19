@@ -128,39 +128,52 @@ end
 isfixed(kv::Pair) = isfixed(kv[2])
 isfixed(info::NamedTuple) = isnothing(info.rhs)
 walk_rhs(e; kwargs...) = e
-walk_rhs(e::Expr; dependent, properties) = if e.head == :let
-    locals = properties[dependent].locals
+walk_rhs(e::Expr; locals, properties) = if e.head == :let
+    # locals = properties[dependent].locals
     ls = Set{Symbol}()
     !Meta.isexpr(e.args[1], :block) && (e.args[1] = Expr(:block, e.args[1]))
     map!(e.args[1].args, e.args[1].args) do arg 
         isa(arg, Symbol) && (arg = Expr(:(=), arg, arg))
         @assert Meta.isexpr(arg, :(=))
-        name, rhs = arg.args[1], walk_rhs(arg.args[2]; dependent, properties)
+        name, rhs = arg.args[1], walk_rhs(arg.args[2]; locals, properties)
         name in locals || push!(ls, name)
         push!(locals, name)
         Expr(:(=), name, rhs)
     end
-    e.args[2] = walk_rhs(e.args[2]; dependent, properties)
+    e.args[2] = walk_rhs(e.args[2]; locals, properties)
     for l in ls
         delete!(locals, l)
     end
     e
 elseif e.head == :kw
-    Expr(e.head, e.args[1], walk_rhs.(e.args[2:end]; dependent, properties)...)
+    Expr(e.head, e.args[1], walk_rhs.(e.args[2:end]; locals, properties)...)
 else
-    Expr(e.head, walk_rhs.(e.args; dependent, properties)...)
+    Expr(e.head, walk_rhs.(e.args; locals, properties)...)
 end
-walk_rhs(e::Symbol; dependent, properties) = if e in keys(properties) && !(e in properties[dependent].locals)
-    isfixed(properties[e]) || push!(properties[dependent].dependson, e)
+walk_rhs(e::Symbol; locals, properties) = if e in keys(properties) && !(e in locals)
+    # isfixed(properties[e]) || push!(properties[dependent].dependson, e)
     :(o.$e)
 else
-    e == dependent && push!(properties[dependent].dependson, e)
+    # e == dependent && push!(properties[dependent].dependson, e)
     e
 end
 function compute_property end
 function iscached end
 function resumes end
 function meta end
+extractnames(x::Vector) = mapreduce(extractnames, union, x; init=Set())
+extractnames(x::Symbol) = Set((x,))
+extractnames(x::Expr) = if Meta.isexpr(x, :(::))
+    extractnames(length(x.args) == 1 ? Symbol("") : x.args[1])
+elseif Meta.isexpr(x, :kw)
+    @assert length(x.args) == 2
+    extractnames(x.args[1])
+elseif Meta.isexpr(x, (:parameters, :(...)))
+    extractnames(x.args)
+else
+    dump(x)
+    error("Don't know how to handle $x")
+end
 dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin 
     @assert expr.head == :struct
     mut, head, body = expr.args
@@ -194,9 +207,9 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
             dependson = Set{Symbol}()
             locals = Set{Symbol}()
         end
-        if Meta.isexpr(arg, :ref)
+        if Meta.isexpr(arg, (:ref, :call))
             arg, indices... = arg.args
-            union!(locals, indices)
+            union!(locals, extractnames(indices))
         end
         name = if Meta.isexpr(arg, :(::))
             arg.args[1]
@@ -211,10 +224,10 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
         name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices)
     end |> filter(!isnothing)
     properties = Dict(oproperties)
-    for (dependent, info) in properties
-        isfixed(info) && continue
-        properties[dependent] = merge(info, (;rhs=walk_rhs(info.rhs; dependent, properties)))
-    end
+    # for (dependent, info) in properties
+    #     isfixed(info) && continue
+    #     properties[dependent] = merge(info, (;rhs=walk_rhs(info.rhs; dependent, properties)))
+    # end
 
     docstring = something(docstring, "DynamicStruct `$type`.") * "\n\n" * join([
         "* " * (isnothing(doc) ? "" : "$doc: ") * "`$name" * (hasrhs ? " = ..." : "") * "`"
@@ -240,18 +253,18 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
         end,
         [
             quote
-                DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...); $(name)=nothing) = $(info.rhs)
+                DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...); $(name)=$(length(info.indices) > 0 ? :(o.$name) : nothing)) = $(info.rhs)
                 DynamicObjects.iscached(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = $(Symbol("@cached") in info.macros)
-                DynamicObjects.resumes(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = $(name in info.dependson)
+                DynamicObjects.resumes(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = false#$(name in info.dependson)
             end |> replacelnn(;info.lnn)
-            for (name, info) in properties if !isfixed(info)
+            for (name, info) in oproperties if !isfixed(info)
         ]...,
         [
             quote
-                DynamicObjects.iscached(o::$type, ::Val{$(Meta.quot(name))}) = false
                 DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}) = $IndexableProperty($(Meta.quot(name)), o, $subcache(o.cache))
+                DynamicObjects.iscached(o::$type, ::Val{$(Meta.quot(name))}) = false
             end |> replacelnn(;info.lnn)
-            for (name, info) in properties if length(info.indices) > 0
+            for (name, info) in oproperties if length(info.indices) > 0
         ]...,
     ))
 end
