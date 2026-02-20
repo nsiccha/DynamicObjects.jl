@@ -21,15 +21,15 @@ struct PropertyCache{D<:AbstractDict{Symbol,Any}}
     PropertyCache(D, c::NamedTuple) = new{D{Symbol,Any}}(D{Symbol,Any}(pairs(c)))
 end
 Base.get!(f::Function, c::PropertyCache, key) = get!(f, c.cache, key)
-Base.get!(f::Function, ::PropertyCache, key, indices...) = f()
+Base.get!(f::Function, ::PropertyCache, key, indices...; kwargs...) = f()
 struct IndexableProperty{N,O,D<:AbstractDict}
     o::O
     cache::D
     IndexableProperty(N,o,cache=Dict()) = new{N,typeof(o),typeof(cache)}(o, cache)
 end
 name(::IndexableProperty{N}) where {N} = N
-Base.getindex((;o, cache)::IndexableProperty{name}, indices...; kwargs...) where {name} = get!(cache, indices; kwargs...) do
-    getorcomputeproperty(o, name, indices...)
+Base.getindex((;o, cache)::IndexableProperty{name}, indices...; kwargs...) where {name} = get!(cache, indices) do
+    getorcomputeproperty(o, name, indices...; kwargs...)
 end
 (ip::IndexableProperty)(indices...; kwargs...) = begin 
     getindex(ip, indices...; kwargs...)
@@ -41,6 +41,9 @@ struct ThreadsafeDict{K,V} <: AbstractDict{K,V}
     tasks::Dict{K,Task}
     ThreadsafeDict{K,V}(c) where {K,V} = new{K,V}(ReentrantLock(), Dict{K,V}(c), Dict{K,Task}())
     ThreadsafeDict() = new{Any,Any}(ReentrantLock(), Dict{Any,Any}(), Dict{Any,Task}())
+end
+Base.getindex((;o, cache)::IndexableProperty{name,Any,<:ThreadsafeDict}, indices...; fetch=fetch, kwargs...) where {name} = get!(cache, indices; fetch) do
+    getorcomputeproperty(o, name, indices...; kwargs...)
 end
 Base.get!(f::Function, c::ThreadsafeDict, key; fetch=fetch) = begin
     rv = lock(c.lock) do
@@ -67,14 +70,14 @@ end
 subcache(::PropertyCache{<:Dict}) = Dict()
 subcache(::PropertyCache{<:ThreadsafeDict}) = ThreadsafeDict()
 
-getorcomputeproperty(o, name, indices...) = if hasfield(typeof(o), name)
-    @assert length(indices) == 0
+getorcomputeproperty(o, name, indices...; kwargs...) = if hasfield(typeof(o), name)
+    @assert length(indices) == length(kwargs) == 0
     getfield(o, name)
 else
-    get!(getfield(o, :cache), name, indices...) do 
+    get!(getfield(o, :cache), name, indices...; kwargs...) do 
         vname = Val(name)
-        if iscached(o, vname, indices...)
-            cache_path = get_cache_path(o, name, indices...)
+        if iscached(o, vname, indices...; kwargs...)
+            cache_path = get_cache_path(o, name, indices...; kwargs...)
             mkpath(dirname(cache_path))
             cache_status = get_cache_status(cache_path)
             rv = if cache_status == :ready
@@ -85,35 +88,37 @@ else
                 touch(cache_path)
                 nothing
             end
-            if cache_status != :ready || resumes(o, vname, indices...)
+            if cache_status != :ready || resumes(o, vname, indices...; kwargs...)
                 @debug "Generating $cache_path..."
-                rv = compute_property(o, vname, indices...; (name=>rv, )...)
+                rv = compute_property(o, vname, indices...; (name=>rv, )..., kwargs...)
                 Serialization.serialize(cache_path, rv)
             end
             rv
         else
-            compute_property(o, vname, indices...)
+            compute_property(o, vname, indices...; kwargs...)
         end
     end
 end
 maybehash(x::Number) = x
 maybehash(x) = persistent_hash(x)
-get_cache_path(o, args...) = joinpath(o.cache_path, join(map(maybehash, args), "_") * ".sjl")
-get_cache_status(o, args...) = get_cache_status(get_cache_path(o, args...)) 
+get_cache_path(o, args...; kwargs...) = joinpath(o.cache_path, join(map(
+    maybehash, length(kwargs) == 0 ? args : (args..., sort(collect(kwargs))...)
+), "_") * ".sjl")
+get_cache_status(o, args...; kwargs...) = get_cache_status(get_cache_path(o, args...; kwargs...)) 
 get_cache_status(cache_path::AbstractString) = begin
     !isfile(cache_path) && return :unstarted
     filesize(cache_path) == 0 && return :started
     return :ready
 end
 cache_f_expr(x; f) = begin
-    x, indices = if Meta.isexpr(x, :ref)
+    x, indices = if Meta.isexpr(x, (:ref, :call))
         x.args[1], x.args[2:end]
     else
         x, []
     end
     @assert Meta.isexpr(x, :.)
     o, name = x.args
-    :($f($o, $(name), $(indices...)))
+    :($f($o, $(name), $(indices...))) |> fixcall
 end
 macro cache_status(x)
     cache_f_expr(x; f=get_cache_status) |> esc
@@ -173,6 +178,23 @@ elseif Meta.isexpr(x, (:parameters, :(...)))
 else
     dump(x)
     error("Don't know how to handle $x")
+end
+fixcall(x) = x
+fixcall(x::Expr) = if Meta.isexpr(x, :call)
+    # args = fixcall.(x.args)
+    f = x.args[1]
+    pargs = []
+    args = []
+    for arg in fixcall.(x.args[2:end])
+        if Meta.isexpr(arg, :parameters)
+            append!(pargs, arg.args)
+        else
+            push!(args, arg)
+        end
+    end
+    Expr(x.head, f, Expr(:parameters, pargs...), args...)
+else
+    Expr(x.head, fixcall.(x.args)...)
 end
 dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin 
     @assert expr.head == :struct
@@ -257,7 +279,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
                 DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...); $(name)=$(length(info.indices) > 0 ? :(o.$name) : nothing)) = $(walk_rhs(info.rhs; info.locals, properties))
                 DynamicObjects.iscached(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = $(Symbol("@cached") in info.macros)
                 DynamicObjects.resumes(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = false#$(name in info.dependson)
-            end |> replacelnn(;info.lnn)
+            end |> fixcall# |> replacelnn(;info.lnn)
             for (name, info) in oproperties if !isfixed(info)
         ]...,
         [
