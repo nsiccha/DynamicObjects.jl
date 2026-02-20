@@ -102,7 +102,7 @@ end
 maybehash(x::Number) = x
 maybehash(x) = persistent_hash(x)
 get_cache_path(o, args...; kwargs...) = joinpath(o.cache_path, join(map(
-    maybehash, length(kwargs) == 0 ? args : (args..., sort(collect(kwargs))...)
+    maybehash, length(kwargs) == 0 ? args : (args..., sort(collect(kwargs); by=first)...)
 ), "_") * ".sjl")
 get_cache_status(o, args...; kwargs...) = get_cache_status(get_cache_path(o, args...; kwargs...)) 
 get_cache_status(cache_path::AbstractString) = begin
