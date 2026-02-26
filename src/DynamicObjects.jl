@@ -1,5 +1,5 @@
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path
+export @dynamicstruct, @cache_status, @is_cached, @cache_path#, @persist
 
 import SHA, Serialization
 
@@ -22,6 +22,7 @@ struct PropertyCache{D<:AbstractDict{Symbol,Any}}
 end
 Base.get!(f::Function, c::PropertyCache, key) = get!(f, c.cache, key)
 Base.get!(f::Function, ::PropertyCache, key, indices...; kwargs...) = f()
+Base.setindex!(c::PropertyCache, args...) = setindex!(c.cache, args...)
 struct IndexableProperty{N,O,D<:AbstractDict}
     o::O
     cache::D
@@ -129,6 +130,22 @@ end
 macro cache_path(x)
     cache_f_expr(x; f=get_cache_path) |> esc
 end
+macro persist(x)
+    x, indices = if Meta.isexpr(x, (:ref, :call))
+        x.args[1], x.args[2:end]
+    else
+        x, []
+    end
+    @assert Meta.isexpr(x, :.)
+    o, name = x.args
+    :($persist($x, $o, $(name), $(indices...))) |> fixcall |> esc
+end
+persist(v, args...; kwargs...) = begin
+    Serialization.serialize(
+        get_cache_path(args...; kwargs...),
+        v
+    )
+end
 
 isfixed(kv::Pair) = isfixed(kv[2])
 isfixed(info::NamedTuple) = isnothing(info.rhs)
@@ -173,7 +190,7 @@ extractnames(x::Expr) = if Meta.isexpr(x, :(::))
 elseif Meta.isexpr(x, :kw)
     @assert length(x.args) == 2
     extractnames(x.args[1])
-elseif Meta.isexpr(x, (:parameters, :(...)))
+elseif Meta.isexpr(x, (:tuple, :parameters, :(...)))
     extractnames(x.args)
 else
     dump(x)
@@ -270,22 +287,23 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
     esc(Expr(:block, 
         :(@doc $docstring $struct_expr),
         quote
-            Base.hasproperty(o::$type, name::Symbol) = name in $(keys(properties))
-            Base.getproperty(o::$type, name::Symbol) = $getorcomputeproperty(o, name)
-            DynamicObjects.meta(::Type{$type}) = $properties
+            $Base.hasproperty(o::$type, name::Symbol) = name in $(keys(properties))
+            $Base.getproperty(o::$type, name::Symbol) = $getorcomputeproperty(o, name)
+            $Base.setproperty!(o::$type, name::Symbol, value) = getfield(o, :cache)[name] = value
+            $DynamicObjects.meta(::Type{$type}) = $properties
         end,
         [
             quote
-                DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...); $(name)=$(length(info.indices) > 0 ? :(o.$name) : nothing)) = $(walk_rhs(info.rhs; info.locals, properties))
-                DynamicObjects.iscached(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = $(Symbol("@cached") in info.macros)
-                DynamicObjects.resumes(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = false#$(name in info.dependson)
+                $DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...); $(name)=$(length(info.indices) > 0 ? :(o.$name) : nothing)) = $(walk_rhs(info.rhs; info.locals, properties))
+                $DynamicObjects.iscached(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = $(Symbol("@cached") in info.macros)
+                $DynamicObjects.resumes(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = false#$(name in info.dependson)
             end |> fixcall# |> replacelnn(;info.lnn)
             for (name, info) in oproperties if !isfixed(info)
         ]...,
         [
             quote
-                DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}) = $IndexableProperty($(Meta.quot(name)), o, $subcache(o.cache))
-                DynamicObjects.iscached(o::$type, ::Val{$(Meta.quot(name))}) = false
+                $DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}) = $IndexableProperty($(Meta.quot(name)), o, $subcache(o.cache))
+                $DynamicObjects.iscached(o::$type, ::Val{$(Meta.quot(name))}) = false
             end# |> replacelnn(;info.lnn)
             for name in properties_with_indices#Set(first.(filter(oproperties))) if length(info.indices) > 0
         ]...,
