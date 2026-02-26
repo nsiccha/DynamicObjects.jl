@@ -101,6 +101,7 @@ else
     end
 end
 maybehash(x::Number) = x
+maybehash(x::Symbol) = x
 maybehash(x) = persistent_hash(x)
 get_cache_path(o, args...; kwargs...) = joinpath(o.cache_path, join(map(
     maybehash, length(kwargs) == 0 ? args : (args..., sort(collect(kwargs); by=first)...)
