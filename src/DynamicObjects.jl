@@ -29,7 +29,7 @@ struct IndexableProperty{N,O,D<:AbstractDict}
     IndexableProperty(N,o,cache=Dict()) = new{N,typeof(o),typeof(cache)}(o, cache)
 end
 name(::IndexableProperty{N}) where {N} = N
-Base.getindex((;o, cache)::IndexableProperty{name}, indices...; fetch=fetch, kwargs...) where {name} = get!(cache, indices) do
+Base.getindex((;o, cache)::IndexableProperty{name}, indices...; fetch=fetch, kwargs...) where {name} = get!(cache, (indices, kwargs)) do
     getorcomputeproperty(o, name, indices...; kwargs...)
 end
 (ip::IndexableProperty)(indices...; kwargs...) = begin 
@@ -43,7 +43,7 @@ struct ThreadsafeDict{K,V} <: AbstractDict{K,V}
     ThreadsafeDict{K,V}(c) where {K,V} = new{K,V}(ReentrantLock(), Dict{K,V}(c), Dict{K,Task}())
     ThreadsafeDict() = new{Any,Any}(ReentrantLock(), Dict{Any,Any}(), Dict{Any,Task}())
 end
-Base.getindex((;o, cache)::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indices...; fetch=fetch, kwargs...) where {name} = get!(cache, indices; fetch) do
+Base.getindex((;o, cache)::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indices...; fetch=fetch, kwargs...) where {name} = get!(cache, (indices, kwargs); fetch) do
     getorcomputeproperty(o, name, indices...; kwargs...)
 end
 Base.get!(f::Function, c::ThreadsafeDict, key; fetch=fetch) = begin
