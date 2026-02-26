@@ -34,7 +34,7 @@ Base.getindex((;o, cache)::IndexableProperty{name}, indices...; fetch=fetch, kwa
 end
 (ip::IndexableProperty)(indices...; kwargs...) = begin 
     getindex(ip, indices...; kwargs...)
-    pop!(ip.cache, indices)
+    pop!(ip.cache, (indices, kwargs))
 end
 struct ThreadsafeDict{K,V} <: AbstractDict{K,V}
     lock::ReentrantLock
