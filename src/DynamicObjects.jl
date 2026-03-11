@@ -393,7 +393,8 @@ end
         field                     # fixed field (constructor argument)
         prop = expr               # lazily computed property
         @cached prop = expr       # lazily computed + disk-cached property
-        prop[idx] = expr          # indexable property
+        prop[idx] = expr          # indexable property (cached per index)
+        prop(args...; kw...) = expr  # indexable property (fresh each call)
         @cached prop[idx] = expr  # indexable + disk-cached property
     end
 
@@ -446,6 +447,22 @@ e = Experiment(1_000_000)
 e.result   # computed on first access, cached to disk
 e2 = Experiment(1_000_000)
 e2.result  # loaded from disk (same n → same hash → same cache path)
+```
+
+```julia
+# Indexed properties with bracket and call syntax.
+# Properties reference each other by bare name (auto-rewritten to __self__.<name>).
+@dynamicstruct struct DataSet
+    items = ["apple", "banana", "cherry"]
+    matches[query] = filter(x -> occursin(query, x), items)  # bracket: cached per query
+    search(query) = filter(x -> occursin(query, x), items)   # call: fresh each time
+    top(query; n=1) = first(search(query), n)                # call with kwargs
+end
+
+ds = DataSet()
+ds.matches["an"]        # ["banana"] — cached per query
+ds.search("an")         # ["banana"] — fresh each call
+ds.top("a"; n=2)        # ["apple", "banana"] — kwargs supported
 ```
 """
 macro dynamicstruct(expr)

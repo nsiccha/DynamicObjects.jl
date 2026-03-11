@@ -75,11 +75,53 @@ Use bracket syntax to define properties that take indices:
 ```julia
 @dynamicstruct struct Grid
     f[i, j] = i + 10 * j
-    @cached g[i, j] = i^2 + j^2   # each (i,j) pair cached to disk
+    label(i, j) = "cell ($i, $j)"           # call syntax
+    @cached g[i, j] = i^2 + j^2             # each (i,j) pair cached to disk
 end
 
-Grid().f[1, 2]   # 21
+grid = Grid()
+grid.f[1, 2]       # 21        — cached per index
+grid.label(1, 2)    # "cell (1, 2)" — computed fresh each call
 ```
+
+Both bracket and call syntax define indexable properties — the difference is
+in the calling convention:
+
+- `obj.prop[args...]` caches the result per index (same args → same result).
+- `obj.prop(args...)` computes fresh each time (the cache entry is popped after access).
+
+Call-syntax properties can also accept keyword arguments:
+
+```julia
+@dynamicstruct struct Formatter
+    format(x; digits=2) = round(x; digits)
+end
+
+f = Formatter()
+f.format(π)              # 3.14
+f.format(π; digits=4)    # 3.1416
+```
+
+### Dynamic dispatch on indexable properties
+
+Since indexable properties generate standard Julia `compute_property` methods,
+they participate in Julia's multiple dispatch.  You can define multiple
+signatures for the same property name:
+
+```julia
+@dynamicstruct struct Greeter
+    greeting = "Hello"
+    greet(name::String) = "$(greeting), $(name)!"
+    greet(n::Int)       = "$(greeting), person #$(n)!"
+end
+
+g = Greeter()
+g.greet("Alice")   # "Hello, Alice!"
+g.greet(42)        # "Hello, person #42!"
+```
+
+This works because each definition emits a separate method with the appropriate
+type signature, just like ordinary Julia function definitions.
 
 ### remake
 
