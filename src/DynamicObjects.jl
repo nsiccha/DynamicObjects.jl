@@ -1,5 +1,18 @@
+"""
+    DynamicObjects
+
+Provides the `@dynamicstruct` macro for defining structs with lazily computed,
+optionally disk-cached properties.
+
+# Exports
+- [`@dynamicstruct`](@ref): Define a struct with computed/cached properties.
+- [`@cache_status`](@ref): Get the disk-cache status of a property (`:unstarted`, `:started`, `:ready`).
+- [`@is_cached`](@ref): Check whether a property's disk cache is ready.
+- [`@cache_path`](@ref): Get the file path used for a property's disk cache.
+- [`remake`](@ref): Create a new instance of a `@dynamicstruct` type with some fields changed.
+"""
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path#, @persist
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, remake#, @persist
 
 import SHA, Serialization
 
@@ -33,8 +46,9 @@ Base.getindex((;o, cache)::IndexableProperty{name}, indices...; fetch=fetch, kwa
     getorcomputeproperty(o, name, indices...; kwargs...)
 end
 (ip::IndexableProperty)(indices...; kwargs...) = begin 
-    getindex(ip, indices...; kwargs...)
-    pop!(ip.cache, (indices, kwargs))
+    rv = getindex(ip, indices...; kwargs...)
+    maybepop!(ip.cache, (indices, kwargs))
+    rv 
 end
 struct ThreadsafeDict{K,V} <: AbstractDict{K,V}
     lock::ReentrantLock
@@ -66,6 +80,12 @@ end
 Base.pop!(c::ThreadsafeDict, key) = begin 
     lock(c.lock) do 
         pop!(c.cache, key)
+    end
+end
+maybepop!(c::AbstractDict, key) = key in keys(c) && pop!(c, key)
+maybepop!(c::ThreadsafeDict, key) = begin 
+    lock(c.lock) do 
+        maybepop!(c.cache, key)
     end
 end
 subcache(::PropertyCache{<:Dict}) = Dict()
@@ -104,7 +124,7 @@ maybehash(x::Number) = x
 maybehash(x::Symbol) = x
 maybehash(x) = persistent_hash(x)
 get_cache_path(o, args...; kwargs...) = joinpath(o.cache_path, join(map(
-    maybehash, length(kwargs) == 0 ? args : (args..., sort(collect(kwargs); by=first)...)
+    maybehash, length(kwargs) == 0 ? args : (args..., sort(collect(kwargs); by=first))
 ), "_") * ".sjl")
 get_cache_status(o, args...; kwargs...) = get_cache_status(get_cache_path(o, args...; kwargs...)) 
 get_cache_status(cache_path::AbstractString) = begin
@@ -122,12 +142,53 @@ cache_f_expr(x; f) = begin
     o, name = x.args
     :($f($o, $(name), $(indices...))) |> fixcall
 end
+"""
+    @cache_status o.prop
+    @cache_status o.prop[indices...]
+
+Return the disk-cache status of a `@cached` property as a `Symbol`:
+- `:unstarted` — no cache file exists yet.
+- `:started`   — an empty placeholder file exists (previous run may have crashed).
+- `:ready`     — a complete cache file exists and can be deserialized.
+
+```julia
+@cache_status e.result          # :unstarted (before first access)
+e.result
+@cache_status e.result          # :ready
+@cache_status e.ci[2]           # for indexable properties
+```
+"""
 macro cache_status(x)
     cache_f_expr(x; f=get_cache_status) |> esc
 end
-macro is_cached(x) 
+
+"""
+    @is_cached o.prop
+    @is_cached o.prop[indices...]
+
+Return `true` if the disk cache for `o.prop` (or `o.prop[indices...]`) is
+`:ready`, i.e. the cached value can be loaded from disk without recomputation.
+
+```julia
+@is_cached e.result   # false before first access, true afterwards
+```
+"""
+macro is_cached(x)
     :($(cache_f_expr(x; f=get_cache_status)) == :ready) |> esc
 end
+
+"""
+    @cache_path o.prop
+    @cache_path o.prop[indices...]
+
+Return the file path where the disk-cached value of `o.prop` (or
+`o.prop[indices...]`) is (or would be) stored.
+
+```julia
+@cache_path e.result          # e.g. "cache/<hash>/result.sjl"
+@cache_path e.ci[2]           # "cache/<hash>/2.sjl"
+```
+"""
 macro cache_path(x)
     cache_f_expr(x; f=get_cache_path) |> esc
 end
@@ -175,7 +236,7 @@ else
 end
 walk_rhs(e::Symbol; locals, properties) = if e in keys(properties) && !(e in locals)
     # isfixed(properties[e]) || push!(properties[dependent].dependson, e)
-    :(o.$e)
+    :(__self__.$e)
 else
     # e == dependent && push!(properties[dependent].dependson, e)
     e
@@ -288,25 +349,25 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
     esc(Expr(:block, 
         :(@doc $docstring $struct_expr),
         quote
-            $Base.hasproperty(o::$type, name::Symbol) = name in $(keys(properties))
-            $Base.getproperty(o::$type, name::Symbol) = $getorcomputeproperty(o, name)
-            $Base.setproperty!(o::$type, name::Symbol, value) = getfield(o, :cache)[name] = value
+            $Base.hasproperty(__self__::$type, name::Symbol) = name in $(keys(properties))
+            $Base.getproperty(__self__::$type, name::Symbol) = $getorcomputeproperty(__self__, name)
+            $Base.setproperty!(__self__::$type, name::Symbol, value) = getfield(__self__, :cache)[name] = value
             $DynamicObjects.meta(::Type{$type}) = $properties
         end,
         [
             quote
-                $DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...); $(name)=$(length(info.indices) > 0 ? :(o.$name) : nothing)) = $(walk_rhs(info.rhs; info.locals, properties))
-                $DynamicObjects.iscached(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = $(Symbol("@cached") in info.macros)
-                $DynamicObjects.resumes(o::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = false#$(name in info.dependson)
-            end |> fixcall# |> replacelnn(;info.lnn)
+                $DynamicObjects.compute_property(__self__::$type, ::Val{$(Meta.quot(name))}, $(info.indices...); $(name)=$(length(info.indices) > 0 ? :(__self__.$name) : nothing)) = $(walk_rhs(info.rhs; info.locals, properties))
+                $DynamicObjects.iscached(__self__::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = $(Symbol("@cached") in info.macros)
+                $DynamicObjects.resumes(__self__::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = false#$(name in info.dependson)
+            end |> fixcall |> setlnn(info.lnn)
             for (name, info) in oproperties if !isfixed(info)
         ]...,
         [
             quote
-                $DynamicObjects.compute_property(o::$type, ::Val{$(Meta.quot(name))}) = $IndexableProperty($(Meta.quot(name)), o, $subcache(o.cache))
-                $DynamicObjects.iscached(o::$type, ::Val{$(Meta.quot(name))}) = false
-            end# |> replacelnn(;info.lnn)
-            for name in properties_with_indices#Set(first.(filter(oproperties))) if length(info.indices) > 0
+                $DynamicObjects.compute_property(__self__::$type, ::Val{$(Meta.quot(name))}) = $IndexableProperty($(Meta.quot(name)), __self__, $subcache(__self__.cache))
+                $DynamicObjects.iscached(__self__::$type, ::Val{$(Meta.quot(name))}) = false
+            end |> setlnn(properties[name].lnn)
+            for name in properties_with_indices
         ]...,
     ))
 end
@@ -316,6 +377,77 @@ replacelnn(x::Expr; lnn::LineNumberNode) = Expr(x.head, replacelnn.(x.args; lnn)
 replacelnn(::LineNumberNode; lnn::LineNumberNode) = lnn
 replacelnn(x; lnn::LineNumberNode) = x
 
+# Replace only the top-level LineNumberNodes in a block, leaving nested ones intact.
+# This gives Revise the source-location metadata it needs to track method changes,
+# without clobbering the internal LineNumberNodes that make stack traces useful.
+function setlnn(lnn::Union{LineNumberNode,Nothing})
+    function(expr::Expr)
+        isnothing(lnn) && return expr
+        @assert expr.head == :block
+        Expr(:block, map(x -> isa(x, LineNumberNode) ? lnn : x, expr.args)...)
+    end
+end
+
+"""
+    @dynamicstruct [docstring] [cache_type] struct Name
+        field                     # fixed field (constructor argument)
+        prop = expr               # lazily computed property
+        @cached prop = expr       # lazily computed + disk-cached property
+        prop[idx] = expr          # indexable property
+        @cached prop[idx] = expr  # indexable + disk-cached property
+    end
+
+Define a struct whose *fixed fields* are set at construction time and whose
+*derived properties* are computed lazily on first access and then stored in an
+in-memory cache.
+
+Derived properties may reference any other field or property by name; the
+reference is automatically rewritten to `__self__.<name>`.  Order of definition
+does not matter — cycles will result in a stack overflow at runtime.
+
+`cache_type` controls the in-memory cache backend:
+- `:serial` (default) — plain `Dict`, single-threaded safe.
+- `:parallel` — `ThreadsafeDict`, safe to access from multiple tasks
+  simultaneously; duplicate work is avoided by sharing in-flight `Task`s.
+
+Properties marked `@cached` are additionally persisted to disk under
+`__self__.cache_path` (which itself defaults to
+`joinpath(__self__.cache_base, __self__.hash)`).
+
+Keyword arguments passed to the constructor pre-populate the cache, so they act
+as overrides for any computed property.
+
+# Examples
+```julia
+using DynamicObjects
+
+@dynamicstruct struct Point
+    x::Float64
+    y::Float64
+    r     = sqrt(x^2 + y^2)
+    theta = atan(y, x)
+end
+
+p = Point(3.0, 4.0)
+p.r      # 5.0
+p.theta  # atan(4, 3)
+```
+
+```julia
+# Disk-cached expensive computation.
+# cache_path defaults to joinpath("cache", hash(n)), so two Experiment(n)
+# instances with the same n share the same cache directory.
+@dynamicstruct struct Experiment
+    n::Int
+    @cached result = sum(rand(n))   # computed once, then loaded from disk
+end
+
+e = Experiment(1_000_000)
+e.result   # computed on first access, cached to disk
+e2 = Experiment(1_000_000)
+e2.result  # loaded from disk (same n → same hash → same cache path)
+```
+"""
 macro dynamicstruct(expr)
     dynamicstruct(expr)
 end
@@ -324,6 +456,38 @@ macro dynamicstruct(docstring, expr)
 end
 macro dynamicstruct(docstring, cache_type, expr)
     dynamicstruct(expr; docstring, cache_type)
+end
+
+"""
+    remake(obj; kwargs...)
+
+Create a new instance of the same `@dynamicstruct` type as `obj`, copying all
+fixed fields from `obj` and overriding any specified via keyword arguments.
+
+Keyword arguments that correspond to fixed fields replace those field values in
+the new instance. Any remaining keyword arguments are forwarded to the
+constructor as cache pre-population overrides.
+
+# Example
+```julia
+@dynamicstruct struct Config
+    n::Int
+    scale::Float64
+    result = scale * sum(rand(n))
+end
+
+c  = Config(100, 2.0)
+c2 = remake(c; n=200)       # n=200, scale=2.0, result recomputed fresh
+c3 = remake(c; scale=3.0)   # n=100, scale=3.0, result recomputed fresh
+c4 = remake(c; result=0.0)  # n=100, scale=2.0, result pre-set to 0.0
+```
+"""
+function remake(obj; kwargs...)
+    T = typeof(obj)
+    fixed_names = fieldnames(T)[1:end-1]  # all fields except :cache
+    args = [get(kwargs, name, getfield(obj, name)) for name in fixed_names]
+    cache_kwargs = filter(p -> !(first(p) in fixed_names), kwargs)
+    T(args...; cache_kwargs...)
 end
 
 
