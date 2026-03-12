@@ -138,9 +138,15 @@ cache_f_expr(x; f) = begin
     else
         x, []
     end
-    @assert Meta.isexpr(x, :.)
-    o, name = x.args
-    :($f($o, $(name), $(indices...))) |> fixcall
+    if Meta.isexpr(x, :$)
+        # Interpolated property name: @is_cached $prop[indices...]
+        name_expr = x.args[1]
+        :($f(__self__, $name_expr, $(indices...))) |> fixcall
+    else
+        @assert Meta.isexpr(x, :.)
+        o, name = x.args
+        :($f($o, $(name), $(indices...))) |> fixcall
+    end
 end
 """
     @cache_status o.prop
@@ -151,11 +157,21 @@ Return the disk-cache status of a `@cached` property as a `Symbol`:
 - `:started`   — an empty placeholder file exists (previous run may have crashed).
 - `:ready`     — a complete cache file exists and can be deserialized.
 
+Can be used both outside and inside a `@dynamicstruct` body. Inside a struct
+definition, omit the object prefix — just use the property name:
+
 ```julia
+# Outside the struct:
 @cache_status e.result          # :unstarted (before first access)
 e.result
 @cache_status e.result          # :ready
 @cache_status e.ci[2]           # for indexable properties
+
+# Inside the struct body:
+@dynamicstruct struct App
+    @cached result[key] = expensive(key)
+    status[key] = @cache_status result[key]   # :unstarted, :started, or :ready
+end
 ```
 """
 macro cache_status(x)
@@ -169,8 +185,22 @@ end
 Return `true` if the disk cache for `o.prop` (or `o.prop[indices...]`) is
 `:ready`, i.e. the cached value can be loaded from disk without recomputation.
 
+Can be used both outside and inside a `@dynamicstruct` body. Inside a struct
+definition, omit the object prefix — just use the property name:
+
 ```julia
+# Outside the struct:
 @is_cached e.result   # false before first access, true afterwards
+
+# Inside the struct body:
+@dynamicstruct struct App
+    @cached result[key] = expensive(key)
+    summary[key] = if @is_cached result[key]
+        "cached: \$(result[key])"
+    else
+        "not yet computed"
+    end
+end
 ```
 """
 macro is_cached(x)

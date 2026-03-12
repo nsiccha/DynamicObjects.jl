@@ -12,6 +12,7 @@
 @cache_status
 @is_cached
 @cache_path
+@persist
 ```
 
 ## Functions

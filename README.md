@@ -1,23 +1,21 @@
 # DynamicObjects.jl
 
-Provides an `@dynamicstruct` macro, allowing quickly defining structs with derived (and optionally cached) properties, 
-which can be defined inline using `prop = expr` using all previously or afterwards defined fields and properties, e.g. as
+Structs with lazily computed, optionally disk-cached properties.
 
 ```julia
 using DynamicObjects
 
-@dynamicstruct struct MyStruct 
-    "Standard fields are defined without an `=` sign. These can have types."
+@dynamicstruct struct MyStruct
     a::Float64
-    "Derived properties can use any of the other fields or properties (provided there are no cycles)."
-    b = a + 1
-    "Derived properties can be cached."
-    @cached d = c + 1
-    "Order of definition does not matter"
-    c = b + 1
-    "Derived properties get computed lazily and then get stored locally."
+    b = a + 1        # derived from `a`
+    c = b + 1        # derived from `b`
+    @cached d = c + 1 # disk-cached
     e = d + 1
 end
+
+s = MyStruct(1.0)
+s.b  # 2.0 — computed on first access, then cached in memory
+s.d  # 4.0 — computed on first access, then cached to disk
 ```
 
-See [https://nsiccha.github.io/DynamicObjects.jl](https://nsiccha.github.io/DynamicObjects.jl) for a non-minimal example.
+See the [full documentation](https://nsiccha.github.io/DynamicObjects.jl) for details on indexed properties, `@persist`, scoping rules, thread safety, and more.

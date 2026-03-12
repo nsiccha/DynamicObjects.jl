@@ -123,12 +123,129 @@ g.greet(42)        # "Hello, person #42!"
 This works because each definition emits a separate method with the appropriate
 type signature, just like ordinary Julia function definitions.
 
+### How property references work (`__self__`)
+
+When writing the RHS of a derived property, bare names that match any
+property or field of the struct are **automatically rewritten** to
+`__self__.<name>`. The generated method looks like:
+
+```julia
+# What you write:
+@dynamicstruct struct Foo
+    a::Int
+    b = a * 2
+end
+
+# What gets generated (simplified):
+DynamicObjects.compute_property(::Val{:b}, __self__::Foo) = __self__.a * 2
+```
+
+This means `__self__` is available as a bare symbol in any property RHS —
+it's the parameter name of the generated method. You normally don't need
+it directly, but it's required for API calls like `get_cache_status`:
+
+```julia
+@dynamicstruct struct App
+    @cached data[url] = fetch(url)
+    loader[url] = begin
+        status = DynamicObjects.get_cache_status(__self__, :data, url)
+        status == :ready ? data[url] : "Loading..."
+    end
+end
+```
+
+### Scoping rules
+
+Not every bare name gets rewritten — `let` bindings and lambda parameters
+are treated as local and left alone, even if they shadow a property:
+
+```julia
+@dynamicstruct struct App
+    items = [1, 2, 3, 4]
+    evens = let items = filter(iseven, items)  # outer `items` → __self__.items
+        sum(items)                              # inner `items` is the local
+    end
+    mapped = map(x -> x * 2, items)           # `x` is local, `items` → __self__.items
+end
+```
+
+### Mutating the cache (`setproperty!`)
+
+Derived properties can be overwritten at runtime:
+
+```julia
+p = Point(3.0, 4.0)
+p.r       # 5.0
+p.r = 99
+p.r       # 99
+```
+
+Inside a property RHS, writing `prop = value` is rewritten to
+`__self__.prop = value`, which calls `setproperty!` and updates the
+in-memory cache:
+
+```julia
+@dynamicstruct struct Counter
+    @cached count = 0
+    increment = begin
+        count = count + 1   # rewritten to: __self__.count = __self__.count + 1
+        count
+    end
+end
+```
+
+### Persisting cache changes (`@persist`)
+
+When you mutate a `@cached` property via assignment, the change only
+affects the in-memory cache. Use `@persist` to serialise the current
+value back to disk:
+
+```julia
+@dynamicstruct struct Timer
+    @cached running = false
+    @cached current_log = nothing
+
+    toggle = begin
+        running = !running
+        @persist running
+        if !running
+            current_log = nothing
+            @persist current_log
+        end
+    end
+end
+
+t = Timer()
+t.toggle    # running = true, persisted to disk
+# In a new session:
+t2 = Timer()
+t2.running  # true — loaded from disk
+```
+
+`@persist` also works for indexed cached properties: `@persist data[url]`.
+
+### Constructor kwargs as cache overrides
+
+Keyword arguments pre-populate the cache, overriding any derived property:
+
+```julia
+p = Point(3.0, 4.0; r=10.0)
+p.r  # 10.0 — override, not computed
+```
+
 ### remake
 
 `remake` creates a new instance with some fields changed:
 
 ```julia
 e2 = remake(e; n=2_000_000)   # fresh instance, n changed, result recomputed
+```
+
+Keyword arguments that don't match fixed fields are treated as cache
+overrides, same as the constructor:
+
+```julia
+e3 = remake(e; result=0.0)    # n unchanged, result pre-set to 0.0
 ```
 
 ## Extended example
