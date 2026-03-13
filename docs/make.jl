@@ -6,6 +6,7 @@ makedocs(
     format   = DocumenterVitepress.MarkdownVitepress(
         repo = "github.com/nsiccha/DynamicObjects.jl",
         devurl = "dev",
+        devbranch = "dev",
     ),
     pages = [
         "Home"      => "index.md",
