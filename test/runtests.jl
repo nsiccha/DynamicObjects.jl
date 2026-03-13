@@ -145,6 +145,52 @@ end
     @test isa(s.ci3, DynamicObjects.IndexableProperty)
 end
 
+# ── Indexed properties with all-default indices ──────────────────────────────
+
+@testset "All-default indexed properties" begin
+    @dynamicstruct struct AllDefaults
+        item[x="default"] = "got: $x"
+        multi[a=1, b=2] = a + b
+    end
+
+    s = AllDefaults()
+
+    # IndexableProperty wrapper should be returned for zero-arg access
+    @test isa(s.item, DynamicObjects.IndexableProperty)
+    @test isa(s.multi, DynamicObjects.IndexableProperty)
+
+    # Explicit args work
+    @test s.item["hello"] == "got: hello"
+    @test s.multi[10, 20] == 30
+
+    # Default args work
+    @test s.item["default"] == "got: default"
+    @test s.multi[1, 2] == 3
+end
+
+# ── Call syntax (fresh each time) vs bracket syntax (cached) ─────────────────
+
+@testset "Call vs bracket caching" begin
+    counter = Ref(0)
+
+    @dynamicstruct struct CallVsBracket
+        counted[x] = (counter[] += 1; x * 2)
+    end
+
+    s = CallVsBracket()
+
+    # Bracket syntax: cached per index
+    counter[] = 0
+    @test s.counted[5] == 10
+    @test counter[] == 1
+    @test s.counted[5] == 10  # cached — counter should NOT increment
+    @test counter[] == 1
+
+    # Different index: computes again
+    @test s.counted[6] == 12
+    @test counter[] == 2
+end
+
 # ── Parallel (threadsafe) cache ───────────────────────────────────────────────
 
 @testset "Parallel cache" begin

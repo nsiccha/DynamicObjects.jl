@@ -95,14 +95,24 @@ getorcomputeproperty(o, name, indices...; kwargs...) = if hasfield(typeof(o), na
     @assert length(indices) == length(kwargs) == 0
     getfield(o, name)
 else
-    get!(getfield(o, :cache), name, indices...; kwargs...) do 
+    get!(getfield(o, :cache), name, indices...; kwargs...) do
         vname = Val(name)
+        # When called with no indices on an indexed property, return an
+        # IndexableProperty wrapper instead of calling compute_property.
+        # This avoids generating a zero-arg compute_property method that
+        # would conflict with indexed properties whose indices all have defaults.
+        if isempty(indices) && isempty(kwargs)
+            m = meta(typeof(o))
+            if haskey(m, name) && !isempty(m[name].indices)
+                return IndexableProperty(name, o, subcache(getfield(o, :cache)))
+            end
+        end
         if iscached(o, vname, indices...; kwargs...)
             cache_path = get_cache_path(o, name, indices...; kwargs...)
             mkpath(dirname(cache_path))
             cache_status = get_cache_status(cache_path)
             rv = if cache_status == :ready
-                Serialization.deserialize(cache_path) 
+                Serialization.deserialize(cache_path)
             elseif cache_status == :started
                 @warn "Cache file $cache_path exists but has size 0.\nAssuming a previous run failed."
             else
@@ -355,7 +365,6 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
         name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices)
     end |> filter(!isnothing)
     properties = Dict(oproperties)
-    properties_with_indices = Set(first.(filter(((name, info),)->length(info.indices) > 0, oproperties)))
     # for (dependent, info) in properties
     #     isfixed(info) && continue
     #     properties[dependent] = merge(info, (;rhs=walk_rhs(info.rhs; dependent, properties)))
@@ -392,13 +401,9 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
             end |> fixcall |> setlnn(info.lnn)
             for (name, info) in oproperties if !isfixed(info)
         ]...,
-        [
-            quote
-                $DynamicObjects.compute_property(__self__::$type, ::Val{$(Meta.quot(name))}) = $IndexableProperty($(Meta.quot(name)), __self__, $subcache(__self__.cache))
-                $DynamicObjects.iscached(__self__::$type, ::Val{$(Meta.quot(name))}) = false
-            end |> setlnn(properties[name].lnn)
-            for name in properties_with_indices
-        ]...,
+        # IndexableProperty wrappers for indexed properties are now created
+        # directly in getorcomputeproperty (via meta check), so no zero-arg
+        # compute_property methods are needed here.
     ))
 end
 
