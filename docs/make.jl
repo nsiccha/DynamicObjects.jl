@@ -27,6 +27,6 @@ end
 
 DocumenterVitepress.deploydocs(
     repo = "github.com/nsiccha/DynamicObjects.jl",
-    devbranch = "main",
+    devbranch = "dev",
     push_preview = true,
 )
