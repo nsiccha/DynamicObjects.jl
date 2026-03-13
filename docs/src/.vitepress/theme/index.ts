@@ -12,6 +12,7 @@ import {
 import VersionPicker from "@/VersionPicker.vue"
 import AuthorBadge from '@/AuthorBadge.vue'
 import Authors from '@/Authors.vue'
+import Banner from '@/Banner.vue'
 
 import { enhanceAppWithTabs } from 'vitepress-plugin-tabs/client'
 
@@ -23,6 +24,7 @@ export const Theme: ThemeConfig = {
   extends: DefaultTheme,
   Layout() {
     return h(DefaultTheme.Layout, null, {
+      'layout-bottom': () => h(Banner),
       'nav-bar-content-after': () => [
         h(NolebaseEnhancedReadabilitiesMenu), // Enhanced Readabilities menu
       ],
