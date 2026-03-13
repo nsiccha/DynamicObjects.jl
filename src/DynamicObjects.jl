@@ -269,6 +269,13 @@ walk_rhs(e::Expr; locals, properties) = if e.head == :let
         delete!(locals, l)
     end
     e
+elseif e.head == :(->)
+    # Lambda: first arg is parameter(s), second is body.
+    # Add lambda params to locals so they are not rewritten.
+    params = e.args[1]
+    ls = extractnames(isa(params, Expr) && Meta.isexpr(params, :tuple) ? params.args : [params])
+    new_locals = union(locals, ls)
+    Expr(e.head, e.args[1], walk_rhs(e.args[2]; locals=new_locals, properties))
 elseif e.head == :kw
     Expr(e.head, e.args[1], walk_rhs.(e.args[2:end]; locals, properties)...)
 else

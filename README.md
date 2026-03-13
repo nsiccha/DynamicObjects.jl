@@ -1,5 +1,8 @@
 # DynamicObjects.jl
 
+[![Dev Docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://nsiccha.github.io/DynamicObjects.jl/dev/)
+[![CI](https://github.com/nsiccha/DynamicObjects.jl/actions/workflows/test.yml/badge.svg)](https://github.com/nsiccha/DynamicObjects.jl/actions/workflows/test.yml)
+
 Structs with lazily computed, optionally disk-cached properties.
 
 ```julia
@@ -19,3 +22,7 @@ s.d  # 4.0 — computed on first access, then cached to disk
 ```
 
 See the [full documentation](https://nsiccha.github.io/DynamicObjects.jl) for details on indexed properties, `@persist`, scoping rules, thread safety, and more.
+
+## See also
+
+- [ReactiveObjects.jl](https://github.com/nsiccha/ReactiveObjects.jl) — reactive variant with automatic recomputation
