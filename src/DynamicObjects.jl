@@ -12,7 +12,7 @@ optionally disk-cached properties.
 - [`remake`](@ref): Create a new instance of a `@dynamicstruct` type with some fields changed.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, remake#, @persist
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, remake, fetchindex#, @persist
 
 import SHA, Serialization
 
@@ -77,11 +77,37 @@ Base.get!(f::Function, c::ThreadsafeDict, key; fetch=fetch) = begin
     end
     fetch(rv)
 end
-Base.pop!(c::ThreadsafeDict, key) = begin 
-    lock(c.lock) do 
+Base.pop!(c::ThreadsafeDict, key) = begin
+    lock(c.lock) do
         pop!(c.cache, key)
     end
 end
+
+"""
+    fetchindex(fetch, args...; kwargs...)
+
+Call `getindex(args...; fetch, kwargs...)` with a custom `fetch` function.
+
+For `IndexableProperty` backed by a `ThreadsafeDict`, `getindex` spawns a `Task`
+for the computation and calls `fetch(rv)` on the result. By default, `fetch` is
+`Base.fetch`, which blocks until the Task completes. Passing a custom `fetch`
+function lets you inspect the in-flight `Task` (e.g. to render a progress bar)
+instead of blocking.
+
+# Example
+```julia
+fetchindex(ip, key1, key2) do result
+    if isa(result, Task)
+        # still computing — render progress
+        h.div("Computing...")
+    else
+        # done — render result
+        render(result)
+    end
+end
+```
+"""
+fetchindex(fetch, args...; kwargs...) = getindex(args...; fetch, kwargs...)
 maybepop!(c::AbstractDict, key) = key in keys(c) && pop!(c, key)
 maybepop!(c::ThreadsafeDict, key) = begin 
     lock(c.lock) do 
@@ -179,8 +205,8 @@ e.result
 
 # Inside the struct body:
 @dynamicstruct struct App
-    @cached result[key] = expensive(key)
-    status[key] = @cache_status result[key]   # :unstarted, :started, or :ready
+    @cached result(key) = expensive(key)
+    status(key) = @cache_status result[key]   # :unstarted, :started, or :ready
 end
 ```
 """
@@ -204,8 +230,8 @@ definition, omit the object prefix — just use the property name:
 
 # Inside the struct body:
 @dynamicstruct struct App
-    @cached result[key] = expensive(key)
-    summary[key] = if @is_cached result[key]
+    @cached result(key) = expensive(key)
+    summary(key) = if @is_cached result[key]
         "cached: \$(result[key])"
     else
         "not yet computed"
@@ -247,6 +273,54 @@ persist(v, args...; kwargs...) = begin
         get_cache_path(args...; kwargs...),
         v
     )
+end
+
+"""
+    @clear_cache! o.prop
+    @clear_cache! o.prop[indices...]
+
+Clear the disk cache (and in-memory cache) for a `@cached` property.
+
+Without indices, clears **all** cached entries for the property (both the
+in-memory value and all `.sjl` files for that property on disk).
+With indices, clears only the specific entry.
+
+```julia
+@clear_cache! e.result        # clear all cached entries for `result`
+@clear_cache! e.ci[3]         # clear only the ci[3] entry
+```
+"""
+clear_cache!(o, name::Symbol, indices...; kwargs...) = begin
+    cache = getfield(o, :cache).cache
+    if isempty(indices) && isempty(kwargs)
+        # Clear in-memory (whole property, including IndexableProperty wrapper)
+        delete!(cache, name)
+        # Clear all disk cache files for this property
+        cp = try; o.cache_path; catch; nothing; end
+        if !isnothing(cp) && isdir(cp)
+            prefix = string(name)
+            for f in readdir(cp)
+                if endswith(f, ".sjl") && (f == prefix * ".sjl" || startswith(f, prefix * "_"))
+                    rm(joinpath(cp, f))
+                end
+            end
+        end
+    else
+        # Clear specific indexed entry from in-memory cache
+        if haskey(cache, name)
+            v = cache[name]
+            if v isa IndexableProperty
+                maybepop!(v.cache, (indices, kwargs))
+            end
+        end
+        # Clear specific disk cache file
+        path = get_cache_path(o, name, indices...; kwargs...)
+        isfile(path) && rm(path)
+    end
+    nothing
+end
+macro clear_cache!(x)
+    cache_f_expr(x; f=clear_cache!) |> esc
 end
 
 isfixed(kv::Pair) = isfixed(kv[2])
@@ -332,14 +406,15 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
     lnn = nothing
     doc = nothing
     docs = []
-    oproperties = map(body.args) do arg
+    oproperties = Pair[]
+    for arg in body.args
         if isa(arg, LineNumberNode)
             lnn = arg
-            return
+            continue
         end
         if isa(arg, String)
             doc = arg
-            return
+            continue
         end
         macros = Set{Symbol}()
         rhs = nothing
@@ -355,6 +430,59 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
             dependson = Set{Symbol}()
             locals = Set{Symbol}()
         end
+        # Multi-lhs: a, b = expr or (;a, b) = expr → hidden group property + individual extractors
+        if Meta.isexpr(arg, :tuple)
+            # Detect named destructuring: (;a, b) parses as Expr(:tuple, Expr(:parameters, :a, :b))
+            named = length(arg.args) == 1 && Meta.isexpr(arg.args[1], :parameters)
+            raw_args = named ? arg.args[1].args : arg.args
+            # Build list of (property_name, extract_expr_builder) pairs
+            # extract_expr_builder takes the group_name and returns the RHS expression
+            members = Pair{Symbol, Any}[]  # name => source_field_or_index
+            if named
+                for a in raw_args
+                    if isa(a, Symbol)
+                        # (;a) → property a, extracts .a
+                        push!(members, a => a)
+                    elseif Meta.isexpr(a, :call) && a.args[1] == :(<=)
+                        target, source = a.args[2], a.args[3]
+                        if isa(source, Symbol)
+                            # (;x_val<=val) → property x_val, extracts .val
+                            push!(members, target => source)
+                        elseif Meta.isexpr(source, :tuple)
+                            # (;x_ <= (val, grad)) → properties x_val, x_grad
+                            prefix = string(target)
+                            for s in source.args
+                                push!(members, Symbol(prefix, s) => s)
+                            end
+                        end
+                    end
+                end
+            else
+                for (i, a) in enumerate(raw_args)
+                    n = Meta.isexpr(a, :(::)) ? a.args[1] : a
+                    push!(members, n => i)
+                end
+            end
+            prop_names = first.(members)
+            group_name = Symbol("_tuple_", join(prop_names, "_"))
+            # Group property: computes the full tuple/NamedTuple
+            group_locals = Set{Symbol}(prop_names)
+            push!(group_locals, group_name)
+            push!(oproperties, group_name=>(;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple()))
+            push!(docs, (group_name=>(doc, true)))
+            doc = nothing
+            # Individual properties: extract from the group
+            for (prop_name, source) in members
+                extract_rhs = if source isa Symbol
+                    Expr(:., group_name, QuoteNode(source))
+                else
+                    :($group_name[$source])
+                end
+                push!(oproperties, prop_name=>(;lhs=prop_name, macros=Set{Symbol}(), rhs=extract_rhs, lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([prop_name]), indices=tuple()))
+                push!(docs, (prop_name=>(nothing, true)))
+            end
+            continue
+        end
         if Meta.isexpr(arg, (:ref, :call))
             arg, indices... = arg.args
             union!(locals, extractnames(indices))
@@ -369,8 +497,8 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
         doc = nothing
         !isnothing(locals) && push!(locals, name)
         @assert !isnothing(rhs) || length(macros) == 0
-        name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices)
-    end |> filter(!isnothing)
+        push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices))
+    end
     properties = Dict(oproperties)
     # for (dependent, info) in properties
     #     isfixed(info) && continue
@@ -382,10 +510,13 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
         for (name, (doc, hasrhs)) in docs
     ], "\n")
 
-    struct_expr = Expr(:struct, mut, head, Expr(:block, 
-        [info.lhs for (name,info) in oproperties if isfixed(info)]..., :(cache::$PropertyCache),
-        :($type(args...; cache_type=$(Meta.quot(cache_type)), kwargs...) = new(
-            args..., 
+    fixed_fields = [(name, info.lhs) for (name, info) in oproperties if isfixed(info)]
+    fixed_names = [n for (n, _) in fixed_fields]
+    fixed_lhs = [lhs for (_, lhs) in fixed_fields]
+    struct_expr = Expr(:struct, mut, head, Expr(:block,
+        fixed_lhs..., :(cache::$PropertyCache),
+        :($type($(fixed_lhs...); cache_type=$(Meta.quot(cache_type)), kwargs...) = new(
+            $(fixed_names...),
             $PropertyCache(
                 $get((;serial=$Dict, parallel=$ThreadsafeDict), cache_type, cache_type),
                 (;kwargs...)
@@ -435,9 +566,9 @@ end
         field                     # fixed field (constructor argument)
         prop = expr               # lazily computed property
         @cached prop = expr       # lazily computed + disk-cached property
-        prop[idx] = expr          # indexable property (cached per index)
+        prop(idx) = expr          # indexable property (fresh each call)
         prop(args...; kw...) = expr  # indexable property (fresh each call)
-        @cached prop[idx] = expr  # indexable + disk-cached property
+        @cached prop(idx) = expr  # indexable + disk-cached property (cached per index)
     end
 
 Define a struct whose *fixed fields* are set at construction time and whose
@@ -496,7 +627,7 @@ e2.result  # loaded from disk (same n → same hash → same cache path)
 # Properties reference each other by bare name (auto-rewritten to __self__.<name>).
 @dynamicstruct struct DataSet
     items = ["apple", "banana", "cherry"]
-    matches[query] = filter(x -> occursin(query, x), items)  # bracket: cached per query
+    matches(query) = filter(x -> occursin(query, x), items)   # call: fresh each time
     search(query) = filter(x -> occursin(query, x), items)   # call: fresh each time
     top(query; n=1) = first(search(query), n)                # call with kwargs
 end
