@@ -36,4 +36,9 @@ jobs:
             Pkg.instantiate()
             Pkg.precompile()
           '
-          julia --project=. -e 'include("test/runtests.jl")'
+          julia --project=. -e '
+            using TestModules
+            println("@testset defined: ", isdefined(@__MODULE__, Symbol("@testset")))
+            println("exports: ", filter(n -> startswith(string(n), "@test"), names(TestModules)))
+            include("test/runtests.jl")
+          '
