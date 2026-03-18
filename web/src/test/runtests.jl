@@ -171,6 +171,11 @@ end
     slow[key] = (sleep(0.05); key * 2)
 end
 
+@dynamicstruct struct FailingProps
+    will_fail = error("serial failure")
+    will_fail_indexed(key) = error("serial failure for key=$key")
+end
+
 _persistable_path = Ref("")
 @dynamicstruct struct Persistable
     cache_path = _persistable_path[]
@@ -475,4 +480,30 @@ end
     @test s.counter == 1
     s2 = Persistable(; cache_path=_persistable_path[])
     @test s2.counter == 1
+end
+
+@testset "PropertyComputationError" begin
+    # Serial: scalar property
+    f = FailingProps()
+    err = try; f.will_fail; nothing; catch e; e; end
+    @test err isa DynamicObjects.PropertyComputationError
+    @test err.property == :will_fail
+    @test err.type_name == "FailingProps"
+    @test DynamicObjects.unwrap_error(err) isa ErrorException
+
+    # Serial: indexed property
+    f2 = FailingProps()
+    err2 = try; f2.will_fail_indexed["abc"]; nothing; catch e; e; end
+    @test err2 isa DynamicObjects.PropertyComputationError
+    @test err2.property == :will_fail_indexed
+    @test err2.indices == ("abc",)
+
+    # Parallel: indexed property (TaskFailedException wrapped)
+    pf = FailingProps(; cache_type=:parallel)
+    err3 = try; pf.will_fail_indexed["xyz"]; nothing; catch e; e; end
+    @test err3 isa Base.TaskFailedException
+    inner = err3.task.exception
+    @test inner isa DynamicObjects.PropertyComputationError
+    @test inner.property == :will_fail_indexed
+    @test DynamicObjects.unwrap_error(inner) isa ErrorException
 end
