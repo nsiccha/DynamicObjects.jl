@@ -14,7 +14,7 @@ optionally disk-cached properties.
 - [`getstatus`](@ref): Read the status object for an in-flight computation.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, remake, fetchindex, getstatus#, @persist
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, remake, fetchindex, getstatus, PropertyComputationError, unwrap_error#, @persist
 
 import SHA, Serialization
 
@@ -26,10 +26,10 @@ persistent_hash(x) = begin
     bytes2hex(SHA.sha1(take!(b)))
 end
 iscached(o, ::Val) = false
-compute_property(o, ::Val{:hash_fields}) = ntuple(Base.Fix1(getfield, o), fieldcount(typeof(o))-1)
-compute_property(o, ::Val{:hash}) = persistent_hash((typeof(o), o.hash_fields))
-compute_property(o, ::Val{:cache_base}) = "cache"
-compute_property(o, ::Val{:cache_path}) = joinpath(o.cache_base, o.hash)
+compute_property(o, ::Val{:hash_fields}; __status__=nothing) = ntuple(Base.Fix1(getfield, o), fieldcount(typeof(o))-1)
+compute_property(o, ::Val{:hash}; __status__=nothing) = persistent_hash((typeof(o), o.hash_fields))
+compute_property(o, ::Val{:cache_base}; __status__=nothing) = "cache"
+compute_property(o, ::Val{:cache_path}; __status__=nothing) = joinpath(o.cache_base, o.hash)
 
 struct PropertyCache{D<:AbstractDict{Symbol,Any}}
     cache::D
@@ -177,26 +177,38 @@ else
                 return IndexableProperty(name, o, subcache(getfield(o, :cache)))
             end
         end
-        if iscached(o, vname, indices...; kwargs...)
-            cache_path = get_cache_path(o, name, indices...; kwargs...)
-            mkpath(dirname(cache_path))
-            cache_status = get_cache_status(cache_path)
-            rv = if cache_status == :ready
-                Serialization.deserialize(cache_path)
-            elseif cache_status == :started
-                @warn "Cache file $cache_path exists but has size 0.\nAssuming a previous run failed."
+        try
+            if iscached(o, vname, indices...; kwargs...)
+                cache_path = get_cache_path(o, name, indices...; kwargs...)
+                mkpath(dirname(cache_path))
+                cache_status = get_cache_status(cache_path)
+                rv = if cache_status == :ready
+                    Serialization.deserialize(cache_path)
+                elseif cache_status == :started
+                    @warn "Cache file $cache_path exists but has size 0.\nAssuming a previous run failed."
+                else
+                    touch(cache_path)
+                    nothing
+                end
+                if cache_status != :ready || resumes(o, vname, indices...; kwargs...)
+                    @debug "Generating $cache_path..."
+                    rv = compute_property(o, vname, indices...; __status__, (name=>rv, )..., kwargs...)
+                    Serialization.serialize(cache_path, rv)
+                end
+                rv
             else
-                touch(cache_path)
-                nothing
+                compute_property(o, vname, indices...; __status__, kwargs...)
             end
-            if cache_status != :ready || resumes(o, vname, indices...; kwargs...)
-                @debug "Generating $cache_path..."
-                rv = compute_property(o, vname, indices...; __status__, (name=>rv, )..., kwargs...)
-                Serialization.serialize(cache_path, rv)
-            end
-            rv
-        else
-            compute_property(o, vname, indices...; __status__, kwargs...)
+        catch e
+            e isa PropertyComputationError && rethrow()
+            kw_tuple = isempty(kwargs) ? () : Tuple(pairs(kwargs))
+            throw(PropertyComputationError(
+                string(typeof(o).name.name),
+                name,
+                indices,
+                kw_tuple,
+                e,
+            ))
         end
     end
 end
@@ -758,5 +770,69 @@ function remake(obj; kwargs...)
     T(args...; cache_kwargs...)
 end
 
+# --- Error display for property computations ---
+
+struct PropertyComputationError <: Exception
+    type_name::String
+    property::Symbol
+    indices::Tuple
+    kwargs::Tuple  # tuple of pairs
+    cause::Any
+end
+
+"""Recursively unwrap TaskFailedException / CompositeException to find the root cause."""
+unwrap_error(e::Base.TaskFailedException) = unwrap_error(e.task.exception)
+unwrap_error(e::CompositeException) = unwrap_error(first(e.exceptions))
+unwrap_error(e::PropertyComputationError) = unwrap_error(e.cause)
+unwrap_error(e) = e
+
+_filter_bt(bt) = filter(bt) do frame
+    file = string(frame.file)
+    !any(p -> occursin(p, file), (
+        "DynamicObjects.jl/src", "HTMXObjects.jl/src",
+        "/Oxygen/", "/HTTP/", "task.jl", "lock.jl",
+        "essentials.jl", "dict.jl",
+    ))
+end
+
+function _format_property_key(name, indices, kwargs)
+    s = string(name)
+    parts = String[]
+    !isempty(indices) && append!(parts, repr.(indices))
+    for (k, v) in kwargs
+        push!(parts, "$k=$(repr(v))")
+    end
+    isempty(parts) ? s : s * "[" * join(parts, ", ") * "]"
+end
+
+function Base.showerror(io::IO, e::PropertyComputationError)
+    key = _format_property_key(e.property, e.indices, e.kwargs)
+    root = unwrap_error(e.cause)
+    print(io, "PropertyComputationError: computing `$key` on $(e.type_name)\n")
+    print(io, "  Caused by: ")
+    showerror(io, root)
+end
+
+function Base.showerror(io::IO, e::PropertyComputationError, bt::Vector; backtrace=true)
+    showerror(io, e)
+    if backtrace
+        root_bt = _get_root_backtrace(e)
+        frames = !isempty(root_bt) ? root_bt : bt
+        filtered = _filter_bt(Base.stacktrace(frames))
+        if !isempty(filtered)
+            println(io, "\n\n  User code stacktrace:")
+            for (i, frame) in enumerate(filtered)
+                println(io, "   [$i] $(frame.func) at $(frame.file):$(frame.line)")
+            end
+        end
+    end
+end
+
+_get_root_backtrace(e::PropertyComputationError) = _get_root_backtrace(e.cause)
+_get_root_backtrace(e::Base.TaskFailedException) = begin
+    task_bt = try; e.task.backtrace; catch; []; end
+    isempty(task_bt) ? _get_root_backtrace(e.task.exception) : task_bt
+end
+_get_root_backtrace(::Any) = []
 
 end
