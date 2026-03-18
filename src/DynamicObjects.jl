@@ -38,19 +38,21 @@ end
 Base.get!(f::Function, c::PropertyCache, key) = get!((_...) -> f(), c.cache, key)
 Base.get!(f::Function, ::PropertyCache, key, indices...; kwargs...) = f()
 Base.setindex!(c::PropertyCache, args...) = setindex!(c.cache, args...)
+Base.show(io::IO, pc::PropertyCache) = print(io, "PropertyCache(", length(pc.cache), " properties)")
 struct IndexableProperty{N,O,D<:AbstractDict}
     o::O
     cache::D
     IndexableProperty(N,o,cache=Dict()) = new{N,typeof(o),typeof(cache)}(o, cache)
 end
 name(::IndexableProperty{N}) where {N} = N
-Base.getindex((;o, cache)::IndexableProperty{name}, indices...; fetch=fetch, kwargs...) where {name} = get!(cache, (indices, kwargs)) do
+Base.show(io::IO, ip::IndexableProperty{N}) where {N} = print(io, "IndexableProperty :", N, " (", ip.cache, ")")
+Base.getindex((;o, cache)::IndexableProperty{name}, indices...; fetch=fetch, kwargs...) where {name} = get!(cache, (indices, (;kwargs...))) do
     getorcomputeproperty(o, name, indices...; kwargs...)
 end
-(ip::IndexableProperty)(indices...; kwargs...) = begin 
+(ip::IndexableProperty)(indices...; kwargs...) = begin
     rv = getindex(ip, indices...; kwargs...)
-    maybepop!(ip.cache, (indices, kwargs))
-    rv 
+    maybepop!(ip.cache, (indices, (;kwargs...)))
+    rv
 end
 struct ThreadsafeDict{K,V} <: AbstractDict{K,V}
     lock::ReentrantLock
@@ -59,6 +61,13 @@ struct ThreadsafeDict{K,V} <: AbstractDict{K,V}
     status::Dict{K,Any}
     ThreadsafeDict{K,V}(c) where {K,V} = new{K,V}(ReentrantLock(), Dict{K,V}(c), Dict{K,Task}(), Dict{K,Any}())
     ThreadsafeDict() = new{Any,Any}(ReentrantLock(), Dict{Any,Any}(), Dict{Any,Task}(), Dict{Any,Any}())
+end
+Base.length(c::ThreadsafeDict) = lock(c.lock) do; length(c.cache); end
+Base.iterate(c::ThreadsafeDict) = lock(c.lock) do; iterate(c.cache); end
+Base.iterate(c::ThreadsafeDict, state) = lock(c.lock) do; iterate(c.cache, state); end
+n_running(c::ThreadsafeDict) = lock(c.lock) do; length(c.tasks); end
+Base.show(io::IO, c::ThreadsafeDict{K,V}) where {K,V} = lock(c.lock) do
+    print(io, "ThreadsafeDict{", K, ",", V, "}(", length(c.cache), " cached, ", length(c.tasks), " running)")
 end
 Base.getindex((;o, cache)::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indices...; fetch=fetch, kwargs...) where {name} = begin
     substatus_f = if name != :__substatus__ && name != :__status__ && haskey(meta(typeof(o)), :__substatus__)
@@ -69,7 +78,7 @@ Base.getindex((;o, cache)::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indic
     else
         nothing
     end
-    get!(cache, (indices, kwargs); fetch, substatus=substatus_f) do s
+    get!(cache, (indices, (;kwargs...)); fetch, substatus=substatus_f) do s
         getorcomputeproperty(o, name, indices...; __status__=s, kwargs...)
     end
 end
@@ -116,7 +125,7 @@ Only meaningful for `IndexableProperty` backed by a `ThreadsafeDict`.
 """
 getstatus(ip::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indices...; kwargs...) where {name} = begin
     lock(ip.cache.lock) do
-        get(ip.cache.status, (indices, kwargs), nothing)
+        get(ip.cache.status, (indices, (;kwargs...)), nothing)
     end
 end
 getstatus(::IndexableProperty, indices...; kwargs...) = nothing
@@ -370,7 +379,7 @@ clear_cache!(o, name::Symbol, indices...; kwargs...) = begin
         if haskey(cache, name)
             v = cache[name]
             if v isa IndexableProperty
-                maybepop!(v.cache, (indices, kwargs))
+                maybepop!(v.cache, (indices, (;kwargs...)))
             end
         end
         # Clear specific disk cache file
@@ -591,6 +600,15 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
             $Base.getproperty(__self__::$type, name::Symbol) = $getorcomputeproperty(__self__, name)
             $Base.setproperty!(__self__::$type, name::Symbol, value) = getfield(__self__, :cache)[name] = value
             $DynamicObjects.meta(::Type{$type}) = $properties
+            $Base.show(io::IO, __self__::$type) = begin
+                print(io, $(string(type)), "(")
+                $([let sep = i == 1 ? :() : :(print(io, ", "))
+                    quote; $sep; print(io, $(string(fn)), "="); show(io, getfield(__self__, $(QuoteNode(fn)))); end
+                end for (i, fn) in enumerate(fixed_names)]...)
+                $(isempty(fixed_names) ? :() : :(print(io, "; ")))
+                show(io, getfield(__self__, :cache))
+                print(io, ")")
+            end
         end,
         [
             begin
