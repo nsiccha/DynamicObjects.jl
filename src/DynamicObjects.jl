@@ -614,13 +614,12 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
             begin
                 cp_kwargs = [Expr(:kw, name, length(info.indices) > 0 ? :(__self__.$name) : nothing)]
                 name != :__status__ && push!(cp_kwargs, Expr(:kw, :__status__, :nothing))
-                # Build compute_property with replacelnn so ALL internal LNNs
-                # point to the user's source file, not DynamicObjects.jl.
-                # iscached/resumes are trivial and don't need source locations.
+                # NOTE: Do NOT use replacelnn here — it clobbers internal LNNs in the body,
+                # making all stacktrace frames point to the definition line.
+                # The outer setlnn(info.lnn) on the quote block handles Revise tracking.
                 cp_expr = :(
                     $DynamicObjects.compute_property(__self__::$type, ::Val{$(Meta.quot(name))}, $(info.indices...); $(cp_kwargs...)) = $(walk_rhs(info.rhs; info.locals, properties))
                 ) |> fixcall
-                !isnothing(info.lnn) && (cp_expr = replacelnn(cp_expr; lnn=info.lnn))
                 quote
                     $cp_expr
                     $DynamicObjects.iscached(__self__::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = $(Symbol("@cached") in info.macros)
@@ -838,6 +837,17 @@ function _format_property_key(name, indices, kwargs)
     isempty(parts) ? s : s * "[" * join(parts, ", ") * "]"
 end
 
+function _format_frame(frame)
+    if frame.linfo isa Core.MethodInstance
+        sig = frame.linfo.specTypes
+        params = fieldtypes(sig)
+        fname = string(frame.func)
+        arg_strs = ["::$(p)" for p in params[2:end]]
+        return fname * "(" * join(arg_strs, ", ") * ")"
+    end
+    return string(frame.func)
+end
+
 function Base.showerror(io::IO, e::PropertyComputationError)
     key = _format_property_key(e.property, e.indices, e.kwargs)
     root = unwrap_error(e)
@@ -852,7 +862,7 @@ function Base.showerror(io::IO, e::PropertyComputationError)
         if !isempty(filtered)
             println(io, "\n\n  Stacktrace (user code):")
             for (i, frame) in enumerate(filtered)
-                println(io, "   [$i] $(frame.func) at $(frame.file):$(frame.line)")
+                println(io, "   [$i] $(_format_frame(frame)) at $(frame.file):$(frame.line)")
             end
         end
     end
