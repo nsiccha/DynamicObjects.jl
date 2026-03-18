@@ -595,8 +595,15 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
             begin
                 cp_kwargs = [Expr(:kw, name, length(info.indices) > 0 ? :(__self__.$name) : nothing)]
                 name != :__status__ && push!(cp_kwargs, Expr(:kw, :__status__, :nothing))
-                quote
+                # Build compute_property with replacelnn so ALL internal LNNs
+                # point to the user's source file, not DynamicObjects.jl.
+                # iscached/resumes are trivial and don't need source locations.
+                cp_expr = :(
                     $DynamicObjects.compute_property(__self__::$type, ::Val{$(Meta.quot(name))}, $(info.indices...); $(cp_kwargs...)) = $(walk_rhs(info.rhs; info.locals, properties))
+                ) |> fixcall
+                !isnothing(info.lnn) && (cp_expr = replacelnn(cp_expr; lnn=info.lnn))
+                quote
+                    $cp_expr
                     $DynamicObjects.iscached(__self__::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = $(Symbol("@cached") in info.macros)
                     $DynamicObjects.resumes(__self__::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = false#$(name in info.dependson)
                 end |> fixcall |> setlnn(info.lnn)
