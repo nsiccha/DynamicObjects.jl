@@ -205,12 +205,13 @@ else
         catch e
             e isa PropertyComputationError && rethrow()
             kw_tuple = isempty(kwargs) ? () : Tuple(pairs(kwargs))
+            bt = catch_backtrace()
             throw(PropertyComputationError(
                 string(typeof(o).name.name),
                 name,
                 indices,
                 kw_tuple,
-                e,
+                (e, bt),  # store exception + backtrace from the actual throw site
             ))
         end
     end
@@ -793,8 +794,12 @@ end
 """Recursively unwrap TaskFailedException / CompositeException to find the root cause."""
 unwrap_error(e::Base.TaskFailedException) = unwrap_error(e.task.exception)
 unwrap_error(e::CompositeException) = unwrap_error(first(e.exceptions))
-unwrap_error(e::PropertyComputationError) = unwrap_error(e.cause)
+unwrap_error(e::PropertyComputationError) = unwrap_error(_cause_error(e))
 unwrap_error(e) = e
+
+# Extract the exception from cause (which may be a (exception, backtrace) tuple)
+_cause_error(e::PropertyComputationError) = e.cause isa Tuple ? first(e.cause) : e.cause
+_cause_backtrace(e::PropertyComputationError) = e.cause isa Tuple ? last(e.cause) : []
 
 _filter_bt(bt) = filter(bt) do frame
     file = string(frame.file)
@@ -817,20 +822,17 @@ end
 
 function Base.showerror(io::IO, e::PropertyComputationError)
     key = _format_property_key(e.property, e.indices, e.kwargs)
-    root = unwrap_error(e.cause)
+    root = unwrap_error(e)
     print(io, "PropertyComputationError: computing `$key` on $(e.type_name)\n")
     print(io, "  Caused by: ")
     showerror(io, root)
-end
-
-function Base.showerror(io::IO, e::PropertyComputationError, bt::Vector; backtrace=true)
-    showerror(io, e)
-    if backtrace
-        root_bt = _get_root_backtrace(e)
-        frames = !isempty(root_bt) ? root_bt : bt
-        filtered = _filter_bt(Base.stacktrace(frames))
+    # Show filtered backtrace from the original throw site
+    orig_bt = _cause_backtrace(e)
+    if !isempty(orig_bt)
+        frames = Base.stacktrace(orig_bt)
+        filtered = _filter_bt(frames)
         if !isempty(filtered)
-            println(io, "\n\n  User code stacktrace:")
+            println(io, "\n\n  Stacktrace (user code):")
             for (i, frame) in enumerate(filtered)
                 println(io, "   [$i] $(frame.func) at $(frame.file):$(frame.line)")
             end
@@ -838,11 +840,7 @@ function Base.showerror(io::IO, e::PropertyComputationError, bt::Vector; backtra
     end
 end
 
-_get_root_backtrace(e::PropertyComputationError) = _get_root_backtrace(e.cause)
-_get_root_backtrace(e::Base.TaskFailedException) = begin
-    task_bt = try; e.task.backtrace; catch; []; end
-    isempty(task_bt) ? _get_root_backtrace(e.task.exception) : task_bt
-end
-_get_root_backtrace(::Any) = []
+# 3-arg method: suppress Oxygen's backtrace since we show our own filtered one above
+Base.showerror(io::IO, e::PropertyComputationError, ::Any) = showerror(io, e)
 
 end
