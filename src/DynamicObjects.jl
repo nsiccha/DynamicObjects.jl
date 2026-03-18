@@ -10,9 +10,11 @@ optionally disk-cached properties.
 - [`@is_cached`](@ref): Check whether a property's disk cache is ready.
 - [`@cache_path`](@ref): Get the file path used for a property's disk cache.
 - [`remake`](@ref): Create a new instance of a `@dynamicstruct` type with some fields changed.
+- [`fetchindex`](@ref): Non-blocking access to `ThreadsafeDict`-backed properties with `(rv, status)` callback.
+- [`getstatus`](@ref): Read the status object for an in-flight computation.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, remake, fetchindex#, @persist
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, remake, fetchindex, getstatus#, @persist
 
 import SHA, Serialization
 
@@ -33,7 +35,7 @@ struct PropertyCache{D<:AbstractDict{Symbol,Any}}
     cache::D
     PropertyCache(D, c::NamedTuple) = new{D{Symbol,Any}}(D{Symbol,Any}(pairs(c)))
 end
-Base.get!(f::Function, c::PropertyCache, key) = get!(f, c.cache, key)
+Base.get!(f::Function, c::PropertyCache, key) = get!((_...) -> f(), c.cache, key)
 Base.get!(f::Function, ::PropertyCache, key, indices...; kwargs...) = f()
 Base.setindex!(c::PropertyCache, args...) = setindex!(c.cache, args...)
 struct IndexableProperty{N,O,D<:AbstractDict}
@@ -54,24 +56,43 @@ struct ThreadsafeDict{K,V} <: AbstractDict{K,V}
     lock::ReentrantLock
     cache::Dict{K,V}
     tasks::Dict{K,Task}
-    ThreadsafeDict{K,V}(c) where {K,V} = new{K,V}(ReentrantLock(), Dict{K,V}(c), Dict{K,Task}())
-    ThreadsafeDict() = new{Any,Any}(ReentrantLock(), Dict{Any,Any}(), Dict{Any,Task}())
+    status::Dict{K,Any}
+    ThreadsafeDict{K,V}(c) where {K,V} = new{K,V}(ReentrantLock(), Dict{K,V}(c), Dict{K,Task}(), Dict{K,Any}())
+    ThreadsafeDict() = new{Any,Any}(ReentrantLock(), Dict{Any,Any}(), Dict{Any,Task}(), Dict{Any,Any}())
 end
-Base.getindex((;o, cache)::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indices...; fetch=fetch, kwargs...) where {name} = get!(cache, (indices, kwargs); fetch) do
-    getorcomputeproperty(o, name, indices...; kwargs...)
+Base.getindex((;o, cache)::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indices...; fetch=fetch, kwargs...) where {name} = begin
+    substatus_f = if name != :__substatus__ && name != :__status__ && haskey(meta(typeof(o)), :__substatus__)
+        () -> begin
+            root = hasproperty(o, :__status__) ? o.__status__ : nothing
+            compute_property(o, Val(:__substatus__), name, indices...; __status__=root, kwargs...)
+        end
+    else
+        nothing
+    end
+    get!(cache, (indices, kwargs); fetch, substatus=substatus_f) do s
+        getorcomputeproperty(o, name, indices...; __status__=s, kwargs...)
+    end
 end
-Base.get!(f::Function, c::ThreadsafeDict, key; fetch=fetch) = begin
+Base.get!(f::Function, c::ThreadsafeDict, key; fetch=fetch, substatus=nothing) = begin
     rv = lock(c.lock) do
-        get(c.cache, key) do 
+        get(c.cache, key) do
+            # Clean up failed tasks so they can be retried
+            if haskey(c.tasks, key) && istaskdone(c.tasks[key]) && istaskfailed(c.tasks[key])
+                pop!(c.tasks, key)
+                haskey(c.status, key) && pop!(c.status, key)
+            end
             get!(c.tasks, key) do
-                Threads.@spawn begin 
-                    tmp = f()
-                    lock(c.lock) do 
+                s = isnothing(substatus) ? nothing : substatus()
+                !isnothing(s) && (c.status[key] = s)
+                Threads.@spawn begin
+                    tmp = f(s)
+                    lock(c.lock) do
                         c.cache[key] = tmp
                         pop!(c.tasks, key)
+                        haskey(c.status, key) && pop!(c.status, key)
                     end
                     tmp
-                end 
+                end
             end
         end
     end
@@ -79,45 +100,68 @@ Base.get!(f::Function, c::ThreadsafeDict, key; fetch=fetch) = begin
 end
 Base.pop!(c::ThreadsafeDict, key) = begin
     lock(c.lock) do
+        haskey(c.status, key) && pop!(c.status, key)
         pop!(c.cache, key)
     end
 end
 
 """
-    fetchindex(fetch, args...; kwargs...)
+    getstatus(ip::IndexableProperty, indices...; kwargs...)
 
-Call `getindex(args...; fetch, kwargs...)` with a custom `fetch` function.
+Return the status object associated with an in-flight computation for the given
+key, or `nothing` if no status exists (computation not started, already finished,
+or no `__substatus__` defined).
+
+Only meaningful for `IndexableProperty` backed by a `ThreadsafeDict`.
+"""
+getstatus(ip::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indices...; kwargs...) where {name} = begin
+    lock(ip.cache.lock) do
+        get(ip.cache.status, (indices, kwargs), nothing)
+    end
+end
+getstatus(::IndexableProperty, indices...; kwargs...) = nothing
+
+"""
+    fetchindex(fetch, ip, indices...; kwargs...)
+
+Call `getindex(ip, indices...; kwargs...)` with a custom `fetch` function.
 
 For `IndexableProperty` backed by a `ThreadsafeDict`, `getindex` spawns a `Task`
-for the computation and calls `fetch(rv)` on the result. By default, `fetch` is
-`Base.fetch`, which blocks until the Task completes. Passing a custom `fetch`
-function lets you inspect the in-flight `Task` (e.g. to render a progress bar)
-instead of blocking.
+for the computation. The `fetch` callback receives `(rv, status)` where `rv` is
+the `Task` (still running) or the computed result (done), and `status` is the
+substatus object (from `__substatus__`) or `nothing`.
 
 # Example
 ```julia
-fetchindex(ip, key1, key2) do result
-    if isa(result, Task)
-        # still computing — render progress
-        h.div("Computing...")
+fetchindex(app.results, key) do rv, status
+    if rv isa Task
+        # still computing — status is the progress node
+        render_progress(status)
     else
         # done — render result
-        render(result)
+        render(rv)
     end
 end
 ```
 """
+function fetchindex(fetch, ip::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indices...; kwargs...) where {name}
+    rv = getindex(ip, indices...; fetch=identity, kwargs...)
+    status = getstatus(ip, indices...; kwargs...)
+    fetch(rv, status)
+end
+# Fallback for non-ThreadsafeDict IPs (1-arg callback, no status)
 fetchindex(fetch, args...; kwargs...) = getindex(args...; fetch, kwargs...)
 maybepop!(c::AbstractDict, key) = key in keys(c) && pop!(c, key)
-maybepop!(c::ThreadsafeDict, key) = begin 
-    lock(c.lock) do 
+maybepop!(c::ThreadsafeDict, key) = begin
+    lock(c.lock) do
+        haskey(c.status, key) && pop!(c.status, key)
         maybepop!(c.cache, key)
     end
 end
 subcache(::PropertyCache{<:Dict}) = Dict()
 subcache(::PropertyCache{<:ThreadsafeDict}) = ThreadsafeDict()
 
-getorcomputeproperty(o, name, indices...; kwargs...) = if hasfield(typeof(o), name)
+getorcomputeproperty(o, name, indices...; __status__=nothing, kwargs...) = if hasfield(typeof(o), name)
     @assert length(indices) == length(kwargs) == 0
     getfield(o, name)
 else
@@ -147,12 +191,12 @@ else
             end
             if cache_status != :ready || resumes(o, vname, indices...; kwargs...)
                 @debug "Generating $cache_path..."
-                rv = compute_property(o, vname, indices...; (name=>rv, )..., kwargs...)
+                rv = compute_property(o, vname, indices...; __status__, (name=>rv, )..., kwargs...)
                 Serialization.serialize(cache_path, rv)
             end
             rv
         else
-            compute_property(o, vname, indices...; kwargs...)
+            compute_property(o, vname, indices...; __status__, kwargs...)
         end
     end
 end
@@ -496,6 +540,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
         push!(docs, (name=>(doc, !isnothing(rhs))))
         doc = nothing
         !isnothing(locals) && push!(locals, name)
+        !isnothing(locals) && push!(locals, :__status__)
         @assert !isnothing(rhs) || length(macros) == 0
         push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices))
     end
@@ -532,11 +577,15 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
             $DynamicObjects.meta(::Type{$type}) = $properties
         end,
         [
-            quote
-                $DynamicObjects.compute_property(__self__::$type, ::Val{$(Meta.quot(name))}, $(info.indices...); $(name)=$(length(info.indices) > 0 ? :(__self__.$name) : nothing)) = $(walk_rhs(info.rhs; info.locals, properties))
-                $DynamicObjects.iscached(__self__::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = $(Symbol("@cached") in info.macros)
-                $DynamicObjects.resumes(__self__::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = false#$(name in info.dependson)
-            end |> fixcall |> setlnn(info.lnn)
+            begin
+                cp_kwargs = [Expr(:kw, name, length(info.indices) > 0 ? :(__self__.$name) : nothing)]
+                name != :__status__ && push!(cp_kwargs, Expr(:kw, :__status__, :nothing))
+                quote
+                    $DynamicObjects.compute_property(__self__::$type, ::Val{$(Meta.quot(name))}, $(info.indices...); $(cp_kwargs...)) = $(walk_rhs(info.rhs; info.locals, properties))
+                    $DynamicObjects.iscached(__self__::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = $(Symbol("@cached") in info.macros)
+                    $DynamicObjects.resumes(__self__::$type, ::Val{$(Meta.quot(name))}, $(info.indices...)) = false#$(name in info.dependson)
+                end |> fixcall |> setlnn(info.lnn)
+            end
             for (name, info) in oproperties if !isfixed(info)
         ]...,
         # IndexableProperty wrappers for indexed properties are now created
@@ -637,6 +686,35 @@ ds.matches["an"]        # ["banana"] — cached per query
 ds.search("an")         # ["banana"] — fresh each call
 ds.top("a"; n=2)        # ["apple", "banana"] — kwargs supported
 ```
+
+# Async progress with `__status__` and `__substatus__`
+
+With `cache_type=:parallel`, indexed properties spawn background `Task`s.
+Define `__status__` (root progress node) and `__substatus__` (per-computation
+factory) to automatically wire progress into spawned tasks:
+
+```julia
+@dynamicstruct struct MyApp
+    __status__ = initialize_progress!(:state; description="MyApp")
+    __substatus__(name, args...; kwargs...) =
+        initialize_progress!(__status__; description="\$name[\$(join(args, ","))]")
+    results[key] = expensive_computation(__status__)  # __status__ is the substatus
+end
+app = MyApp(; cache_type=:parallel)
+
+# Non-blocking access with progress:
+fetchindex(app.results, key) do rv, status
+    rv isa Task ? render_progress(status) : render_result(rv)
+end
+```
+
+`__substatus__(name, args...; kwargs...)` is called before each Task spawn.
+`name` is the property symbol, `args`/`kwargs` are the indices. The returned
+object is stored in `ThreadsafeDict.status` (accessible via `getstatus`) and
+passed to the computation body as the local `__status__`.
+
+`__substatus__` only fires on ThreadsafeDict `getindex` (bracket access).
+Call syntax and scalar property access do not trigger it.
 """
 macro dynamicstruct(expr)
     dynamicstruct(expr)
