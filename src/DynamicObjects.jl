@@ -69,7 +69,7 @@ n_running(c::ThreadsafeDict) = lock(c.lock) do; length(c.tasks); end
 Base.show(io::IO, c::ThreadsafeDict{K,V}) where {K,V} = lock(c.lock) do
     print(io, "ThreadsafeDict{", K, ",", V, "}(", length(c.cache), " cached, ", length(c.tasks), " running)")
 end
-Base.getindex((;o, cache)::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indices...; fetch=fetch, kwargs...) where {name} = begin
+Base.getindex((;o, cache)::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indices...; fetch=fetch, retry_failed=true, kwargs...) where {name} = begin
     substatus_f = if name != :__substatus__ && name != :__status__ && haskey(meta(typeof(o)), :__substatus__)
         () -> begin
             root = hasproperty(o, :__status__) ? o.__status__ : nothing
@@ -78,15 +78,15 @@ Base.getindex((;o, cache)::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indic
     else
         nothing
     end
-    get!(cache, (indices, (;kwargs...)); fetch, substatus=substatus_f) do s
+    get!(cache, (indices, (;kwargs...)); fetch, substatus=substatus_f, retry_failed) do s
         getorcomputeproperty(o, name, indices...; __status__=s, kwargs...)
     end
 end
-Base.get!(f::Function, c::ThreadsafeDict, key; fetch=fetch, substatus=nothing) = begin
+Base.get!(f::Function, c::ThreadsafeDict, key; fetch=fetch, substatus=nothing, retry_failed=true) = begin
     rv = lock(c.lock) do
         get(c.cache, key) do
-            # Clean up failed tasks so they can be retried
-            if haskey(c.tasks, key) && istaskdone(c.tasks[key]) && istaskfailed(c.tasks[key])
+            # Clean up failed tasks so they can be retried (only when retry_failed=true)
+            if retry_failed && haskey(c.tasks, key) && istaskdone(c.tasks[key]) && istaskfailed(c.tasks[key])
                 pop!(c.tasks, key)
                 haskey(c.status, key) && pop!(c.status, key)
             end
@@ -153,8 +153,9 @@ fetchindex(app.results, key) do rv, status
 end
 ```
 """
-function fetchindex(fetch, ip::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indices...; kwargs...) where {name}
-    rv = getindex(ip, indices...; fetch=identity, kwargs...)
+function fetchindex(fetch, ip::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indices...; force=false, kwargs...) where {name}
+    force && maybepop!(ip.cache, (indices, (;kwargs...)))
+    rv = getindex(ip, indices...; fetch=identity, retry_failed=false, kwargs...)
     status = getstatus(ip, indices...; kwargs...)
     fetch(rv, status)
 end
