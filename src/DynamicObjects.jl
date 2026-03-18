@@ -26,10 +26,10 @@ persistent_hash(x) = begin
     bytes2hex(SHA.sha1(take!(b)))
 end
 iscached(o, ::Val) = false
-compute_property(o, ::Val{:hash_fields}; __status__=nothing) = ntuple(Base.Fix1(getfield, o), fieldcount(typeof(o))-1)
-compute_property(o, ::Val{:hash}; __status__=nothing) = persistent_hash((typeof(o), o.hash_fields))
-compute_property(o, ::Val{:cache_base}; __status__=nothing) = "cache"
-compute_property(o, ::Val{:cache_path}; __status__=nothing) = joinpath(o.cache_base, o.hash)
+compute_property(o, ::Val{:hash_fields}) = ntuple(Base.Fix1(getfield, o), fieldcount(typeof(o))-1)
+compute_property(o, ::Val{:hash}) = persistent_hash((typeof(o), o.hash_fields))
+compute_property(o, ::Val{:cache_base}) = "cache"
+compute_property(o, ::Val{:cache_path}) = joinpath(o.cache_base, o.hash)
 
 struct PropertyCache{D<:AbstractDict{Symbol,Any}}
     cache::D
