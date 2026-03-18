@@ -447,7 +447,7 @@ end
     app = AsyncApp(; cache_type=:parallel)
     @test app.slow[3] == 6
     seen_task = Ref(false)
-    result = fetchindex(app.slow, 42) do rv
+    result = fetchindex(app.slow, 42) do rv, status
         if isa(rv, Task)
             seen_task[] = true
             Base.fetch(rv)
@@ -457,7 +457,7 @@ end
     end
     @test result == 84
     seen_task2 = Ref(false)
-    result2 = fetchindex(app.slow, 42) do rv
+    result2 = fetchindex(app.slow, 42) do rv, status
         if isa(rv, Task)
             seen_task2[] = true
         end
