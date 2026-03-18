@@ -177,6 +177,9 @@ else
                 return IndexableProperty(name, o, subcache(getfield(o, :cache)))
             end
         end
+        # Only pass __status__ to properties that accept it (generated properties
+        # in meta). Base properties (cache_path, hash, etc.) don't have it.
+        _status_kw = haskey(meta(typeof(o)), name) ? (; __status__) : (;)
         try
             if iscached(o, vname, indices...; kwargs...)
                 cache_path = get_cache_path(o, name, indices...; kwargs...)
@@ -192,12 +195,12 @@ else
                 end
                 if cache_status != :ready || resumes(o, vname, indices...; kwargs...)
                     @debug "Generating $cache_path..."
-                    rv = compute_property(o, vname, indices...; __status__, (name=>rv, )..., kwargs...)
+                    rv = compute_property(o, vname, indices...; _status_kw..., (name=>rv, )..., kwargs...)
                     Serialization.serialize(cache_path, rv)
                 end
                 rv
             else
-                compute_property(o, vname, indices...; __status__, kwargs...)
+                compute_property(o, vname, indices...; _status_kw..., kwargs...)
             end
         catch e
             e isa PropertyComputationError && rethrow()
