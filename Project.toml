@@ -11,7 +11,7 @@ Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 TestModules = {url = "https://github.com/nsiccha/TestModules.jl"}
 
 [compat]
-julia = "1.11"
+julia = "1.10"
 
 [extras]
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"

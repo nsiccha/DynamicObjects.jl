@@ -854,11 +854,14 @@ end
 
 function _format_frame(frame)
     if frame.linfo isa Core.MethodInstance
-        sig = frame.linfo.specTypes
-        params = fieldtypes(sig)
-        fname = string(frame.func)
-        arg_strs = ["::$(p)" for p in params[2:end]]
-        return fname * "(" * join(arg_strs, ", ") * ")"
+        try
+            sig = frame.linfo.specTypes
+            params = fieldtypes(sig)
+            fname = string(frame.func)
+            arg_strs = ["::$(p)" for p in params[2:end]]
+            return fname * "(" * join(arg_strs, ", ") * ")"
+        catch
+        end
     end
     return string(frame.func)
 end
