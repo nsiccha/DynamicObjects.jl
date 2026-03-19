@@ -12,6 +12,7 @@
 @cache_status
 @is_cached
 @cache_path
+@clear_cache!
 @persist
 ```
 
@@ -19,4 +20,13 @@
 
 ```@docs
 remake
+fetchindex
+getstatus
+```
+
+## Error handling
+
+```@docs
+PropertyComputationError
+unwrap_error
 ```

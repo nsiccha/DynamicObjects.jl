@@ -12,14 +12,16 @@ optionally disk-cached properties.
 - [`remake`](@ref): Create a new instance of a `@dynamicstruct` type with some fields changed.
 - [`fetchindex`](@ref): Non-blocking access to `ThreadsafeDict`-backed properties with `(rv, status)` callback.
 - [`getstatus`](@ref): Read the status object for an in-flight computation.
+- [`@clear_cache!`](@ref): Clear the disk and in-memory cache for a property.
+- [`@persist`](@ref): Manually persist a property value to disk cache.
+- [`PropertyComputationError`](@ref): Exception wrapper for errors during property computation.
+- [`unwrap_error`](@ref): Dig through exception wrappers to find the root cause.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, remake, fetchindex, getstatus, PropertyComputationError, unwrap_error#, @persist
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, remake, fetchindex, getstatus, PropertyComputationError, unwrap_error
 
 import SHA, Serialization
 
-# serialize(args...; kwargs...) = error("Serialization requires loading e.g. Serialization.jl")
-# deserialize(args...; kwargs...) = error("Serialization requires loading e.g. Serialization.jl")
 persistent_hash(x) = begin
     b = IOBuffer()
     Serialization.serialize(b, x)
@@ -801,6 +803,13 @@ end
 
 # --- Error display for property computations ---
 
+"""
+    PropertyComputationError <: Exception
+
+Wraps an error that occurred during lazy property computation, adding context
+about which property failed (property name, type, indices/kwargs). The original
+exception and backtrace are stored in the `cause` field.
+"""
 struct PropertyComputationError <: Exception
     type_name::String
     property::Symbol
@@ -809,7 +818,12 @@ struct PropertyComputationError <: Exception
     cause::Any
 end
 
-"""Recursively unwrap TaskFailedException / CompositeException to find the root cause."""
+"""
+    unwrap_error(e)
+
+Recursively unwrap `TaskFailedException`, `CompositeException`, and
+`PropertyComputationError` wrappers to find the root cause exception.
+"""
 unwrap_error(e::Base.TaskFailedException) = unwrap_error(e.task.exception)
 unwrap_error(e::CompositeException) = unwrap_error(first(e.exceptions))
 unwrap_error(e::PropertyComputationError) = unwrap_error(_cause_error(e))
