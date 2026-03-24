@@ -609,18 +609,25 @@ else
 end
 fixcall(x) = x
 fixcall(x::Expr) = if Meta.isexpr(x, :call)
-    # args = fixcall.(x.args)
     f = x.args[1]
-    pargs = []
+    # Collect keyword args in two passes: fixed kwargs first, splats (kwargs...) last.
+    # This is necessary because the new Expr-based method generation may merge multiple
+    # :parameters nodes (e.g. one from info.indices containing `kwargs...` and one from
+    # cp_kwargs containing `name=val`). Julia requires splat kwargs to be final, so we
+    # sort them to the end regardless of which :parameters node they originated from.
+    pargs_fixed = []
+    pargs_splat = []
     args = []
     for arg in fixcall.(x.args[2:end])
         if Meta.isexpr(arg, :parameters)
-            append!(pargs, arg.args)
+            for a in arg.args
+                Meta.isexpr(a, :(...)) ? push!(pargs_splat, a) : push!(pargs_fixed, a)
+            end
         else
             push!(args, arg)
         end
     end
-    Expr(x.head, f, Expr(:parameters, pargs...), args...)
+    Expr(x.head, f, Expr(:parameters, pargs_fixed..., pargs_splat...), args...)
 else
     Expr(x.head, fixcall.(x.args)...)
 end
