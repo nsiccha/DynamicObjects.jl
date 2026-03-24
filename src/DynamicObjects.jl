@@ -16,9 +16,13 @@ optionally disk-cached properties.
 - [`@persist`](@ref): Manually persist a property value to disk cache.
 - [`PropertyComputationError`](@ref): Exception wrapper for errors during property computation.
 - [`unwrap_error`](@ref): Dig through exception wrappers to find the root cause.
+- [`entries`](@ref): List all entries in a `ThreadsafeDict`-backed property with state info.
+- [`cached_entries`](@ref): Iterate completed (non-Task) entries of an indexed property.
+- [`clear_all_caches!`](@ref): Clear all `@cached` properties on a `@dynamicstruct` instance.
+- [`PersistentSet`](@ref): Thread-safe, disk-persisted `Set`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, remake, fetchindex, getstatus, PropertyComputationError, unwrap_error
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, remake, fetchindex, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, PersistentSet
 
 import SHA, Serialization
 
@@ -48,9 +52,10 @@ struct IndexableProperty{N,O,D<:AbstractDict}
 end
 name(::IndexableProperty{N}) where {N} = N
 Base.show(io::IO, ip::IndexableProperty{N}) where {N} = print(io, "IndexableProperty :", N, " (", ip.cache, ")")
-Base.getindex((;o, cache)::IndexableProperty{name}, indices...; fetch=fetch, kwargs...) where {name} = get!(cache, (indices, (;kwargs...))) do
-    getorcomputeproperty(o, name, indices...; kwargs...)
-end
+Base.getindex((;o, cache)::IndexableProperty{name}, indices...; fetch=Base.fetch, kwargs...) where {name} =
+    get!(cache, (indices, (;kwargs...))) do
+        getorcomputeproperty(o, name, indices...; kwargs...)
+    end
 (ip::IndexableProperty)(indices...; kwargs...) = begin
     rv = getindex(ip, indices...; kwargs...)
     maybepop!(ip.cache, (indices, (;kwargs...)))
@@ -65,13 +70,16 @@ struct ThreadsafeDict{K,V} <: AbstractDict{K,V}
     ThreadsafeDict() = new{Any,Any}(ReentrantLock(), Dict{Any,Any}(), Dict{Any,Task}(), Dict{Any,Any}())
 end
 Base.length(c::ThreadsafeDict) = lock(c.lock) do; length(c.cache); end
+# NOTE: iteration is NOT truly thread-safe — each iterate call locks independently,
+# so the dict can mutate between calls. For thread-safe iteration, use
+# lock(c.lock) do ... end or entries(ip) which holds the lock for the full sweep.
 Base.iterate(c::ThreadsafeDict) = lock(c.lock) do; iterate(c.cache); end
 Base.iterate(c::ThreadsafeDict, state) = lock(c.lock) do; iterate(c.cache, state); end
 n_running(c::ThreadsafeDict) = lock(c.lock) do; length(c.tasks); end
 Base.show(io::IO, c::ThreadsafeDict{K,V}) where {K,V} = lock(c.lock) do
     print(io, "ThreadsafeDict{", K, ",", V, "}(", length(c.cache), " cached, ", length(c.tasks), " running)")
 end
-Base.getindex((;o, cache)::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indices...; fetch=fetch, retry_failed=true, kwargs...) where {name} = begin
+Base.getindex((;o, cache)::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indices...; fetch=Base.fetch, retry_failed=true, kwargs...) where {name} = begin
     substatus_f = if name != :__substatus__ && name != :__status__ && haskey(meta(typeof(o)), :__substatus__)
         () -> begin
             root = hasproperty(o, :__status__) ? o.__status__ : nothing
@@ -84,7 +92,7 @@ Base.getindex((;o, cache)::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indic
         getorcomputeproperty(o, name, indices...; __status__=s, kwargs...)
     end
 end
-Base.get!(f::Function, c::ThreadsafeDict, key; fetch=fetch, substatus=nothing, retry_failed=true) = begin
+Base.get!(f::Function, c::ThreadsafeDict, key; fetch=Base.fetch, substatus=nothing, retry_failed=true) = begin
     rv = lock(c.lock) do
         get(c.cache, key) do
             # Clean up failed tasks so they can be retried (only when retry_failed=true)
@@ -94,7 +102,9 @@ Base.get!(f::Function, c::ThreadsafeDict, key; fetch=fetch, substatus=nothing, r
             end
             get!(c.tasks, key) do
                 s = isnothing(substatus) ? nothing : substatus()
-                !isnothing(s) && (c.status[key] = s)
+                if !isnothing(s)
+                    c.status[key] = s
+                end
                 Threads.@spawn begin
                     tmp = f(s)
                     lock(c.lock) do
@@ -125,7 +135,7 @@ or no `__substatus__` defined).
 
 Only meaningful for `IndexableProperty` backed by a `ThreadsafeDict`.
 """
-getstatus(ip::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indices...; kwargs...) where {name} = begin
+getstatus(ip::IndexableProperty{<:Any,<:Any,<:ThreadsafeDict}, indices...; kwargs...) = begin
     lock(ip.cache.lock) do
         get(ip.cache.status, (indices, (;kwargs...)), nothing)
     end
@@ -155,7 +165,7 @@ fetchindex(app.results, key) do rv, status
 end
 ```
 """
-function fetchindex(fetch, ip::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indices...; force=false, kwargs...) where {name}
+function fetchindex(fetch, ip::IndexableProperty{<:Any,<:Any,<:ThreadsafeDict}, indices...; force=false, kwargs...)
     force && maybepop!(ip.cache, (indices, (;kwargs...)))
     rv = getindex(ip, indices...; fetch=identity, retry_failed=false, kwargs...)
     status = getstatus(ip, indices...; kwargs...)
@@ -163,7 +173,7 @@ function fetchindex(fetch, ip::IndexableProperty{name,<:Any,<:ThreadsafeDict}, i
 end
 # Fallback for non-ThreadsafeDict IPs (1-arg callback, no status)
 fetchindex(fetch, args...; kwargs...) = getindex(args...; fetch, kwargs...)
-maybepop!(c::AbstractDict, key) = key in keys(c) && pop!(c, key)
+maybepop!(c::AbstractDict, key) = haskey(c, key) && pop!(c, key)
 maybepop!(c::ThreadsafeDict, key) = begin
     lock(c.lock) do
         haskey(c.status, key) && pop!(c.status, key)
@@ -172,6 +182,151 @@ maybepop!(c::ThreadsafeDict, key) = begin
 end
 subcache(::PropertyCache{<:Dict}) = Dict()
 subcache(::PropertyCache{<:ThreadsafeDict}) = ThreadsafeDict()
+
+# --- PersistentSet ---
+
+"""
+    PersistentSet(path)
+
+A thread-safe `Set` that persists to disk via `Serialization`. Loads existing
+data from `path` on construction, or starts empty if the file doesn't exist.
+"""
+struct PersistentSet{P<:AbstractString,S<:AbstractSet}
+    lock::ReentrantLock
+    path::P
+    data::S
+end
+PersistentSet(path) = begin
+    data = isfile(path) ? Serialization.deserialize(path) : Set()
+    PersistentSet(ReentrantLock(), path, data)
+end
+Base.push!(s::PersistentSet, item) = @lock s.lock begin
+    item in s.data && return s
+    isfile(s.path) && union!(s.data, Serialization.deserialize(s.path))
+    Serialization.serialize(s.path, push!(s.data, item))
+    s
+end
+Base.pop!(s::PersistentSet, item) = @lock s.lock begin
+    pop!(s.data, item)
+    Serialization.serialize(s.path, s.data)
+    s
+end
+Base.in(item, s::PersistentSet) = @lock s.lock item in s.data
+Base.length(s::PersistentSet) = @lock s.lock length(s.data)
+Base.collect(s::PersistentSet) = @lock s.lock collect(s.data)
+# NOTE: iteration is NOT truly thread-safe — each iterate call locks independently.
+Base.iterate(s::PersistentSet) = @lock s.lock iterate(s.data)
+Base.iterate(s::PersistentSet, state) = @lock s.lock iterate(s.data, state)
+Base.show(io::IO, s::PersistentSet) = print(io, "PersistentSet(", length(s.data), " items, ", s.path, ")")
+
+# --- entries / cached_entries for IndexableProperty ---
+
+"""
+    entries(ip::IndexableProperty)
+
+Return a vector of `(; key, state, status, value)` for all entries in a
+`ThreadsafeDict`-backed `IndexableProperty`. `state` is one of `:running`,
+`:failed`, `:finishing`, or `:done`. `value` is the cached result (for `:done`)
+or the `Task` (for running/failed/finishing). `status` is the substatus object
+or `nothing`.
+"""
+function entries(ip::IndexableProperty{<:Any,<:Any,<:ThreadsafeDict})
+    result = NamedTuple{(:key, :state, :status, :value), Tuple{Any, Symbol, Any, Any}}[]
+    lock(ip.cache.lock) do
+        for (k, task) in ip.cache.tasks
+            status = get(ip.cache.status, k, nothing)
+            state = if istaskfailed(task)
+                :failed
+            elseif istaskdone(task)
+                :finishing
+            else
+                :running
+            end
+            push!(result, (; key=k, state, status, value=task))
+        end
+        for (k, v) in ip.cache.cache
+            haskey(ip.cache.tasks, k) && continue
+            push!(result, (; key=k, state=:done, status=nothing, value=v))
+        end
+    end
+    result
+end
+
+"""
+    cached_entries(ip::IndexableProperty)
+
+Return a vector of `(key, value)` pairs for completed (non-Task) entries only.
+"""
+function cached_entries(ip::IndexableProperty{<:Any,<:Any,<:ThreadsafeDict})
+    lock(ip.cache.lock) do
+        collect(ip.cache.cache)
+    end
+end
+function cached_entries(ip::IndexableProperty)
+    collect(ip.cache)
+end
+
+# --- clear_all_caches! ---
+
+"""
+    clear_all_caches!(obj)
+
+Clear all `@cached` properties on a `@dynamicstruct` instance — both in-memory
+and on disk. Equivalent to calling `@clear_cache!` on every cached property.
+"""
+function clear_all_caches!(obj)
+    m = meta(typeof(obj))
+    for (name, info) in m
+        isfixed(info) && continue
+        Symbol("@cached") in info.macros || continue
+        clear_cache!(obj, name)
+    end
+    nothing
+end
+
+# --- Accessed-keys tracking for IndexableProperty ---
+
+"""
+    accessed_keys_path(ip::IndexableProperty)
+
+Return the path where accessed keys are persisted for a cached IndexableProperty.
+"""
+function accessed_keys_path(ip::IndexableProperty{name}) where {name}
+    joinpath(ip.o.cache_path, string(name) * "_keys.sjl")
+end
+
+"""
+    accessed_keys(ip::IndexableProperty)
+
+Return the set of keys that have been accessed for this IndexableProperty,
+loaded from disk. Returns an empty `Set` if no keys have been recorded.
+"""
+function accessed_keys(ip::IndexableProperty)
+    path = accessed_keys_path(ip)
+    isfile(path) ? Serialization.deserialize(path) : Set()
+end
+
+function _record_key_to_path(path, key)
+    mkpath(dirname(path))
+    existing = isfile(path) ? Serialization.deserialize(path) : Set()
+    key in existing && return
+    push!(existing, key)
+    Serialization.serialize(path, existing)
+    nothing
+end
+
+"""
+    record_access!(ip::IndexableProperty, key)
+
+Record that `key` was accessed for this IndexableProperty, persisting to disk.
+"""
+record_access!(ip::IndexableProperty, key) = _record_key_to_path(accessed_keys_path(ip), key)
+
+# Internal: record accessed key from getorcomputeproperty context
+function _record_accessed_key(o, name::Symbol, indices, kwargs)
+    path = joinpath(o.cache_path, string(name) * "_keys.sjl")
+    _record_key_to_path(path, (indices, (;kwargs...)))
+end
 
 getorcomputeproperty(o, name, indices...; __status__=nothing, kwargs...) = if hasfield(typeof(o), name)
     @assert length(indices) == length(kwargs) == 0
@@ -199,9 +354,8 @@ else
                 cache_status = get_cache_status(cache_path)
                 rv = if cache_status == :ready
                     Serialization.deserialize(cache_path)
-                elseif cache_status == :started
-                    @warn "Cache file $cache_path exists but has size 0.\nAssuming a previous run failed."
                 else
+                    cache_status == :started && @warn "Cache file $cache_path exists but has size 0.\nAssuming a previous run failed."
                     touch(cache_path)
                     nothing
                 end
@@ -209,6 +363,10 @@ else
                     @debug "Generating $cache_path..."
                     rv = compute_property(o, vname, indices...; _status_kw..., (name=>rv, )..., kwargs...)
                     Serialization.serialize(cache_path, rv)
+                end
+                # Record accessed key for indexed @cached properties
+                if !isempty(indices)
+                    _record_accessed_key(o, name, indices, kwargs)
                 end
                 rv
             else
@@ -368,8 +526,8 @@ clear_cache!(o, name::Symbol, indices...; kwargs...) = begin
         # Clear in-memory (whole property, including IndexableProperty wrapper)
         delete!(cache, name)
         # Clear all disk cache files for this property
-        cp = try; o.cache_path; catch; nothing; end
-        if !isnothing(cp) && isdir(cp)
+        cp = o.cache_path
+        if isdir(cp)
             prefix = string(name)
             for f in readdir(cp)
                 if endswith(f, ".sjl") && (f == prefix * ".sjl" || startswith(f, prefix * "_"))
@@ -427,11 +585,9 @@ elseif e.head == :kw
 else
     Expr(e.head, walk_rhs.(e.args; locals, properties)...)
 end
-walk_rhs(e::Symbol; locals, properties) = if e in keys(properties) && !(e in locals)
-    # isfixed(properties[e]) || push!(properties[dependent].dependson, e)
+walk_rhs(e::Symbol; locals, properties) = if haskey(properties, e) && !(e in locals)
     :(__self__.$e)
 else
-    # e == dependent && push!(properties[dependent].dependson, e)
     e
 end
 function compute_property end
@@ -573,10 +729,6 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
         push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices))
     end
     properties = Dict(oproperties)
-    # for (dependent, info) in properties
-    #     isfixed(info) && continue
-    #     properties[dependent] = merge(info, (;rhs=walk_rhs(info.rhs; dependent, properties)))
-    # end
 
     docstring = something(docstring, "DynamicStruct `$type`.") * "\n\n" * join([
         "* " * (isnothing(doc) ? "" : "$doc: ") * "`$name" * (hasrhs ? " = ..." : "") * "`"
@@ -599,7 +751,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
     esc(Expr(:block, 
         :(@doc $docstring $struct_expr),
         quote
-            $Base.hasproperty(__self__::$type, name::Symbol) = name in $(keys(properties))
+            $Base.hasproperty(__self__::$type, name::Symbol) = name in $(Tuple(keys(properties)))
             $Base.getproperty(__self__::$type, name::Symbol) = $getorcomputeproperty(__self__, name)
             $Base.setproperty!(__self__::$type, name::Symbol, value) = getfield(__self__, :cache)[name] = value
             $DynamicObjects.meta(::Type{$type}) = $properties
@@ -617,9 +769,8 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
             begin
                 cp_kwargs = [Expr(:kw, name, length(info.indices) > 0 ? :(__self__.$name) : nothing)]
                 name != :__status__ && push!(cp_kwargs, Expr(:kw, :__status__, :nothing))
-                # NOTE: Do NOT use replacelnn here — it clobbers internal LNNs in the body,
-                # making all stacktrace frames point to the definition line.
-                # The outer setlnn(info.lnn) on the quote block handles Revise tracking.
+                # setlnn(info.lnn) on the quote block handles Revise tracking
+                # while preserving internal LNNs for useful stacktraces.
                 cp_expr = :(
                     $DynamicObjects.compute_property(__self__::$type, ::Val{$(Meta.quot(name))}, $(info.indices...); $(cp_kwargs...)) = $(walk_rhs(info.rhs; info.locals, properties))
                 ) |> fixcall
@@ -637,14 +788,9 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
     ))
 end
 
-replacelnn(;lnn::LineNumberNode) = x->replacelnn(x;lnn)
-replacelnn(x::Expr; lnn::LineNumberNode) = Expr(x.head, replacelnn.(x.args; lnn)...)
-replacelnn(::LineNumberNode; lnn::LineNumberNode) = lnn
-replacelnn(x; lnn::LineNumberNode) = x
-
 # Replace only the top-level LineNumberNodes in a block, leaving nested ones intact.
 # This gives Revise the source-location metadata it needs to track method changes,
-# without clobbering the internal LineNumberNodes that make stack traces useful.
+# while preserving internal LineNumberNodes for useful stacktraces.
 function setlnn(lnn::Union{LineNumberNode,Nothing})
     function(expr::Expr)
         isnothing(lnn) && return expr

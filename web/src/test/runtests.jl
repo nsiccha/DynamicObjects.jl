@@ -1,5 +1,5 @@
 using TestModules, Random, DynamicObjects, Serialization
-import DynamicObjects: @persist
+import DynamicObjects: @persist, entries, cached_entries, clear_all_caches!, PersistentSet, accessed_keys, record_access!
 
 # --- Struct definitions (hoisted to module scope) ---
 
@@ -185,6 +185,30 @@ _persistable_path = Ref("")
         @persist counter
         counter
     end
+end
+
+@dynamicstruct struct EntriesApp
+    slow[key] = (sleep(0.05); key * 2)
+end
+
+_cached_keys_path = Ref("")
+@dynamicstruct struct CachedKeysApp
+    cache_path = _cached_keys_path[]
+    @cached result[key] = key ^ 2
+end
+
+_clearall_path = Ref("")
+@dynamicstruct struct ClearAllApp
+    cache_path = _clearall_path[]
+    @cached a = 42
+    @cached b[k] = k * 2
+    uncached = 99
+end
+
+_kwargs_keys_path = Ref("")
+@dynamicstruct struct KwargsKeysApp
+    cache_path = _kwargs_keys_path[]
+    @cached result(key; mode="default") = "$key:$mode"
 end
 
 # --- Tests ---
@@ -506,4 +530,121 @@ end
     @test inner isa DynamicObjects.PropertyComputationError
     @test inner.property == :will_fail_indexed
     @test DynamicObjects.unwrap_error(inner) isa ErrorException
+end
+
+@testset "entries / cached_entries" begin
+    app = EntriesApp(; cache_type=:parallel)
+    # Compute some values
+    @test app.slow[1] == 2
+    @test app.slow[2] == 4
+    es = entries(app.slow)
+    @test length(es) == 2
+    @test all(e -> e.state == :done, es)
+    @test Set(e.value for e in es) == Set([2, 4])
+
+    ce = cached_entries(app.slow)
+    @test length(ce) == 2
+    @test Set(v for (_, v) in ce) == Set([2, 4])
+end
+
+@testset "clear_all_caches!" begin
+    _clearall_path[] = mktempdir()
+    app = ClearAllApp()
+    @test app.a == 42
+    @test app.b[3] == 6
+    @test @is_cached app.a
+    @test @is_cached app.b[3]
+    clear_all_caches!(app)
+    @test @cache_status(app.a) == :unstarted
+    @test @cache_status(app.b[3]) == :unstarted
+    # uncached property still works
+    @test app.uncached == 99
+end
+
+@testset "PersistentSet" begin
+    path = joinpath(mktempdir(), "test_set.sjl")
+    s = PersistentSet(path)
+    @test length(s) == 0
+    push!(s, "a")
+    push!(s, "b")
+    @test length(s) == 2
+    @test "a" in s
+    @test !("c" in s)
+    # Persists across instances
+    s2 = PersistentSet(path)
+    @test length(s2) == 2
+    @test "a" in s2
+    pop!(s2, "a")
+    @test length(s2) == 1
+    @test !("a" in s2)
+    # Idempotent push
+    push!(s2, "b")
+    @test length(s2) == 1
+end
+
+@testset "accessed_keys tracking" begin
+    _cached_keys_path[] = mktempdir()
+    app = CachedKeysApp()
+    # No keys accessed yet
+    ak = accessed_keys(app.result)
+    @test isempty(ak)
+    # Access some keys
+    @test app.result[3] == 9
+    @test app.result[5] == 25
+    ak = accessed_keys(app.result)
+    @test length(ak) == 2
+    @test ((3,), (;)) in ak
+    @test ((5,), (;)) in ak
+    # Accessing same key again doesn't duplicate
+    @test app.result[3] == 9
+    ak = accessed_keys(app.result)
+    @test length(ak) == 2
+    # New instance with same cache_path sees the same keys
+    app2 = CachedKeysApp(; cache_path=_cached_keys_path[])
+    ak2 = accessed_keys(app2.result)
+    @test length(ak2) == 2
+end
+
+@testset "accessed_keys with kwargs" begin
+    _kwargs_keys_path[] = mktempdir()
+    app = KwargsKeysApp()
+    @test app.result("x") == "x:default"
+    @test app.result("x"; mode="fast") == "x:fast"
+    ak = accessed_keys(app.result)
+    @test length(ak) == 2
+    # Call with no explicit kwargs records (("x",), (;))
+    @test (("x",), (;)) in ak
+    # Call with explicit kwargs records them in the key
+    @test (("x",), (;mode="fast")) in ak
+end
+
+@testset "cached_entries on plain Dict" begin
+    app = CallVsBracket()
+    app.counted[1]
+    app.counted[2]
+    ce = cached_entries(app.counted)
+    @test length(ce) == 2
+    @test Set(v for (_, v) in ce) == Set([2, 4])
+end
+
+@testset "clear_all_caches! on object with no @cached" begin
+    b = Basic(3.0, 4.0)
+    # Should be a no-op, not error
+    clear_all_caches!(b)
+    @test b.r ≈ 5.0
+end
+
+@testset "PersistentSet collect and iterate" begin
+    path = joinpath(mktempdir(), "iter_set.sjl")
+    s = PersistentSet(path)
+    push!(s, 1)
+    push!(s, 2)
+    push!(s, 3)
+    @test Set(collect(s)) == Set([1, 2, 3])
+    # iterate
+    items = Set{Any}()
+    for item in s
+        push!(items, item)
+    end
+    @test items == Set([1, 2, 3])
 end
