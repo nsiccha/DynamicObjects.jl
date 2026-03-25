@@ -125,6 +125,14 @@ Base.pop!(c::ThreadsafeDict, key) = begin
         pop!(c.cache, key)
     end
 end
+Base.delete!(c::ThreadsafeDict, key) = begin
+    lock(c.lock) do
+        delete!(c.status, key)
+        delete!(c.tasks, key)
+        delete!(c.cache, key)
+    end
+    c
+end
 
 """
     getstatus(ip::IndexableProperty, indices...; kwargs...)
