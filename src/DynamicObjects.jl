@@ -998,16 +998,6 @@ unwrap_error(e) = e
 
 # Extract the exception from cause (which may be a (exception, backtrace) tuple)
 _cause_error(e::PropertyComputationError) = e.cause isa Tuple ? first(e.cause) : e.cause
-_cause_backtrace(e::PropertyComputationError) = e.cause isa Tuple ? last(e.cause) : []
-
-_filter_bt(bt) = filter(bt) do frame
-    file = string(frame.file)
-    !any(p -> occursin(p, file), (
-        "DynamicObjects.jl/src", "HTMXObjects.jl/src",
-        "/Oxygen/", "/HTTP/", "task.jl", "lock.jl",
-        "essentials.jl", "dict.jl",
-    ))
-end
 
 function _format_property_key(name, indices, kwargs)
     s = string(name)
@@ -1019,41 +1009,21 @@ function _format_property_key(name, indices, kwargs)
     isempty(parts) ? s : s * "[" * join(parts, ", ") * "]"
 end
 
-function _format_frame(frame)
-    if frame.linfo isa Core.MethodInstance
-        try
-            sig = frame.linfo.specTypes
-            params = fieldtypes(sig)
-            fname = string(frame.func)
-            arg_strs = ["::$(p)" for p in params[2:end]]
-            return fname * "(" * join(arg_strs, ", ") * ")"
-        catch
-        end
-    end
-    return string(frame.func)
-end
-
 function Base.showerror(io::IO, e::PropertyComputationError)
     key = _format_property_key(e.property, e.indices, e.kwargs)
-    root = unwrap_error(e)
     print(io, "PropertyComputationError: computing `$key` on $(e.type_name)\n")
     print(io, "  Caused by: ")
-    showerror(io, root)
-    # Show filtered backtrace from the original throw site
-    orig_bt = _cause_backtrace(e)
-    if !isempty(orig_bt)
-        frames = Base.stacktrace(orig_bt)
-        filtered = _filter_bt(frames)
-        if !isempty(filtered)
-            println(io, "\n\n  Stacktrace (user code):")
-            for (i, frame) in enumerate(filtered)
-                println(io, "   [$i] $(_format_frame(frame)) at $(frame.file):$(frame.line)")
-            end
-        end
-    end
+    showerror(io, unwrap_error(e))
 end
 
-# 3-arg method: suppress Oxygen's backtrace since we show our own filtered one above
-Base.showerror(io::IO, e::PropertyComputationError, ::Any) = showerror(io, e)
+function Base.showerror(io::IO, e::PropertyComputationError, bt; kwargs...)
+    try
+        showerror(io, e)
+    catch internal_err
+        print(io, "PropertyComputationError (display failed: ")
+        showerror(io, internal_err)
+        print(io, ")")
+    end
+end
 
 end
