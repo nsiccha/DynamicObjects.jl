@@ -53,7 +53,7 @@ end
 name(::IndexableProperty{N}) where {N} = N
 Base.show(io::IO, ip::IndexableProperty{N}) where {N} = print(io, "IndexableProperty :", N, " (", ip.cache, ")")
 ((;o)::IndexableProperty{name})(indices...; kwargs...) where {name} =
-    getorcomputeproperty(o, name, indices...; kwargs...)
+    _computeproperty(o, name, indices...; kwargs...)
 Base.getindex(ip::IndexableProperty, indices...; fetch=Base.fetch, kwargs...) =
     get!(ip.cache, (indices, (;kwargs...))) do
         ip(indices...; kwargs...)
@@ -334,12 +334,54 @@ function _record_accessed_key(o, name::Symbol, indices, kwargs)
     _record_key_to_path(path, (indices, (;kwargs...)))
 end
 
-getorcomputeproperty(o, name, indices...; __status__=nothing, kwargs...) = if hasfield(typeof(o), name)
+_computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
+    vname = Val(name)
+    # Only pass __status__ to properties that accept it (generated properties
+    # in meta). Base properties (cache_path, hash, etc.) don't have it.
+    _status_kw = haskey(meta(typeof(o)), name) ? (; __status__) : (;)
+    try
+        if iscached(o, vname, indices...; kwargs...)
+            cache_path = get_cache_path(o, name, indices...; kwargs...)
+            mkpath(dirname(cache_path))
+            cache_status = get_cache_status(cache_path)
+            rv = if cache_status == :ready
+                Serialization.deserialize(cache_path)
+            else
+                cache_status == :started && @warn "Cache file $cache_path exists but has size 0.\nAssuming a previous run failed."
+                touch(cache_path)
+                nothing
+            end
+            if cache_status != :ready || resumes(o, vname, indices...; kwargs...)
+                @debug "Generating $cache_path..."
+                rv = compute_property(o, vname, indices...; _status_kw..., (name=>rv, )..., kwargs...)
+                Serialization.serialize(cache_path, rv)
+            end
+            # Record accessed key for indexed @cached properties
+            if !isempty(indices)
+                _record_accessed_key(o, name, indices, kwargs)
+            end
+            rv
+        else
+            compute_property(o, vname, indices...; _status_kw..., kwargs...)
+        end
+    catch e
+        e isa PropertyComputationError && rethrow()
+        kw_tuple = isempty(kwargs) ? () : Tuple(pairs(kwargs))
+        bt = catch_backtrace()
+        throw(PropertyComputationError(
+            string(typeof(o).name.name),
+            name,
+            indices,
+            kw_tuple,
+            (e, bt),  # store exception + backtrace from the actual throw site
+        ))
+    end
+end
+getorcomputeproperty(o, name, indices...; kwargs...) = if hasfield(typeof(o), name)
     @assert length(indices) == length(kwargs) == 0
     getfield(o, name)
 else
     get!(getfield(o, :cache), name, indices...; kwargs...) do
-        vname = Val(name)
         # When called with no indices on an indexed property (declared with
         # call/ref syntax, e.g. `x() = ...` or `x[i] = ...`), return an
         # IndexableProperty wrapper instead of calling compute_property.
@@ -349,46 +391,7 @@ else
                 return IndexableProperty(name, o, subcache(getfield(o, :cache)))
             end
         end
-        # Only pass __status__ to properties that accept it (generated properties
-        # in meta). Base properties (cache_path, hash, etc.) don't have it.
-        _status_kw = haskey(meta(typeof(o)), name) ? (; __status__) : (;)
-        try
-            if iscached(o, vname, indices...; kwargs...)
-                cache_path = get_cache_path(o, name, indices...; kwargs...)
-                mkpath(dirname(cache_path))
-                cache_status = get_cache_status(cache_path)
-                rv = if cache_status == :ready
-                    Serialization.deserialize(cache_path)
-                else
-                    cache_status == :started && @warn "Cache file $cache_path exists but has size 0.\nAssuming a previous run failed."
-                    touch(cache_path)
-                    nothing
-                end
-                if cache_status != :ready || resumes(o, vname, indices...; kwargs...)
-                    @debug "Generating $cache_path..."
-                    rv = compute_property(o, vname, indices...; _status_kw..., (name=>rv, )..., kwargs...)
-                    Serialization.serialize(cache_path, rv)
-                end
-                # Record accessed key for indexed @cached properties
-                if !isempty(indices)
-                    _record_accessed_key(o, name, indices, kwargs)
-                end
-                rv
-            else
-                compute_property(o, vname, indices...; _status_kw..., kwargs...)
-            end
-        catch e
-            e isa PropertyComputationError && rethrow()
-            kw_tuple = isempty(kwargs) ? () : Tuple(pairs(kwargs))
-            bt = catch_backtrace()
-            throw(PropertyComputationError(
-                string(typeof(o).name.name),
-                name,
-                indices,
-                kw_tuple,
-                (e, bt),  # store exception + backtrace from the actual throw site
-            ))
-        end
+        _computeproperty(o, name, indices...; kwargs...)
     end
 end
 maybehash(x::Number) = x
