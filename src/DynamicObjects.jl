@@ -52,15 +52,12 @@ struct IndexableProperty{N,O,D<:AbstractDict}
 end
 name(::IndexableProperty{N}) where {N} = N
 Base.show(io::IO, ip::IndexableProperty{N}) where {N} = print(io, "IndexableProperty :", N, " (", ip.cache, ")")
-Base.getindex((;o, cache)::IndexableProperty{name}, indices...; fetch=Base.fetch, kwargs...) where {name} =
-    get!(cache, (indices, (;kwargs...))) do
-        getorcomputeproperty(o, name, indices...; kwargs...)
+((;o)::IndexableProperty{name})(indices...; kwargs...) where {name} =
+    getorcomputeproperty(o, name, indices...; kwargs...)
+Base.getindex(ip::IndexableProperty, indices...; fetch=Base.fetch, kwargs...) =
+    get!(ip.cache, (indices, (;kwargs...))) do
+        ip(indices...; kwargs...)
     end
-(ip::IndexableProperty)(indices...; kwargs...) = begin
-    rv = getindex(ip, indices...; kwargs...)
-    maybepop!(ip.cache, (indices, (;kwargs...)))
-    rv
-end
 struct ThreadsafeDict{K,V} <: AbstractDict{K,V}
     lock::ReentrantLock
     cache::Dict{K,V}
@@ -79,7 +76,8 @@ n_running(c::ThreadsafeDict) = lock(c.lock) do; length(c.tasks); end
 Base.show(io::IO, c::ThreadsafeDict{K,V}) where {K,V} = lock(c.lock) do
     print(io, "ThreadsafeDict{", K, ",", V, "}(", length(c.cache), " cached, ", length(c.tasks), " running)")
 end
-Base.getindex((;o, cache)::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indices...; fetch=Base.fetch, retry_failed=true, kwargs...) where {name} = begin
+Base.getindex(ip::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indices...; fetch=Base.fetch, retry_failed=true, kwargs...) where {name} = begin
+    (;o, cache) = ip
     substatus_f = if name != :__substatus__ && name != :__status__ && haskey(meta(typeof(o)), :__substatus__)
         () -> begin
             root = hasproperty(o, :__status__) ? o.__status__ : nothing
@@ -342,13 +340,12 @@ getorcomputeproperty(o, name, indices...; __status__=nothing, kwargs...) = if ha
 else
     get!(getfield(o, :cache), name, indices...; kwargs...) do
         vname = Val(name)
-        # When called with no indices on an indexed property, return an
+        # When called with no indices on an indexed property (declared with
+        # call/ref syntax, e.g. `x() = ...` or `x[i] = ...`), return an
         # IndexableProperty wrapper instead of calling compute_property.
-        # This avoids generating a zero-arg compute_property method that
-        # would conflict with indexed properties whose indices all have defaults.
         if isempty(indices) && isempty(kwargs)
             m = meta(typeof(o))
-            if haskey(m, name) && !isempty(m[name].indices)
+            if haskey(m, name) && m[name].indexed
                 return IndexableProperty(name, o, subcache(getfield(o, :cache)))
             end
         end
@@ -664,6 +661,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
         dependson = nothing
         locals = nothing
         indices = tuple()
+        indexed = false
         while Meta.isexpr(arg, :macrocall)
             push!(macros, arg.args[1])
             arg = arg.args[end]
@@ -711,7 +709,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
             # Group property: computes the full tuple/NamedTuple
             group_locals = Set{Symbol}(prop_names)
             push!(group_locals, group_name)
-            push!(oproperties, group_name=>(;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple()))
+            push!(oproperties, group_name=>(;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false))
             push!(docs, (group_name=>(doc, true)))
             doc = nothing
             # Individual properties: extract from the group
@@ -721,13 +719,14 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
                 else
                     :($group_name[$source])
                 end
-                push!(oproperties, prop_name=>(;lhs=prop_name, macros=Set{Symbol}(), rhs=extract_rhs, lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([prop_name]), indices=tuple()))
+                push!(oproperties, prop_name=>(;lhs=prop_name, macros=Set{Symbol}(), rhs=extract_rhs, lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([prop_name]), indices=tuple(), indexed=false))
                 push!(docs, (prop_name=>(nothing, true)))
             end
             continue
         end
         if Meta.isexpr(arg, (:ref, :call))
             arg, indices... = arg.args
+            indexed = true
             union!(locals, extractnames(indices))
         end
         name = if Meta.isexpr(arg, :(::))
@@ -741,7 +740,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
         !isnothing(locals) && push!(locals, name)
         !isnothing(locals) && push!(locals, :__status__)
         @assert !isnothing(rhs) || length(macros) == 0
-        push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices))
+        push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices, indexed))
     end
     properties = Dict(oproperties)
 
