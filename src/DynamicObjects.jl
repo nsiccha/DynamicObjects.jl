@@ -165,6 +165,9 @@ for the computation. The `fetch` callback receives `(rv, status)` where `rv` is
 the `Task` (still running) or the computed result (done), and `status` is the
 substatus object (from `__substatus__`) or `nothing`.
 
+Pass `force=true` to unconditionally recompute: clears both the in-memory cache
+entry and the on-disk cache file so `getindex` always spawns a fresh Task.
+
 # Example
 ```julia
 fetchindex(app.results, key) do rv, status
@@ -179,7 +182,11 @@ end
 ```
 """
 function fetchindex(fetch, ip::IndexableProperty{<:Any,<:Any,<:ThreadsafeDict}, indices...; force=false, kwargs...)
-    force && maybepop!(ip.cache, (indices, (;kwargs...)))
+    if force
+        maybepop!(ip.cache, (indices, (;kwargs...)))
+        path = get_cache_path(ip.o, name(ip), indices...; kwargs...)
+        isfile(path) && rm(path)
+    end
     rv = getindex(ip, indices...; fetch=identity, retry_failed=false, kwargs...)
     status = getstatus(ip, indices...; kwargs...)
     fetch(rv, status)
