@@ -20,9 +20,16 @@ optionally disk-cached properties.
 - [`cached_entries`](@ref): Iterate completed (non-Task) entries of an indexed property.
 - [`clear_all_caches!`](@ref): Clear all `@cached` properties on a `@dynamicstruct` instance.
 - [`PersistentSet`](@ref): Thread-safe, disk-persisted `Set`.
+- [`KeyTracker`](@ref): Abstract type for pluggable accessed-keys persistence strategies.
+- [`SharedFileTracker`](@ref): Default strategy — single shared `_keys.sjl` file.
+- [`PerPodFileTracker`](@ref): Per-pod strategy — one file per pod ID, merged on read.
+- [`NoKeyTracker`](@ref): No-op strategy — never records or loads keys.
+- [`key_tracker`](@ref): Override to set the tracking strategy per object type / property.
+- [`record!`](@ref): Record an accessed key via a `KeyTracker`.
+- [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, remake, fetchindex, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, PersistentSet
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, remake, fetchindex, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, PersistentSet, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys
 
 import SHA, Serialization
 
@@ -290,27 +297,46 @@ function clear_all_caches!(obj)
     nothing
 end
 
-# --- Accessed-keys tracking for IndexableProperty ---
+# --- KeyTracker: pluggable strategy for accessed-keys persistence ---
 
 """
-    accessed_keys_path(ip::IndexableProperty)
+    KeyTracker
 
-Return the path where accessed keys are persisted for a cached IndexableProperty.
+Abstract type for pluggable accessed-keys persistence strategies. Implement
+`record!(tracker, key)` and `load_keys(tracker)` for custom strategies.
+
+Override `key_tracker(o, ::Val{name})` on your object type to select a strategy.
 """
-function accessed_keys_path(ip::IndexableProperty{name}) where {name}
-    joinpath(ip.o.cache_path, string(name) * "_keys.sjl")
+abstract type KeyTracker end
+
+"""
+    SharedFileTracker(path)
+
+Default strategy: all pods/processes share a single `_keys.sjl` file.
+Simple, but not safe for concurrent multi-process writes to NFS.
+"""
+struct SharedFileTracker <: KeyTracker
+    path::String
 end
 
 """
-    accessed_keys(ip::IndexableProperty)
+    PerPodFileTracker(base_path, pod_id)
 
-Return the set of keys that have been accessed for this IndexableProperty,
-loaded from disk. Returns an empty `Set` if no keys have been recorded.
+Per-pod strategy: each pod writes only to its own `_keys_{pod_id}.sjl` file.
+`load_keys` unions all matching files. Safe for NFS multi-pod setups — writes
+are never concurrent since each pod touches only its own file.
 """
-function accessed_keys(ip::IndexableProperty)
-    path = accessed_keys_path(ip)
-    isfile(path) ? Serialization.deserialize(path) : Set()
+struct PerPodFileTracker <: KeyTracker
+    base_path::String  # path WITHOUT extension, e.g. "cache/abc/cmdstan_keys"
+    pod_id::String
 end
+
+"""
+    NoKeyTracker()
+
+No-op strategy: never records or loads keys. Use when tracking is unwanted.
+"""
+struct NoKeyTracker <: KeyTracker end
 
 function _record_key_to_path(path, key)
     mkpath(dirname(path))
@@ -322,16 +348,75 @@ function _record_key_to_path(path, key)
 end
 
 """
+    record!(tracker::KeyTracker, key)
+
+Record that `key` was accessed, persisting according to the tracker's strategy.
+"""
+record!(tracker::SharedFileTracker, key) = _record_key_to_path(tracker.path, key)
+record!(tracker::NoKeyTracker, key)      = nothing
+function record!(tracker::PerPodFileTracker, key)
+    _record_key_to_path(tracker.base_path * "_" * tracker.pod_id * ".sjl", key)
+end
+
+"""
+    load_keys(tracker::KeyTracker) -> Set
+
+Load the full set of recorded keys according to the tracker's strategy.
+"""
+load_keys(tracker::SharedFileTracker) =
+    isfile(tracker.path) ? Serialization.deserialize(tracker.path) : Set()
+load_keys(tracker::NoKeyTracker) = Set()
+function load_keys(tracker::PerPodFileTracker)
+    dir    = dirname(tracker.base_path)
+    prefix = basename(tracker.base_path) * "_"
+    isdir(dir) || return Set()
+    files = filter(
+        f -> startswith(basename(f), prefix) && endswith(f, ".sjl"),
+        readdir(dir; join=true)
+    )
+    isempty(files) && return Set()
+    mapreduce(Serialization.deserialize, union, files)
+end
+
+"""
+    key_tracker(o, ::Val{name}) -> KeyTracker
+
+Return the `KeyTracker` to use for property `name` on object `o`.
+Override this method on your type to change the tracking strategy.
+
+```julia
+# Example: use per-pod files for all indexed properties on MyType
+DynamicObjects.key_tracker(o::MyType, ::Val{name}) where {name} =
+    DynamicObjects.PerPodFileTracker(joinpath(o.cache_path, string(name) * "_keys"), pod_id)
+```
+"""
+key_tracker(o, ::Val{name}) where {name} =
+    SharedFileTracker(joinpath(o.cache_path, string(name) * "_keys.sjl"))
+
+# --- Accessed-keys tracking for IndexableProperty ---
+
+"""
+    accessed_keys(ip::IndexableProperty)
+
+Return the set of keys that have been accessed for this IndexableProperty,
+loaded from disk. Returns an empty `Set` if no keys have been recorded.
+"""
+function accessed_keys(ip::IndexableProperty{name}) where {name}
+    load_keys(key_tracker(ip.o, Val(name)))
+end
+
+"""
     record_access!(ip::IndexableProperty, key)
 
 Record that `key` was accessed for this IndexableProperty, persisting to disk.
 """
-record_access!(ip::IndexableProperty, key) = _record_key_to_path(accessed_keys_path(ip), key)
+function record_access!(ip::IndexableProperty{name}, key) where {name}
+    record!(key_tracker(ip.o, Val(name)), key)
+end
 
 # Internal: record accessed key from getorcomputeproperty context
 function _record_accessed_key(o, name::Symbol, indices, kwargs)
-    path = joinpath(o.cache_path, string(name) * "_keys.sjl")
-    _record_key_to_path(path, (indices, (;kwargs...)))
+    record!(key_tracker(o, Val(name)), (indices, (;kwargs...)))
 end
 
 _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
