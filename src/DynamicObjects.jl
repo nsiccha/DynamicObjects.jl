@@ -1095,12 +1095,12 @@ _cause_error(e::PropertyComputationError) = e.cause isa Tuple ? first(e.cause) :
 
 function _format_property_key(name, indices, kwargs)
     s = string(name)
-    parts = String[]
-    !isempty(indices) && append!(parts, repr.(indices))
-    for (k, v) in kwargs
-        push!(parts, "$k=$(repr(v))")
-    end
-    isempty(parts) ? s : s * "[" * join(parts, ", ") * "]"
+    pos_parts = !isempty(indices) ? repr.(collect(indices)) : String[]
+    kw_parts = ["$k=$(repr(v))" for (k, v) in kwargs]
+    all_parts = isempty(pos_parts) && !isempty(kw_parts) ?
+        ["; " * join(kw_parts, ", ")] :
+        vcat(pos_parts, isempty(kw_parts) ? String[] : ["; " * join(kw_parts, ", ")])
+    isempty(all_parts) ? s : s * "(" * join(all_parts, ", ") * ")"
 end
 
 function Base.showerror(io::IO, e::PropertyComputationError)
