@@ -457,7 +457,6 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
             compute_property(o, vname, indices...; _status_kw..., kwargs...)
         end
     catch e
-        e isa PropertyComputationError && rethrow()
         kw_tuple = isempty(kwargs) ? () : Tuple(pairs(kwargs))
         bt = catch_backtrace()
         throw(PropertyComputationError(
@@ -465,7 +464,7 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
             name,
             indices,
             kw_tuple,
-            (e, bt),  # store exception + backtrace from the actual throw site
+            (e, bt),
         ))
     end
 end
@@ -738,6 +737,69 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
     Meta.isexpr(type, :(<:)) && (type = type.args[1])
     Meta.isexpr(type, :(curly)) && (type = type.args[1])
     @assert body.head == :block
+    # --- Extract inline struct definitions ---
+    # Collect parent property names (excluding inline structs themselves)
+    parent_props = Symbol[]
+    for arg in body.args
+        arg isa Expr || continue
+        a = arg
+        while Meta.isexpr(a, :macrocall); a = a.args[end]; end
+        # Skip inline structs (both forms)
+        Meta.isexpr(a, :struct) && continue
+        Meta.isexpr(a, :(=)) && Meta.isexpr(a.args[2], :struct) && continue
+        lhs = if Meta.isexpr(a, :(=))
+            a.args[1]
+        else
+            a  # fixed field: bare symbol or typed symbol
+        end
+        Meta.isexpr(lhs, (:call, :ref)) && (lhs = lhs.args[1])
+        Meta.isexpr(lhs, :(::)) && (lhs = lhs.args[1])
+        lhs isa Symbol && push!(parent_props, lhs)
+    end
+    extracted_structs = Expr[]
+    for (i, arg) in enumerate(body.args)
+        arg isa Expr || continue
+        prop_name = nothing
+        child_struct = nothing
+        # Form 1: prop = struct Name ... end
+        if Meta.isexpr(arg, :(=)) && Meta.isexpr(arg.args[2], :struct)
+            prop_name = arg.args[1]
+            child_struct = arg.args[2]
+        # Form 2: struct Name ... end (bare)
+        elseif Meta.isexpr(arg, :struct)
+            child_struct = arg
+        end
+        isnothing(child_struct) && continue
+        child_name = child_struct.args[2]
+        isnothing(prop_name) && (prop_name = child_name)
+        # Rename child struct to Parent_Child to avoid kwarg shadowing
+        gen_name = Symbol(type, "_", child_name)
+        child_struct.args[2] = gen_name
+        # Collect child's own property names to avoid collision
+        child_props = Set{Symbol}()
+        for ca in child_struct.args[3].args
+            ca isa Expr || continue
+            ca2 = ca
+            while Meta.isexpr(ca2, :macrocall); ca2 = ca2.args[end]; end
+            Meta.isexpr(ca2, :(=)) || continue
+            clhs = ca2.args[1]
+            Meta.isexpr(clhs, (:call, :ref)) && (clhs = clhs.args[1])
+            Meta.isexpr(clhs, :(::)) && (clhs = clhs.args[1])
+            clhs isa Symbol && push!(child_props, clhs)
+        end
+        # Prepend __parent__ and forwarded properties to child body
+        child_body = child_struct.args[3]
+        forwarded = [pp for pp in parent_props if !(pp in child_props)]
+        prepend = Expr[]
+        push!(prepend, :(__parent__ = nothing))
+        if !isempty(forwarded)
+            push!(prepend, :($(Expr(:tuple, Expr(:parameters, forwarded...))) = __parent__))
+        end
+        child_body.args = vcat(prepend, child_body.args)
+        push!(extracted_structs, child_struct)
+        # Replace with property assignment
+        body.args[i] = :($prop_name = $gen_name(; __parent__=__self__))
+    end
     lnn = nothing
     doc = nothing
     docs = []
@@ -867,7 +929,15 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
             )
         ))
     ))
-    esc(Expr(:block, 
+    result = Expr(:block)
+    # Prepend extracted inline child structs (processed recursively)
+    for s in extracted_structs
+        child_result = dynamicstruct(s)
+        # Unwrap esc() — parent handles escaping
+        @assert Meta.isexpr(child_result, :escape)
+        push!(result.args, child_result.args[1])
+    end
+    push!(result.args, Expr(:block,
         :(@doc $docstring $struct_expr),
         quote
             $Base.hasproperty(__self__::$type, name::Symbol) = name in $(Tuple(keys(properties)))
@@ -911,6 +981,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
         # directly in getorcomputeproperty (via meta check), so no zero-arg
         # compute_property methods are needed here.
     ))
+    esc(result)
 end
 
 # Replace only the top-level LineNumberNodes in a block, leaving nested ones intact.
@@ -1116,17 +1187,15 @@ end
 function Base.showerror(io::IO, e::PropertyComputationError)
     key = _format_property_key(e.property, e.indices, e.kwargs)
     print(io, "PropertyComputationError: computing `$key` on $(e.type_name)\n")
+    cause_err = _cause_error(e)
+    cause_bt = e.cause isa Tuple && length(e.cause) >= 2 ? e.cause[2] : nothing
     print(io, "  Caused by: ")
-    showerror(io, unwrap_error(e))
-end
-
-function Base.showerror(io::IO, e::PropertyComputationError, bt; kwargs...)
-    try
-        showerror(io, e)
-    catch internal_err
-        print(io, "PropertyComputationError (display failed: ")
-        showerror(io, internal_err)
-        print(io, ")")
+    if cause_err isa PropertyComputationError
+        showerror(io, cause_err)
+    elseif !isnothing(cause_bt)
+        showerror(io, cause_err, cause_bt)
+    else
+        showerror(io, cause_err)
     end
 end
 
