@@ -680,7 +680,7 @@ elseif e.head == :(->)
     ls = extractnames(isa(params, Expr) && Meta.isexpr(params, :tuple) ? params.args : [params])
     new_locals = union(locals, ls)
     Expr(e.head, e.args[1], walk_rhs(e.args[2]; locals=new_locals, properties))
-elseif e.head == :kw
+elseif e.head in (:kw, :(=))
     Expr(e.head, e.args[1], walk_rhs.(e.args[2:end]; locals, properties)...)
 else
     Expr(e.head, walk_rhs.(e.args; locals, properties)...)
@@ -804,19 +804,25 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
                 end
             end
             prop_names = first.(members)
-            group_name = Symbol("_tuple_", join(prop_names, "_"))
-            # Group property: computes the full tuple/NamedTuple
-            group_locals = Set{Symbol}(prop_names)
-            push!(group_locals, group_name)
-            push!(oproperties, group_name=>(;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false))
-            push!(docs, (group_name=>(doc, true)))
+            # When RHS is a bare symbol in named destructuring, skip the hidden
+            # group property and extract directly: (;a, b) = config → a = config.a
+            # Otherwise, use a group property to evaluate the RHS once.
+            extract_from = if named && rhs isa Symbol
+                rhs
+            else
+                group_name = Symbol("_tuple_", join(prop_names, "_"))
+                group_locals = Set{Symbol}(prop_names)
+                push!(group_locals, group_name)
+                push!(oproperties, group_name=>(;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false))
+                push!(docs, (group_name=>(doc, true)))
+                group_name
+            end
             doc = nothing
-            # Individual properties: extract from the group
             for (prop_name, source) in members
                 extract_rhs = if source isa Symbol
-                    Expr(:., group_name, QuoteNode(source))
+                    Expr(:., extract_from, QuoteNode(source))
                 else
-                    :($group_name[$source])
+                    :($extract_from[$source])
                 end
                 push!(oproperties, prop_name=>(;lhs=prop_name, macros=Set{Symbol}(), rhs=extract_rhs, lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([prop_name]), indices=tuple(), indexed=false))
                 push!(docs, (prop_name=>(nothing, true)))
