@@ -761,6 +761,10 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial) = begin
             push!(macros, arg.args[1])
             arg = arg.args[end]
         end
+        if Meta.isexpr(arg, :function)
+            fname = Meta.isexpr(arg.args[1], :call) ? arg.args[1].args[1] : arg.args[1]
+            error("Use short-form syntax for properties in @dynamicstruct: `$fname(...) = ...` instead of `function $fname(...) ... end`. If `$fname` is a helper that doesn't depend on the struct's state, move it outside the @dynamicstruct body.")
+        end
         if Meta.isexpr(arg, :(=))
             arg, rhs = arg.args
             dependson = Set{Symbol}()
