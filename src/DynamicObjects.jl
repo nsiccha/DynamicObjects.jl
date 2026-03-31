@@ -1193,17 +1193,16 @@ ds.search("an")         # ["banana"] — fresh each call
 ds.top("a"; n=2)        # ["apple", "banana"] — kwargs supported
 ```
 
-# Async progress with `__status__` and `__substatus__`
+# Async progress with `__status__`
 
 With `cache_type=:parallel`, indexed properties spawn background `Task`s.
-Define `__status__` (root progress node) and `__substatus__` (per-computation
-factory) to automatically wire progress into spawned tasks:
+Define `__status__` (root progress node) to automatically wire progress into
+spawned tasks. A default `__substatus__` is provided that creates child progress
+nodes when Treebars is loaded (via the TreebarsExt extension):
 
 ```julia
 @dynamicstruct struct MyApp
     __status__ = initialize_progress!(:state; description="MyApp")
-    __substatus__(name, args...; kwargs...) =
-        initialize_progress!(__status__; description="\$name[\$(join(args, ","))]")
     results[key] = expensive_computation(__status__)  # __status__ is the substatus
 end
 app = MyApp(; cache_type=:parallel)
@@ -1214,7 +1213,7 @@ fetchindex(app.results, key) do rv, status
 end
 ```
 
-`__substatus__(name, args...; kwargs...)` is called before each Task spawn.
+`__substatus__` is called before each Task spawn.
 `name` is the property symbol, `args`/`kwargs` are the indices. The returned
 object is stored in `ThreadsafeDict.status` (accessible via `getstatus`) and
 passed to the computation body as the local `__status__`.
