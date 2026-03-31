@@ -43,6 +43,10 @@ compute_property(o, ::Val{:hash_fields}) = ntuple(Base.Fix1(getfield, o), fieldc
 compute_property(o, ::Val{:hash}) = persistent_hash((typeof(o), o.hash_fields))
 compute_property(o, ::Val{:cache_base}) = "cache"
 compute_property(o, ::Val{:cache_path}) = joinpath(o.cache_base, o.hash)
+compute_property(o, ::Val{:__status__}) = nothing
+compute_property(o, ::Val{:__substatus__}, name, args...; kwargs...) =
+    _default_substatus(o.__status__, name, args...; kwargs...)
+_default_substatus(status, name, args...; kwargs...) = nothing
 
 struct PropertyCache{D<:AbstractDict{Symbol,Any}}
     cache::D
