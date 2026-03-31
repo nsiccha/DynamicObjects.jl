@@ -1000,6 +1000,12 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial, child_handler=nothing
             end
             continue
         end
+        if Meta.isexpr(arg, :ref)
+            loc = isnothing(lnn) ? "" : " (near $(lnn.file):$(lnn.line))"
+            pname = arg.args[1]
+            Meta.isexpr(pname, :(::)) && (pname = pname.args[1])
+            @warn "Deprecated: `$pname` uses [] syntax which cannot combine with kwargs$loc. Use () instead: $pname($(join(arg.args[2:end], ", ")))"
+        end
         if Meta.isexpr(arg, (:ref, :call))
             arg, indices... = arg.args
             indexed = true
