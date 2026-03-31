@@ -79,6 +79,7 @@ Base.length(c::ThreadsafeDict) = lock(c.lock) do; length(c.cache); end
 # lock(c.lock) do ... end or entries(ip) which holds the lock for the full sweep.
 Base.iterate(c::ThreadsafeDict) = lock(c.lock) do; iterate(c.cache); end
 Base.iterate(c::ThreadsafeDict, state) = lock(c.lock) do; iterate(c.cache, state); end
+Base.empty!(c::ThreadsafeDict) = (lock(c.lock) do; empty!(c.cache); empty!(c.tasks); empty!(c.status); end; c)
 n_running(c::ThreadsafeDict) = lock(c.lock) do; length(c.tasks); end
 Base.show(io::IO, c::ThreadsafeDict{K,V}) where {K,V} = lock(c.lock) do
     print(io, "ThreadsafeDict{", K, ",", V, "}(", length(c.cache), " cached, ", length(c.tasks), " running)")
