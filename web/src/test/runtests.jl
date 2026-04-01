@@ -171,6 +171,10 @@ end
     slow[key] = (sleep(0.05); key * 2)
 end
 
+@dynamicstruct struct CancelApp
+    slow[key] = (sleep(10); key * 2)
+end
+
 @dynamicstruct struct FailingProps
     will_fail = error("serial failure")
     will_fail_indexed(key) = error("serial failure for key=$key")
@@ -647,4 +651,39 @@ end
         push!(items, item)
     end
     @test items == Set([1, 2, 3])
+end
+
+@testset "cancel! and cancel_all!" begin
+    app = CancelApp(; cache_type=:parallel)
+    # Trigger a slow computation (returns Task via fetch=identity)
+    task = app.slow[42; fetch=identity]
+    @test task isa Task
+    @test !istaskdone(task)
+    # Cancel it
+    key = ((42,), (;))
+    @test cancel!(app.slow, 42) == true
+    # Task should be done and failed
+    sleep(0.01)  # give scheduler a moment
+    @test istaskdone(task)
+    @test istaskfailed(task)
+    # tasks and status should be cleaned up
+    @test !haskey(app.slow.cache.tasks, key)
+    @test !haskey(app.slow.cache.status, key)
+    # Cancelling again returns false
+    @test cancel!(app.slow, 42) == false
+
+    # cancel_all!
+    t1 = app.slow[1; fetch=identity]
+    t2 = app.slow[2; fetch=identity]
+    @test !istaskdone(t1) && !istaskdone(t2)
+    cancel_all!(app.slow)
+    sleep(0.01)
+    @test istaskdone(t1) && istaskdone(t2)
+    @test isempty(app.slow.cache.tasks)
+    @test isempty(app.slow.cache.status)
+
+    # Fallbacks for non-ThreadsafeDict IPs
+    serial_app = CancelApp()
+    @test cancel!(serial_app.slow, 1) == false
+    @test cancel_all!(serial_app.slow) === nothing
 end

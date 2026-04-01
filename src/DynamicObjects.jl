@@ -29,7 +29,7 @@ optionally disk-cached properties.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, remake, fetchindex, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, PersistentSet, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, remake, fetchindex, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, PersistentSet, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!
 
 import SHA, Serialization
 
@@ -159,6 +159,44 @@ getstatus(ip::IndexableProperty{<:Any,<:Any,<:ThreadsafeDict}, indices...; kwarg
     end
 end
 getstatus(::IndexableProperty, indices...; kwargs...) = nothing
+
+"""
+    cancel!(ip::IndexableProperty, indices...; kwargs...)
+
+Cancel a running task for the given key on a `ThreadsafeDict`-backed `IndexableProperty`.
+Returns `true` if a running task was found and interrupted, `false` otherwise.
+"""
+cancel!(ip::IndexableProperty{<:Any,<:Any,<:ThreadsafeDict}, indices...; kwargs...) = begin
+    key = (indices, (;kwargs...))
+    lock(ip.cache.lock) do
+        if haskey(ip.cache.tasks, key) && !istaskdone(ip.cache.tasks[key])
+            Base.schedule(ip.cache.tasks[key], InterruptException(); error=true)
+            pop!(ip.cache.tasks, key)
+            haskey(ip.cache.status, key) && pop!(ip.cache.status, key)
+            true
+        else
+            false
+        end
+    end
+end
+cancel!(::IndexableProperty, args...; kwargs...) = false
+
+"""
+    cancel_all!(ip::IndexableProperty)
+
+Cancel all running tasks on a `ThreadsafeDict`-backed `IndexableProperty`.
+"""
+cancel_all!(ip::IndexableProperty{<:Any,<:Any,<:ThreadsafeDict}) = begin
+    lock(ip.cache.lock) do
+        for (key, task) in ip.cache.tasks
+            istaskdone(task) || Base.schedule(task, InterruptException(); error=true)
+        end
+        empty!(ip.cache.tasks)
+        empty!(ip.cache.status)
+    end
+    nothing
+end
+cancel_all!(::IndexableProperty) = nothing
 
 """
     fetchindex(fetch, ip, indices...; kwargs...)
