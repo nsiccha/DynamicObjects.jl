@@ -90,9 +90,9 @@ Base.show(io::IO, c::ThreadsafeDict{K,V}) where {K,V} = lock(c.lock) do
 end
 Base.getindex(ip::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indices...; fetch=Base.fetch, retry_failed=true, kwargs...) where {name} = begin
     (;o, cache) = ip
-    substatus_f = if name != :__substatus__ && name != :__status__ && haskey(meta(typeof(o)), :__substatus__)
+    substatus_f = if name != :__substatus__ && name != :__status__
         () -> begin
-            root = hasproperty(o, :__status__) ? o.__status__ : nothing
+            root = o.__status__
             compute_property(o, Val(:__substatus__), name, indices...; __status__=root, kwargs...)
         end
     else
