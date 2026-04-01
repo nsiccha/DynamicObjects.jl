@@ -471,6 +471,7 @@ end
 
 _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
     vname = Val(name)
+    isnothing(__status__) && name != :__status__ && (__status__ = getorcomputeproperty(o, :__status__))
     # Only pass __status__ to properties that accept it (generated properties
     # in meta). Base properties (cache_path, hash, etc.) don't have it.
     _status_kw = haskey(meta(typeof(o)), name) ? (; __status__) : (;)
