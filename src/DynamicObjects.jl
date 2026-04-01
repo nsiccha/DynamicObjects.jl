@@ -481,7 +481,15 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
             mkpath(dirname(cache_path))
             cache_status = get_cache_status(cache_path)
             rv = if cache_status == :ready
-                Serialization.deserialize(cache_path)
+                try
+                    Serialization.deserialize(cache_path)
+                catch e
+                    @warn "Deserialization failed for $cache_path, recomputing." exception=e
+                    rm(cache_path; force=true)
+                    cache_status = :unstarted
+                    touch(cache_path)
+                    nothing
+                end
             else
                 cache_status == :started && @warn "Cache file $cache_path exists but has size 0.\nAssuming a previous run failed."
                 touch(cache_path)
