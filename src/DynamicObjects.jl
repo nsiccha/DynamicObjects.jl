@@ -1123,10 +1123,23 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial, child_handler=nothing
                 # the method body — Julia uses the body's first LNN for
                 # Method.file/line, which must point at user code.
                 _lnn = something(info.lnn, LineNumberNode(0, :unknown))
+                walked_indices = map(info.indices) do idx
+                    if Meta.isexpr(idx, :parameters)
+                        Expr(:parameters, map(idx.args) do a
+                            if Meta.isexpr(a, :kw)
+                                Expr(:kw, a.args[1], walk_rhs(a.args[2]; info.locals, properties, lnn=info.lnn))
+                            else
+                                a
+                            end
+                        end...)
+                    else
+                        idx
+                    end
+                end
                 _call(f, extras...) = fixcall(Expr(:call,
                     Expr(:., DynamicObjects, QuoteNode(f)),
                     :(__self__::$type), :(::Val{$(Meta.quot(name))}),
-                    info.indices..., Expr(:parameters, extras...),
+                    walked_indices..., Expr(:parameters, extras...),
                 ))
                 iscached_val = Symbol("@cached") in info.macros
                 Expr(:block,
