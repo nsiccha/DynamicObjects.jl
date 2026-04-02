@@ -399,6 +399,7 @@ No-op strategy: never records or loads keys. Use when tracking is unwanted.
 """
 struct NoKeyTracker <: KeyTracker end
 
+# TODO: use DiskCacheLocks to make _record_key_to_path concurrency-safe
 function _record_key_to_path(path, key)
     mkpath(dirname(path))
     existing = isfile(path) ? Serialization.deserialize(path) : Set()
@@ -476,8 +477,10 @@ function record_access!(ip::IndexableProperty{name}, key) where {name}
 end
 
 # Internal: record accessed key from getorcomputeproperty context
+# Disabled: key tracking files are not concurrency-safe and cause EOFError crashes
 function _record_accessed_key(o, name::Symbol, indices, kwargs)
-    record!(key_tracker(o, Val(name)), (indices, (;kwargs...)))
+    # record!(key_tracker(o, Val(name)), (indices, (;kwargs...)))
+    nothing
 end
 
 _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
@@ -496,6 +499,9 @@ If multiple objects with the same hash are writing here concurrently, this may i
             disk_locks = _disk_cache(o, vname)
             rv = if __strict__ && !isnothing(disk_locks)
                 path_lock = get_path_lock!(disk_locks, cache_path)
+                if islocked(path_lock)
+                    @info "Waiting for disk cache lock on $cache_path\n$_cache_context"
+                end
                 lock(path_lock) do
                     cache_status = get_cache_status(cache_path)
                     rv = if cache_status == :ready
