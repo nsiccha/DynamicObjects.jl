@@ -936,7 +936,7 @@ fixcall(x::Expr) = if Meta.isexpr(x, :call)
 else
     Expr(x.head, fixcall.(x.args)...)
 end
-dynamicstruct(expr; docstring=nothing, cache_type=:serial, child_handler=nothing) = begin
+dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothing) = begin
     @assert expr.head == :struct
     mut, head, body = expr.args
     type = head
@@ -1252,8 +1252,8 @@ reference is automatically rewritten to `__self__.<name>`.  Order of definition
 does not matter — cycles will result in a stack overflow at runtime.
 
 `cache_type` controls the in-memory cache backend:
-- `:serial` (default) — plain `Dict`, single-threaded safe.
-- `:parallel` — `ThreadsafeDict`, safe to access from multiple tasks
+- `:serial` — plain `Dict`, single-threaded safe.
+- `:parallel` (default) — `ThreadsafeDict`, safe to access from multiple tasks
   simultaneously; duplicate work is avoided by sharing in-flight `Task`s.
 
 Properties marked `@cached` are additionally persisted to disk under
