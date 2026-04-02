@@ -87,10 +87,19 @@ grid.label(1, 2)    # "cell (1, 2)" — computed fresh each call
 Both bracket and call syntax define indexable properties — the difference is
 in the calling convention:
 
-- `obj.prop[args...]` caches the result per index (same args → same result).
-- `obj.prop(args...)` computes fresh each time (the cache entry is popped after access).
+- `obj.prop[args...]` caches the result per index in memory (same args → same result).
+- `obj.prop(args...)` computes fresh each time (directly invokes `compute_property`, no caching).
 
-Call-syntax properties can also accept keyword arguments:
+**Note:** `obj.prop[args...; kwargs...]` is **not valid Julia syntax** — semicolons
+inside `[]` mean array concatenation, not keyword arguments. Use call syntax `()`
+for kwargs:
+
+```julia
+obj.prop(args...; kwarg=val)   # ✓ works
+obj.prop[args...; kwarg=val]   # ✗ not valid Julia
+```
+
+Call-syntax properties can accept keyword arguments:
 
 ```julia
 @dynamicstruct struct Formatter
