@@ -33,6 +33,15 @@ export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @p
 
 import SHA, Serialization
 
+struct DiskCacheLocks
+    lock::ReentrantLock
+    locks::Dict{String, ReentrantLock}
+end
+DiskCacheLocks() = DiskCacheLocks(ReentrantLock(), Dict{String, ReentrantLock}())
+get_path_lock!(d::DiskCacheLocks, path::String) = lock(d.lock) do
+    get!(() -> ReentrantLock(), d.locks, path)
+end
+
 persistent_hash(x) = begin
     b = IOBuffer()
     Serialization.serialize(b, x)
@@ -479,36 +488,60 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
         if iscached(o, vname, indices...; kwargs...)
             cache_path = get_cache_path(o, name, indices...; kwargs...)
             mkpath(dirname(cache_path))
-            cache_status = get_cache_status(cache_path)
             __strict__ = getorcomputeproperty(o, :__strict__)
             _is_threadsafe = getorcomputeproperty(o, :__cache_type__) <: ThreadsafeDict
             _cache_context = """Object type: $(nameof(typeof(o))) (objectid: $(objectid(o)), hash: $(hash(o)))
 Cache dict: $(_is_threadsafe ? "ThreadsafeDict (parallel)" : "Dict (serial) — if concurrent access is intended, use cache_type=:parallel")
 If multiple objects with the same hash are writing here concurrently, this may indicate a concurrency issue or a hashing collision."""
-            rv = if cache_status == :ready
-                try
-                    Serialization.deserialize(cache_path)
-                catch e
-                    __strict__ && @warn "Deserialization failed for $cache_path (strict mode, rethrowing).\n$_cache_context" exception=e
-                    __strict__ && rethrow()
-                    @warn "Deserialization failed for $cache_path, recomputing." exception=e
-                    rm(cache_path; force=true)
-                    cache_status = :unstarted
+            disk_locks = _disk_cache(o, vname)
+            rv = if __strict__ && !isnothing(disk_locks)
+                path_lock = get_path_lock!(disk_locks, cache_path)
+                lock(path_lock) do
+                    cache_status = get_cache_status(cache_path)
+                    rv = if cache_status == :ready
+                        try
+                            Serialization.deserialize(cache_path)
+                        catch e
+                            @warn "Deserialization failed for $cache_path, recomputing.\n$_cache_context" exception=e
+                            rm(cache_path; force=true)
+                            nothing
+                        end
+                    else
+                        nothing
+                    end
+                    if isnothing(rv) || resumes(o, vname, indices...; kwargs...)
+                        @debug "Generating $cache_path...\n$_cache_context"
+                        rv = compute_property(o, vname, indices...; _status_kw..., (name=>rv, )..., kwargs...)
+                        Serialization.serialize(cache_path, rv)
+                    end
+                    rv
+                end
+            else
+                # Non-strict or no disk locks: original flow
+                cache_status = get_cache_status(cache_path)
+                rv = if cache_status == :ready
+                    try
+                        Serialization.deserialize(cache_path)
+                    catch e
+                        @warn "Deserialization failed for $cache_path, recomputing." exception=e
+                        rm(cache_path; force=true)
+                        cache_status = :unstarted
+                        touch(cache_path)
+                        nothing
+                    end
+                else
+                    if cache_status == :started
+                        @warn "Cache file $cache_path exists but has size 0.\nAssuming a previous run failed.\n$_cache_context"
+                    end
                     touch(cache_path)
                     nothing
                 end
-            else
-                if cache_status == :started
-                    @warn "Cache file $cache_path exists but has size 0.\nAssuming a previous run failed.\n$_cache_context"
-                    __strict__ && error("Cache file $cache_path exists but has size 0 (strict mode). See warning above for details.")
+                if cache_status != :ready || resumes(o, vname, indices...; kwargs...)
+                    @debug "Generating $cache_path...\n$_cache_context"
+                    rv = compute_property(o, vname, indices...; _status_kw..., (name=>rv, )..., kwargs...)
+                    Serialization.serialize(cache_path, rv)
                 end
-                touch(cache_path)
-                nothing
-            end
-            if cache_status != :ready || resumes(o, vname, indices...; kwargs...)
-                @debug "Generating $cache_path..."
-                rv = compute_property(o, vname, indices...; _status_kw..., (name=>rv, )..., kwargs...)
-                Serialization.serialize(cache_path, rv)
+                rv
             end
             # Record accessed key for indexed @cached properties
             if !isempty(indices)
@@ -865,6 +898,7 @@ function resumes end
 function meta end
 is_generated_property(o, name) = false
 is_indexed_property(o, name) = false
+_disk_cache(o, name) = nothing
 extractnames(x::Vector) = mapreduce(extractnames, union, x; init=Set())
 extractnames(x::Symbol) = Set((x,))
 extractnames(x::Expr) = if Meta.isexpr(x, :(::))
@@ -1096,6 +1130,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial, child_handler=nothing
 
     generated_names = Tuple(name for (name, info) in oproperties if !isfixed(info))
     indexed_names = Tuple(name for (name, info) in oproperties if info.indexed)
+    cached_names = [(name, Symbol("_", type, "_", name, "_disk_cache")) for (name, info) in oproperties if !isfixed(info) && Symbol("@cached") in info.macros]
     fixed_fields = [(name, info.lhs) for (name, info) in oproperties if isfixed(info)]
     fixed_names = [n for (n, _) in fixed_fields]
     fixed_lhs = [lhs for (_, lhs) in fixed_fields]
@@ -1110,6 +1145,10 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial, child_handler=nothing
         ))
     ))
     result = Expr(:block)
+    # Emit per-cached-property DiskCacheLocks
+    for (name, varname) in cached_names
+        push!(result.args, :($varname = $DiskCacheLocks()))
+    end
     # Prepend extracted inline child structs (processed recursively)
     _child_handler = isnothing(child_handler) ? (s -> dynamicstruct(s; cache_type)) : child_handler
     for s in extracted_structs
@@ -1127,6 +1166,9 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial, child_handler=nothing
             $DynamicObjects.meta(::Type{$type}) = $properties
             $DynamicObjects.is_generated_property(::$type, name::Symbol) = name in $generated_names
             $DynamicObjects.is_indexed_property(::$type, name::Symbol) = name in $indexed_names
+            $([:(
+                $DynamicObjects._disk_cache(::$type, ::Val{$(QuoteNode(name))}) = $varname
+            ) for (name, varname) in cached_names]...)
             $Base.show(io::IO, __self__::$type) = begin
                 print(io, $(string(type)), "(")
                 $([let sep = i == 1 ? :() : :(print(io, ", "))
