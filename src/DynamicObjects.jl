@@ -44,6 +44,8 @@ compute_property(o, ::Val{:hash}) = persistent_hash((typeof(o), o.hash_fields))
 compute_property(o, ::Val{:cache_base}) = "cache"
 compute_property(o, ::Val{:cache_path}) = joinpath(o.cache_base, o.hash)
 compute_property(o, ::Val{:__status__}) = nothing
+compute_property(o, ::Val{:__strict__}) = true
+compute_property(o, ::Val{:__cache_type__}) = typeof(getfield(o, :cache).cache)
 compute_property(o, ::Val{:__substatus__}, name, args...; kwargs...) =
     _default_substatus(o.__status__, name, args...; kwargs...)
 _default_substatus(status, name, args...; kwargs...) = nothing
@@ -472,18 +474,23 @@ end
 _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
     vname = Val(name)
     isnothing(__status__) && name != :__status__ && (__status__ = getorcomputeproperty(o, :__status__))
-    # Only pass __status__ to properties that accept it (generated properties
-    # in meta). Base properties (cache_path, hash, etc.) don't have it.
-    _status_kw = haskey(meta(typeof(o)), name) ? (; __status__) : (;)
+    _status_kw = is_generated_property(o, name) ? (; __status__) : (;)
     try
         if iscached(o, vname, indices...; kwargs...)
             cache_path = get_cache_path(o, name, indices...; kwargs...)
             mkpath(dirname(cache_path))
             cache_status = get_cache_status(cache_path)
+            __strict__ = getorcomputeproperty(o, :__strict__)
+            _is_threadsafe = getorcomputeproperty(o, :__cache_type__) <: ThreadsafeDict
+            _cache_context = """Object type: $(nameof(typeof(o))) (objectid: $(objectid(o)), hash: $(hash(o)))
+Cache dict: $(_is_threadsafe ? "ThreadsafeDict (parallel)" : "Dict (serial) — if concurrent access is intended, use cache_type=:parallel")
+If multiple objects with the same hash are writing here concurrently, this may indicate a concurrency issue or a hashing collision."""
             rv = if cache_status == :ready
                 try
                     Serialization.deserialize(cache_path)
                 catch e
+                    __strict__ && @warn "Deserialization failed for $cache_path (strict mode, rethrowing).\n$_cache_context" exception=e
+                    __strict__ && rethrow()
                     @warn "Deserialization failed for $cache_path, recomputing." exception=e
                     rm(cache_path; force=true)
                     cache_status = :unstarted
@@ -491,7 +498,10 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
                     nothing
                 end
             else
-                cache_status == :started && @warn "Cache file $cache_path exists but has size 0.\nAssuming a previous run failed."
+                if cache_status == :started
+                    @warn "Cache file $cache_path exists but has size 0.\nAssuming a previous run failed.\n$_cache_context"
+                    __strict__ && error("Cache file $cache_path exists but has size 0 (strict mode). See warning above for details.")
+                end
                 touch(cache_path)
                 nothing
             end
@@ -529,8 +539,7 @@ else
         # call/ref syntax, e.g. `x() = ...` or `x[i] = ...`), return an
         # IndexableProperty wrapper instead of calling compute_property.
         if isempty(indices) && isempty(kwargs)
-            m = meta(typeof(o))
-            if haskey(m, name) && m[name].indexed
+            if is_indexed_property(o, name)
                 return IndexableProperty(name, o, subcache(getfield(o, :cache)))
             end
         end
@@ -854,6 +863,8 @@ function compute_property end
 function iscached end
 function resumes end
 function meta end
+is_generated_property(o, name) = false
+is_indexed_property(o, name) = false
 extractnames(x::Vector) = mapreduce(extractnames, union, x; init=Set())
 extractnames(x::Symbol) = Set((x,))
 extractnames(x::Expr) = if Meta.isexpr(x, :(::))
@@ -950,7 +961,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial, child_handler=nothing
         end
         # Prepend __parent__ and forwarded properties to child body
         child_body = child_struct.args[3]
-        forwarded = [pp for pp in parent_props if !(pp in child_props)]
+        forwarded = [pp for pp in parent_props if !(pp in child_props) && pp != :__status__]
         prepend = Expr[]
         push!(prepend, :(__parent__ = nothing))
         if !isempty(forwarded)
@@ -959,7 +970,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial, child_handler=nothing
         child_body.args = vcat(prepend, child_body.args)
         push!(extracted_structs, child_struct)
         # Replace with property assignment
-        body.args[i] = :($prop_name = $gen_name(; __parent__=__self__))
+        body.args[i] = :($prop_name = $gen_name(; __parent__=__self__, cache_type=__self__.__cache_type__, __status__=$compute_property(__self__, Val(:__substatus__), $(QuoteNode(prop_name)))))
     end
     lnn = nothing
     doc = nothing
@@ -1083,6 +1094,8 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial, child_handler=nothing
         for (name, (doc, hasrhs)) in docs
     ], "\n")
 
+    generated_names = Tuple(name for (name, info) in oproperties if !isfixed(info))
+    indexed_names = Tuple(name for (name, info) in oproperties if info.indexed)
     fixed_fields = [(name, info.lhs) for (name, info) in oproperties if isfixed(info)]
     fixed_names = [n for (n, _) in fixed_fields]
     fixed_lhs = [lhs for (_, lhs) in fixed_fields]
@@ -1098,7 +1111,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial, child_handler=nothing
     ))
     result = Expr(:block)
     # Prepend extracted inline child structs (processed recursively)
-    _child_handler = isnothing(child_handler) ? dynamicstruct : child_handler
+    _child_handler = isnothing(child_handler) ? (s -> dynamicstruct(s; cache_type)) : child_handler
     for s in extracted_structs
         child_result = _child_handler(s)
         # Unwrap esc() — parent handles escaping
@@ -1112,6 +1125,8 @@ dynamicstruct(expr; docstring=nothing, cache_type=:serial, child_handler=nothing
             $Base.getproperty(__self__::$type, name::Symbol) = $getorcomputeproperty(__self__, name)
             $Base.setproperty!(__self__::$type, name::Symbol, value) = getfield(__self__, :cache)[name] = value
             $DynamicObjects.meta(::Type{$type}) = $properties
+            $DynamicObjects.is_generated_property(::$type, name::Symbol) = name in $generated_names
+            $DynamicObjects.is_indexed_property(::$type, name::Symbol) = name in $indexed_names
             $Base.show(io::IO, __self__::$type) = begin
                 print(io, $(string(type)), "(")
                 $([let sep = i == 1 ? :() : :(print(io, ", "))
