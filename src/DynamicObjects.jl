@@ -491,7 +491,10 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
                     nothing
                 end
             else
-                cache_status == :started && @warn "Cache file $cache_path exists but has size 0.\nAssuming a previous run failed."
+                if cache_status == :started
+                    @warn "Cache file $cache_path exists but has size 0. Removing and recomputing."
+                    rm(cache_path)
+                end
                 touch(cache_path)
                 nothing
             end
