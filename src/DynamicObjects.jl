@@ -523,7 +523,7 @@ If multiple objects with the same hash are writing here concurrently, this may i
                     try
                         Serialization.deserialize(cache_path)
                     catch e
-                        @warn "Deserialization failed for $cache_path, recomputing." exception=e
+                        @warn "Deserialization failed for $cache_path, recomputing.\n$_cache_context\nEnable __strict__=true for disk cache locking to prevent concurrent write issues." exception=e
                         rm(cache_path; force=true)
                         cache_status = :unstarted
                         touch(cache_path)
@@ -531,7 +531,7 @@ If multiple objects with the same hash are writing here concurrently, this may i
                     end
                 else
                     if cache_status == :started
-                        @warn "Cache file $cache_path exists but has size 0.\nAssuming a previous run failed.\n$_cache_context"
+                        @warn "Cache file $cache_path exists but has size 0.\nAssuming a previous run failed.\n$_cache_context\nEnable __strict__=true for disk cache locking to prevent concurrent write issues."
                     end
                     touch(cache_path)
                     nothing
