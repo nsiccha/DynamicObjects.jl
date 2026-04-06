@@ -56,8 +56,8 @@ compute_property(o, ::Val{:__status__}) = nothing
 compute_property(o, ::Val{:__strict__}) = true
 compute_property(o, ::Val{:__cache_type__}) = typeof(getfield(o, :cache).cache)
 compute_property(o, ::Val{:__substatus__}, name, args...; kwargs...) =
-    _default_substatus(o.__status__, name, args...; kwargs...)
-_default_substatus(status, name, args...; kwargs...) = nothing
+    _default_substatus(o.__status__, o, name, args...; kwargs...)
+_default_substatus(status, o, name, args...; kwargs...) = nothing
 
 struct PropertyCache{D<:AbstractDict{Symbol,Any}}
     cache::D
@@ -902,6 +902,13 @@ function compute_property end
 function iscached end
 function resumes end
 function meta end
+"""    _property_description(o, ::Val{name}, args...; kwargs...)
+
+Return a human-readable description for the property `name` with the given arguments.
+Override generated per-property when a docstring is present in @dynamicstruct.
+Default: "name[arg1,arg2,...]"
+"""
+_property_description(o, ::Val{name}, args...; kwargs...) where {name} = "$name[$(join(args, ","))]"
 is_generated_property(o, name) = false
 is_indexed_property(o, name) = false
 _disk_cache(o, name) = nothing
@@ -1021,7 +1028,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             lnn = arg
             continue
         end
-        if isa(arg, String)
+        if isa(arg, String) || Meta.isexpr(arg, :string)
             doc = arg
             continue
         end
@@ -1128,9 +1135,10 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices, indexed))
     end
     properties = Dict(oproperties)
+    property_docs = Dict(name => doc for (name, (doc, _)) in docs if !isnothing(doc))
 
     docstring = something(docstring, "DynamicStruct `$type`.") * "\n\n" * join([
-        "* " * (isnothing(doc) ? "" : "$doc: ") * "`$name" * (hasrhs ? " = ..." : "") * "`"
+        "* " * (isnothing(doc) ? "" : "$(doc isa String ? doc : sprint(Base.show_unquoted, doc)): ") * "`$name" * (hasrhs ? " = ..." : "") * "`"
         for (name, (doc, hasrhs)) in docs
     ], "\n")
 
@@ -1213,11 +1221,19 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     walked_indices..., Expr(:parameters, extras...),
                 ))
                 iscached_val = Symbol("@cached") in info.macros
-                Expr(:block,
+                desc_expr = if haskey(property_docs, name)
+                    pdoc = property_docs[name]
+                    _lnn, Expr(:(=), _call(:_property_description, :(kwargs...)), Expr(:block, _lnn, pdoc))
+                else
+                    nothing
+                end
+                block = Expr(:block,
                     _lnn, Expr(:(=), _call(:compute_property, cp_kwargs...), Expr(:block, _lnn, walk_rhs(info.rhs; info.locals, properties, lnn=info.lnn))),
                     _lnn, Expr(:(=), _call(:iscached), Expr(:block, _lnn, iscached_val)),
                     _lnn, Expr(:(=), _call(:resumes), Expr(:block, _lnn, false)),
                 )
+                !isnothing(desc_expr) && push!(block.args, desc_expr...)
+                block
             end
             for (name, info) in oproperties if !isfixed(info)
         ]...,
