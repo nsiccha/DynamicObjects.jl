@@ -63,6 +63,7 @@ struct PropertyCache{D<:AbstractDict{Symbol,Any}}
     cache::D
     PropertyCache(D, c::NamedTuple) = new{D{Symbol,Any}}(D{Symbol,Any}(pairs(c)))
 end
+
 Base.get!(f::Function, c::PropertyCache, key) = get!((_...) -> f(), c.cache, key)
 Base.get!(f::Function, ::PropertyCache, key, indices...; kwargs...) = f()
 Base.setindex!(c::PropertyCache, args...) = setindex!(c.cache, args...)
@@ -88,6 +89,11 @@ struct ThreadsafeDict{K,V} <: AbstractDict{K,V}
     ThreadsafeDict{K,V}(c) where {K,V} = new{K,V}(ReentrantLock(), Dict{K,V}(c), Dict{K,Task}(), Dict{K,Any}())
     ThreadsafeDict() = new{Any,Any}(ReentrantLock(), Dict{Any,Any}(), Dict{Any,Task}(), Dict{Any,Any}())
 end
+
+const _cache_types = (;serial=Dict, parallel=ThreadsafeDict)
+resolve_cache_type(s::Symbol) = get(_cache_types, s, s)
+resolve_cache_type(T::Type) = T isa UnionAll ? T : T.name.wrapper
+
 Base.length(c::ThreadsafeDict) = lock(c.lock) do; length(c.cache); end
 # NOTE: iteration is NOT truly thread-safe — each iterate call locks independently,
 # so the dict can mutate between calls. For thread-safe iteration, use
@@ -1153,7 +1159,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         :($type($(fixed_lhs...); cache_type=$(Meta.quot(cache_type)), kwargs...) = new(
             $(fixed_names...),
             $PropertyCache(
-                $get((;serial=$Dict, parallel=$ThreadsafeDict), cache_type, cache_type),
+                $(resolve_cache_type)(cache_type),
                 (;kwargs...)
             )
         ))
