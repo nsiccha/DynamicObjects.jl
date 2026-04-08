@@ -48,6 +48,7 @@ persistent_hash(x) = begin
     bytes2hex(SHA.sha1(take!(b)))
 end
 iscached(o, ::Val) = false
+cache_version(o, ::Val) = nothing
 compute_property(o, ::Val{:hash_fields}) = ntuple(Base.Fix1(getfield, o), fieldcount(typeof(o))-1)
 compute_property(o, ::Val{:hash}) = persistent_hash((typeof(o), o.hash_fields))
 compute_property(o, ::Val{:cache_base}) = "cache"
@@ -594,9 +595,14 @@ end
 maybehash(x::Number) = x
 maybehash(x::Symbol) = x
 maybehash(x) = persistent_hash(x)
-get_cache_path(o, args...; kwargs...) = joinpath(o.cache_path, join(map(
-    maybehash, length(kwargs) == 0 ? args : (args..., sort(collect(kwargs); by=first))
-), "_") * ".sjl")
+get_cache_path(o, name, args...; kwargs...) = begin
+    parts = length(kwargs) == 0 ? (name, args...) : (name, args..., sort(collect(kwargs); by=first))
+    ver = cache_version(o, Val(name))
+    if !isnothing(ver)
+        parts = (parts..., Symbol("v", ver))
+    end
+    joinpath(o.cache_path, join(map(maybehash, parts), "_") * ".sjl")
+end
 get_cache_status(o, args...; kwargs...) = get_cache_status(get_cache_path(o, args...; kwargs...)) 
 get_cache_status(cache_path::AbstractString) = begin
     !isfile(cache_path) && return :unstarted
@@ -1044,8 +1050,19 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         locals = nothing
         indices = tuple()
         indexed = false
+        cache_version = nothing
         while Meta.isexpr(arg, :macrocall)
             push!(macros, arg.args[1])
+            if arg.args[1] == Symbol("@cached") && length(arg.args) == 4
+                ver_expr = arg.args[3]
+                if Meta.isexpr(ver_expr, :macrocall) && ver_expr.args[1] == Symbol("@v_str")
+                    cache_version = VersionNumber(ver_expr.args[end])
+                elseif ver_expr isa VersionNumber
+                    cache_version = ver_expr
+                else
+                    error("@cached version argument must be a version string like v\"2\", got: $ver_expr")
+                end
+            end
             arg = arg.args[end]
         end
         if Meta.isexpr(arg, :function)
@@ -1100,7 +1117,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 group_name = Symbol("_tuple_", join(prop_names, "_"))
                 group_locals = Set{Symbol}(prop_names)
                 push!(group_locals, group_name)
-                push!(oproperties, group_name=>(;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false))
+                push!(oproperties, group_name=>(;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, cache_version))
                 push!(docs, (group_name=>(doc, true)))
                 group_name
             end
@@ -1111,7 +1128,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 else
                     :($extract_from[$source])
                 end
-                push!(oproperties, prop_name=>(;lhs=prop_name, macros=Set{Symbol}(), rhs=extract_rhs, lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([prop_name]), indices=tuple(), indexed=false))
+                push!(oproperties, prop_name=>(;lhs=prop_name, macros=Set{Symbol}(), rhs=extract_rhs, lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([prop_name]), indices=tuple(), indexed=false, cache_version=nothing))
                 push!(docs, (prop_name=>(nothing, true)))
             end
             continue
@@ -1138,7 +1155,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         !isnothing(locals) && push!(locals, name)
         !isnothing(locals) && push!(locals, :__status__)
         @assert !isnothing(rhs) || length(macros) == 0
-        push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices, indexed))
+        push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices, indexed, cache_version))
     end
     properties = Dict(oproperties)
     property_docs = Dict(name => doc for (name, (doc, _)) in docs if !isnothing(doc))
@@ -1238,6 +1255,10 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     _lnn, Expr(:(=), _call(:iscached), Expr(:block, _lnn, iscached_val)),
                     _lnn, Expr(:(=), _call(:resumes), Expr(:block, _lnn, false)),
                 )
+                if !isnothing(info.cache_version)
+                    cv_expr = (_lnn, Expr(:(=), _call(:cache_version), Expr(:block, _lnn, info.cache_version)))
+                    push!(block.args, cv_expr...)
+                end
                 !isnothing(desc_expr) && push!(block.args, desc_expr...)
                 block
             end

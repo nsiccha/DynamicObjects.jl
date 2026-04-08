@@ -92,6 +92,17 @@ _disk_cache_path = Ref("")
     @cached d = isnothing(d) ? 1 : d + 1
 end
 
+_version_cache_path = Ref("")
+@dynamicstruct struct VersionedCache
+    cache_path = _version_cache_path[]
+    @cached v"1" result = 42
+end
+
+@dynamicstruct struct UnversionedCache
+    cache_path = _version_cache_path[]
+    @cached result = 42
+end
+
 _idx_path = Ref("")
 @dynamicstruct struct Idx
     cache_path = _idx_path[]
@@ -686,4 +697,29 @@ end
     serial_app = CancelApp()
     @test cancel!(serial_app.slow, 1) == false
     @test cancel_all!(serial_app.slow) === nothing
+end
+
+@testset "Cache versioning" begin
+    _version_cache_path[] = mktempdir()
+
+    v_obj = VersionedCache()
+    u_obj = UnversionedCache()
+
+    # cache_version dispatch
+    @test DynamicObjects.cache_version(v_obj, Val(:result)) == v"1"
+    @test DynamicObjects.cache_version(u_obj, Val(:result)) === nothing
+
+    # Versioned and unversioned produce different paths
+    v_path = DynamicObjects.get_cache_path(v_obj, :result)
+    u_path = DynamicObjects.get_cache_path(u_obj, :result)
+    @test v_path != u_path
+
+    # Unversioned path is stable (same as a fresh object)
+    u_obj2 = UnversionedCache()
+    u_path2 = DynamicObjects.get_cache_path(u_obj2, :result)
+    @test u_path == u_path2
+
+    # Version string appears in path
+    @test occursin("v1.0.0", v_path)
+    @test !occursin("v1.0.0", u_path)
 end
