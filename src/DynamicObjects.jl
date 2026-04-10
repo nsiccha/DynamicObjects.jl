@@ -1256,7 +1256,12 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     _lnn, Expr(:(=), _call(:resumes), Expr(:block, _lnn, false)),
                 )
                 if !isnothing(info.cache_version)
-                    cv_expr = (_lnn, Expr(:(=), _call(:cache_version), Expr(:block, _lnn, info.cache_version)))
+                    # Don't use _call — cache_version is per-property, not per-index
+                    cv_method = Expr(:call,
+                        Expr(:., DynamicObjects, QuoteNode(:cache_version)),
+                        :(__self__::$type), :(::Val{$(Meta.quot(name))}),
+                    )
+                    cv_expr = (_lnn, Expr(:(=), cv_method, Expr(:block, _lnn, info.cache_version)))
                     push!(block.args, cv_expr...)
                 end
                 !isnothing(desc_expr) && push!(block.args, desc_expr...)

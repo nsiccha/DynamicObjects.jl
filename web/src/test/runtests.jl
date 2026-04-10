@@ -103,6 +103,11 @@ end
     @cached result = 42
 end
 
+@dynamicstruct struct VersionedIndexedCache
+    cache_path = _version_cache_path[]
+    @cached v"1" result(key) = key ^ 2
+end
+
 _idx_path = Ref("")
 @dynamicstruct struct Idx
     cache_path = _idx_path[]
@@ -722,4 +727,10 @@ end
     # Version string appears in path
     @test occursin("v1.0.0", v_path)
     @test !occursin("v1.0.0", u_path)
+
+    # Indexed properties also pick up the version
+    vi_obj = VersionedIndexedCache()
+    @test DynamicObjects.cache_version(vi_obj, Val(:result)) == v"1"
+    vi_path = DynamicObjects.get_cache_path(vi_obj, :result, "foo")
+    @test occursin("v1.0.0", vi_path)
 end
