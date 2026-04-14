@@ -1100,9 +1100,10 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         for ip in index_params
             push!(prepend, :($ip = nothing))
         end
-        if !isempty(index_params)
+        if !isempty(index_params) && !(:hash_fields in child_props)
             # Tie the child's disk-cache namespace to (parent, indices...).
             # Relies on _hash_replace collapsing __parent__ to parent.hash.
+            # Skip if the user already defined hash_fields in the child body.
             push!(prepend, :(hash_fields = $(Expr(:tuple, :__parent__, index_params...))))
         end
         if !isempty(forwarded)
