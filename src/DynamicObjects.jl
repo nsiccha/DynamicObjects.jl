@@ -1111,7 +1111,10 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         # (b) aren't __status__ (scoped separately), (c) aren't DO-internal
         # cache/identity names, and (d) aren't one of the names we're about
         # to prepend ourselves.
-        forwarded = [pp for pp in parent_props if !(pp in child_props) && pp != :__status__ && !(pp in nonforwardable) && !(pp in prepend_names)]
+        # Dedupe: a parent can declare the same property name multiple times
+        # (indexed properties with multi-method dispatch on the index type).
+        # We only want one forwarding extractor per name.
+        forwarded = unique!(Symbol[pp for pp in parent_props if !(pp in child_props) && pp != :__status__ && !(pp in nonforwardable) && !(pp in prepend_names)])
         prepend = Expr[]
         push!(prepend, :(__parent__ = nothing))
         for ip in index_params
