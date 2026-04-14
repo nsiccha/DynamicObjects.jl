@@ -876,11 +876,31 @@ elseif e.head in (:kw, :(=))
             end
             for s in shadowed
                 loc = isnothing(lnn) ? "" : " (near $(lnn.file):$(lnn.line))"
-                @warn "Assignment to `$s` in a property RHS shadows property `$s`$loc. This writes to the property cache, not a local variable. Use `let $s = ...` for a local."
+                error("Assignment to `$s` in a property RHS shadows property `$s`$loc. This writes to the property cache, not a local variable. Declare it with `local $s` (or `local $s = ...`) or use `let $s = ...` to make it a local.")
             end
         end
         Expr(e.head, e.args[1], walk_rhs.(e.args[2:end]; locals, properties, lnn)...)
     end
+elseif e.head == :local
+    # `local x`, `local x, y, z`, or `local x = expr` — add names to the local
+    # scope so subsequent assignments don't hit the property cache.
+    walked = map(e.args) do arg
+        if arg isa Symbol
+            push!(locals, arg)
+            arg
+        elseif Meta.isexpr(arg, :(=)) && arg.args[1] isa Symbol
+            push!(locals, arg.args[1])
+            Expr(:(=), arg.args[1], walk_rhs(arg.args[2]; locals, properties, lnn))
+        elseif Meta.isexpr(arg, :tuple)
+            for s in arg.args
+                s isa Symbol && push!(locals, s)
+            end
+            arg
+        else
+            walk_rhs(arg; locals, properties, lnn)
+        end
+    end
+    Expr(:local, walked...)
 elseif e.head == :tuple
     # Named tuple: (x=1, y=2) — :(=) children are field definitions, not assignments.
     # Walk only the values, not the keys.
