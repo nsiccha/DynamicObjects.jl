@@ -988,6 +988,31 @@ fixcall(x::Expr) = if Meta.isexpr(x, :call)
 else
     Expr(x.head, fixcall.(x.args)...)
 end
+_collect_leaves(e) = if e isa Symbol
+    Symbol[e]
+elseif Meta.isexpr(e, :(::))
+    Symbol[e.args[1]]
+elseif Meta.isexpr(e, :tuple)
+    mapreduce(_collect_leaves, append!, e.args; init=Symbol[])
+else
+    error("unsupported destructuring element: $e")
+end
+_emit_positional_destructure!(oproperties, docs, elements, source_sym, lnn) = for (i, a) in enumerate(elements)
+    if a isa Symbol || Meta.isexpr(a, :(::))
+        leaf = Meta.isexpr(a, :(::)) ? a.args[1] : a
+        push!(oproperties, leaf => (;lhs=leaf, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([leaf]), indices=tuple(), indexed=false, cache_version=nothing))
+        push!(docs, (leaf => (nothing, true)))
+    elseif Meta.isexpr(a, :tuple)
+        inner_leaves = _collect_leaves(a)
+        inner_name = Symbol("_tuple_", join(inner_leaves, "_"))
+        inner_locals = Set{Symbol}(inner_leaves); push!(inner_locals, inner_name)
+        push!(oproperties, inner_name => (;lhs=inner_name, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=inner_locals, indices=tuple(), indexed=false, cache_version=nothing))
+        push!(docs, (inner_name => (nothing, true)))
+        _emit_positional_destructure!(oproperties, docs, a.args, inner_name, lnn)
+    else
+        error("unsupported destructuring element: $a")
+    end
+end
 dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothing) = begin
     @assert expr.head == :struct
     mut, head, body = expr.args
@@ -1145,6 +1170,18 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             # Detect named destructuring: (;a, b) parses as Expr(:tuple, Expr(:parameters, :a, :b))
             named = length(arg.args) == 1 && Meta.isexpr(arg.args[1], :parameters)
             raw_args = named ? arg.args[1].args : arg.args
+            # Nested positional destructuring: ((a, b), (c, d)) = expr
+            # Handled recursively: outer group + inner group per nested tuple.
+            if !named && any(a -> Meta.isexpr(a, :tuple), raw_args)
+                all_leaves = _collect_leaves(arg)
+                group_name = Symbol("_tuple_", join(all_leaves, "_"))
+                group_locals = Set{Symbol}(all_leaves); push!(group_locals, group_name)
+                push!(oproperties, group_name => (;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, cache_version))
+                push!(docs, (group_name => (doc, true)))
+                _emit_positional_destructure!(oproperties, docs, raw_args, group_name, lnn)
+                doc = nothing
+                continue
+            end
             # Build list of (property_name, extract_expr_builder) pairs
             # extract_expr_builder takes the group_name and returns the RHS expression
             members = Pair{Symbol, Any}[]  # name => source_field_or_index
