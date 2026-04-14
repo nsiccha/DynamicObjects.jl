@@ -1094,16 +1094,30 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         # Prepend __parent__, index params, hash_fields override, and
         # forwarded parent properties to the child body.
         child_body = child_struct.args[3]
-        forwarded = [pp for pp in parent_props if !(pp in child_props) && pp != :__status__ && !(pp in index_params)]
+        prepend_names = Set{Symbol}([:__parent__, index_params...])
+        # For indexed inline structs we override hash_fields to
+        # (__parent__, indices...) so the child's disk-cache namespace is
+        # tied to the parent hash. Skip if the user declared hash_fields
+        # inside the child body.
+        will_prepend_hash_fields = !isempty(index_params) && !(:hash_fields in child_props)
+        will_prepend_hash_fields && push!(prepend_names, :hash_fields)
+        # Never forward DO-internal cache/identity properties from the parent
+        # into the child — they have per-instance semantics (the child has its
+        # own hash/cache_path/cache_base) and forwarding them collides with the
+        # automatic machinery (e.g. with our hash_fields prepend, producing
+        # duplicate compute_property method definitions).
+        nonforwardable = Set{Symbol}([:hash_fields, :hash, :cache_path, :cache])
+        # Forward parent properties that (a) aren't overridden in the child,
+        # (b) aren't __status__ (scoped separately), (c) aren't DO-internal
+        # cache/identity names, and (d) aren't one of the names we're about
+        # to prepend ourselves.
+        forwarded = [pp for pp in parent_props if !(pp in child_props) && pp != :__status__ && !(pp in nonforwardable) && !(pp in prepend_names)]
         prepend = Expr[]
         push!(prepend, :(__parent__ = nothing))
         for ip in index_params
             push!(prepend, :($ip = nothing))
         end
-        if !isempty(index_params) && !(:hash_fields in child_props)
-            # Tie the child's disk-cache namespace to (parent, indices...).
-            # Relies on _hash_replace collapsing __parent__ to parent.hash.
-            # Skip if the user already defined hash_fields in the child body.
+        if will_prepend_hash_fields
             push!(prepend, :(hash_fields = $(Expr(:tuple, :__parent__, index_params...))))
         end
         if !isempty(forwarded)
