@@ -1021,15 +1021,25 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         child_struct = nothing
         index_params = Symbol[]
         # Form 1a: prop(idx...) = struct Name ... end  (indexed inline struct)
-        if Meta.isexpr(arg, :(=)) && Meta.isexpr(arg.args[2], :struct) && Meta.isexpr(arg.args[1], :call)
-            call_expr = arg.args[1]
-            prop_name = call_expr.args[1]
-            for p in call_expr.args[2:end]
-                pname = Meta.isexpr(p, :(::)) ? p.args[1] : p
-                @assert pname isa Symbol "indexed inline struct: index param must be a Symbol, got $p"
-                push!(index_params, pname)
+        # Julia parses short-form function defs with a :block wrapper around the
+        # RHS — so `subject(idx) = struct Subject ... end` has args[2] = :block
+        # containing a LineNumberNode + the :struct. Unwrap that case.
+        if Meta.isexpr(arg, :(=)) && Meta.isexpr(arg.args[1], :call)
+            rhs_expr = arg.args[2]
+            if Meta.isexpr(rhs_expr, :block)
+                inner = [a for a in rhs_expr.args if !(a isa LineNumberNode)]
+                length(inner) == 1 && Meta.isexpr(inner[1], :struct) && (rhs_expr = inner[1])
             end
-            child_struct = arg.args[2]
+            if Meta.isexpr(rhs_expr, :struct)
+                call_expr = arg.args[1]
+                prop_name = call_expr.args[1]
+                for p in call_expr.args[2:end]
+                    pname = Meta.isexpr(p, :(::)) ? p.args[1] : p
+                    @assert pname isa Symbol "indexed inline struct: index param must be a Symbol, got $p"
+                    push!(index_params, pname)
+                end
+                child_struct = rhs_expr
+            end
         # Form 1b: prop = struct Name ... end
         elseif Meta.isexpr(arg, :(=)) && Meta.isexpr(arg.args[2], :struct)
             prop_name = arg.args[1]
