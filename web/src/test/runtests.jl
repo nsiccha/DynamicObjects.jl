@@ -231,6 +231,26 @@ _kwargs_keys_path = Ref("")
     @cached result(key; mode="default") = "$key:$mode"
 end
 
+@dynamicstruct struct HashLeaf
+    x::Int
+    y::String
+end
+
+@dynamicstruct struct HashParent
+    leaf::HashLeaf
+    k::Int
+end
+
+@dynamicstruct struct HashParentTuple
+    leaves::Tuple
+    k::Int
+end
+
+@dynamicstruct struct HashNoDOs
+    x::Int
+    y::Vector{Float64}
+end
+
 # --- Tests ---
 
 @testset "Multi-lhs assignment" begin
@@ -702,6 +722,37 @@ end
     serial_app = CancelApp()
     @test cancel!(serial_app.slow, 1) == false
     @test cancel_all!(serial_app.slow) === nothing
+end
+
+@testset "Hash with nested DOs" begin
+    # 1. DO with no nested DOs: hash uses raw serialize of fixed fields,
+    #    unaffected by the _hash_replace walker (values pass through).
+    no_dos = HashNoDOs(7, [1.0, 2.0, 3.0])
+    expected = DynamicObjects.persistent_hash((HashNoDOs, (7, [1.0, 2.0, 3.0])))
+    @test no_dos.hash == expected
+
+    # 2. Nested DO as a fixed field: parent.hash depends on child.hash
+    #    only, not on the child's cache dict contents.
+    leaf = HashLeaf(1, "a")
+    parent1 = HashParent(leaf, 42)
+    h1 = parent1.hash
+    # Mutate the leaf's cache dict. Pre-fix, this would change parent.hash
+    # because the raw leaf (including its cache) got serialized.
+    getfield(leaf, :cache)[:garbage] = rand(100)
+    parent2 = HashParent(leaf, 42)  # fresh parent wrapping the mutated leaf
+    @test parent2.hash == h1
+
+    # 3. Different leaf fixed fields → different parent hash.
+    parent3 = HashParent(HashLeaf(2, "a"), 42)
+    @test parent3.hash != h1
+
+    # 4. Tuple of DOs: shallow recursion collapses each DO via _hash_replace.
+    leaves = (HashLeaf(1, "a"), HashLeaf(2, "b"))
+    p_tup1 = HashParentTuple(leaves, 0)
+    h_tup = p_tup1.hash
+    getfield(leaves[1], :cache)[:junk] = :junk
+    p_tup2 = HashParentTuple(leaves, 0)
+    @test p_tup2.hash == h_tup
 end
 
 @testset "Cache versioning" begin

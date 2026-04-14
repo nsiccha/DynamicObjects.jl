@@ -50,7 +50,14 @@ end
 iscached(o, ::Val) = false
 cache_version(o, ::Val) = nothing
 compute_property(o, ::Val{:hash_fields}) = ntuple(Base.Fix1(getfield, o), fieldcount(typeof(o))-1)
-compute_property(o, ::Val{:hash}) = persistent_hash((typeof(o), o.hash_fields))
+compute_property(o, ::Val{:hash}) = persistent_hash((typeof(o), _hash_replace(o.hash_fields)))
+# Shallow walker used only by the :hash compute. Leaves non-DO values
+# structurally identical so hashes stay stable for DOs that don't nest DOs,
+# and substitutes any DO with its own (stable) `.hash` string. Per-type
+# `_hash_replace(::MyType) = x.hash` overloads are emitted by @dynamicstruct.
+_hash_replace(x::Tuple) = map(_hash_replace, x)
+_hash_replace(x::NamedTuple) = map(_hash_replace, x)
+_hash_replace(x) = x
 compute_property(o, ::Val{:cache_base}) = "cache"
 compute_property(o, ::Val{:cache_path}) = joinpath(o.cache_base, o.hash)
 compute_property(o, ::Val{:__status__}) = nothing
@@ -1012,8 +1019,19 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         arg isa Expr || continue
         prop_name = nothing
         child_struct = nothing
-        # Form 1: prop = struct Name ... end
-        if Meta.isexpr(arg, :(=)) && Meta.isexpr(arg.args[2], :struct)
+        index_params = Symbol[]
+        # Form 1a: prop(idx...) = struct Name ... end  (indexed inline struct)
+        if Meta.isexpr(arg, :(=)) && Meta.isexpr(arg.args[2], :struct) && Meta.isexpr(arg.args[1], :call)
+            call_expr = arg.args[1]
+            prop_name = call_expr.args[1]
+            for p in call_expr.args[2:end]
+                pname = Meta.isexpr(p, :(::)) ? p.args[1] : p
+                @assert pname isa Symbol "indexed inline struct: index param must be a Symbol, got $p"
+                push!(index_params, pname)
+            end
+            child_struct = arg.args[2]
+        # Form 1b: prop = struct Name ... end
+        elseif Meta.isexpr(arg, :(=)) && Meta.isexpr(arg.args[2], :struct)
             prop_name = arg.args[1]
             child_struct = arg.args[2]
         # Form 2: struct Name ... end (bare)
@@ -1038,18 +1056,36 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             Meta.isexpr(clhs, :(::)) && (clhs = clhs.args[1])
             clhs isa Symbol && push!(child_props, clhs)
         end
-        # Prepend __parent__ and forwarded properties to child body
+        # Prepend __parent__, index params, hash_fields override, and
+        # forwarded parent properties to the child body.
         child_body = child_struct.args[3]
-        forwarded = [pp for pp in parent_props if !(pp in child_props) && pp != :__status__]
+        forwarded = [pp for pp in parent_props if !(pp in child_props) && pp != :__status__ && !(pp in index_params)]
         prepend = Expr[]
         push!(prepend, :(__parent__ = nothing))
+        for ip in index_params
+            push!(prepend, :($ip = nothing))
+        end
+        if !isempty(index_params)
+            # Tie the child's disk-cache namespace to (parent, indices...).
+            # Relies on _hash_replace collapsing __parent__ to parent.hash.
+            push!(prepend, :(hash_fields = $(Expr(:tuple, :__parent__, index_params...))))
+        end
         if !isempty(forwarded)
             push!(prepend, :($(Expr(:tuple, Expr(:parameters, forwarded...))) = __parent__))
         end
         child_body.args = vcat(prepend, child_body.args)
         push!(extracted_structs, child_struct)
-        # Replace with property assignment
-        body.args[i] = :($prop_name = $gen_name(; __parent__=__self__, cache_type=__self__.__cache_type__, __status__=$compute_property(__self__, Val(:__substatus__), $(QuoteNode(prop_name)))))
+        # Replace with parent property definition. For indexed form, emit an
+        # indexed property `prop(idx...)`; for the plain form, a bare `prop`.
+        constructor_kwargs = Any[
+            Expr(:kw, :__parent__, :__self__),
+            (Expr(:kw, ip, ip) for ip in index_params)...,
+            Expr(:kw, :cache_type, :(__self__.__cache_type__)),
+            Expr(:kw, :__status__, Expr(:call, compute_property, :__self__, :(Val(:__substatus__)), QuoteNode(prop_name), index_params...)),
+        ]
+        constructor = Expr(:call, gen_name, Expr(:parameters, constructor_kwargs...))
+        lhs_expr = isempty(index_params) ? prop_name : Expr(:call, prop_name, index_params...)
+        body.args[i] = Expr(:(=), lhs_expr, constructor)
     end
     lnn = nothing
     doc = nothing
@@ -1223,6 +1259,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             $DynamicObjects.meta(::Type{$type}) = $properties
             $DynamicObjects.is_generated_property(::$type, name::Symbol) = name in $generated_names
             $DynamicObjects.is_indexed_property(::$type, name::Symbol) = name in $indexed_names
+            $DynamicObjects._hash_replace(__self__::$type) = __self__.hash
             $([:(
                 $DynamicObjects._disk_cache(::$type, ::Val{$(QuoteNode(name))}) = $varname
             ) for (name, varname) in cached_names]...)
