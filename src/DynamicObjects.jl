@@ -29,7 +29,7 @@ optionally disk-cached properties.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, remake, fetchindex, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, PersistentSet, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo, remake, fetchindex, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, PersistentSet, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!
 
 import SHA, Serialization
 
@@ -716,6 +716,33 @@ macro persist(x)
     o, name = x.args
     :($persist($x, $o, $(name), $(indices...))) |> fixcall |> esc
 end
+
+"""
+    @memo f(args...; kwargs...)
+
+Rewrite `f(args...; kwargs...)` as `getindex(f, args...; kwargs...)`. This makes
+memoization explicit at the call site for `IndexableProperty` properties defined
+inside a `@dynamicstruct`.
+
+Inside a `@dynamicstruct`, an indexable property `prop(i) = ...` can be invoked
+two different ways:
+
+- `o.prop(i)` — recompute on every call, no caching.
+- `o.prop[i]` — look up in the in-memory cache, compute (and cache) on miss.
+
+The bracket-vs-paren distinction is easy to miss when reading code. `@memo` lets
+you keep the call syntax while still going through the cached path:
+
+```julia
+@memo o.prop(i)        # equivalent to o.prop[i]
+@memo o.prop(i; k=v)   # equivalent to getindex(o.prop, i; k=v)
+```
+"""
+macro memo(x)
+    Meta.isexpr(x, :call) || error("@memo expects a call expression `f(args...; kwargs...)`, got: $x")
+    fixcall(Expr(:call, GlobalRef(Base, :getindex), x.args...)) |> esc
+end
+
 persist(v, args...; kwargs...) = begin
     Serialization.serialize(
         get_cache_path(args...; kwargs...),
