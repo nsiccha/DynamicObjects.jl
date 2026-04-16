@@ -17,4 +17,10 @@ DynamicObjects._default_substatus(status::Treebars.ProgressNode, o, name, args..
 DynamicObjects._finalize_substatus!(s::Treebars.ProgressNode) = Treebars.finalize_progress!(s)
 DynamicObjects._fail_substatus!(s::Treebars.ProgressNode, e) = Treebars.fail_progress!(s, e)
 
+DynamicObjects.fetchindex!(status::Treebars.ProgressNode, ip, indices...; fetch=Base.fetch, kwargs...) =
+    DynamicObjects.fetchindex(ip, indices...; kwargs...) do rv, s
+        Treebars.add_child!(status, s)
+        fetch(rv)
+    end
+
 end

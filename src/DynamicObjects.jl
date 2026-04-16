@@ -29,7 +29,7 @@ optionally disk-cached properties.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo, remake, fetchindex, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, PersistentSet, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, PersistentSet, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!
 
 import SHA, Serialization
 
@@ -156,7 +156,6 @@ Base.get!(f::Function, c::ThreadsafeDict, key; fetch=Base.fetch, substatus=nothi
                         lock(c.lock) do
                             c.cache[key] = tmp
                             pop!(c.tasks, key)
-                            haskey(c.status, key) && pop!(c.status, key)
                         end
                         _finalize_substatus!(s)
                         tmp
@@ -273,17 +272,19 @@ function fetchindex(fetch, ip::IndexableProperty{<:Any,<:Any,<:ThreadsafeDict}, 
         path = get_cache_path(ip.o, name(ip), indices...; kwargs...)
         isfile(path) && rm(path)
     end
-    rv = getindex(ip, indices...; fetch=identity, retry_failed=false, kwargs...)
+    rv = getindex(ip, indices...; fetch=identity, retry_failed=force, kwargs...)
     status = getstatus(ip, indices...; kwargs...)
     fetch(rv, status)
 end
 # Fallback for non-ThreadsafeDict IPs (1-arg callback, no status)
 fetchindex(fetch, args...; kwargs...) = getindex(args...; fetch, kwargs...)
+fetchindex!(::Nothing, ip, indices...; fetch=Base.fetch, kwargs...) = getindex(ip, indices...; fetch, kwargs...)
 maybepop!(c::AbstractDict, key) = haskey(c, key) && pop!(c, key)
 maybepop!(c::ThreadsafeDict, key) = begin
     lock(c.lock) do
-        haskey(c.status, key) && pop!(c.status, key)
         maybepop!(c.cache, key)
+        maybepop!(c.tasks, key)
+        maybepop!(c.status, key)
     end
 end
 subcache(::PropertyCache{<:Dict}) = Dict()
