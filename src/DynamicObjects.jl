@@ -67,6 +67,16 @@ compute_property(o, ::Val{:__substatus__}, name, args...; kwargs...) =
     _default_substatus(o.__status__, o, name, args...; kwargs...)
 _default_substatus(status, o, name, args...; kwargs...) = nothing
 
+# Substatus lifecycle hooks — overridden by TreebarsExt to forward to
+# `Treebars.finalize_progress!` / `Treebars.fail_progress!`. Default is no-op
+# so DO stays independent of Treebars. Called from ThreadsafeDict's spawn
+# wrapper around `f(s)` to give the substatus the `with_progress` init/run/
+# finalize symmetry it otherwise lacks.
+_finalize_substatus!(s) = nothing
+_finalize_substatus!(::Nothing) = nothing
+_fail_substatus!(s, e) = nothing
+_fail_substatus!(::Nothing, e) = nothing
+
 struct PropertyCache{D<:AbstractDict{Symbol,Any}}
     cache::D
     PropertyCache(D, c::NamedTuple) = new{D{Symbol,Any}}(D{Symbol,Any}(pairs(c)))
@@ -141,13 +151,21 @@ Base.get!(f::Function, c::ThreadsafeDict, key; fetch=Base.fetch, substatus=nothi
                     c.status[key] = s
                 end
                 Threads.@spawn begin
-                    tmp = f(s)
-                    lock(c.lock) do
-                        c.cache[key] = tmp
-                        pop!(c.tasks, key)
-                        haskey(c.status, key) && pop!(c.status, key)
+                    try
+                        tmp = f(s)
+                        lock(c.lock) do
+                            c.cache[key] = tmp
+                            pop!(c.tasks, key)
+                            haskey(c.status, key) && pop!(c.status, key)
+                        end
+                        _finalize_substatus!(s)
+                        tmp
+                    catch e
+                        # Leave c.tasks/c.status populated so entries()/getstatus()
+                        # can surface the failure until retry_failed clears it.
+                        _fail_substatus!(s, e)
+                        rethrow()
                     end
-                    tmp
                 end
             end
         end
