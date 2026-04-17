@@ -1180,8 +1180,16 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             Expr(:kw, :__parent__, :__self__),
             (Expr(:kw, ip, ip) for ip in index_params)...,
             Expr(:kw, :cache_type, :(__self__.__cache_type__)),
-            Expr(:kw, :__status__, Expr(:call, compute_property, :__self__, :(Val(:__substatus__)), QuoteNode(prop_name), index_params...)),
         ]
+        # Auto-wire __status__ as a substatus of the parent, UNLESS the child
+        # body declares its own __status__ (opt-out). Declaring
+        # `__status__ = nothing` suppresses per-access Treebar nodes; declaring
+        # `__status__ = __parent__.__status__` inherits the parent's status
+        # directly without creating a child progress node.
+        if !(:__status__ in child_props)
+            push!(constructor_kwargs,
+                Expr(:kw, :__status__, Expr(:call, compute_property, :__self__, :(Val(:__substatus__)), QuoteNode(prop_name), index_params...)))
+        end
         constructor = Expr(:call, gen_name, Expr(:parameters, constructor_kwargs...))
         lhs_expr = isempty(index_params) ? prop_name : Expr(:call, prop_name, index_params...)
         body.args[i] = Expr(:(=), lhs_expr, constructor)
