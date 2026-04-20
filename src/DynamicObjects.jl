@@ -22,6 +22,7 @@ optionally disk-cached properties.
 - [`clear_disk_caches!`](@ref): Delete on-disk cache files (in-memory values untouched).
 - [`clear_all_caches!`](@ref): Clear both in-memory and disk caches.
 - [`PersistentSet`](@ref): Thread-safe, disk-persisted `Set`.
+- [`LazyPersistentDict`](@ref): Thread-safe, lazily-loaded, disk-persisted `Dict`.
 - [`KeyTracker`](@ref): Abstract type for pluggable accessed-keys persistence strategies.
 - [`SharedFileTracker`](@ref): Default strategy — single shared `_keys.sjl` file.
 - [`PerPodFileTracker`](@ref): Per-pod strategy — one file per pod ID, merged on read.
@@ -31,7 +32,7 @@ optionally disk-cached properties.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!
 
 import SHA, Serialization
 
@@ -327,6 +328,130 @@ Base.collect(s::PersistentSet) = @lock s.lock collect(s.data)
 Base.iterate(s::PersistentSet) = @lock s.lock iterate(s.data)
 Base.iterate(s::PersistentSet, state) = @lock s.lock iterate(s.data, state)
 Base.show(io::IO, s::PersistentSet) = print(io, "PersistentSet(", length(s.data), " items, ", s.path, ")")
+
+# --- LazyPersistentDict ---
+
+"""
+    LazyPersistentDict{D<:AbstractDict}(path[, empty_data]; seed!)
+
+Threadsafe dict backed by `Serialization.serialize`/`deserialize`. The backing
+file path is resolved **lazily** via a callable `path` so the constructor
+itself is precompile-safe (no `mkpath`, no file I/O). The on-disk file is
+loaded on the first operation (double-checked under the lock), and the
+optional `seed!(data)` callback runs once after load if the dict is empty.
+Mutations persist to disk synchronously under the lock.
+
+`path` may be an `AbstractString` (fixed path) or a 0-arg function returning
+a `String`. Pass an ordered backing dict (e.g. `OrderedDict{K,V}()`) to
+preserve insertion order.
+"""
+mutable struct LazyPersistentDict{D<:AbstractDict}
+    path_fn::Function
+    data::D
+    seed!::Function
+    lock::ReentrantLock
+    loaded::Bool
+end
+
+_no_seed!(_) = nothing
+
+function LazyPersistentDict(path, empty_data::D = Dict{Any,Any}();
+        seed! = _no_seed!) where {D<:AbstractDict}
+    path_fn = path isa AbstractString ? (let p = String(path); () -> p end) : path
+    LazyPersistentDict{D}(path_fn, empty_data, seed!, ReentrantLock(), false)
+end
+
+function _ensure_loaded!(d::LazyPersistentDict)
+    @lock d.lock begin
+        d.loaded && return
+        p = d.path_fn()
+        if isfile(p)
+            try
+                loaded = Serialization.deserialize(p)
+                if loaded isa typeof(d.data)
+                    d.data = loaded
+                else
+                    merge!(d.data, loaded)
+                end
+            catch e
+                @warn "LazyPersistentDict: failed to load $p, starting empty" exception=e
+            end
+        end
+        if isempty(d.data)
+            d.seed!(d.data)
+            if !isempty(d.data)
+                try
+                    _persist_unlocked!(d)
+                catch e
+                    @warn "LazyPersistentDict: failed to persist seeded data to $(d.path_fn())" exception=e
+                end
+            end
+        end
+        d.loaded = true
+    end
+end
+
+function _persist_unlocked!(d::LazyPersistentDict)
+    p = d.path_fn()
+    mkpath(dirname(p))
+    Serialization.serialize(p, d.data)
+end
+
+Base.keys(d::LazyPersistentDict) = (_ensure_loaded!(d); @lock d.lock collect(keys(d.data)))
+Base.values(d::LazyPersistentDict) = (_ensure_loaded!(d); @lock d.lock collect(values(d.data)))
+Base.pairs(d::LazyPersistentDict) = (_ensure_loaded!(d); @lock d.lock collect(pairs(d.data)))
+Base.length(d::LazyPersistentDict) = (_ensure_loaded!(d); @lock d.lock length(d.data))
+Base.isempty(d::LazyPersistentDict) = (_ensure_loaded!(d); @lock d.lock isempty(d.data))
+Base.haskey(d::LazyPersistentDict, k) = (_ensure_loaded!(d); @lock d.lock haskey(d.data, k))
+Base.getindex(d::LazyPersistentDict, k) = (_ensure_loaded!(d); @lock d.lock d.data[k])
+Base.get(d::LazyPersistentDict, k, default) = (_ensure_loaded!(d); @lock d.lock get(d.data, k, default))
+
+function Base.iterate(d::LazyPersistentDict, st=nothing)
+    if st === nothing
+        _ensure_loaded!(d)
+        snap = @lock d.lock collect(pairs(d.data))
+        rv = iterate(snap)
+        rv === nothing && return nothing
+        (pair, idx) = rv
+        return (pair, (snap, idx))
+    end
+    (snap, idx) = st
+    rv = iterate(snap, idx)
+    rv === nothing && return nothing
+    (pair, next_idx) = rv
+    (pair, (snap, next_idx))
+end
+Base.IteratorSize(::Type{<:LazyPersistentDict}) = Base.HasLength()
+Base.eltype(::Type{LazyPersistentDict{D}}) where {D<:AbstractDict} = eltype(D)
+
+function Base.setindex!(d::LazyPersistentDict, v, k)
+    _ensure_loaded!(d)
+    @lock d.lock begin
+        d.data[k] = v
+        _persist_unlocked!(d)
+    end
+    v
+end
+
+function Base.delete!(d::LazyPersistentDict, k)
+    _ensure_loaded!(d)
+    @lock d.lock begin
+        delete!(d.data, k)
+        _persist_unlocked!(d)
+    end
+    d
+end
+
+function Base.get!(f::Function, d::LazyPersistentDict, k)
+    _ensure_loaded!(d)
+    @lock d.lock begin
+        haskey(d.data, k) && return d.data[k]
+        rv = f()
+        d.data[k] = rv
+        _persist_unlocked!(d)
+        rv
+    end
+end
 
 # --- entries / cached_entries for IndexableProperty ---
 
