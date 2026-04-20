@@ -18,7 +18,9 @@ optionally disk-cached properties.
 - [`unwrap_error`](@ref): Dig through exception wrappers to find the root cause.
 - [`entries`](@ref): List all entries in a `ThreadsafeDict`-backed property with state info.
 - [`cached_entries`](@ref): Iterate completed (non-Task) entries of an indexed property.
-- [`clear_all_caches!`](@ref): Clear all `@cached` properties on a `@dynamicstruct` instance.
+- [`clear_mem_caches!`](@ref): Clear in-memory memoized values (disk caches untouched).
+- [`clear_disk_caches!`](@ref): Delete on-disk cache files (in-memory values untouched).
+- [`clear_all_caches!`](@ref): Clear both in-memory and disk caches.
 - [`PersistentSet`](@ref): Thread-safe, disk-persisted `Set`.
 - [`KeyTracker`](@ref): Abstract type for pluggable accessed-keys persistence strategies.
 - [`SharedFileTracker`](@ref): Default strategy — single shared `_keys.sjl` file.
@@ -29,7 +31,7 @@ optionally disk-cached properties.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, PersistentSet, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!
 
 import SHA, Serialization
 
@@ -373,22 +375,57 @@ function cached_entries(ip::IndexableProperty)
     collect(ip.cache)
 end
 
-# --- clear_all_caches! ---
+# --- cache clearing ---
+
+"""
+    clear_mem_caches!(obj)
+
+Clear all in-memory memoized property values on a `@dynamicstruct` instance,
+leaving disk caches (`@cached` files) untouched. Every derived property —
+including child DOs stored as values — will be recomputed on next access.
+
+This is useful after hot-reloading code via Revise: property values computed by
+old method definitions stay memoized until the process restarts or this function
+is called.
+"""
+function clear_mem_caches!(obj)
+    empty!(getfield(obj, :cache).cache)
+    nothing
+end
+
+"""
+    clear_disk_caches!(obj)
+
+Delete all on-disk cache files for `@cached` properties on a `@dynamicstruct`
+instance. In-memory values are left intact (they'll be stale until
+`clear_mem_caches!` is also called, or until the process restarts).
+"""
+function clear_disk_caches!(obj)
+    m = meta(typeof(obj))
+    cp = obj.cache_path
+    isdir(cp) || return nothing
+    for (name, info) in m
+        isfixed(info) && continue
+        Symbol("@cached") in info.macros || continue
+        prefix = string(name)
+        for f in readdir(cp)
+            if endswith(f, ".sjl") && (f == prefix * ".sjl" || startswith(f, prefix * "_"))
+                rm(joinpath(cp, f))
+            end
+        end
+    end
+    nothing
+end
 
 """
     clear_all_caches!(obj)
 
 Clear all `@cached` properties on a `@dynamicstruct` instance — both in-memory
-and on disk. Equivalent to calling `@clear_cache!` on every cached property.
+and on disk. Equivalent to `clear_mem_caches!` + `clear_disk_caches!`.
 """
 function clear_all_caches!(obj)
-    m = meta(typeof(obj))
-    for (name, info) in m
-        isfixed(info) && continue
-        Symbol("@cached") in info.macros || continue
-        clear_cache!(obj, name)
-    end
-    nothing
+    clear_mem_caches!(obj)
+    clear_disk_caches!(obj)
 end
 
 # --- KeyTracker: pluggable strategy for accessed-keys persistence ---
