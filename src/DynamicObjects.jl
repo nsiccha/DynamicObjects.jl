@@ -1754,11 +1754,22 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 # the method body — Julia uses the body's first LNN for
                 # Method.file/line, which must point at user code.
                 _lnn = something(info.lnn, LineNumberNode(0, :unknown))
+                # Walk kwarg defaults with kwarg names excluded from locals,
+                # so that `seed=seed` correctly transforms the default `seed`
+                # into `__self__.seed` rather than leaving it as a bare symbol.
+                kwarg_names = Set{Symbol}()
+                for idx in info.indices
+                    Meta.isexpr(idx, :parameters) || continue
+                    for a in idx.args
+                        Meta.isexpr(a, :kw) && push!(kwarg_names, a.args[1] isa Expr ? a.args[1].args[1] : a.args[1])
+                    end
+                end
+                defaults_locals = setdiff(info.locals, kwarg_names)
                 walked_indices = map(info.indices) do idx
                     if Meta.isexpr(idx, :parameters)
                         Expr(:parameters, map(idx.args) do a
                             if Meta.isexpr(a, :kw)
-                                Expr(:kw, a.args[1], walk_rhs(a.args[2]; info.locals, properties, lnn=info.lnn))
+                                Expr(:kw, a.args[1], walk_rhs(a.args[2]; locals=defaults_locals, properties, lnn=info.lnn))
                             else
                                 a
                             end
