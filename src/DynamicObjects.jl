@@ -1232,7 +1232,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     # Collect parent property names (excluding inline structs themselves)
     parent_props = Symbol[]
     for arg in body.args
-        arg isa Expr || continue
+        arg isa LineNumberNode && continue
         a = arg
         while Meta.isexpr(a, :macrocall); a = a.args[end]; end
         # Skip inline structs (both forms)
