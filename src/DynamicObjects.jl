@@ -9,6 +9,7 @@ optionally disk-cached properties.
 - [`@cache_status`](@ref): Get the disk-cache status of a property (`:unstarted`, `:started`, `:ready`).
 - [`@is_cached`](@ref): Check whether a property's disk cache is ready.
 - [`@cache_path`](@ref): Get the file path used for a property's disk cache.
+- [`@lru`](@ref): Bound an indexed property's in-memory cache via LRU eviction.
 - [`remake`](@ref): Create a new instance of a `@dynamicstruct` type with some fields changed.
 - [`fetchindex`](@ref): Non-blocking access to `ThreadsafeDict`-backed properties with `(rv, status)` callback.
 - [`getstatus`](@ref): Read the status object for an in-flight computation.
@@ -32,7 +33,7 @@ optionally disk-cached properties.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo, @lru, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, ThreadsafeLRUDict, LRUDict
 
 import SHA, Serialization
 
@@ -102,7 +103,18 @@ Base.getindex(ip::IndexableProperty, indices...; fetch=Base.fetch, kwargs...) =
     get!(ip.cache, (indices, (;kwargs...))) do
         ip(indices...; kwargs...)
     end
-struct ThreadsafeDict{K,V} <: AbstractDict{K,V}
+"""
+    AbstractThreadsafeDict{K,V}
+
+Supertype for the lock-protected, task-spawning dicts that back `:parallel`
+indexed properties. Concrete subtypes (`ThreadsafeDict`, `ThreadsafeLRUDict`)
+share the `(lock, cache, tasks, status)` shape so that `getstatus`/`cancel!`/
+`fetchindex`/`entries` and the `IndexableProperty` task-spawning `getindex`
+dispatch generically.
+"""
+abstract type AbstractThreadsafeDict{K,V} <: AbstractDict{K,V} end
+
+struct ThreadsafeDict{K,V} <: AbstractThreadsafeDict{K,V}
     lock::ReentrantLock
     cache::Dict{K,V}
     tasks::Dict{K,Task}
@@ -111,22 +123,66 @@ struct ThreadsafeDict{K,V} <: AbstractDict{K,V}
     ThreadsafeDict() = new{Any,Any}(ReentrantLock(), Dict{Any,Any}(), Dict{Any,Task}(), Dict{Any,Any}())
 end
 
+"""
+    ThreadsafeLRUDict{K,V}(maxsize)
+
+A `ThreadsafeDict` variant that bounds its cache to `maxsize` entries, evicting
+the least-recently-used keys on insert. Eviction skips keys that have an
+in-flight `Task` (i.e. a running computation), so callers awaiting a result
+never observe its cache slot vanish underneath them. If every slot is pinned
+by a running task, the dict is allowed to temporarily exceed `maxsize`.
+
+The `(lock, cache, tasks, status)` shape matches `ThreadsafeDict`, so all the
+generic dispatch on `<:AbstractThreadsafeDict` (`getstatus`, `cancel!`,
+`fetchindex`, `entries`, …) works unchanged.
+"""
+mutable struct ThreadsafeLRUDict{K,V} <: AbstractThreadsafeDict{K,V}
+    lock::ReentrantLock
+    cache::Dict{K,V}
+    tasks::Dict{K,Task}
+    status::Dict{K,Any}
+    order::Vector{K}        # MRU-last
+    maxsize::Int
+end
+ThreadsafeLRUDict{K,V}(maxsize::Integer) where {K,V} =
+    ThreadsafeLRUDict{K,V}(ReentrantLock(), Dict{K,V}(), Dict{K,Task}(), Dict{K,Any}(), K[], Int(maxsize))
+ThreadsafeLRUDict(maxsize::Integer) = ThreadsafeLRUDict{Any,Any}(maxsize)
+
+"""
+    LRUDict{K,V}(maxsize)
+
+Plain (non-thread-safe) `Dict` bounded to `maxsize` entries via least-recently-used
+eviction. Used as the per-property in-memory cache for `@lru`-marked properties on
+`:serial` `@dynamicstruct` instances.
+"""
+mutable struct LRUDict{K,V} <: AbstractDict{K,V}
+    cache::Dict{K,V}
+    order::Vector{K}        # MRU-last
+    maxsize::Int
+    LRUDict{K,V}(maxsize::Integer) where {K,V} = new{K,V}(Dict{K,V}(), K[], Int(maxsize))
+end
+LRUDict(maxsize::Integer) = LRUDict{Any,Any}(maxsize)
+
 const _cache_types = (;serial=Dict, parallel=ThreadsafeDict)
 resolve_cache_type(s::Symbol) = get(_cache_types, s, s)
 resolve_cache_type(T::Type) = T isa UnionAll ? T : T.name.wrapper
 
-Base.length(c::ThreadsafeDict) = lock(c.lock) do; length(c.cache); end
+Base.length(c::AbstractThreadsafeDict) = lock(c.lock) do; length(c.cache); end
 # NOTE: iteration is NOT truly thread-safe — each iterate call locks independently,
 # so the dict can mutate between calls. For thread-safe iteration, use
 # lock(c.lock) do ... end or entries(ip) which holds the lock for the full sweep.
-Base.iterate(c::ThreadsafeDict) = lock(c.lock) do; iterate(c.cache); end
-Base.iterate(c::ThreadsafeDict, state) = lock(c.lock) do; iterate(c.cache, state); end
+Base.iterate(c::AbstractThreadsafeDict) = lock(c.lock) do; iterate(c.cache); end
+Base.iterate(c::AbstractThreadsafeDict, state) = lock(c.lock) do; iterate(c.cache, state); end
 Base.empty!(c::ThreadsafeDict) = (lock(c.lock) do; empty!(c.cache); empty!(c.tasks); empty!(c.status); end; c)
-n_running(c::ThreadsafeDict) = lock(c.lock) do; length(c.tasks); end
+Base.empty!(c::ThreadsafeLRUDict) = (lock(c.lock) do; empty!(c.cache); empty!(c.tasks); empty!(c.status); empty!(c.order); end; c)
+n_running(c::AbstractThreadsafeDict) = lock(c.lock) do; length(c.tasks); end
 Base.show(io::IO, c::ThreadsafeDict{K,V}) where {K,V} = lock(c.lock) do
     print(io, "ThreadsafeDict{", K, ",", V, "}(", length(c.cache), " cached, ", length(c.tasks), " running)")
 end
-Base.getindex(ip::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indices...; fetch=Base.fetch, retry_failed=true, kwargs...) where {name} = begin
+Base.show(io::IO, c::ThreadsafeLRUDict{K,V}) where {K,V} = lock(c.lock) do
+    print(io, "ThreadsafeLRUDict{", K, ",", V, "}(", length(c.cache), "/", c.maxsize, " cached, ", length(c.tasks), " running)")
+end
+Base.getindex(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...; fetch=Base.fetch, retry_failed=true, kwargs...) where {name} = begin
     (;o, cache) = ip
     substatus_f = if name != :__substatus__ && name != :__status__
         () -> begin
@@ -140,9 +196,13 @@ Base.getindex(ip::IndexableProperty{name,<:Any,<:ThreadsafeDict}, indices...; fe
         getorcomputeproperty(o, name, indices...; __status__=s, kwargs...)
     end
 end
-Base.get!(f::Function, c::ThreadsafeDict, key; fetch=Base.fetch, substatus=nothing, retry_failed=true) = begin
+Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substatus=nothing, retry_failed=true) = begin
     rv = lock(c.lock) do
-        get(c.cache, key) do
+        v = get(c.cache, key, _missing_sentinel)
+        if v !== _missing_sentinel
+            _on_hit!(c, key)
+            v
+        else
             # Clean up failed tasks so they can be retried (only when retry_failed=true)
             if retry_failed && haskey(c.tasks, key) && istaskdone(c.tasks[key]) && istaskfailed(c.tasks[key])
                 pop!(c.tasks, key)
@@ -159,6 +219,7 @@ Base.get!(f::Function, c::ThreadsafeDict, key; fetch=Base.fetch, substatus=nothi
                         lock(c.lock) do
                             c.cache[key] = tmp
                             pop!(c.tasks, key)
+                            _on_store!(c, key)
                         end
                         _finalize_substatus!(s)
                         tmp
@@ -174,18 +235,103 @@ Base.get!(f::Function, c::ThreadsafeDict, key; fetch=Base.fetch, substatus=nothi
     end
     fetch(rv)
 end
-Base.pop!(c::ThreadsafeDict, key) = begin
+
+# Singleton sentinel so a single `get` lookup distinguishes "key absent" from
+# "key present with value === nothing" without allowing collision with any
+# user-stored value.
+struct _Missing end
+const _missing_sentinel = _Missing()
+
+# Hooks into get! for LRU bookkeeping. No-ops on plain ThreadsafeDict;
+# ThreadsafeLRUDict implements ordering and eviction. Both run under c.lock.
+_on_hit!(::AbstractThreadsafeDict, key) = nothing
+_on_store!(::AbstractThreadsafeDict, key) = nothing
+function _on_hit!(c::ThreadsafeLRUDict, key)
+    idx = findfirst(==(key), c.order)
+    isnothing(idx) && return
+    idx == length(c.order) && return
+    deleteat!(c.order, idx)
+    push!(c.order, key)
+end
+function _on_store!(c::ThreadsafeLRUDict, key)
+    push!(c.order, key)
+    # Evict from front, skipping pinned keys (those with running tasks).
+    # If every slot is pinned, leave the dict temporarily oversized.
+    while length(c.cache) > c.maxsize
+        evicted = false
+        for i in eachindex(c.order)
+            k = c.order[i]
+            if !haskey(c.tasks, k)
+                deleteat!(c.order, i)
+                haskey(c.cache, k) && pop!(c.cache, k)
+                haskey(c.status, k) && pop!(c.status, k)
+                evicted = true
+                break
+            end
+        end
+        evicted || break
+    end
+end
+
+Base.pop!(c::AbstractThreadsafeDict, key) = begin
     lock(c.lock) do
         haskey(c.status, key) && pop!(c.status, key)
+        _drop_order!(c, key)
         pop!(c.cache, key)
     end
 end
-Base.delete!(c::ThreadsafeDict, key) = begin
+Base.delete!(c::AbstractThreadsafeDict, key) = begin
     lock(c.lock) do
         delete!(c.status, key)
         delete!(c.tasks, key)
+        _drop_order!(c, key)
         delete!(c.cache, key)
     end
+    c
+end
+_drop_order!(::AbstractThreadsafeDict, key) = nothing
+function _drop_order!(c::ThreadsafeLRUDict, key)
+    idx = findfirst(==(key), c.order)
+    isnothing(idx) || deleteat!(c.order, idx)
+end
+
+# --- Synchronous LRUDict (for :serial @dynamicstruct + @lru) ---
+Base.length(c::LRUDict) = length(c.cache)
+Base.iterate(c::LRUDict, args...) = iterate(c.cache, args...)
+Base.haskey(c::LRUDict, key) = haskey(c.cache, key)
+Base.empty!(c::LRUDict) = (empty!(c.cache); empty!(c.order); c)
+Base.show(io::IO, c::LRUDict{K,V}) where {K,V} =
+    print(io, "LRUDict{", K, ",", V, "}(", length(c.cache), "/", c.maxsize, ")")
+function _touch_lru!(c::LRUDict, key)
+    idx = findfirst(==(key), c.order)
+    isnothing(idx) && return
+    idx == length(c.order) && return
+    deleteat!(c.order, idx)
+    push!(c.order, key)
+end
+function Base.get!(f::Function, c::LRUDict, key)
+    if haskey(c.cache, key)
+        _touch_lru!(c, key)
+        return c.cache[key]
+    end
+    v = f()
+    c.cache[key] = v
+    push!(c.order, key)
+    while length(c.cache) > c.maxsize
+        evicted = popfirst!(c.order)
+        delete!(c.cache, evicted)
+    end
+    v
+end
+function Base.pop!(c::LRUDict, key)
+    idx = findfirst(==(key), c.order)
+    isnothing(idx) || deleteat!(c.order, idx)
+    pop!(c.cache, key)
+end
+function Base.delete!(c::LRUDict, key)
+    idx = findfirst(==(key), c.order)
+    isnothing(idx) || deleteat!(c.order, idx)
+    delete!(c.cache, key)
     c
 end
 
@@ -198,7 +344,7 @@ or no `__substatus__` defined).
 
 Only meaningful for `IndexableProperty` backed by a `ThreadsafeDict`.
 """
-getstatus(ip::IndexableProperty{<:Any,<:Any,<:ThreadsafeDict}, indices...; kwargs...) = begin
+getstatus(ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}, indices...; kwargs...) = begin
     lock(ip.cache.lock) do
         get(ip.cache.status, (indices, (;kwargs...)), nothing)
     end
@@ -211,7 +357,7 @@ getstatus(::IndexableProperty, indices...; kwargs...) = nothing
 Cancel a running task for the given key on a `ThreadsafeDict`-backed `IndexableProperty`.
 Returns `true` if a running task was found and interrupted, `false` otherwise.
 """
-cancel!(ip::IndexableProperty{<:Any,<:Any,<:ThreadsafeDict}, indices...; kwargs...) = begin
+cancel!(ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}, indices...; kwargs...) = begin
     key = (indices, (;kwargs...))
     lock(ip.cache.lock) do
         if haskey(ip.cache.tasks, key) && !istaskdone(ip.cache.tasks[key])
@@ -231,7 +377,7 @@ cancel!(::IndexableProperty, args...; kwargs...) = false
 
 Cancel all running tasks on a `ThreadsafeDict`-backed `IndexableProperty`.
 """
-cancel_all!(ip::IndexableProperty{<:Any,<:Any,<:ThreadsafeDict}) = begin
+cancel_all!(ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}) = begin
     lock(ip.cache.lock) do
         for (key, task) in ip.cache.tasks
             istaskdone(task) || Base.schedule(task, InterruptException(); error=true)
@@ -269,7 +415,7 @@ fetchindex(app.results, key) do rv, status
 end
 ```
 """
-function fetchindex(fetch, ip::IndexableProperty{<:Any,<:Any,<:ThreadsafeDict}, indices...; force=false, kwargs...)
+function fetchindex(fetch, ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}, indices...; force=false, kwargs...)
     if force
         maybepop!(ip.cache, (indices, (;kwargs...)))
         path = get_cache_path(ip.o, name(ip), indices...; kwargs...)
@@ -283,15 +429,23 @@ end
 fetchindex(fetch, args...; kwargs...) = getindex(args...; fetch, kwargs...)
 fetchindex!(::Nothing, ip, indices...; fetch=Base.fetch, kwargs...) = getindex(ip, indices...; fetch, kwargs...)
 maybepop!(c::AbstractDict, key) = haskey(c, key) && pop!(c, key)
-maybepop!(c::ThreadsafeDict, key) = begin
+maybepop!(c::AbstractThreadsafeDict, key) = begin
     lock(c.lock) do
         maybepop!(c.cache, key)
         maybepop!(c.tasks, key)
         maybepop!(c.status, key)
+        _drop_order!(c, key)
     end
 end
+
+# Per-property cache backing. Default falls through to the parent cache type;
+# `@dynamicstruct` emits 4-arg overrides for `@lru`-marked properties to swap
+# in an LRU-bounded dict. The 4-arg form is keyed on `(ParentType, Val{name})`
+# so an `@lru` directive on one struct doesn't leak to another struct that
+# happens to declare a property with the same Symbol.
+subcache(pc::PropertyCache, ::Type, ::Val) = subcache(pc)
 subcache(::PropertyCache{<:Dict}) = Dict()
-subcache(::PropertyCache{<:ThreadsafeDict}) = ThreadsafeDict()
+subcache(::PropertyCache{<:AbstractThreadsafeDict}) = ThreadsafeDict()
 
 # --- PersistentSet ---
 
@@ -464,7 +618,7 @@ Return a vector of `(; key, state, status, value)` for all entries in a
 or the `Task` (for running/failed/finishing). `status` is the substatus object
 or `nothing`.
 """
-function entries(ip::IndexableProperty{<:Any,<:Any,<:ThreadsafeDict})
+function entries(ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict})
     result = NamedTuple{(:key, :state, :status, :value), Tuple{Any, Symbol, Any, Any}}[]
     lock(ip.cache.lock) do
         for (k, task) in ip.cache.tasks
@@ -491,7 +645,7 @@ end
 
 Return a vector of `(key, value)` pairs for completed (non-Task) entries only.
 """
-function cached_entries(ip::IndexableProperty{<:Any,<:Any,<:ThreadsafeDict})
+function cached_entries(ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict})
     lock(ip.cache.lock) do
         collect(ip.cache.cache)
     end
@@ -687,7 +841,7 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
             cache_path = get_cache_path(o, name, indices...; kwargs...)
             mkpath(dirname(cache_path))
             __strict__ = getorcomputeproperty(o, :__strict__)
-            _is_threadsafe = getorcomputeproperty(o, :__cache_type__) <: ThreadsafeDict
+            _is_threadsafe = getorcomputeproperty(o, :__cache_type__) <: AbstractThreadsafeDict
             _cache_context = """Object type: $(nameof(typeof(o))) (objectid: $(objectid(o)), hash: $(hash(o)))
 Cache dict: $(_is_threadsafe ? "ThreadsafeDict (parallel)" : "Dict (serial) — if concurrent access is intended, use cache_type=:parallel")
 If multiple objects with the same hash are writing here concurrently, this may indicate a concurrency issue or a hashing collision."""
@@ -774,7 +928,7 @@ else
         # IndexableProperty wrapper instead of calling compute_property.
         if isempty(indices) && isempty(kwargs)
             if is_indexed_property(o, name)
-                return IndexableProperty(name, o, subcache(getfield(o, :cache)))
+                return IndexableProperty(name, o, subcache(getfield(o, :cache), typeof(o), Val(name)))
             end
         end
         _computeproperty(o, name, indices...; kwargs...)
@@ -887,6 +1041,38 @@ Return the file path where the disk-cached value of `o.prop` (or
 macro cache_path(x)
     cache_f_expr(x; f=get_cache_path) |> esc
 end
+"""
+    @lru maxsize prop(idx...) = expr
+
+Mark an indexed property in a `@dynamicstruct` body so that its per-property
+in-memory cache is bounded to `maxsize` entries with least-recently-used
+eviction, instead of the unbounded `Dict`/`ThreadsafeDict` inherited from the
+struct's `cache_type`.
+
+`maxsize` must be a literal integer (so the bound is fixed at struct-definition
+time). Eviction is task-aware on `:parallel` structs: keys with an in-flight
+`Task` are never evicted — if every slot is pinned, the cache temporarily
+exceeds `maxsize` until something settles.
+
+`@lru` is orthogonal to `@cached`: both can apply to the same property — the
+disk cache is unaffected, only the in-memory dict is bounded.
+
+```julia
+@dynamicstruct struct App
+    @lru 100 sim(subject_id) = expensive(subject_id)
+    @cached @lru 50 fit(model, seed) = run_fit(model, seed)
+end
+```
+
+Outside a `@dynamicstruct` body the macro is a no-op pass-through on the
+property expression — the actual cache substitution is done via the
+`subcache` overrides emitted by `@dynamicstruct`.
+"""
+macro lru(maxsize, x)
+    maxsize isa Integer || error("@lru: maxsize must be a literal Integer, got: \$maxsize")
+    esc(x)
+end
+
 macro persist(x)
     x, indices = if Meta.isexpr(x, (:ref, :call))
         x.args[1], x.args[2:end]
@@ -1208,13 +1394,13 @@ end
 _emit_positional_destructure!(oproperties, docs, elements, source_sym, lnn) = for (i, a) in enumerate(elements)
     if a isa Symbol || Meta.isexpr(a, :(::))
         leaf = Meta.isexpr(a, :(::)) ? a.args[1] : a
-        push!(oproperties, leaf => (;lhs=leaf, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([leaf]), indices=tuple(), indexed=false, cache_version=nothing))
+        push!(oproperties, leaf => (;lhs=leaf, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([leaf]), indices=tuple(), indexed=false, cache_version=nothing, lru_size=nothing))
         push!(docs, (leaf => (nothing, true)))
     elseif Meta.isexpr(a, :tuple)
         inner_leaves = _collect_leaves(a)
         inner_name = Symbol("_tuple_", join(inner_leaves, "_"))
         inner_locals = Set{Symbol}(inner_leaves); push!(inner_locals, inner_name)
-        push!(oproperties, inner_name => (;lhs=inner_name, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=inner_locals, indices=tuple(), indexed=false, cache_version=nothing))
+        push!(oproperties, inner_name => (;lhs=inner_name, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=inner_locals, indices=tuple(), indexed=false, cache_version=nothing, lru_size=nothing))
         push!(docs, (inner_name => (nothing, true)))
         _emit_positional_destructure!(oproperties, docs, a.args, inner_name, lnn)
     else
@@ -1376,6 +1562,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         indices = tuple()
         indexed = false
         cache_version = nothing
+        lru_size = nothing
         while Meta.isexpr(arg, :macrocall)
             push!(macros, arg.args[1])
             if arg.args[1] == Symbol("@cached") && length(arg.args) == 4
@@ -1387,6 +1574,10 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 else
                     error("@cached version argument must be a version string like v\"2\", got: $ver_expr")
                 end
+            elseif arg.args[1] == Symbol("@lru") && length(arg.args) == 4
+                sz = arg.args[3]
+                sz isa Integer || error("@lru: maxsize must be a literal Integer, got: $sz")
+                lru_size = Int(sz)
             end
             arg = arg.args[end]
         end
@@ -1410,7 +1601,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 all_leaves = _collect_leaves(arg)
                 group_name = Symbol("_tuple_", join(all_leaves, "_"))
                 group_locals = Set{Symbol}(all_leaves); push!(group_locals, group_name)
-                push!(oproperties, group_name => (;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, cache_version))
+                push!(oproperties, group_name => (;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, cache_version, lru_size=nothing))
                 push!(docs, (group_name => (doc, true)))
                 _emit_positional_destructure!(oproperties, docs, raw_args, group_name, lnn)
                 doc = nothing
@@ -1454,7 +1645,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 group_name = Symbol("_tuple_", join(prop_names, "_"))
                 group_locals = Set{Symbol}(prop_names)
                 push!(group_locals, group_name)
-                push!(oproperties, group_name=>(;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, cache_version))
+                push!(oproperties, group_name=>(;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, cache_version, lru_size=nothing))
                 push!(docs, (group_name=>(doc, true)))
                 group_name
             end
@@ -1465,7 +1656,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 else
                     :($extract_from[$source])
                 end
-                push!(oproperties, prop_name=>(;lhs=prop_name, macros=Set{Symbol}(), rhs=extract_rhs, lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([prop_name]), indices=tuple(), indexed=false, cache_version=nothing))
+                push!(oproperties, prop_name=>(;lhs=prop_name, macros=Set{Symbol}(), rhs=extract_rhs, lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([prop_name]), indices=tuple(), indexed=false, cache_version=nothing, lru_size=nothing))
                 push!(docs, (prop_name=>(nothing, true)))
             end
             continue
@@ -1492,7 +1683,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         !isnothing(locals) && push!(locals, name)
         !isnothing(locals) && push!(locals, :__status__)
         @assert !isnothing(rhs) || length(macros) == 0
-        push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices, indexed, cache_version))
+        push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices, indexed, cache_version, lru_size))
     end
     properties = Dict(oproperties)
     property_docs = Dict(name => doc for (name, (doc, _)) in docs if !isnothing(doc))
@@ -1601,6 +1792,22 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     )
                     cv_expr = (_lnn, Expr(:(=), cv_method, Expr(:block, _lnn, info.cache_version)))
                     push!(block.args, cv_expr...)
+                end
+                if !isnothing(info.lru_size)
+                    info.indexed || error("@lru on non-indexed property `$name`: only indexed properties have a per-property cache to bound. Drop the `@lru` or give the property index parameters: `$name(idx) = …`")
+                    sz = info.lru_size
+                    pc_ts = :($(Expr(:., DynamicObjects, QuoteNode(:PropertyCache))){<:$(Expr(:., DynamicObjects, QuoteNode(:AbstractThreadsafeDict)))})
+                    pc_pl = :($(Expr(:., DynamicObjects, QuoteNode(:PropertyCache))){<:Dict})
+                    sub_call_ts = Expr(:call, Expr(:., DynamicObjects, QuoteNode(:subcache)),
+                        :(::$pc_ts), :(::Type{$type}), :(::Val{$(Meta.quot(name))}))
+                    sub_call_pl = Expr(:call, Expr(:., DynamicObjects, QuoteNode(:subcache)),
+                        :(::$pc_pl), :(::Type{$type}), :(::Val{$(Meta.quot(name))}))
+                    sub_body_ts = Expr(:block, _lnn,
+                        Expr(:call, Expr(:curly, Expr(:., DynamicObjects, QuoteNode(:ThreadsafeLRUDict)), :Any, :Any), sz))
+                    sub_body_pl = Expr(:block, _lnn,
+                        Expr(:call, Expr(:curly, Expr(:., DynamicObjects, QuoteNode(:LRUDict)), :Any, :Any), sz))
+                    push!(block.args, _lnn, Expr(:(=), sub_call_ts, sub_body_ts))
+                    push!(block.args, _lnn, Expr(:(=), sub_call_pl, sub_body_pl))
                 end
                 !isnothing(desc_expr) && push!(block.args, desc_expr...)
                 block
