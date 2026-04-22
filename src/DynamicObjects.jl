@@ -1419,6 +1419,26 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     Meta.isexpr(type, :(<:)) && (type = type.args[1])
     Meta.isexpr(type, :(curly)) && (type = type.args[1])
     @assert body.head == :block
+    # --- Rewrite `@struct prop[(idx...)] = begin body end` into the equivalent
+    # `prop[(idx...)] = struct <auto-named> body end` so the Form 1 path picks
+    # it up. `@struct` is not a real macro — it's a marker handled here.
+    for (i, arg) in enumerate(body.args)
+        arg isa Expr || continue
+        Meta.isexpr(arg, :macrocall) || continue
+        arg.args[1] == Symbol("@struct") || continue
+        inner = arg.args[end]
+        Meta.isexpr(inner, :(=)) ||
+            error("@struct: expected `prop = begin ... end` or `prop(idx...) = begin ... end`, got $(arg)")
+        lhs = inner.args[1]
+        rhs = inner.args[2]
+        Meta.isexpr(rhs, :block) ||
+            error("@struct: RHS must be a `begin ... end` block, got $(rhs)")
+        prop_sym = Meta.isexpr(lhs, :call) ? lhs.args[1] : lhs
+        prop_sym isa Symbol ||
+            error("@struct: LHS must be `prop` or `prop(idx...)`, got $(lhs)")
+        gen_child_name = Symbol(prop_sym, "_inline")
+        body.args[i] = Expr(:(=), lhs, Expr(:struct, false, gen_child_name, rhs))
+    end
     # --- Extract inline struct definitions ---
     # Collect parent property names (excluding inline structs themselves)
     parent_props = Symbol[]
