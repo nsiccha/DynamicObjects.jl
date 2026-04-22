@@ -1464,6 +1464,10 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         prop_name = nothing
         child_struct = nothing
         index_params = Symbol[]
+        # (name, default_or_nothing) — `nothing` here means "no user-supplied
+        # default" (required kwarg); any explicit default (even a literal
+        # `nothing` written by the user) is wrapped in Some(...).
+        index_kwargs = Tuple{Symbol,Any}[]
         # Form 1a: prop(idx...) = struct Name ... end  (indexed inline struct)
         # Julia parses short-form function defs with a :block wrapper around the
         # RHS — so `subject(idx) = struct Subject ... end` has args[2] = :block
@@ -1478,9 +1482,24 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 call_expr = arg.args[1]
                 prop_name = call_expr.args[1]
                 for p in call_expr.args[2:end]
-                    pname = Meta.isexpr(p, :(::)) ? p.args[1] : p
-                    @assert pname isa Symbol "indexed inline struct: index param must be a Symbol, got $p"
-                    push!(index_params, pname)
+                    if Meta.isexpr(p, :parameters)
+                        for kw in p.args
+                            if Meta.isexpr(kw, :kw)
+                                kname = kw.args[1]
+                                Meta.isexpr(kname, :(::)) && (kname = kname.args[1])
+                                @assert kname isa Symbol "indexed inline struct kwarg name must be a Symbol, got $(kw.args[1])"
+                                push!(index_kwargs, (kname, Some(kw.args[2])))
+                            else
+                                kname = Meta.isexpr(kw, :(::)) ? kw.args[1] : kw
+                                @assert kname isa Symbol "indexed inline struct kwarg name must be a Symbol, got $kw"
+                                push!(index_kwargs, (kname, nothing))
+                            end
+                        end
+                    else
+                        pname = Meta.isexpr(p, :(::)) ? p.args[1] : p
+                        @assert pname isa Symbol "indexed inline struct: index param must be a Symbol, got $p"
+                        push!(index_params, pname)
+                    end
                 end
                 child_struct = rhs_expr
             end
@@ -1513,12 +1532,13 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         # Prepend __parent__, index params, hash_fields override, and
         # forwarded parent properties to the child body.
         child_body = child_struct.args[3]
-        prepend_names = Set{Symbol}([:__parent__, index_params...])
+        kwarg_names = Symbol[n for (n, _) in index_kwargs]
+        prepend_names = Set{Symbol}([:__parent__, index_params..., kwarg_names...])
         # For indexed inline structs we override hash_fields to
-        # (__parent__, indices...) so the child's disk-cache namespace is
-        # tied to the parent hash. Skip if the user declared hash_fields
-        # inside the child body.
-        will_prepend_hash_fields = !isempty(index_params) && !(:hash_fields in child_props)
+        # (__parent__, indices..., kwargs...) so the child's disk-cache
+        # namespace is tied to the parent hash AND to the kwarg values. Skip
+        # if the user declared hash_fields inside the child body.
+        will_prepend_hash_fields = (!isempty(index_params) || !isempty(index_kwargs)) && !(:hash_fields in child_props)
         will_prepend_hash_fields && push!(prepend_names, :hash_fields)
         # Never forward DO-internal cache/identity properties from the parent
         # into the child — they have per-instance semantics (the child has its
@@ -1539,8 +1559,17 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         for ip in index_params
             push!(prepend, :($ip = nothing))
         end
+        # For kwargs: use user-supplied default if any, else `nothing`. The
+        # value actually used at runtime comes from the constructor kwarg;
+        # the in-body rhs is a compute_property fallback (required kwargs
+        # won't hit it because the parent wrapper's call signature enforces
+        # them at the call site).
+        for (kname, kdefault) in index_kwargs
+            rhs = kdefault === nothing ? nothing : something(kdefault)
+            push!(prepend, :($kname = $rhs))
+        end
         if will_prepend_hash_fields
-            push!(prepend, :(hash_fields = $(Expr(:tuple, :__parent__, index_params...))))
+            push!(prepend, :(hash_fields = $(Expr(:tuple, :__parent__, index_params..., kwarg_names...))))
         end
         if !isempty(forwarded)
             push!(prepend, :($(Expr(:tuple, Expr(:parameters, forwarded...))) = __parent__))
@@ -1548,10 +1577,12 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         child_body.args = vcat(prepend, child_body.args)
         push!(extracted_structs, child_struct)
         # Replace with parent property definition. For indexed form, emit an
-        # indexed property `prop(idx...)`; for the plain form, a bare `prop`.
+        # indexed property `prop(idx...; kw=default, ...)`; for the plain
+        # form, a bare `prop`.
         constructor_kwargs = Any[
             Expr(:kw, :__parent__, :__self__),
             (Expr(:kw, ip, ip) for ip in index_params)...,
+            (Expr(:kw, kname, kname) for (kname, _) in index_kwargs)...,
             Expr(:kw, :cache_type, :(__self__.__cache_type__)),
         ]
         # Auto-wire __status__ as a substatus of the parent, UNLESS the child
@@ -1564,7 +1595,18 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 Expr(:kw, :__status__, Expr(:call, compute_property, :__self__, :(Val(:__substatus__)), QuoteNode(prop_name), index_params...)))
         end
         constructor = Expr(:call, gen_name, Expr(:parameters, constructor_kwargs...))
-        lhs_expr = isempty(index_params) ? prop_name : Expr(:call, prop_name, index_params...)
+        lhs_expr = if isempty(index_params) && isempty(index_kwargs)
+            prop_name
+        elseif isempty(index_kwargs)
+            Expr(:call, prop_name, index_params...)
+        else
+            # Emit kwargs as an Expr(:parameters, ...) on the parent-property
+            # call signature. Required kwargs stay as bare Symbols; defaulted
+            # kwargs become Expr(:kw, name, default).
+            kw_nodes = Any[kdefault === nothing ? kname : Expr(:kw, kname, something(kdefault))
+                           for (kname, kdefault) in index_kwargs]
+            Expr(:call, prop_name, Expr(:parameters, kw_nodes...), index_params...)
+        end
         body.args[i] = Expr(:(=), lhs_expr, constructor)
     end
     lnn = nothing
