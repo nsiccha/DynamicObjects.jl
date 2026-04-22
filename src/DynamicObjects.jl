@@ -2046,10 +2046,21 @@ unwrap_error(e) = e
 # Extract the exception from cause (which may be a (exception, backtrace) tuple)
 _cause_error(e::PropertyComputationError) = e.cause isa Tuple ? first(e.cause) : e.cause
 
+# Compact, truncated repr for error messages — avoids dumping huge DataFrames/
+# arrays that happen to be passed as property arguments. Small values (numbers,
+# strings, symbols) render identically to `repr`; large/multi-line values
+# collapse to a one-line `summary`-style snippet.
+function _short_repr(v; limit=120)
+    s = sprint(show, v; context=(:limit => true, :compact => true, :displaysize => (3, limit)))
+    nl = findfirst('\n', s)
+    isnothing(nl) || (s = summary(v))
+    length(s) > limit ? first(s, limit - 1) * "…" : s
+end
+
 function _format_property_key(name, indices, kwargs)
     s = string(name)
-    pos_parts = !isempty(indices) ? repr.(collect(indices)) : String[]
-    kw_parts = ["$k=$(repr(v))" for (k, v) in kwargs]
+    pos_parts = !isempty(indices) ? _short_repr.(collect(indices)) : String[]
+    kw_parts = ["$k=$(_short_repr(v))" for (k, v) in kwargs]
     all_parts = isempty(pos_parts) && !isempty(kw_parts) ?
         ["; " * join(kw_parts, ", ")] :
         vcat(pos_parts, isempty(kw_parts) ? String[] : ["; " * join(kw_parts, ", ")])
