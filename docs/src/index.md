@@ -1,9 +1,6 @@
 # DynamicObjects.jl
 
-`DynamicObjects.jl` provides the `@dynamicstruct` macro for defining Julia structs
-with lazily computed, optionally disk-cached properties.
-
-## Quick start
+Structs with lazily computed, optionally disk-cached properties.
 
 ```julia
 using DynamicObjects
@@ -16,42 +13,188 @@ using DynamicObjects
 end
 
 p = Point(3.0, 4.0)
-p.r      # 5.0  (computed on first access, cached in-memory)
+p.r      # 5.0  — computed on first access, then cached in-memory
 p.theta  # atan(4, 3)
 ```
 
-## Key concepts
+Every name on the left of `=` becomes a **property**. Fixed fields (no `=`) are
+constructor arguments. Derived properties are compiled into
+`compute_property` methods and memoised per instance. Adding `@cached` also
+persists results to disk, keyed by a hash of the fixed fields.
 
-### Fixed fields vs derived properties
+## Defining properties
 
-Lines **without** `=` declare fixed fields — they become constructor arguments:
+### Fixed fields
+
+Lines without `=` are fixed fields — positional constructor arguments:
 
 ```julia
 @dynamicstruct struct Foo
-    a::Int        # fixed: set at construction time
-    b = a * 2     # derived: computed lazily from a
+    a::Int
+    b::String
 end
 
-Foo(3).b   # 6
+Foo(3, "hi")   # Foo(a=3, b="hi")
 ```
 
-Properties on the right-hand side of `=` may reference any other field or
-property by name; the reference is automatically resolved through the object.
-Order of definition does not matter.
+### Derived properties
 
-### In-memory caching
+Any RHS referencing other fields or properties by name works; order of
+definition does not matter.
 
-Derived properties are computed at most once per object and stored in an
-in-memory cache.  To share values across tasks without duplicate computation,
-pass `cache_type=:parallel` to the constructor:
+```julia
+@dynamicstruct struct Foo
+    a::Int
+    b = a * 2        # derived
+    c = b + 1        # references another derived property
+end
+```
+
+### Indexed properties (call & bracket syntax)
+
+Use call syntax `prop(args...) = expr` to declare indexed properties:
+
+```julia
+@dynamicstruct struct App
+    items = [1, 2, 3, 4]
+    filter(pred)       = Base.filter(pred, items)
+    element(i::Int)    = items[i]
+    render(i; tag="li") = "<$(tag)>$(element(i))</$(tag)>"
+end
+
+a = App()
+a.filter(iseven)           # [2, 4] — fresh each call
+a.filter[iseven]           # [2, 4] — cached in-memory by argument
+a.render(1; tag="span")    # "<span>1</span>"
+```
+
+**Calling convention:**
+
+- `obj.prop(args...)` — computes fresh each time (no caching).
+- `obj.prop[args...]` — caches the result in-memory keyed by `(args, kwargs)`.
+
+Multiple method signatures work; they participate in normal Julia dispatch:
+
+```julia
+greet(name::String) = "Hello, $(name)!"
+greet(n::Int)       = "Hello, person #$(n)!"
+```
+
+!!! warning "Don't use bracket syntax in declarations"
+    Declaring with `prop[i] = expr` silently works but can't combine with kwargs
+    (`prop[i](; kw=default)` throws `AssertionError`). Always declare with
+    call syntax: `prop(i; kw=default)`. Bracket syntax is only for *access*.
+
+!!! warning "Brackets can't carry kwargs"
+    `obj.prop[args...; kwargs...]` is not valid Julia — semicolons inside `[]`
+    mean array concatenation. Use `obj.prop(args...; kwargs...)` when you need
+    kwargs (call-syntax is uncached though). Bracket access is positional only.
+
+### Zero-arg indexed properties
+
+`x() = expr` and `x = expr` are **different**:
+
+```julia
+timestamp = time()   # plain: cached once, always returns the same value
+now()     = time()   # indexed: obj.now() is fresh each call, obj.now[] caches
+```
+
+### Multi-LHS destructuring
+
+A single expression can define several properties at once:
+
+```julia
+@dynamicstruct struct Grad
+    x::Float64
+    val, grad = (f(x), df(x))              # positional (by index)
+    (; val, grad) = (; val=f(x), grad=df(x))  # named (by field)
+    (; x_val<=val, x_grad<=grad) = autodiff(x)   # per-field rename
+    (; x_ <= (val, grad)) = autodiff(x)          # prefix shorthand
+    (; a, x_b<=b, y_ <= (c, d)) = f()            # mixed
+    @cached a, b = expensive()                   # @cached applies to the group
+end
+```
+
+The group is computed once (stored in a hidden property); individual members
+extract by index or field name. `<=` reads as "from": `x_val<=val` means
+"property `x_val` is extracted from field `val`".
+
+## How bare names are resolved (`__self__`)
+
+Inside a property RHS, bare names matching another field or property are
+rewritten to `__self__.<name>`. The generated method is roughly:
+
+```julia
+# You write:
+@dynamicstruct struct Foo
+    a::Int
+    b = a * 2
+end
+
+# Generated (simplified):
+compute_property(::Val{:b}, __self__::Foo) = __self__.a * 2
+```
+
+`__self__` is the parameter name of the generated method, available as a bare
+symbol in any RHS. You'll need it explicitly for API calls that take the
+object, e.g. `get_cache_status(__self__, :data, url)`.
+
+**Scoping:** `let`-bindings, lambda parameters, and LHS symbols (named-tuple
+keys, assignment targets) are left alone even if they shadow a property:
+
+```julia
+evens = let items = filter(iseven, items)   # outer `items` → __self__.items
+    sum(items)                               # inner `items` is the local let-binding
+end
+mapped = map(x -> x * 2, items)              # `x` is local, `items` → __self__.items
+```
+
+## Caching
+
+### In-memory cache
+
+Every derived property's value is stored in an instance-level cache dict after
+first compute. The dict type is controlled by `cache_type`:
+
+- `cache_type=:serial` (default) — `Dict{Symbol,Any}`.
+- `cache_type=:parallel` — `ThreadsafeDict{Symbol,Any}`, deduplicates in-flight
+  tasks and is safe for concurrent access.
 
 ```julia
 obj = Foo(3; cache_type=:parallel)
 ```
 
-### Disk caching with `@cached`
+You can set the package-level default via the 2-arg macro form:
 
-Mark a property `@cached` to additionally persist it to disk:
+```julia
+@dynamicstruct :parallel struct SafeApp
+    data(id) = expensive(id)
+end
+```
+
+### Overriding and mutating cached values
+
+Keyword arguments to the constructor (or to [`remake`](@ref)) pre-populate the
+cache:
+
+```julia
+p = Point(3.0, 4.0; r=10.0)   # p.r returns 10.0 without computing
+```
+
+Inside a property body, `prop = value` is rewritten to
+`__self__.prop = value`, which writes to the in-memory cache:
+
+```julia
+@dynamicstruct struct Counter
+    @cached count = 0
+    increment = begin
+        count = count + 1   # rewrites to __self__.count = __self__.count + 1
+        count
+    end
+end
+```
+
+### Disk caching with `@cached`
 
 ```julia
 @dynamicstruct struct Experiment
@@ -59,208 +202,252 @@ Mark a property `@cached` to additionally persist it to disk:
     @cached result = sum(rand(n))
 end
 
-e = Experiment(1_000_000)
-e.result    # computed and written to cache/
-e2 = Experiment(1_000_000)
-e2.result   # loaded from disk (same n → same hash → same path)
+e = Experiment(1_000)
+e.result    # computes and serialises to "cache/<hash>/result.sjl"
+Experiment(1_000).result  # loads from disk
 ```
 
-The cache location is controlled by `cache_base` (defaults to `"cache"`) and
-`cache_path` (defaults to `joinpath(cache_base, hash_of_fields)`).
-
-### Indexable properties
-
-Use bracket syntax to define properties that take indices:
+`@cached` also works on indexed properties — each argument tuple is keyed and
+persisted separately:
 
 ```julia
-@dynamicstruct struct Grid
-    f[i, j] = i + 10 * j
-    label(i, j) = "cell ($i, $j)"           # call syntax
-    @cached g[i, j] = i^2 + j^2             # each (i,j) pair cached to disk
-end
-
-grid = Grid()
-grid.f[1, 2]       # 21        — cached per index
-grid.label(1, 2)    # "cell (1, 2)" — computed fresh each call
+@cached g(i, j) = i^2 + j^2   # one file per (i, j)
 ```
 
-Both bracket and call syntax define indexable properties — the difference is
-in the calling convention:
-
-- `obj.prop[args...]` caches the result per index in memory (same args → same result).
-- `obj.prop(args...)` computes fresh each time (directly invokes `compute_property`, no caching).
-
-**Note:** `obj.prop[args...; kwargs...]` is **not valid Julia syntax** — semicolons
-inside `[]` mean array concatenation, not keyword arguments. Use call syntax `()`
-for kwargs:
+**Cache location** — `cache_path = joinpath(cache_base, hash)` where
+`cache_base` defaults to `"cache"` and `hash` is derived from `hash_fields`
+(default: all fixed fields). Override either to move caches or narrow the
+hash:
 
 ```julia
-obj.prop(args...; kwarg=val)   # ✓ works
-obj.prop[args...; kwarg=val]   # ✗ not valid Julia
-```
-
-Call-syntax properties can accept keyword arguments:
-
-```julia
-@dynamicstruct struct Formatter
-    format(x; digits=2) = round(x; digits)
-end
-
-f = Formatter()
-f.format(π)              # 3.14
-f.format(π; digits=4)    # 3.1416
-```
-
-### Dynamic dispatch on indexable properties
-
-Since indexable properties generate standard Julia `compute_property` methods,
-they participate in Julia's multiple dispatch.  You can define multiple
-signatures for the same property name:
-
-```julia
-@dynamicstruct struct Greeter
-    greeting = "Hello"
-    greet(name::String) = "$(greeting), $(name)!"
-    greet(n::Int)       = "$(greeting), person #$(n)!"
-end
-
-g = Greeter()
-g.greet("Alice")   # "Hello, Alice!"
-g.greet(42)        # "Hello, person #42!"
-```
-
-This works because each definition emits a separate method with the appropriate
-type signature, just like ordinary Julia function definitions.
-
-### How property references work (`__self__`)
-
-When writing the RHS of a derived property, bare names that match any
-property or field of the struct are **automatically rewritten** to
-`__self__.<name>`. The generated method looks like:
-
-```julia
-# What you write:
 @dynamicstruct struct Foo
     a::Int
-    b = a * 2
-end
-
-# What gets generated (simplified):
-DynamicObjects.compute_property(::Val{:b}, __self__::Foo) = __self__.a * 2
-```
-
-This means `__self__` is available as a bare symbol in any property RHS —
-it's the parameter name of the generated method. You normally don't need
-it directly, but it's required for API calls like `get_cache_status`:
-
-```julia
-@dynamicstruct struct App
-    @cached data[url] = fetch(url)
-    loader[url] = begin
-        status = DynamicObjects.get_cache_status(__self__, :data, url)
-        status == :ready ? data[url] : "Loading..."
-    end
+    b::Int
+    hash_fields = (a,)         # only `a` contributes to the hash
+    cache_base  = "/mnt/cache"
+    @cached result = a + b     # `b` can change without invalidating the cache
 end
 ```
 
-### Scoping rules
+### `@persist` — write cached state back to disk
 
-Not every bare name gets rewritten — `let` bindings and lambda parameters
-are treated as local and left alone, even if they shadow a property:
-
-```julia
-@dynamicstruct struct App
-    items = [1, 2, 3, 4]
-    evens = let items = filter(iseven, items)  # outer `items` → __self__.items
-        sum(items)                              # inner `items` is the local
-    end
-    mapped = map(x -> x * 2, items)           # `x` is local, `items` → __self__.items
-end
-```
-
-### Mutating the cache (`setproperty!`)
-
-Derived properties can be overwritten at runtime:
-
-```julia
-p = Point(3.0, 4.0)
-p.r       # 5.0
-p.r = 99
-p.r       # 99
-```
-
-Inside a property RHS, writing `prop = value` is rewritten to
-`__self__.prop = value`, which calls `setproperty!` and updates the
-in-memory cache:
-
-```julia
-@dynamicstruct struct Counter
-    @cached count = 0
-    increment = begin
-        count = count + 1   # rewritten to: __self__.count = __self__.count + 1
-        count
-    end
-end
-```
-
-### Persisting cache changes (`@persist`)
-
-When you mutate a `@cached` property via assignment, the change only
-affects the in-memory cache. Use `@persist` to serialise the current
-value back to disk:
+`@cached` properties load from disk on first access and are mutated in-memory
+via `prop = value`. Use `@persist prop` to flush the current in-memory value
+back to the cache file:
 
 ```julia
 @dynamicstruct struct Timer
     @cached running = false
-    @cached current_log = nothing
-
+    @cached log     = nothing
     toggle = begin
         running = !running
         @persist running
         if !running
-            current_log = nothing
-            @persist current_log
+            log = nothing
+            @persist log
         end
     end
 end
-
-t = Timer()
-t.toggle    # running = true, persisted to disk
-# In a new session:
-t2 = Timer()
-t2.running  # true — loaded from disk
 ```
 
-`@persist` also works for indexed cached properties: `@persist data[url]`.
+Indexed forms work: `@persist data[url]`.
 
-### Constructor kwargs as cache overrides
+### LRU eviction with `@lru`
 
-Keyword arguments pre-populate the cache, overriding any derived property:
+Cap the in-memory entries for an indexed property. Orthogonal to `@cached`:
+you can combine them.
 
 ```julia
-p = Point(3.0, 4.0; r=10.0)
-p.r  # 10.0 — override, not computed
+@dynamicstruct struct Models
+    @cached @lru 50 fit(seed) = run_fit(seed)  # 50 most-recent kept in RAM, all on disk
+end
 ```
 
-### remake
-
-`remake` creates a new instance with some fields changed:
+### Memoising free functions with `@memo`
 
 ```julia
-e2 = remake(e; n=2_000_000)   # fresh instance, n changed, result recomputed
+@memo expensive(x, y) = heavy_computation(x, y)
 ```
 
-Keyword arguments that don't match fixed fields are treated as cache
-overrides, same as the constructor:
+Produces a process-wide memoised version. Useful outside `@dynamicstruct`.
+
+### Cache inspection
+
+All of these work on indexed properties too (e.g. `@is_cached obj.result[key]`):
+
+| Macro / function                        | Returns                                   |
+|-----------------------------------------|-------------------------------------------|
+| `@cache_status obj.result`              | `:unstarted` / `:started` / `:ready`       |
+| `@is_cached obj.result`                 | `true` / `false`                           |
+| `@cache_path obj.result`                | on-disk path                               |
+| `@clear_cache! obj.result`              | clear disk + in-memory entries             |
+| `@clear_cache! obj.result[key]`         | clear one index                            |
+| `clear_mem_caches!(obj)`                | clear all in-memory caches on `obj`        |
+| `clear_disk_caches!(obj)`               | clear all on-disk caches on `obj`          |
+| `clear_all_caches!(obj)`                | both                                       |
+
+These macros also work inside `@dynamicstruct` bodies — omit the object
+prefix and use bare property names:
 
 ```julia
-e3 = remake(e; result=0.0)    # n unchanged, result pre-set to 0.0
+summary(key) = @is_cached(result[key]) ? "done" : "pending"
 ```
 
-## Extended example
+## Inline nested structs
 
-The `@dynamicstruct` macro is particularly useful for computational experiments
-where some steps are expensive and should be cached:
+Child structs defined inside a parent `@dynamicstruct` are auto-wired to the
+parent — they get a `__parent__` field and transparently access any parent
+property that isn't shadowed. Four forms:
+
+```julia
+@dynamicstruct struct Parent
+    x::Float64
+    y = x + 1
+
+    # Form 1 — explicit property name
+    sub = struct Sub
+        z = x + y        # x, y forwarded from Parent
+    end
+
+    # Form 2 — struct name becomes the property name
+    struct Sub2
+        w = x * 2
+    end
+
+    # Form 1a — indexed inline struct
+    subject(id::Int) = struct Subject
+        score = x + id   # id is a child field, x is forwarded
+    end
+
+    # Form 3 — `@struct` marker, auto-generated child name
+    @struct anon(id::Int) = begin
+        total = x * id
+    end
+
+    # Form 3 with kwargs — defaults can be overridden at call/index sites
+    @struct weighted(id; scale=2, bias) = begin
+        total = x * id * scale + bias   # scale has a default; bias is required
+    end
+end
+
+p = Parent(1.0)
+p.sub.z              # 3.0
+p.Sub2.w             # 2.0
+p.subject(7).score   # 8.0 — fresh each call
+p.subject[7].score   # 8.0 — cached in-memory by id
+p.anon(3).total      # 3.0
+p.weighted(3; bias=1).total            # uses scale=2
+p.weighted[3; bias=1, scale=5].total   # distinct cache entry from the above
+```
+
+Kwargs on indexed inline structs land in the child's `hash_fields`, so distinct
+kwarg values produce distinct cache entries (same rule as positional indices).
+Required kwargs (no default) are enforced at the parent's call site.
+
+**What the macro does for you (all forms):**
+
+- Renames the child struct to `Parent_Child` to avoid kwarg shadowing.
+- Prepends `__parent__` (and any index params) as fixed fields of the child.
+- For indexed forms, sets `hash_fields = (__parent__, indices...)` so the
+  child's disk cache is namespaced by parent + indices.
+- Forwards every parent property name not already declared in the child
+  (parent-property-in-child wins; internal names like `cache_path`, `hash`
+  are excluded).
+- Inherits the parent's `cache_type` (serial / parallel) automatically.
+- Auto-wires `__status__` as a `__substatus__` of the parent — see below.
+- Recurses through nested inline structs.
+
+For Form 3 (`@struct`), the auto-generated child is named `<prop>_inline`
+(e.g. `Parent_anon_inline`). `@struct` is not a real macro — it's
+pattern-matched by `@dynamicstruct` and rewritten into Form 1/1a.
+
+## Progress tracking (`__status__` / `__substatus__`)
+
+The framework exposes two conventional properties:
+
+- `__status__` — root progress node, default `nothing`.
+- `__substatus__(name, args...; kwargs...)` — hook for per-property child nodes.
+
+When present (typically via the Treebars.jl extension), they enable automatic
+progress tracking for long-running indexed computations:
+
+```julia
+@dynamicstruct struct App
+    __status__ = initialize_progress!(:state; description="App")
+    __substatus__(name, args...; kwargs...) =
+        initialize_progress!(__status__; description="$(name)$(args)")
+
+    results(key) = expensive(key; __status__)   # __status__ auto-resolves
+end
+```
+
+- Inside any property body, `__status__` is a local bound to the relevant
+  node: the root `__status__` for plain and call-syntax access, a substatus
+  for `ThreadsafeDict`-backed indexed access (i.e. `obj.results[key]`).
+- `__substatus__` fires **only** on `ThreadsafeDict` `getindex` — not for
+  call syntax, not for scalar access.
+- Inline children get `__status__ = __substatus__(parent, :child_prop, idx...)`
+  automatically. Opt out by declaring the child's own `__status__` (e.g.
+  `__status__ = nothing` to disable, or `__status__ = __parent__.__status__`
+  to inherit without creating a new node).
+
+## Async indexed access (`fetchindex`)
+
+For `cache_type=:parallel` indexed properties, `fetchindex` provides
+non-blocking access to in-flight computations:
+
+```julia
+fetchindex(app.results, key) do rv, status
+    if rv isa Task && istaskfailed(rv)
+        render_error(rv.result)
+    elseif rv isa Task
+        render_progress(progress_state(status))   # still running
+    else
+        render(rv)                                # completed value
+    end
+end
+
+fetchindex(app.results, key; force=true) do rv, status
+    # `force=true` clears the cache entry first — used for "Rerun" buttons
+end
+```
+
+`getstatus(ip, indices...)` returns the current status without triggering a
+fetch. `entries(ip)` and `cached_entries(ip)` enumerate in-flight and
+completed entries (see [API](api.md)).
+
+## Construction and `remake`
+
+```julia
+p  = Point(3.0, 4.0)            # positional fixed fields
+p2 = Point(3.0, 4.0; r=10.0)    # kwarg pre-populates the cache
+p3 = remake(p; x=5.0)           # same type, change fixed fields (derived recomputes)
+p4 = remake(p; r=99.0)          # change a cached value instead
+```
+
+## Errors: `PropertyComputationError`
+
+If a property computation throws, the error is wrapped in a
+`PropertyComputationError` that records the property name, object type,
+indices, and kwargs. `showerror` prints a concise summary with a "Caused by"
+chain; `unwrap_error(err)` peels through `TaskFailedException` /
+`CompositeException` layers to reach the root cause.
+
+## Revise compatibility
+
+Everything inside a `@dynamicstruct` body — property bodies, added / removed /
+renamed derived properties, indexed signatures, inline nested structs,
+macro-decorated properties — is picked up by Revise on save.
+
+Limits (inherited from Julia + Revise):
+
+- Adding, removing, or reordering **fixed fields** changes the underlying
+  struct and needs a rename (`MyStruct2`) or a session restart.
+- `const` bindings can't be redefined — don't use `const` for things you
+  expect to change.
+- New deps in `Project.toml` / `Manifest.toml` require a restart.
+
+## Complete example
 
 ```julia
 using DynamicObjects
@@ -269,19 +456,16 @@ using DynamicObjects
     data_path::String
     n_samples::Int
 
-    # derived from fixed fields
-    data       = load_data(data_path)
-    subsample  = data[1:n_samples]
+    data      = load_data(data_path)
+    subsample = data[1:n_samples]
 
-    # expensive: cached to disk, keyed by (data_path, n_samples)
     @cached fit    = run_model(subsample)
     @cached report = summarise(fit)
 end
 
-a = Analysis("data.csv", 1000)
-a.report   # computes everything and caches fit + report
+a  = Analysis("data.csv", 1_000)
+a.report   # runs fit + report, caches both
 
-# later, in a new session:
-a2 = Analysis("data.csv", 1000)
-a2.report  # loads fit and report from disk — no recomputation
+a2 = Analysis("data.csv", 1_000)
+a2.report  # loads both from disk
 ```
