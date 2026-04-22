@@ -1340,9 +1340,13 @@ function meta end
 
 Return a human-readable description for the property `name` with the given arguments.
 Override generated per-property when a docstring is present in @dynamicstruct.
-Default: "name[arg1,arg2,...]"
+Default: "name(arg1,arg2,...; k1=v1,k2=v2)" — kwargs section is omitted when empty.
 """
-_property_description(o, ::Val{name}, args...; kwargs...) where {name} = "$name[$(join(args, ","))]"
+_property_description(o, ::Val{name}, args...; kwargs...) where {name} = begin
+    argstr = join(args, ",")
+    kwstr = isempty(kwargs) ? "" : "; " * join(("$k=$v" for (k, v) in kwargs), ",")
+    "$name($argstr$kwstr)"
+end
 is_generated_property(o, name) = false
 is_indexed_property(o, name) = false
 _disk_cache(o, name) = nothing
