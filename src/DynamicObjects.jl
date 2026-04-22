@@ -1412,6 +1412,37 @@ _emit_positional_destructure!(oproperties, docs, elements, source_sym, lnn) = fo
         error("unsupported destructuring element: $a")
     end
 end
+# Flatten a destructuring LHS to the property names it introduces. Mirrors the
+# main property-parsing loop (`:tuple` branch): positional → per-index leaves
+# (recursing into nested tuples), named → per-member name with `<=` rename and
+# prefix-tuple expansion. Used by `parent_props` collection so inline children
+# auto-forward destructured parent properties the same way as bare ones.
+_collect_destructure_names(lhs) = begin
+    names = Symbol[]
+    Meta.isexpr(lhs, :tuple) || return names
+    named = length(lhs.args) == 1 && Meta.isexpr(lhs.args[1], :parameters)
+    raw_args = named ? lhs.args[1].args : lhs.args
+    if named
+        for a in raw_args
+            if isa(a, Symbol)
+                push!(names, a)
+            elseif Meta.isexpr(a, :call) && a.args[1] == :(<=)
+                target, source = a.args[2], a.args[3]
+                if isa(source, Symbol)
+                    target isa Symbol && push!(names, target)
+                elseif Meta.isexpr(source, :tuple)
+                    prefix = string(target)
+                    for s in source.args
+                        s isa Symbol && push!(names, Symbol(prefix, s))
+                    end
+                end
+            end
+        end
+    else
+        append!(names, _collect_leaves(lhs))
+    end
+    names
+end
 dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothing) = begin
     @assert expr.head == :struct
     mut, head, body = expr.args
@@ -1456,7 +1487,16 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         end
         Meta.isexpr(lhs, (:call, :ref)) && (lhs = lhs.args[1])
         Meta.isexpr(lhs, :(::)) && (lhs = lhs.args[1])
-        lhs isa Symbol && push!(parent_props, lhs)
+        if lhs isa Symbol
+            push!(parent_props, lhs)
+        elseif Meta.isexpr(lhs, :tuple)
+            # Destructuring assignment — register each extracted name so that
+            # inline children's auto-forward destructure picks them up, same
+            # as bare properties. Handles positional `(a, b) = expr`, nested
+            # positional `((a,b), c) = expr`, named `(;a, b) = expr`, rename
+            # `(;x_val<=val) = expr`, and prefix `(;x_ <= (val, grad)) = expr`.
+            append!(parent_props, _collect_destructure_names(lhs))
+        end
     end
     extracted_structs = Expr[]
     for (i, arg) in enumerate(body.args)
