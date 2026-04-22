@@ -415,13 +415,14 @@ fetchindex(app.results, key) do rv, status
 end
 ```
 """
-function fetchindex(fetch, ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}, indices...; force=false, kwargs...)
+function fetchindex(fetch, ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}, indices...;
+                    force=false, retry_failed=force, kwargs...)
     if force
         maybepop!(ip.cache, (indices, (;kwargs...)))
         path = get_cache_path(ip.o, name(ip), indices...; kwargs...)
         isfile(path) && rm(path)
     end
-    rv = getindex(ip, indices...; fetch=identity, retry_failed=force, kwargs...)
+    rv = getindex(ip, indices...; fetch=identity, retry_failed, kwargs...)
     status = getstatus(ip, indices...; kwargs...)
     fetch(rv, status)
 end
