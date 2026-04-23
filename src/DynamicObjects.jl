@@ -1671,8 +1671,27 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         cache_version = nothing
         lru_size = nothing
         while Meta.isexpr(arg, :macrocall)
-            push!(macros, arg.args[1])
-            if arg.args[1] == Symbol("@cached") && length(arg.args) == 4
+            # Normalise macro name: nested macro-expanded contexts can surface
+            # `GlobalRef(Core, Symbol("@doc"))` (or similar) instead of a bare
+            # `Symbol("@doc")`. Strip to the Symbol name for comparison and
+            # storage so the `Set{Symbol}` push and `== Symbol("@…")` tests
+            # both work regardless of form.
+            mname = arg.args[1]
+            mname isa GlobalRef && (mname = mname.name)
+            # `@doc "str" <def>` — consume the docstring and continue unwrapping
+            # into the real definition. Happens when Julia's docstring lowering
+            # has rewritten `"str"\n<def>` inside a deeply-nested inline struct
+            # body before our recursive pass re-enters the block.
+            if mname === Symbol("@doc") && length(arg.args) >= 4
+                docexpr = arg.args[end-1]
+                if isa(docexpr, String) || Meta.isexpr(docexpr, :string)
+                    doc = docexpr
+                end
+                arg = arg.args[end]
+                continue
+            end
+            push!(macros, mname)
+            if mname == Symbol("@cached") && length(arg.args) == 4
                 ver_expr = arg.args[3]
                 if Meta.isexpr(ver_expr, :macrocall) && ver_expr.args[1] == Symbol("@v_str")
                     cache_version = VersionNumber(ver_expr.args[end])
@@ -1681,7 +1700,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 else
                     error("@cached version argument must be a version string like v\"2\", got: $ver_expr")
                 end
-            elseif arg.args[1] == Symbol("@lru") && length(arg.args) == 4
+            elseif mname == Symbol("@lru") && length(arg.args) == 4
                 sz = arg.args[3]
                 sz isa Integer || error("@lru: maxsize must be a literal Integer, got: $sz")
                 lru_size = Int(sz)
