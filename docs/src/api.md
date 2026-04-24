@@ -1,7 +1,7 @@
 # API Reference
 
-Exports of `DynamicObjects`. For usage, patterns, and worked examples see the
-[manual](index.md).
+Everything exported by `DynamicObjects`. For usage and worked examples see
+the [manual](index.md).
 
 ## The struct macro
 
@@ -9,18 +9,25 @@ Exports of `DynamicObjects`. For usage, patterns, and worked examples see the
 @dynamicstruct
 ```
 
-## Caching macros
+## In-struct property markers
 
-In-struct property markers (pattern-matched by `@dynamicstruct`, not real
-macros — do not use outside a struct body):
+These are *not* real macros — they are pattern-matched by `@dynamicstruct`
+inside a struct body. Outside a struct body they're either no-ops, real
+macros (e.g. `@memo`), or undefined. Don't rely on them in arbitrary
+positions.
 
-- `@cached prop = expr` — on-disk JLD2 cache, keyed by hashable ancestry.
-- `@persist prop = expr` — like `@cached` but writes a single file per object,
-  recomputes on mismatch.
-- `@lru prop = expr` — process-local LRU cache.
-- `@memo prop = expr` — unbounded in-process memoisation.
+| Marker                       | Effect                                                                                  |
+|------------------------------|-----------------------------------------------------------------------------------------|
+| `@cached prop = expr`        | Persist to disk under `cache_path`. Per-key for indexed properties.                     |
+| `@cached v"N" prop = expr`   | Versioned disk cache; bumping `N` invalidates files without changing inputs.            |
+| `@persist prop = expr`       | Write the in-memory value back to disk on demand (see [`@persist`](@ref)).              |
+| `@lru N prop(idx) = expr`    | Bound the per-property in-memory dict to `N` entries (LRU eviction).                    |
+| `@memo prop = expr`          | Inside a struct: rewrite call → bracket access. Outside: process-wide function memoize. |
 
-Real macros for inspecting the `@cached` path of a property:
+## Cache inspection
+
+Real macros — usable inside *and* outside `@dynamicstruct` bodies. Inside
+a body, drop the object prefix and use the bare property name.
 
 ```@docs
 @cache_status
@@ -49,6 +56,13 @@ clear_mem_caches!
 clear_disk_caches!
 ```
 
+## Cancellation
+
+```@docs
+cancel!
+cancel_all!
+```
+
 ## Error handling
 
 ```@docs
@@ -56,32 +70,25 @@ PropertyComputationError
 unwrap_error
 ```
 
-## Supporting types
+## Persistent / bounded collections
 
 ```@docs
 PersistentSet
 LazyPersistentDict
-ThreadsafeLRUDict
 LRUDict
+ThreadsafeLRUDict
 ```
 
-## Key tracking (advanced)
+## Pluggable key tracking
 
-For bounding on-disk caches when the full key set isn't known up front:
+For bounding on-disk caches when the full key set isn't known up front.
 
 ```@docs
 KeyTracker
-NoKeyTracker
 SharedFileTracker
 PerPodFileTracker
+NoKeyTracker
 key_tracker
 record!
 load_keys
-```
-
-## Cancellation
-
-```@docs
-cancel!
-cancel_all!
 ```
