@@ -1848,8 +1848,18 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         @assert Meta.isexpr(child_result, :escape)
         push!(result.args, child_result.args[1])
     end
+    # Docstring precedence:
+    #   1. Emit the internal/2-arg docstring first via `@doc` (auto-generated
+    #      default or the string passed as the 2-arg macro form).
+    #   2. Emit `Base.@__doc__ $type` as an override hook — a no-op on its own
+    #      (the `(meta :doc)` marker is ignored), but if the user wrote
+    #      `"""userdoc"""\n@dynamicstruct struct X ... end`, Julia lowers that
+    #      to `Core.@__doc__ @dynamicstruct ...`, which walks this expansion,
+    #      finds the `Base.@__doc__` marker, and rewrites it to
+    #      `@doc "userdoc" $type` — overriding the internal default.
     push!(result.args, Expr(:block,
         :(@doc $docstring $struct_expr),
+        :(Base.@__doc__ $type),
         quote
             $Base.hasproperty(__self__::$type, name::Symbol) = name in $(Tuple(keys(properties)))
             $Base.getproperty(__self__::$type, name::Symbol) = $getorcomputeproperty(__self__, name)
