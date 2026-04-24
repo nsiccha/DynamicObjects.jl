@@ -1281,7 +1281,8 @@ elseif e.head in (:kw, :(=))
                 error("Assignment to `$s` in a property RHS shadows property `$s`$loc. This writes to the property cache, not a local variable. Declare it with `local $s` (or `local $s = ...`) or use `let $s = ...` to make it a local.")
             end
         end
-        Expr(e.head, e.args[1], walk_rhs.(e.args[2:end]; locals, properties, lnn)...)
+        walked_lhs = Meta.isexpr(lhs, (:ref, :.)) ? walk_rhs(lhs; locals, properties, lnn) : lhs
+        Expr(e.head, walked_lhs, walk_rhs.(e.args[2:end]; locals, properties, lnn)...)
     end
 elseif e.head == :local
     # `local x`, `local x, y, z`, or `local x = expr` — add names to the local
