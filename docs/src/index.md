@@ -41,6 +41,30 @@ cache. Bare names like `x` and `y` on the RHS are auto-rewritten to
   same key, and integrates with [`fetchindex`](#async-access) for
   non-blocking UI polling.
 
+## Three orthogonal axes (read before writing DO code)
+
+These are independent. Conflating them is the single most common source of
+bugs and confused explanations:
+
+1. **Declaration syntax** decides whether a property is an **IndexableProperty (IP)**.
+   - `prop = expr` (no parens on the LHS) → a plain lazy scalar. Not an IP.
+     Not pollable. Computed once per instance.
+   - `prop(args...; kwargs...) = expr` (LHS has a call) → **this is an IP**,
+     with *or without* arguments, with *or without* kwargs.
+     `prop() = …` is an IP. `prop(i) = …` is an IP. `prop(; k=1) = …` is an IP.
+2. **`cache_type`** decides what dict backs the IP's per-key memo.
+   `:parallel` → `ThreadsafeDict` that spawns a `Task` per key, dedupes
+   concurrent requests, and is the thing that makes polling via
+   [`fetchindex`](#async-access) possible. `:serial` → plain `Dict`.
+3. **`@cached`** adds **disk serialisation** on top. It is purely an I/O
+   concern — it doesn't decide IP-ness, it doesn't create polling, it
+   doesn't spawn tasks. Any IP is pollable regardless of `@cached`; any
+   non-IP scalar property can be `@cached` without becoming pollable.
+
+If you want a property to be pollable / cancellable / background-runnable,
+declare it with call syntax — that is what makes it an IP. `@cached` is
+orthogonal. You almost never need `@cached` just to "make something async".
+
 ## Defining properties
 
 ### Fixed fields
