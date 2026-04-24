@@ -352,7 +352,9 @@ Required kwargs (no default) are enforced at the parent's call site.
   child's disk cache is namespaced by parent + indices.
 - Forwards every parent property name not already declared in the child
   (parent-property-in-child wins; internal names like `cache_path`, `hash`
-  are excluded).
+  are excluded). Names introduced by destructuring assignments on the
+  parent — `(; foo, bar) = some_source` — forward the same as bare
+  properties.
 - Inherits the parent's `cache_type` (serial / parallel) automatically.
 - Auto-wires `__status__` as a `__substatus__` of the parent — see below.
 - Recurses through nested inline structs.
@@ -360,6 +362,31 @@ Required kwargs (no default) are enforced at the parent's call site.
 For Form 3 (`@struct`), the auto-generated child is named `<prop>_inline`
 (e.g. `Parent_anon_inline`). `@struct` is not a real macro — it's
 pattern-matched by `@dynamicstruct` and rewritten into Form 1/1a.
+
+## Property docstrings
+
+A string immediately above a property definition overrides
+`_property_description(o, ::Val{:name}, args...; kwargs...)` for that
+property. This is what progress-tree labels, error headers, and any other
+code calling `_property_description` see. `$` interpolation in the string
+resolves against the *call-site* argument values, so labels reflect the
+kwargs actually in use rather than the declared defaults:
+
+```julia
+@dynamicstruct struct Fit
+    "Pathfinder(maxiters=\$maxiters)"
+    pathfinder(instance, init; rng=Xoshiro(42), maxiters=100) =
+        initialize_mcmc(instance, init; rng, progress=__status__, maxiters)
+
+    "Warmup(n_draws=\$n_draws)"
+    posterior_warmup(instance, init; rng=Xoshiro(42), n_draws=200) =
+        adaptive_warmup_mcmc(rng, instance; init, n_draws, progress=__status__)
+end
+```
+
+Plain (non-interpolated) strings work too: `"Pathfinder"` stays literal
+regardless of kwargs. Docstrings work at any nesting depth, including
+inside inline `@struct = begin … end` bodies.
 
 ## Progress tracking (`__status__` / `__substatus__`)
 
