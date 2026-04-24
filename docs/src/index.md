@@ -80,15 +80,12 @@ greet(name::String) = "Hello, $(name)!"
 greet(n::Int)       = "Hello, person #$(n)!"
 ```
 
-!!! warning "Don't use bracket syntax in declarations"
-    Declaring with `prop[i] = expr` silently works but can't combine with kwargs
-    (`prop[i](; kw=default)` throws `AssertionError`). Always declare with
-    call syntax: `prop(i; kw=default)`. Bracket syntax is only for *access*.
-
-!!! warning "Brackets can't carry kwargs"
-    `obj.prop[args...; kwargs...]` is not valid Julia — semicolons inside `[]`
-    mean array concatenation. Use `obj.prop(args...; kwargs...)` when you need
-    kwargs (call-syntax is uncached though). Bracket access is positional only.
+!!! warning "Brackets don't combine with kwargs"
+    Declare with call syntax (`prop(i; kw=default)`), not bracket
+    (`prop[i] = …`) — the bracket form can't take kwargs. Bracket syntax is
+    only for *access*, and access-side kwargs need parens too
+    (`obj.prop(i; kw=v)`, never `obj.prop[i; kw=v]`). Bracket access with
+    kwargs is not even valid Julia — `;` inside `[]` means concatenation.
 
 ### Zero-arg indexed properties
 
@@ -231,26 +228,9 @@ end
 
 ### `@persist` — write cached state back to disk
 
-`@cached` properties load from disk on first access and are mutated in-memory
-via `prop = value`. Use `@persist prop` to flush the current in-memory value
-back to the cache file:
-
-```julia
-@dynamicstruct struct Timer
-    @cached running = false
-    @cached log     = nothing
-    toggle = begin
-        running = !running
-        @persist running
-        if !running
-            log = nothing
-            @persist log
-        end
-    end
-end
-```
-
-Indexed forms work: `@persist data[url]`.
+`@cached` properties load from disk on first access; in-memory mutations
+(`prop = value`) stay in RAM until you flush them. `@persist prop` writes the
+current value to the cache file. Indexed forms work: `@persist data[url]`.
 
 ### LRU eviction with `@lru`
 
@@ -296,97 +276,56 @@ summary(key) = @is_cached(result[key]) ? "done" : "pending"
 ## Inline nested structs
 
 Child structs defined inside a parent `@dynamicstruct` are auto-wired to the
-parent — they get a `__parent__` field and transparently access any parent
-property that isn't shadowed. Four forms:
+parent — they get a `__parent__` field and access any parent property that
+isn't shadowed.
 
 ```julia
 @dynamicstruct struct Parent
     x::Float64
     y = x + 1
 
-    # Form 1 — explicit property name
-    sub = struct Sub
-        z = x + y        # x, y forwarded from Parent
+    @struct sub = begin
+        z = x + y        # x, y forwarded from parent
     end
 
-    # Form 2 — struct name becomes the property name
-    struct Sub2
-        w = x * 2
-    end
-
-    # Form 1a — indexed inline struct
-    subject(id::Int) = struct Subject
-        score = x + id   # id is a child field, x is forwarded
-    end
-
-    # Form 3 — `@struct` marker, auto-generated child name
-    @struct anon(id::Int) = begin
-        total = x * id
-    end
-
-    # Form 3 with kwargs — defaults can be overridden at call/index sites
     @struct weighted(id; scale=2, bias) = begin
-        total = x * id * scale + bias   # scale has a default; bias is required
+        total = x * id * scale + bias   # id/scale/bias become child properties
     end
 end
 
 p = Parent(1.0)
-p.sub.z              # 3.0
-p.Sub2.w             # 2.0
-p.subject(7).score   # 8.0 — fresh each call
-p.subject[7].score   # 8.0 — cached in-memory by id
-p.anon(3).total      # 3.0
-p.weighted(3; bias=1).total            # uses scale=2
-p.weighted[3; bias=1, scale=5].total   # distinct cache entry from the above
+p.sub.z                               # 3.0
+p.weighted(3; bias=1).total           # fresh each call, uses scale=2
+p.weighted[3; bias=1, scale=5].total  # distinct cache entry
 ```
 
-Kwargs on indexed inline structs land in the child's `hash_fields`, so distinct
-kwarg values produce distinct cache entries (same rule as positional indices).
-Required kwargs (no default) are enforced at the parent's call site.
+- **`@struct name = begin … end`** — singleton child.
+- **`@struct name(args...; kwargs...) = begin … end`** — one cached
+  instance per args tuple. Args/kwargs become child properties and are
+  prepended to the child's auto-`hash_fields`, so distinct values produce
+  distinct cache entries. Required kwargs (no default) are enforced at
+  the parent's call site.
 
-**What the macro does for you (all forms):**
-
-- Renames the child struct to `Parent_Child` to avoid kwarg shadowing.
-- Prepends `__parent__` (and any index params) as fixed fields of the child.
-- For indexed forms, sets `hash_fields = (__parent__, indices...)` so the
-  child's disk cache is namespaced by parent + indices.
-- Forwards every parent property name not already declared in the child
-  (parent-property-in-child wins; internal names like `cache_path`, `hash`
-  are excluded). Names introduced by destructuring assignments on the
-  parent — `(; foo, bar) = some_source` — forward the same as bare
-  properties.
-- Inherits the parent's `cache_type` (serial / parallel) automatically.
-- Auto-wires `__status__` as a `__substatus__` of the parent — see below.
-- Recurses through nested inline structs.
-
-For Form 3 (`@struct`), the auto-generated child is named `<prop>_inline`
-(e.g. `Parent_anon_inline`). `@struct` is not a real macro — it's
-pattern-matched by `@dynamicstruct` and rewritten into Form 1/1a.
+Older forms `sub = struct Sub … end`, `struct Sub … end`, and
+`subject(id) = struct Subject … end` still work; `@struct` is just a marker
+that auto-generates the child struct name. For all forms, the parent's
+properties (including those introduced by destructuring,
+`(; foo) = source`) auto-forward; the parent's `cache_type` is inherited;
+`__status__` is auto-wired as a `__substatus__` of the parent.
 
 ## Property docstrings
 
 A string immediately above a property definition overrides
-`_property_description(o, ::Val{:name}, args...; kwargs...)` for that
-property. This is what progress-tree labels, error headers, and any other
-code calling `_property_description` see. `$` interpolation in the string
-resolves against the *call-site* argument values, so labels reflect the
-kwargs actually in use rather than the declared defaults:
+`_property_description(o, ::Val{:name}, args...; kwargs...)` — the label
+shown in progress trees and error headers. `$` interpolation resolves
+against *call-site* kwarg values, so labels reflect actual use rather than
+declared defaults. Works at any nesting depth.
 
 ```julia
-@dynamicstruct struct Fit
-    "Pathfinder(maxiters=\$maxiters)"
-    pathfinder(instance, init; rng=Xoshiro(42), maxiters=100) =
-        initialize_mcmc(instance, init; rng, progress=__status__, maxiters)
-
-    "Warmup(n_draws=\$n_draws)"
-    posterior_warmup(instance, init; rng=Xoshiro(42), n_draws=200) =
-        adaptive_warmup_mcmc(rng, instance; init, n_draws, progress=__status__)
-end
+"Pathfinder(maxiters=\$maxiters)"
+pathfinder(instance, init; rng=Xoshiro(42), maxiters=100) =
+    initialize_mcmc(instance, init; rng, progress=__status__, maxiters)
 ```
-
-Plain (non-interpolated) strings work too: `"Pathfinder"` stays literal
-regardless of kwargs. Docstrings work at any nesting depth, including
-inside inline `@struct = begin … end` bodies.
 
 ## Progress tracking (`__status__` / `__substatus__`)
 
@@ -473,26 +412,3 @@ Limits (inherited from Julia + Revise):
 - `const` bindings can't be redefined — don't use `const` for things you
   expect to change.
 - New deps in `Project.toml` / `Manifest.toml` require a restart.
-
-## Complete example
-
-```julia
-using DynamicObjects
-
-@dynamicstruct struct Analysis
-    data_path::String
-    n_samples::Int
-
-    data      = load_data(data_path)
-    subsample = data[1:n_samples]
-
-    @cached fit    = run_model(subsample)
-    @cached report = summarise(fit)
-end
-
-a  = Analysis("data.csv", 1_000)
-a.report   # runs fit + report, caches both
-
-a2 = Analysis("data.csv", 1_000)
-a2.report  # loads both from disk
-```
