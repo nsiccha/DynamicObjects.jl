@@ -1,6 +1,23 @@
 # DynamicObjects.jl
 
-Structs with lazily computed, optionally disk-cached properties.
+Structs that memoise derived properties, optionally across disk and across
+threads. Four headline features:
+
+- **Lazy properties** — `prop = expr` inside `@dynamicstruct` compiles into a
+  `compute_property` method, evaluated on first access, cached in-memory per
+  instance. Order-independent; any RHS can reference any other property by
+  bare name.
+- **Indexed properties** — `prop(args...) = expr` gives you a property that
+  takes arguments. `obj.prop(args...)` computes fresh; `obj.prop[args...]`
+  caches per argument tuple.
+- **Thread-safe async** — with `cache_type=:parallel`, indexed property
+  access spawns a `Task`, de-duplicates concurrent requests for the same
+  key, and integrates with [`fetchindex`](#async-indexed-access-fetchindex)
+  for non-blocking UI polling. Designed for web apps where many requests
+  ask for the same long-running computation.
+- **Disk caching** — `@cached prop = …` persists results keyed by a hash of
+  the struct's fixed fields. `@memo f(x) = …` gives free functions the
+  same process-wide memoisation (no struct required).
 
 ```julia
 using DynamicObjects
@@ -17,10 +34,8 @@ p.r      # 5.0  — computed on first access, then cached in-memory
 p.theta  # atan(4, 3)
 ```
 
-Every name on the left of `=` becomes a **property**. Fixed fields (no `=`) are
-constructor arguments. Derived properties are compiled into
-`compute_property` methods and memoised per instance. Adding `@cached` also
-persists results to disk, keyed by a hash of the fixed fields.
+Every name on the left of `=` becomes a **property**. Fixed fields (no `=`)
+are constructor arguments.
 
 ## Defining properties
 
