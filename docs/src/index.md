@@ -32,7 +32,7 @@ cache. Bare names like `x` and `y` on the RHS are auto-rewritten to
 - **Lazy properties.** Order-independent; any RHS may reference any other
   field or property by bare name.
 - **Indexed properties.** `prop(args...) = expr` declares a property that
-  takes arguments. `obj.prop(args...)` recomputes; `obj.prop[args...]`
+  takes arguments. `obj.prop(args...)` recomputes; `@memo obj.prop(args...)`
   caches per `(args, kwargs)` tuple.
 - **Disk caching.** `@cached prop = …` persists results under a
   hash-derived path. `@memo f(x) = …` does the same for free functions.
@@ -112,19 +112,24 @@ Use call syntax `prop(args...; kwargs...) = expr`:
 end
 
 a = App()
-a.filter(iseven)            # [2, 4] — fresh each call
-a.filter[iseven]            # [2, 4] — cached in the per-property dict
-a.render(1; tag="span")     # "<span>1</span>"
-@memo a.render(1; tag="b")  # rewrite to a.render[1; tag="b"] (cached)
+a.filter(iseven)                  # [2, 4] — fresh each call, no caching
+@memo a.filter(iseven)            # [2, 4] — cached in the per-property dict
+a.render(1; tag="span")           # "<span>1</span>" — fresh
+@memo a.render(1; tag="b")        # "<b>1</b>"       — cached, kwargs included
 ```
 
-The two access forms differ only in what they do with the result:
+Two access forms:
 
-| Access                  | Behavior                                         |
-|-------------------------|--------------------------------------------------|
-| `obj.prop(args...)`     | Recompute every call. No caching.                |
-| `obj.prop[args...]`     | Look up `(args, kwargs)` in a per-property dict. |
-| `@memo obj.prop(args)`  | Sugar for the bracket form, kwargs and all.      |
+| Access                   | Behavior                                                          |
+|--------------------------|-------------------------------------------------------------------|
+| `obj.prop(args...)`      | Recompute every call. No caching.                                 |
+| `@memo obj.prop(args...)` | Look up `(args, kwargs)` in the per-property dict (cached access). |
+
+`@memo obj.prop(args...)` is the preferred way to get cached access at a
+call site — the `@memo` marker makes the caching visible to a reader. The
+underlying bracket form `obj.prop[args...]` still works (and is what
+`@memo` expands to), but prefer `@memo` in new code: the cache is doing
+something that a bare `[...]` doesn't make obvious.
 
 Multiple methods participate in normal Julia dispatch:
 
@@ -133,17 +138,20 @@ greet(name::String) = "Hello, $(name)!"
 greet(n::Int)       = "Hello, person #$(n)!"
 ```
 
-!!! warning "Don't mix brackets and kwargs"
-    `obj.prop[i; kw=v]` is invalid Julia (`;` inside `[]` means concatenation).
-    Use `obj.prop(i; kw=v)` for the call form, or `@memo obj.prop(i; kw=v)`
-    for the cached form. Declare with parens: `prop(i; kw=default) = …`,
-    never `prop[i] = …` (that form can't take kwargs and is deprecated).
+!!! warning "Brackets and kwargs don't mix, in either direction"
+    - **Declaration:** always `prop(i; kw=default) = …`, never
+      `prop[i] = …` — the bracket form can't take kwargs and is
+      deprecated.
+    - **Access:** always `obj.prop(i; kw=v)` or `@memo obj.prop(i; kw=v)`,
+      never `obj.prop[i; kw=v]` — that's invalid Julia (`;` inside `[]`
+      means concatenation).
 
 #### Zero-arg call vs plain property
 
 ```julia
-timestamp = time()        # plain: cached once on first read
-now()     = time()        # indexed: obj.now() is fresh, obj.now[] caches
+timestamp = time()                 # plain: cached once on first read
+now()     = time()                 # indexed: obj.now() is fresh
+@memo obj.now()                    # cached zero-arg access
 ```
 
 ### Multi-LHS destructuring
@@ -344,8 +352,8 @@ later mutate the in-memory value (`obj.result = …`), it stays in RAM until
 you flush it:
 
 ```julia
-@persist obj.result        # plain
-@persist obj.data[url]     # indexed
+@persist obj.result             # plain
+@persist obj.data(url)          # indexed (call form — preferred)
 ```
 
 ### `@lru N`: bound an indexed property's in-memory dict
@@ -364,32 +372,40 @@ slot vanish. If every slot is pinned, the dict temporarily exceeds `maxsize`.
 
 `maxsize` must be a literal `Int`; only indexed properties may carry `@lru`.
 
-### `@memo`: memoize free functions
+### `@memo`: two distinct meanings
+
+Outside `@dynamicstruct`:
 
 ```julia
 @memo expensive(x, y) = heavy_computation(x, y)
 ```
 
-Outside `@dynamicstruct`, `@memo` produces a process-wide memoised version of
-`expensive`. Inside a `@dynamicstruct` body it's a different beast — a
-call-site rewrite that turns `obj.prop(args...)` into
-`obj.prop[args...]` (see [indexed properties](#indexed-properties)).
+Produces a process-wide memoised version of `expensive` — the usual
+[memoize-a-function](https://en.wikipedia.org/wiki/Memoization) pattern.
+
+Inside a `@dynamicstruct` body, `@memo` is a **call-site rewrite** that
+turns `obj.prop(args...; kwargs...)` into the cached access path. It is
+the preferred way to ask for cached access at a call site — the marker
+makes the caching visible to the reader. See
+[indexed properties](#indexed-properties).
 
 ### Inspecting and clearing caches
 
-| Macro / function                | Returns                                          |
-|---------------------------------|--------------------------------------------------|
-| `@cache_status obj.result`      | `:unstarted` / `:started` / `:ready`             |
-| `@is_cached obj.result`         | `true` if the disk cache file is `:ready`        |
-| `@cache_path obj.result`        | The on-disk path                                 |
-| `@clear_cache! obj.result`      | Drop in-memory + delete all on-disk files        |
-| `@clear_cache! obj.result[key]` | Drop a single index                              |
-| `clear_mem_caches!(obj)`        | Drop every in-memory entry on `obj`              |
-| `clear_disk_caches!(obj)`       | Delete every `@cached` file under `obj.cache_path` |
-| `clear_all_caches!(obj)`        | Both                                             |
+| Macro / function                   | Returns                                             |
+|------------------------------------|-----------------------------------------------------|
+| `@cache_status obj.result`         | `:unstarted` / `:started` / `:ready`                |
+| `@is_cached obj.result`            | `true` if the disk cache file is `:ready`           |
+| `@cache_path obj.result`           | The on-disk path                                    |
+| `@clear_cache! obj.result`         | Drop in-memory + delete all on-disk files           |
+| `@clear_cache! obj.result(key)`    | Drop a single index                                 |
+| `clear_mem_caches!(obj)`           | Drop every in-memory entry on `obj`                 |
+| `clear_disk_caches!(obj)`          | Delete every `@cached` file under `obj.cache_path`  |
+| `clear_all_caches!(obj)`           | Both                                                |
 
-All bracket forms work for indexed properties:
-`@is_cached obj.result[key]`, `@cache_path obj.fit(2; seed=42)`, etc.
+Indexed forms use call syntax too: `@is_cached obj.result(key)`,
+`@cache_path obj.fit(2; seed=42)`, `@clear_cache! obj.result(key)`. The
+inspection macros also accept the legacy bracket form, but prefer parens —
+it reads as "inspect this call".
 
 These macros also work *inside* a `@dynamicstruct` body — drop the
 object prefix:
@@ -397,7 +413,7 @@ object prefix:
 ```julia
 @dynamicstruct struct App
     @cached result(key) = expensive(key)
-    summary(key) = @is_cached(result[key]) ? "done" : "pending"
+    summary(key) = @is_cached(result(key)) ? "done" : "pending"
 end
 ```
 
@@ -463,13 +479,13 @@ pathfinder(instance, init; rng=Xoshiro(42), maxiters=100) =
     initialize_mcmc(instance, init; rng, progress=__status__, maxiters)
 ```
 
-`obj.pathfinder[m, init; maxiters=500]` shows `Pathfinder(maxiters=500)`,
-not the default. Works at any nesting depth.
+`@memo obj.pathfinder(m, init; maxiters=500)` shows
+`Pathfinder(maxiters=500)`, not the default. Works at any nesting depth.
 
 ## Async access
 
-With `cache_type=:parallel` (default), `obj.prop[args...]` on an indexed
-property:
+With `cache_type=:parallel` (default), cached access on an indexed property
+(`@memo obj.prop(args...)`):
 
 1. Locks the cache.
 2. If the value is present → returns it.
@@ -544,12 +560,13 @@ fetchindex!(app.__status__, app.fit, "k1")   # extension method
 ```
 
 Inside any property body, `__status__` is bound to the relevant node — the
-root for plain access, the per-key substatus for `obj.prop[key]` access on
-a `ThreadsafeDict`. Pass it to your inner code via the `progress=` kwarg of
-whatever long-running API you call.
+root for plain access, the per-key substatus for cached access on a
+`ThreadsafeDict` (i.e. `@memo obj.prop(key)`). Pass it to your inner code
+via the `progress=` kwarg of whatever long-running API you call.
 
-`__substatus__` only fires on `ThreadsafeDict` `getindex` (bracket access).
-Call syntax and scalar property access don't trigger it.
+`__substatus__` only fires on the **cached** access path
+(`@memo obj.prop(key)` / equivalently `obj.prop[key]`). Fresh call syntax
+`obj.prop(key)` and scalar property access don't trigger it.
 
 ## Construction and `remake`
 
