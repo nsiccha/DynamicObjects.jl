@@ -273,6 +273,13 @@ function _on_store!(c::ThreadsafeLRUDict, key)
     end
 end
 
+Base.setindex!(c::AbstractThreadsafeDict, value, key) = begin
+    lock(c.lock) do
+        c.cache[key] = value
+        _on_store!(c, key)
+    end
+    value
+end
 Base.pop!(c::AbstractThreadsafeDict, key) = begin
     lock(c.lock) do
         haskey(c.status, key) && pop!(c.status, key)
