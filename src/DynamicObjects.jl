@@ -1444,7 +1444,7 @@ _collect_destructure_names(lhs) = begin
     end
     names
 end
-dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothing) = begin
+dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothing, is_child=false) = begin
     @assert expr.head == :struct
     mut, head, body = expr.args
     type = head
@@ -1842,25 +1842,37 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         push!(result.args, :($varname = $DiskCacheLocks()))
     end
     # Prepend extracted inline child structs (processed recursively)
-    _child_handler = isnothing(child_handler) ? (s -> dynamicstruct(s; cache_type)) : child_handler
+    _child_handler = isnothing(child_handler) ? (s -> dynamicstruct(s; cache_type, is_child=true)) : child_handler
     for s in extracted_structs
         child_result = _child_handler(s)
         # Unwrap esc() — parent handles escaping
         @assert Meta.isexpr(child_result, :escape)
         push!(result.args, child_result.args[1])
     end
-    # Docstring precedence:
-    #   1. Emit the internal/2-arg docstring first via `@doc` (auto-generated
-    #      default or the string passed as the 2-arg macro form).
-    #   2. Emit `Base.@__doc__ $type` as an override hook — a no-op on its own
-    #      (the `(meta :doc)` marker is ignored), but if the user wrote
-    #      `"""userdoc"""\n@dynamicstruct struct X ... end`, Julia lowers that
-    #      to `Core.@__doc__ @dynamicstruct ...`, which walks this expansion,
-    #      finds the `Base.@__doc__` marker, and rewrites it to
-    #      `@doc "userdoc" $type` — overriding the internal default.
+    # Docstring precedence — without emitting two `@doc` calls (which would
+    # warn "Replacing docs" on every Revise reload and, worse, cause
+    # `Core.@__doc__` to copy the parent's user docstring onto hoisted
+    # inline children by walking every `Base.@__doc__` marker in the
+    # expansion):
+    #   1. Emit the struct definition bare.
+    #   2. Install the auto-generated property-list docstring as a
+    #      `Base.Docs.getdoc(::Type{T})` fallback. It's guarded to return
+    #      `nothing` when a docstring is already registered for the
+    #      binding, so a user docstring always wins.
+    #   3. For top-level structs only (`is_child=false`), emit
+    #      `Base.@__doc__ $type` as the hook that `Core.@__doc__` rewrites
+    #      into `@doc "userdoc" $type` when the user wrote
+    #      `"""userdoc"""\n@dynamicstruct struct X ... end`. Children omit
+    #      this marker so the parent's user docstring doesn't bleed into
+    #      hoisted inline child structs.
     push!(result.args, Expr(:block,
-        :(@doc $docstring $struct_expr),
-        :(Base.@__doc__ $type),
+        struct_expr,
+        :($Base.Docs.getdoc(::Type{$type}) = begin
+            __b = $Base.Docs.Binding(parentmodule($type), nameof($type))
+            __m = get($Base.Docs.meta(__b.mod), __b, nothing)
+            (__m === nothing || isempty(__m.docs)) ? $docstring : nothing
+        end),
+        (is_child ? :($type) : :(Base.@__doc__ $type)),
         quote
             $Base.hasproperty(__self__::$type, name::Symbol) = name in $(Tuple(keys(properties)))
             $Base.getproperty(__self__::$type, name::Symbol) = $getorcomputeproperty(__self__, name)
