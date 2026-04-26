@@ -1454,13 +1454,27 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     # --- Rewrite `@struct prop[(idx...)] = begin body end` into the equivalent
     # `prop[(idx...)] = struct <auto-named> body end` so the Form 1 path picks
     # it up. `@struct` is not a real macro — it's a marker handled here.
+    # Also peels a `Core.@doc "str" @struct …` wrapper so docstrings on
+    # `@struct` properties survive the rewrite (Julia's parser auto-wraps
+    # `"str"\n<def>` inside any `:struct` body, including @dynamicstruct's).
     for (i, arg) in enumerate(body.args)
         arg isa Expr || continue
-        Meta.isexpr(arg, :macrocall) || continue
-        arg.args[1] == Symbol("@struct") || continue
-        inner = arg.args[end]
+        # Peel a `Core.@doc "str" <inner>` wrapper if present.
+        doc_wrapper = nothing
+        macro_arg = arg
+        if Meta.isexpr(macro_arg, :macrocall)
+            mname = macro_arg.args[1]
+            mname isa GlobalRef && (mname = mname.name)
+            if mname === Symbol("@doc") && length(macro_arg.args) >= 4
+                doc_wrapper = macro_arg
+                macro_arg = macro_arg.args[end]
+            end
+        end
+        Meta.isexpr(macro_arg, :macrocall) || continue
+        macro_arg.args[1] == Symbol("@struct") || continue
+        inner = macro_arg.args[end]
         Meta.isexpr(inner, :(=)) ||
-            error("@struct: expected `prop = begin ... end` or `prop(idx...) = begin ... end`, got $(arg)")
+            error("@struct: expected `prop = begin ... end` or `prop(idx...) = begin ... end`, got $(macro_arg)")
         lhs = inner.args[1]
         rhs = inner.args[2]
         Meta.isexpr(rhs, :block) ||
@@ -1469,7 +1483,9 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         prop_sym isa Symbol ||
             error("@struct: LHS must be `prop` or `prop(idx...)`, got $(lhs)")
         gen_child_name = Symbol(prop_sym, "_inline")
-        body.args[i] = Expr(:(=), lhs, Expr(:struct, false, gen_child_name, rhs))
+        rewritten = Expr(:(=), lhs, Expr(:struct, false, gen_child_name, rhs))
+        body.args[i] = isnothing(doc_wrapper) ? rewritten :
+            Expr(:macrocall, doc_wrapper.args[1:end-1]..., rewritten)
     end
     # --- Extract inline struct definitions ---
     # Collect parent property names (excluding inline structs themselves)
@@ -1502,6 +1518,23 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     extracted_structs = Expr[]
     for (i, arg) in enumerate(body.args)
         arg isa Expr || continue
+        # Peel a `Core.@doc "str" <inner>` wrapper if present, so that
+        # `"docstring"\n@struct prop(args) = …` (which pass 1 has already
+        # rewritten to `Core.@doc "str" (prop(args) = struct gen … end)`)
+        # is recognised as Form 1a here. The wrapper is reattached to the
+        # constructor assignment at the end so the third pass picks the
+        # docstring up via its `@doc` unwrap and routes it into
+        # `_property_description`.
+        doc_wrapper = nothing
+        form_arg = arg
+        if Meta.isexpr(form_arg, :macrocall)
+            mname = form_arg.args[1]
+            mname isa GlobalRef && (mname = mname.name)
+            if mname === Symbol("@doc") && length(form_arg.args) >= 4
+                doc_wrapper = form_arg
+                form_arg = form_arg.args[end]
+            end
+        end
         prop_name = nothing
         child_struct = nothing
         index_params = Symbol[]
@@ -1513,14 +1546,14 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         # Julia parses short-form function defs with a :block wrapper around the
         # RHS — so `subject(idx) = struct Subject ... end` has args[2] = :block
         # containing a LineNumberNode + the :struct. Unwrap that case.
-        if Meta.isexpr(arg, :(=)) && Meta.isexpr(arg.args[1], :call)
-            rhs_expr = arg.args[2]
+        if Meta.isexpr(form_arg, :(=)) && Meta.isexpr(form_arg.args[1], :call)
+            rhs_expr = form_arg.args[2]
             if Meta.isexpr(rhs_expr, :block)
                 inner = [a for a in rhs_expr.args if !(a isa LineNumberNode)]
                 length(inner) == 1 && Meta.isexpr(inner[1], :struct) && (rhs_expr = inner[1])
             end
             if Meta.isexpr(rhs_expr, :struct)
-                call_expr = arg.args[1]
+                call_expr = form_arg.args[1]
                 prop_name = call_expr.args[1]
                 for p in call_expr.args[2:end]
                     if Meta.isexpr(p, :parameters)
@@ -1545,12 +1578,12 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 child_struct = rhs_expr
             end
         # Form 1b: prop = struct Name ... end
-        elseif Meta.isexpr(arg, :(=)) && Meta.isexpr(arg.args[2], :struct)
-            prop_name = arg.args[1]
-            child_struct = arg.args[2]
+        elseif Meta.isexpr(form_arg, :(=)) && Meta.isexpr(form_arg.args[2], :struct)
+            prop_name = form_arg.args[1]
+            child_struct = form_arg.args[2]
         # Form 2: struct Name ... end (bare)
-        elseif Meta.isexpr(arg, :struct)
-            child_struct = arg
+        elseif Meta.isexpr(form_arg, :struct)
+            child_struct = form_arg
         end
         isnothing(child_struct) && continue
         child_name = child_struct.args[2]
@@ -1648,7 +1681,9 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                            for (kname, kdefault) in index_kwargs]
             Expr(:call, prop_name, Expr(:parameters, kw_nodes...), index_params...)
         end
-        body.args[i] = Expr(:(=), lhs_expr, constructor)
+        constructor_assignment = Expr(:(=), lhs_expr, constructor)
+        body.args[i] = isnothing(doc_wrapper) ? constructor_assignment :
+            Expr(:macrocall, doc_wrapper.args[1:end-1]..., constructor_assignment)
     end
     lnn = nothing
     doc = nothing
