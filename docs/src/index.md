@@ -120,9 +120,9 @@ a.render(1; tag="span")           # "<span>1</span>" — fresh
 
 Two access forms:
 
-| Access                   | Behavior                                                          |
-|--------------------------|-------------------------------------------------------------------|
-| `obj.prop(args...)`      | Recompute every call. No caching.                                 |
+| Access                    | Behavior                                                          |
+|---------------------------|-------------------------------------------------------------------|
+| `obj.prop(args...)`       | Recompute every call. No caching.                                 |
 | `@memo obj.prop(args...)` | Look up `(args, kwargs)` in the per-property dict (cached access). |
 
 `@memo obj.prop(args...)` is the preferred way to get cached access at a
@@ -130,6 +130,18 @@ call site — the `@memo` marker makes the caching visible to a reader. The
 underlying bracket form `obj.prop[args...]` still works (and is what
 `@memo` expands to), but prefer `@memo` in new code: the cache is doing
 something that a bare `[...]` doesn't make obvious.
+
+!!! note "`obj.prop` (no call) returns the wrapper"
+    Bare `obj.prop` on an indexed property does **not** invoke the body. It
+    returns an `IndexableProperty` wrapper that you can pass around (to
+    `fetchindex`, `cancel!`, `entries`, etc.). To actually compute, append
+    `(args...)` (fresh call) or `@memo` it (cached call):
+    ```julia
+    a.filter            # IndexableProperty :filter (Dict(...))
+    a.filter(iseven)    # [2, 4]              — fresh
+    @memo a.filter(iseven)  # [2, 4]          — cached
+    fetchindex(a.filter, (iseven,)) do rv, status; … end  # non-blocking
+    ```
 
 Multiple methods participate in normal Julia dispatch:
 
@@ -613,6 +625,116 @@ Limits inherited from Julia + Revise:
 After hot-reloading, in-memory caches still hold values computed by the *old*
 methods. Call `clear_mem_caches!(obj)` to force recomputation against the
 new code without touching `@cached` files.
+
+## Debugging
+
+### Where did this error come from?
+
+Property bodies execute lazily — the throw happens at the access site, not the declaration site. `PropertyComputationError` always tells you *which* property and *which* arguments triggered the failure:
+
+```
+PropertyComputationError: computing `pathfinder(instance, init; maxiters=500)` on App
+  Caused by: ArgumentError("…")
+    <inner stacktrace>
+```
+
+When the error percolates up through a chain (e.g. a property that called another that called another), you'll see nested `PropertyComputationError` frames. Use `unwrap_error(err)` to skip past those plus `TaskFailedException` and `CompositeException` to reach the original cause:
+
+```julia
+try
+    obj.failing_pipeline
+catch err
+    root = unwrap_error(err)        # the actual ArgumentError, not the wrapper
+    @error "pipeline failed" exception=(root, catch_backtrace())
+end
+```
+
+This is exactly what you want when surfacing errors in a UI: the `PropertyComputationError` headers tell the user where the failure happened in the data dependency tree, while `unwrap_error(err)` gives the underlying cause for log/diagnostic display.
+
+### Cycle detection (or rather: the lack of it)
+
+A property cycle (`b = c + 1; c = b - 1`) is **not** detected — it stack-overflows on access. The Julia trace ends with deeply repeated frames in `compute_property`. If you see this:
+
+```
+StackOverflowError:
+Stacktrace:
+ [1] compute_property(__self__::Foo, ::Val{:b})
+ [2] compute_property(__self__::Foo, ::Val{:c})
+ [3] compute_property(__self__::Foo, ::Val{:b})
+ [4] compute_property(__self__::Foo, ::Val{:c})
+ ...
+```
+
+…check for circular dependencies between properties.
+
+### Inspecting in-flight tasks
+
+For `:parallel` indexed properties, `entries(ip)` returns a vector of `(; key, state, status, value)` for every key seen so far — `:running`, `:failed`, `:finishing`, or `:done`:
+
+```julia
+julia> entries(app.fit)
+3-element Vector:
+ (key = ("k1",), state = :done,    status = nothing, value = …)
+ (key = ("k2",), state = :running, status = ProgressNode(…), value = Task(…))
+ (key = ("k3",), state = :failed,  status = nothing, value = Task(…))
+```
+
+`getstatus(ip, args...)` returns the substatus of a single key (or `nothing` if absent). `cancel!(ip, args...)` schedules an `InterruptException` on a single running task; `cancel_all!(ip)` does it across the whole property.
+
+### Cache state inspection
+
+For a single property:
+
+```julia
+@cache_status obj.result        # :unstarted / :started / :ready
+@is_cached    obj.result        # true if disk cache is :ready
+@cache_path   obj.result        # absolute on-disk path
+```
+
+For an indexed property, append the key:
+
+```julia
+@cache_status obj.fit("seed-1")
+@is_cached    obj.fit("seed-1")
+@cache_path   obj.fit("seed-1")
+```
+
+Inside a `@dynamicstruct` body, drop the object prefix:
+
+```julia
+@dynamicstruct struct App
+    @cached result(key) = expensive(key)
+    summary(key) = @is_cached(result(key)) ? "done" : "pending"
+end
+```
+
+### Nested DO hashing
+
+When a fixed field is itself a `@dynamicstruct`, its `.hash` field is substituted into the parent's hash inputs (so nested DOs don't bloat the parent's serialised hash key). To check what a given object's hash and cache path will be:
+
+```julia
+obj.hash         # the cache key
+obj.cache_path   # joinpath(obj.cache_base, obj.hash)
+```
+
+Override `hash_fields` to narrow the hash, or `cache_base` to relocate caches.
+
+### Force recomputation after Revise
+
+After `Revise` hot-reloads a property body, the in-memory cache still holds values produced by the *old* method. To recompute against the new code without touching `@cached` files on disk:
+
+```julia
+clear_mem_caches!(obj)        # wipe the in-memory PropertyCache
+obj.result                    # recompute with the new body
+```
+
+`clear_mem_caches!` only walks the object you pass it — for nested children, walk them too:
+
+```julia
+clear_mem_caches!(parent)
+clear_mem_caches!(parent.sub)                                          # singleton child
+foreach(clear_mem_caches!, last.(cached_entries(parent.weighted)))     # cached indexed children
+```
 
 ## Advanced
 
