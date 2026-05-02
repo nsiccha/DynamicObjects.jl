@@ -428,6 +428,14 @@ function fetchindex(fetch, ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsaf
 end
 # Fallback for non-ThreadsafeDict IPs (1-arg callback, no status)
 fetchindex(fetch, args...; kwargs...) = getindex(args...; fetch, kwargs...)
+
+"""
+    fetchindex!(callback, ip, indices...; fetch=Base.fetch, kwargs...)
+
+In-place variant of [`fetchindex`](@ref). When `callback` is `nothing`, falls
+through to a plain `getindex(ip, indices...; fetch, kwargs...)` — useful for
+sites that opt out of the two-phase fetch dance without changing call shape.
+"""
 fetchindex!(::Nothing, ip, indices...; fetch=Base.fetch, kwargs...) = getindex(ip, indices...; fetch, kwargs...)
 maybepop!(c::AbstractDict, key) = haskey(c, key) && pop!(c, key)
 maybepop!(c::AbstractThreadsafeDict, key) = begin
@@ -1074,6 +1082,15 @@ macro lru(maxsize, x)
     esc(x)
 end
 
+"""
+    @persist o.prop
+    @persist o.prop[indices...]
+
+Write the in-memory value of `o.prop` (or the indexed entry `o.prop[indices...]`)
+back to its disk cache. Use after mutating a value in place when the property
+was declared with `@cached` and the on-disk copy is now stale relative to the
+in-memory copy.
+"""
 macro persist(x)
     x, indices = if Meta.isexpr(x, (:ref, :call))
         x.args[1], x.args[2:end]
@@ -1118,21 +1135,6 @@ persist(v, args...; kwargs...) = begin
     )
 end
 
-"""
-    @clear_cache! o.prop
-    @clear_cache! o.prop[indices...]
-
-Clear the disk cache (and in-memory cache) for a `@cached` property.
-
-Without indices, clears **all** cached entries for the property (both the
-in-memory value and all `.sjl` files for that property on disk).
-With indices, clears only the specific entry.
-
-```julia
-@clear_cache! e.result        # clear all cached entries for `result`
-@clear_cache! e.ci[3]         # clear only the ci[3] entry
-```
-"""
 clear_cache!(o, name::Symbol, indices...; kwargs...) = begin
     cache = getfield(o, :cache).cache
     if isempty(indices) && isempty(kwargs)
@@ -1162,6 +1164,21 @@ clear_cache!(o, name::Symbol, indices...; kwargs...) = begin
     end
     nothing
 end
+"""
+    @clear_cache! o.prop
+    @clear_cache! o.prop[indices...]
+
+Clear the disk cache (and in-memory cache) for a `@cached` property.
+
+Without indices, clears **all** cached entries for the property (both the
+in-memory value and all `.sjl` files for that property on disk).
+With indices, clears only the specific entry.
+
+```julia
+@clear_cache! e.result        # clear all cached entries for `result`
+@clear_cache! e.ci[3]         # clear only the ci[3] entry
+```
+"""
 macro clear_cache!(x)
     cache_f_expr(x; f=clear_cache!) |> esc
 end
