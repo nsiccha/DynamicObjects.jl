@@ -549,23 +549,20 @@ end
 @testset "PropertyComputationError" begin
     # Serial: scalar property
     f = FailingProps()
-    err = try; f.will_fail; nothing; catch e; e; end
-    @test err isa DynamicObjects.PropertyComputationError
+    err = (@test_throws DynamicObjects.PropertyComputationError f.will_fail).value
     @test err.property == :will_fail
     @test err.type_name == "FailingProps"
     @test DynamicObjects.unwrap_error(err) isa ErrorException
 
     # Serial: indexed property
     f2 = FailingProps()
-    err2 = try; f2.will_fail_indexed["abc"]; nothing; catch e; e; end
-    @test err2 isa DynamicObjects.PropertyComputationError
+    err2 = (@test_throws DynamicObjects.PropertyComputationError f2.will_fail_indexed["abc"]).value
     @test err2.property == :will_fail_indexed
     @test err2.indices == ("abc",)
 
     # Parallel: indexed property (TaskFailedException wrapped)
     pf = FailingProps(; cache_type=:parallel)
-    err3 = try; pf.will_fail_indexed["xyz"]; nothing; catch e; e; end
-    @test err3 isa Base.TaskFailedException
+    err3 = (@test_throws Base.TaskFailedException pf.will_fail_indexed["xyz"]).value
     inner = err3.task.exception
     @test inner isa DynamicObjects.PropertyComputationError
     @test inner.property == :will_fail_indexed
