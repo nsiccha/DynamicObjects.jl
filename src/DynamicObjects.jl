@@ -529,25 +529,17 @@ function _ensure_loaded!(d::LazyPersistentDict)
         d.loaded && return
         p = d.path_fn()
         if isfile(p)
-            try
-                loaded = Serialization.deserialize(p)
-                if loaded isa typeof(d.data)
-                    d.data = loaded
-                else
-                    merge!(d.data, loaded)
-                end
-            catch e
-                @warn "LazyPersistentDict: failed to load $p, starting empty" exception=e
+            loaded = Serialization.deserialize(p)
+            if loaded isa typeof(d.data)
+                d.data = loaded
+            else
+                merge!(d.data, loaded)
             end
         end
         if isempty(d.data)
             d.seed!(d.data)
             if !isempty(d.data)
-                try
-                    _persist_unlocked!(d)
-                catch e
-                    @warn "LazyPersistentDict: failed to persist seeded data to $(d.path_fn())" exception=e
-                end
+                _persist_unlocked!(d)
             end
         end
         d.loaded = true

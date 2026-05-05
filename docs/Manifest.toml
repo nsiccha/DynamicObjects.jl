@@ -2,7 +2,7 @@
 
 julia_version = "1.10.11"
 manifest_format = "2.0"
-project_hash = "82577a3a2df69d1f8f100df15aad8b84d49f9861"
+project_hash = "4b8fd88710fd328c85a673228d0f45b7984c20fd"
 
 [[deps.ANSIColoredPrinters]]
 git-tree-sha1 = "574baf8110975760d391c710b6341da1afa48d8c"
@@ -34,6 +34,12 @@ version = "0.7.8"
 deps = ["Printf"]
 uuid = "ade2ca70-3891-5945-98fb-dc099432e06a"
 
+[[deps.DocInventories]]
+deps = ["CodecZlib", "Downloads", "TOML"]
+git-tree-sha1 = "e97cfa8680a39396924dcdca4b7ff1014ed5c499"
+uuid = "43dc2714-ed3b-44b5-b226-857eda1aa7de"
+version = "1.0.0"
+
 [[deps.DocStringExtensions]]
 git-tree-sha1 = "7442a5dfe1ebb773c29cc2962a8980f47221d76c"
 uuid = "ffbed154-4ef7-542d-bbb7-c09d3a79fcae"
@@ -51,6 +57,18 @@ git-tree-sha1 = "253294b1d77e4d3d1d16670b8c7ee9d80524c9cb"
 uuid = "35a29f4d-8980-5a13-9543-d66fff28ecb8"
 version = "0.1.21"
 
+[[deps.DocumenterVitepress]]
+deps = ["ANSIColoredPrinters", "Base64", "DocInventories", "DocStringExtensions", "Documenter", "IOCapture", "Markdown", "NodeJS_20_jll", "REPL", "TOML"]
+git-tree-sha1 = "16ea3c51855a59f41042fd7bc5eb870d55d88568"
+uuid = "4710194d-e776-4893-9690-8d956a29c365"
+version = "0.3.3"
+
+    [deps.DocumenterVitepress.extensions]
+    DocumenterVitepressDocumenterCitationsExt = "DocumenterCitations"
+
+    [deps.DocumenterVitepress.weakdeps]
+    DocumenterCitations = "daee34ce-89f3-4625-b898-19384cb65244"
+
 [[deps.Downloads]]
 deps = ["ArgTools", "FileWatching", "LibCURL", "NetworkOptions"]
 uuid = "f43a241f-c20a-4ad4-852c-f6b1247861c6"
@@ -58,9 +76,15 @@ version = "1.6.0"
 
 [[deps.DynamicObjects]]
 deps = ["SHA", "Serialization"]
-path = ".."
+path = "/home/niko/github/nsiccha/DynamicObjects.jl"
 uuid = "23d02862-63fe-4c6e-8fdb-1d52cbbd39d5"
 version = "0.4.3"
+
+    [deps.DynamicObjects.extensions]
+    TreebarsExt = "Treebars"
+
+    [deps.DynamicObjects.weakdeps]
+    Treebars = "e1e568c4-3a56-40a4-95fa-9b9c6c16fccb"
 
 [[deps.Expat_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
@@ -192,6 +216,12 @@ version = "2025.12.2"
 [[deps.NetworkOptions]]
 uuid = "ca575930-c2e3-43a9-ace4-1e988b2c1908"
 version = "1.2.0"
+
+[[deps.NodeJS_20_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "0b1b4a83773cfdefa5d9dc0322e4c0624ce88b5b"
+uuid = "c7aee132-11e1-519c-8219-0a43005e73c2"
+version = "20.12.2+0"
 
 [[deps.OpenSSH_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl", "OpenSSL_jll", "Zlib_jll"]

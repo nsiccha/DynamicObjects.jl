@@ -1,0 +1,14 @@
+name = "DynamicObjectsWeb"
+uuid = "4803acff-d0d5-1af4-6e6f-86a1fbc95c62"
+version = "0.1.0"
+
+[deps]
+DynamicObjects = "23d02862-63fe-4c6e-8fdb-1d52cbbd39d5"
+HTMX = "27f3e1ef-6ef8-44dc-9e9a-2fb23ed44e83"
+HTMXObjects = "b12ef442-5798-4353-80f3-9562b03a0cb6"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+TestModules = "63c02187-99fd-4e5c-aaf0-4d6bfebc181c"
+Treebars = "e1e568c4-3a56-40a4-95fa-9b9c6c16fccb"

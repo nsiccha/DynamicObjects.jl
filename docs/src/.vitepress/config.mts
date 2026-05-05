@@ -60,6 +60,11 @@ export default defineConfig({
     define: {
       __DEPLOY_ABSPATH__: JSON.stringify('REPLACE_ME_DOCUMENTER_VITEPRESS_DEPLOY_ABSPATH'),
     },
+    server: {
+      // Bind to all interfaces so the dev server is reachable from
+      // other devices on the local network.
+      host: true,
+    },
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '../components')
