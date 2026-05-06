@@ -165,7 +165,8 @@ LRUDict(maxsize::Integer) = LRUDict{Any,Any}(maxsize)
 
 const _cache_types = (;serial=Dict, parallel=ThreadsafeDict)
 resolve_cache_type(s::Symbol) = get(_cache_types, s, s)
-resolve_cache_type(T::Type) = T isa UnionAll ? T : T.name.wrapper
+resolve_cache_type(T::Type) = T.name.wrapper
+resolve_cache_type(T::UnionAll) = T
 
 Base.length(c::AbstractThreadsafeDict) = lock(c.lock) do; length(c.cache); end
 # NOTE: iteration is NOT truly thread-safe — each iterate call locks independently,
@@ -2261,7 +2262,11 @@ unwrap_error(e::PropertyComputationError) = unwrap_error(_cause_error(e))
 unwrap_error(e) = e
 
 # Extract the exception from cause (which may be a (exception, backtrace) tuple)
-_cause_error(e::PropertyComputationError) = e.cause isa Tuple ? first(e.cause) : e.cause
+_cause_error(e::PropertyComputationError) = _unwrap_cause(e.cause)
+_unwrap_cause(c::Tuple) = first(c)
+_unwrap_cause(c) = c
+_cause_bt(c::Tuple) = length(c) >= 2 ? c[2] : nothing
+_cause_bt(_) = nothing
 
 # Compact, truncated repr for error messages — avoids dumping huge DataFrames/
 # arrays that happen to be passed as property arguments. Small values (numbers,
@@ -2288,7 +2293,7 @@ function Base.showerror(io::IO, e::PropertyComputationError)
     key = _format_property_key(e.property, e.indices, e.kwargs)
     print(io, "PropertyComputationError: computing `$key` on $(e.type_name)\n")
     cause_err = _cause_error(e)
-    cause_bt = e.cause isa Tuple && length(e.cause) >= 2 ? e.cause[2] : nothing
+    cause_bt = _cause_bt(e.cause)
     print(io, "  Caused by: ")
     if cause_err isa PropertyComputationError
         showerror(io, cause_err)
