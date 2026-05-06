@@ -1395,10 +1395,18 @@ _collect_self_accesses(e, prop_names) = _collect_self_accesses!(Set{Symbol}(), e
 _contains_call(_) = false
 _contains_call(e::Expr) = Meta.isexpr(e, :call) || any(_contains_call, e.args)
 
+# Any reference to `__self__` anywhere in the body counts as self-access —
+# catches `getproperty(__self__, name)` and similar reflective patterns
+# that the structured `__self__.X` detector would otherwise miss.
+_contains_self_ref(e::Symbol) = e === :__self__
+_contains_self_ref(e::Expr) = any(_contains_self_ref, e.args)
+_contains_self_ref(_) = false
+
 function _lint_property!(name::Symbol, info, walked_rhs, type, prop_names)
     isempty(info.indices) && return
     isempty(info.macros) || return
     _contains_call(walked_rhs) || return
+    _contains_self_ref(walked_rhs) && return
     isempty(_collect_self_accesses(walked_rhs, prop_names)) || return
     loc = isnothing(info.lnn) ? "" : " at $(info.lnn.file):$(info.lnn.line)"
     @warn """DynamicObjects lint: property `$type.$name(…)`$loc calls functions but reads no sibling state. If its args are pre-extracted from sibling properties at every call site (e.g. callers do `s = sibling_status[k]; r = s == :ready ? sibling_result[k] : nothing; $name(label, s, r)`), the natural shape is an inline-child DO — `@struct child(keys...) = begin status = …; result = …; html = …; end` — that owns the lookups and exposes the derivations as plain properties. Scattered call sites then collapse to `child[keys...].some_derived_prop`. If the standalone form is intentional, silence with `@dynamicstruct lint=false struct $type …`."""
