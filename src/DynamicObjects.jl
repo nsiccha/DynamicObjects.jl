@@ -37,23 +37,6 @@ export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @p
 
 import SHA, Serialization
 
-_is_symbol(::Symbol) = true
-_is_symbol(_) = false
-_is_expr(::Expr) = true
-_is_expr(_) = false
-_is_lnn(::LineNumberNode) = true
-_is_lnn(_) = false
-_is_string(::String) = true
-_is_string(_) = false
-_is_integer(::Integer) = true
-_is_integer(_) = false
-_is_task(::Task) = true
-_is_task(_) = false
-_is_globalref(::GlobalRef) = true
-_is_globalref(_) = false
-_is_version(::VersionNumber) = true
-_is_version(_) = false
-
 struct DiskCacheLocks
     lock::ReentrantLock
     locks::Dict{String, ReentrantLock}
@@ -1091,7 +1074,7 @@ property expression — the actual cache substitution is done via the
 `subcache` overrides emitted by `@dynamicstruct`.
 """
 macro lru(maxsize, x)
-    _is_integer(maxsize) || error("@lru: maxsize must be a literal Integer, got: \$maxsize")
+    _validate_lru_maxsize(maxsize)
     esc(x)
 end
 
@@ -1199,13 +1182,43 @@ end
 
 isfixed(kv::Pair) = isfixed(kv[2])
 isfixed(info::NamedTuple) = isnothing(info.rhs)
+
+# Per-element handler for the `:local` branch of `walk_rhs` — register
+# Symbol locals via dispatch instead of an `if arg isa Symbol …` chain
+# inside the loop body. Tuple-Expr leaves go through `_push_if_symbol!`,
+# Symbol assignment LHS through `_walk_local_assign!`.
+_walk_local_arg!(arg::Symbol; locals, kwargs...) = (push!(locals, arg); arg)
+_walk_local_arg!(arg; locals, properties, lnn) = walk_rhs(arg; locals, properties, lnn)
+function _walk_local_arg!(arg::Expr; locals, properties, lnn)
+    if Meta.isexpr(arg, :(=))
+        return _walk_local_assign!(arg.args[1], arg, locals, properties, lnn)
+    elseif Meta.isexpr(arg, :tuple)
+        foreach(s -> _push_if_symbol!(locals, s), arg.args)
+        return arg
+    end
+    walk_rhs(arg; locals, properties, lnn)
+end
+_walk_local_assign!(lhs::Symbol, arg, locals, properties, lnn) =
+    (push!(locals, lhs); Expr(:(=), lhs, walk_rhs(arg.args[2]; locals, properties, lnn)))
+_walk_local_assign!(_, arg, locals, properties, lnn) = walk_rhs(arg; locals, properties, lnn)
+_push_if_symbol!(locals, s::Symbol) = (push!(locals, s); nothing)
+_push_if_symbol!(_, _) = nothing
+
+# Per-element handler for the trailing-else branch of `walk_rhs(::Expr)`.
+# LineNumberNode arms record the LNN into a Ref so subsequent siblings
+# pick it up; everything else recurses with the most recent LNN. Avoids
+# the `if arg isa LineNumberNode` mutating-closure pattern.
+_walk_with_lnn_tracking!(arg::LineNumberNode, ref, locals, properties) = (ref[] = arg; arg)
+_walk_with_lnn_tracking!(arg, ref, locals, properties) =
+    walk_rhs(arg; locals, properties, lnn=ref[])
+
 walk_rhs(e; kwargs...) = e
 walk_rhs(e::Expr; locals, properties, lnn=nothing) = if e.head == :let
     # locals = properties[dependent].locals
     ls = Set{Symbol}()
     !Meta.isexpr(e.args[1], :block) && (e.args[1] = Expr(:block, e.args[1]))
-    map!(e.args[1].args, e.args[1].args) do arg 
-        _is_symbol(arg) && (arg = Expr(:(=), arg, arg))
+    map!(e.args[1].args, e.args[1].args) do arg
+        arg = _normalize_let_binding(arg)
         @assert Meta.isexpr(arg, :(=))
         name, rhs = arg.args[1], walk_rhs(arg.args[2]; locals, properties, lnn)
         name in locals || push!(ls, name)
@@ -1221,7 +1234,7 @@ elseif e.head == :(->)
     # Lambda: first arg is parameter(s), second is body.
     # Add lambda params to locals so they are not rewritten.
     params = e.args[1]
-    ls = extractnames(_is_expr(params) && Meta.isexpr(params, :tuple) ? params.args : [params])
+    ls = extractnames(Meta.isexpr(params, :tuple) ? params.args : [params])
     new_locals = union(locals, ls)
     Expr(e.head, e.args[1], walk_rhs(e.args[2]; locals=new_locals, properties, lnn))
 elseif e.head == :for
@@ -1282,7 +1295,7 @@ elseif e.head == :try
     # args: [try_body, catch_var, catch_body, [finally_body]]
     walked_try = walk_rhs(e.args[1]; locals, properties, lnn)
     catch_var = e.args[2]  # Symbol or false
-    catch_locals = _is_symbol(catch_var) ? union(locals, Set([catch_var])) : locals
+    catch_locals = catch_var === false ? locals : union(locals, Set([catch_var]))
     walked_catch = walk_rhs(e.args[3]; locals=catch_locals, properties, lnn)
     if length(e.args) >= 4
         walked_finally = walk_rhs(e.args[4]; locals, properties, lnn)
@@ -1312,22 +1325,7 @@ elseif e.head in (:kw, :(=))
 elseif e.head == :local
     # `local x`, `local x, y, z`, or `local x = expr` — add names to the local
     # scope so subsequent assignments don't hit the property cache.
-    walked = map(e.args) do arg
-        if _is_symbol(arg)
-            push!(locals, arg)
-            arg
-        elseif Meta.isexpr(arg, :(=)) && _is_symbol(arg.args[1])
-            push!(locals, arg.args[1])
-            Expr(:(=), arg.args[1], walk_rhs(arg.args[2]; locals, properties, lnn))
-        elseif Meta.isexpr(arg, :tuple)
-            for s in arg.args
-                _is_symbol(s) && push!(locals, s)
-            end
-            arg
-        else
-            walk_rhs(arg; locals, properties, lnn)
-        end
-    end
+    walked = map(arg -> _walk_local_arg!(arg; locals, properties, lnn), e.args)
     Expr(:local, walked...)
 elseif e.head == :tuple
     # Named tuple: (x=1, y=2) — :(=) children are field definitions, not assignments.
@@ -1341,16 +1339,12 @@ elseif e.head == :tuple
     end
     Expr(:tuple, walked...)
 else
-    # Track LineNumberNodes for better warning locations
-    new_lnn = lnn
-    walked = map(e.args) do arg
-        if _is_lnn(arg)
-            new_lnn = arg
-            arg
-        else
-            walk_rhs(arg; locals, properties, lnn=new_lnn)
-        end
-    end
+    # Track LineNumberNodes for better warning locations. Dispatch on
+    # the arg type via `_walk_with_lnn_tracking!` (LNN method updates
+    # the Ref; the fallback walks the arg with the current LNN) instead
+    # of branching on `isa` inside the loop body.
+    ref_lnn = Ref{Any}(lnn)
+    walked = map(arg -> _walk_with_lnn_tracking!(arg, ref_lnn, locals, properties), e.args)
     Expr(e.head, walked...)
 end
 walk_rhs(e::Symbol; locals, properties, lnn=nothing) = if haskey(properties, e) && !(e in locals)
@@ -1413,6 +1407,50 @@ fixcall(x::Expr) = if Meta.isexpr(x, :call)
 else
     Expr(x.head, fixcall.(x.args)...)
 end
+# Unwrap a `GlobalRef(M, :@name)` to its bare `:@name` Symbol. Macro names
+# arrive as either form depending on whether the macrocall came through
+# Julia's docstring lowering or a direct user write.
+_resolve_macro_name(m::GlobalRef) = m.name
+_resolve_macro_name(m) = m
+
+# Property names introduced by an `arg`'s LHS — bare symbols, typed
+# fields, and tuple destructures. Inline structs and other shapes
+# contribute none. Used to assemble `parent_props` in `dynamicstruct`.
+_collect_lhs_names(::Any) = ()
+_collect_lhs_names(lhs::Symbol) = (lhs,)
+_collect_lhs_names(lhs::Expr) =
+    Meta.isexpr(lhs, :tuple) ? Tuple(_collect_destructure_names(lhs)) : ()
+
+# Render a stored docstring back to a String for the auto-generated
+# property listing. Strings pass through; anything else (an `Expr` from
+# string interpolation) gets `show_unquoted` to recover the source.
+_doc_to_string(doc::AbstractString) = doc
+_doc_to_string(doc) = sprint(Base.show_unquoted, doc)
+
+# Build the extraction RHS for one member of a destructuring assignment.
+# Symbol source → `extract_from.source`; integer index → `extract_from[i]`.
+_extract_member(extract_from, source::Symbol) = Expr(:., extract_from, QuoteNode(source))
+_extract_member(extract_from, source) = :($extract_from[$source])
+
+# Replace `LineNumberNode` markers in a block with `lnn` (used by
+# `setlnn` to rewrite line tags onto user-supplied locations); leave
+# everything else untouched.
+_replace_lnn(::LineNumberNode, lnn) = lnn
+_replace_lnn(x, _) = x
+
+# Validate `@lru maxsize` / `@cached` Integer args at macro time without
+# inlining `isa(..., Integer) || error(...)`. Per-type method ⇒ Integer
+# passes silently; anything else hits the fallback that errors with the
+# offending value.
+_validate_lru_maxsize(::Integer) = nothing
+_validate_lru_maxsize(x) = error("@lru: maxsize must be a literal Integer, got: $x")
+
+# Normalise a `let` binding: a bare Symbol `x` becomes `x = x` (so the
+# rest of the let-walker can treat every binding as an `Expr(:(=), …)`),
+# already-`=`-shaped bindings pass through.
+_normalize_let_binding(arg::Symbol) = Expr(:(=), arg, arg)
+_normalize_let_binding(arg) = arg
+
 # Names from an `lhs` that would shadow a property when assigned. Plain symbols
 # match if they name a property and aren't already declared local; tuples
 # expand to their symbol leaves; anything else can't shadow.
@@ -1421,7 +1459,11 @@ _shadowed_lhs(lhs::Symbol, properties, locals) =
     haskey(properties, lhs) && !(lhs in locals) ? [lhs] : Symbol[]
 function _shadowed_lhs(lhs::Expr, properties, locals)
     lhs.head === :tuple || return Symbol[]
-    [s for s in lhs.args if _is_symbol(s) && haskey(properties, s) && !(s in locals)]
+    out = Symbol[]
+    for s in lhs.args
+        append!(out, _shadowed_lhs(s, properties, locals))
+    end
+    out
 end
 
 _collect_leaves(e) = error("unsupported destructuring element: $e")
@@ -1554,13 +1596,13 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     # `@struct` properties survive the rewrite (Julia's parser auto-wraps
     # `"str"\n<def>` inside any `:struct` body, including @dynamicstruct's).
     for (i, arg) in enumerate(body.args)
-        _is_expr(arg) || continue
+        arg isa Expr || continue
         # Peel a `Core.@doc "str" <inner>` wrapper if present.
         doc_wrapper = nothing
         macro_arg = arg
         if Meta.isexpr(macro_arg, :macrocall)
             mname = macro_arg.args[1]
-            _is_globalref(mname) && (mname = mname.name)
+            mname = _resolve_macro_name(mname)
             if mname === Symbol("@doc") && length(macro_arg.args) >= 4
                 doc_wrapper = macro_arg
                 macro_arg = macro_arg.args[end]
@@ -1576,7 +1618,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         Meta.isexpr(rhs, :block) ||
             error("@struct: RHS must be a `begin ... end` block, got $(rhs)")
         prop_sym = Meta.isexpr(lhs, :call) ? lhs.args[1] : lhs
-        _is_symbol(prop_sym) ||
+        prop_sym isa Symbol ||
             error("@struct: LHS must be `prop` or `prop(idx...)`, got $(lhs)")
         gen_child_name = Symbol(prop_sym, "_inline")
         rewritten = Expr(:(=), lhs, Expr(:struct, false, gen_child_name, rhs))
@@ -1589,7 +1631,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     # Collect parent property names (excluding inline structs themselves)
     parent_props = Symbol[]
     for arg in body.args
-        _is_lnn(arg) && continue
+        arg isa LineNumberNode && continue
         a = arg
         while Meta.isexpr(a, :macrocall); a = a.args[end]; end
         # Skip inline structs (both forms)
@@ -1602,20 +1644,14 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         end
         Meta.isexpr(lhs, (:call, :ref)) && (lhs = lhs.args[1])
         Meta.isexpr(lhs, :(::)) && (lhs = lhs.args[1])
-        if _is_symbol(lhs)
-            push!(parent_props, lhs)
-        elseif Meta.isexpr(lhs, :tuple)
-            # Destructuring assignment — register each extracted name so that
-            # inline children's auto-forward destructure picks them up, same
-            # as bare properties. Handles positional `(a, b) = expr`, nested
-            # positional `((a,b), c) = expr`, named `(;a, b) = expr`, rename
-            # `(;x_val<=val) = expr`, and prefix `(;x_ <= (val, grad)) = expr`.
-            append!(parent_props, _collect_destructure_names(lhs))
-        end
+        # `_collect_lhs_names` dispatches: bare Symbol → (sym,), tuple
+        # destructure → recursive name collection, anything else → ().
+        # Each new shape is a method, not another `if` arm.
+        append!(parent_props, _collect_lhs_names(lhs))
     end
     extracted_structs = Expr[]
     for (i, arg) in enumerate(body.args)
-        _is_expr(arg) || continue
+        arg isa Expr || continue
         # Peel a `Core.@doc "str" <inner>` wrapper if present, so that
         # `"docstring"\n@struct prop(args) = …` (which pass 1 has already
         # rewritten to `Core.@doc "str" (prop(args) = struct gen … end)`)
@@ -1627,7 +1663,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         form_arg = arg
         if Meta.isexpr(form_arg, :macrocall)
             mname = form_arg.args[1]
-            _is_globalref(mname) && (mname = mname.name)
+            mname = _resolve_macro_name(mname)
             if mname === Symbol("@doc") && length(form_arg.args) >= 4
                 doc_wrapper = form_arg
                 form_arg = form_arg.args[end]
@@ -1647,7 +1683,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         if Meta.isexpr(form_arg, :(=)) && Meta.isexpr(form_arg.args[1], :call)
             rhs_expr = form_arg.args[2]
             if Meta.isexpr(rhs_expr, :block)
-                inner = [a for a in rhs_expr.args if !_is_lnn(a)]
+                inner = [a for a in rhs_expr.args if !(a isa LineNumberNode)]
                 length(inner) == 1 && Meta.isexpr(inner[1], :struct) && (rhs_expr = inner[1])
             end
             if Meta.isexpr(rhs_expr, :struct)
@@ -1659,17 +1695,17 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                             if Meta.isexpr(kw, :kw)
                                 kname = kw.args[1]
                                 Meta.isexpr(kname, :(::)) && (kname = kname.args[1])
-                                @assert _is_symbol(kname) "indexed inline struct kwarg name must be a Symbol, got $(kw.args[1])"
+                                @assert kname isa Symbol "indexed inline struct kwarg name must be a Symbol, got $(kw.args[1])"
                                 push!(index_kwargs, (kname, Some(kw.args[2])))
                             else
                                 kname = Meta.isexpr(kw, :(::)) ? kw.args[1] : kw
-                                @assert _is_symbol(kname) "indexed inline struct kwarg name must be a Symbol, got $kw"
+                                @assert kname isa Symbol "indexed inline struct kwarg name must be a Symbol, got $kw"
                                 push!(index_kwargs, (kname, nothing))
                             end
                         end
                     else
                         pname = Meta.isexpr(p, :(::)) ? p.args[1] : p
-                        @assert _is_symbol(pname) "indexed inline struct: index param must be a Symbol, got $p"
+                        @assert pname isa Symbol "indexed inline struct: index param must be a Symbol, got $p"
                         push!(index_params, pname)
                     end
                 end
@@ -1692,14 +1728,14 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         # Collect child's own property names to avoid collision
         child_props = Set{Symbol}()
         for ca in child_struct.args[3].args
-            _is_expr(ca) || continue
+            ca isa Expr || continue
             ca2 = ca
             while Meta.isexpr(ca2, :macrocall); ca2 = ca2.args[end]; end
             Meta.isexpr(ca2, :(=)) || continue
             clhs = ca2.args[1]
             Meta.isexpr(clhs, (:call, :ref)) && (clhs = clhs.args[1])
             Meta.isexpr(clhs, :(::)) && (clhs = clhs.args[1])
-            _is_symbol(clhs) && push!(child_props, clhs)
+            _push_if_symbol!(child_props, clhs)
         end
         # Prepend __parent__, index params, hash_fields override, and
         # forwarded parent properties to the child body.
@@ -1788,11 +1824,11 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     docs = []
     oproperties = Pair[]
     for arg in body.args
-        if _is_lnn(arg)
+        if arg isa LineNumberNode
             lnn = arg
             continue
         end
-        if _is_string(arg) || Meta.isexpr(arg, :string)
+        if arg isa String || Meta.isexpr(arg, :string)
             doc = arg
             continue
         end
@@ -1811,14 +1847,14 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             # storage so the `Set{Symbol}` push and `== Symbol("@…")` tests
             # both work regardless of form.
             mname = arg.args[1]
-            _is_globalref(mname) && (mname = mname.name)
+            mname = _resolve_macro_name(mname)
             # `@doc "str" <def>` — consume the docstring and continue unwrapping
             # into the real definition. Happens when Julia's docstring lowering
             # has rewritten `"str"\n<def>` inside a deeply-nested inline struct
             # body before our recursive pass re-enters the block.
             if mname === Symbol("@doc") && length(arg.args) >= 4
                 docexpr = arg.args[end-1]
-                if _is_string(docexpr) || Meta.isexpr(docexpr, :string)
+                if docexpr isa String || Meta.isexpr(docexpr, :string)
                     doc = docexpr
                 end
                 arg = arg.args[end]
@@ -1829,14 +1865,14 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 ver_expr = arg.args[3]
                 if Meta.isexpr(ver_expr, :macrocall) && ver_expr.args[1] == Symbol("@v_str")
                     cache_version = VersionNumber(ver_expr.args[end])
-                elseif _is_version(ver_expr)
+                elseif ver_expr isa VersionNumber
                     cache_version = ver_expr
                 else
                     error("@cached version argument must be a version string like v\"2\", got: $ver_expr")
                 end
             elseif mname == Symbol("@lru") && length(arg.args) == 4
                 sz = arg.args[3]
-                _is_integer(sz) || error("@lru: maxsize must be a literal Integer, got: $sz")
+                _validate_lru_maxsize(sz)
                 lru_size = Int(sz)
             end
             arg = arg.args[end]
@@ -1872,12 +1908,12 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             members = Pair{Symbol, Any}[]  # name => source_field_or_index
             if named
                 for a in raw_args
-                    if _is_symbol(a)
+                    if a isa Symbol
                         # (;a) → property a, extracts .a
                         push!(members, a => a)
                     elseif Meta.isexpr(a, :call) && a.args[1] == :(<=)
                         target, source = a.args[2], a.args[3]
-                        if _is_symbol(source)
+                        if source isa Symbol
                             # (;x_val<=val) → property x_val, extracts .val
                             push!(members, target => source)
                         elseif Meta.isexpr(source, :tuple)
@@ -1899,7 +1935,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             # When RHS is a bare symbol in named destructuring, skip the hidden
             # group property and extract directly: (;a, b) = config → a = config.a
             # Otherwise, use a group property to evaluate the RHS once.
-            extract_from = if named && _is_symbol(rhs)
+            extract_from = if named && rhs isa Symbol
                 rhs
             else
                 group_name = Symbol("_tuple_", join(prop_names, "_"))
@@ -1911,11 +1947,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             end
             doc = nothing
             for (prop_name, source) in members
-                extract_rhs = if _is_symbol(source)
-                    Expr(:., extract_from, QuoteNode(source))
-                else
-                    :($extract_from[$source])
-                end
+                extract_rhs = _extract_member(extract_from, source)
                 push!(oproperties, prop_name=>(;lhs=prop_name, macros=Set{Symbol}(), rhs=extract_rhs, lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([prop_name]), indices=tuple(), indexed=false, cache_version=nothing, lru_size=nothing))
                 push!(docs, (prop_name=>(nothing, true)))
             end
@@ -1937,7 +1969,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         else
             arg
         end
-        @assert _is_symbol(name) dump(name)
+        @assert name isa Symbol dump(name)
         push!(docs, (name=>(doc, !isnothing(rhs))))
         doc = nothing
         !isnothing(locals) && push!(locals, name)
@@ -1949,7 +1981,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     property_docs = Dict(name => doc for (name, (doc, _)) in docs if !isnothing(doc))
 
     docstring = something(docstring, "DynamicStruct `$type`.") * "\n\n" * join([
-        "* " * (isnothing(doc) ? "" : "$(_is_string(doc) ? doc : sprint(Base.show_unquoted, doc)): ") * "`$name" * (hasrhs ? " = ..." : "") * "`"
+        "* " * (isnothing(doc) ? "" : "$(_doc_to_string(doc)): ") * "`$name" * (hasrhs ? " = ..." : "") * "`"
         for (name, (doc, hasrhs)) in docs
     ], "\n")
 
@@ -2043,7 +2075,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 for idx in info.indices
                     Meta.isexpr(idx, :parameters) || continue
                     for a in idx.args
-                        Meta.isexpr(a, :kw) && push!(kwarg_names, _is_expr(a.args[1]) ? a.args[1].args[1] : a.args[1])
+                        Meta.isexpr(a, :kw) && push!(kwarg_names, a.args[1] isa Expr ? a.args[1].args[1] : a.args[1])
                     end
                 end
                 defaults_locals = setdiff(info.locals, kwarg_names)
@@ -2121,7 +2153,7 @@ function setlnn(lnn::Union{LineNumberNode,Nothing})
     function(expr::Expr)
         isnothing(lnn) && return expr
         @assert expr.head == :block
-        Expr(:block, map(x -> _is_lnn(x) ? lnn : x, expr.args)...)
+        Expr(:block, map(x -> _replace_lnn(x, lnn), expr.args)...)
     end
 end
 
