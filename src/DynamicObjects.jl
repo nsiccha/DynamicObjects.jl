@@ -1352,6 +1352,43 @@ walk_rhs(e::Symbol; locals, properties, lnn=nothing) = if haskey(properties, e) 
 else
     e
 end
+
+# --- Linter ----------------------------------------------------------------
+#
+# Single-pass checks over a property's already-walked RHS. Each check runs
+# inside `_lint_property!`; add new checks there. Per-struct opt-out is
+# `@dynamicstruct lint=false struct …` (see `dynamicstruct(...)` kwarg).
+#
+# Check #1 — `:no_self_access`: a property body that has at least one call
+# expression but never reads any sibling field/property is almost always a
+# free function pasted into the struct body. Recommend extracting it.
+#
+# To silence per-struct (e.g. for tests that intentionally use a no-state
+# body) pass `lint=false` to the macro. There is no per-property opt-out by
+# design — if you need finer control, that's a signal to split the struct.
+_collect_self_accesses!(acc::Set{Symbol}, _) = acc
+function _collect_self_accesses!(acc::Set{Symbol}, e::Expr)
+    if Meta.isexpr(e, :., 2) && e.args[1] === :__self__ && e.args[2] isa QuoteNode
+        push!(acc, e.args[2].value)
+    end
+    for a in e.args
+        _collect_self_accesses!(acc, a)
+    end
+    acc
+end
+_collect_self_accesses(e) = _collect_self_accesses!(Set{Symbol}(), e)
+
+_contains_call(_) = false
+_contains_call(e::Expr) = Meta.isexpr(e, :call) || any(_contains_call, e.args)
+
+function _lint_property!(name::Symbol, info, walked_rhs, type)
+    isempty(_collect_self_accesses(walked_rhs)) || return
+    _contains_call(walked_rhs) || return
+    loc = isnothing(info.lnn) ? "" : " at $(info.lnn.file):$(info.lnn.line)"
+    sig = isempty(info.indices) ? "$name = …" : "$name(…) = …"
+    @warn """DynamicObjects lint: in `$type`, property `$sig`$loc has a body that calls functions but doesn't read any sibling field/property. This is usually a free function pasted into the struct body. Either move it to module scope, or — if intentional (e.g. test scaffolding) — silence with `@dynamicstruct lint=false struct $type …`."""
+end
+
 function compute_property end
 function iscached end
 function resumes end
@@ -1721,7 +1758,7 @@ function _detect_inline_method_lhs(lhs::Expr)
     (; fname=sig.args[1], sig_args, where_params, self_idx)
 end
 
-dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothing, is_child=false) = begin
+dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothing, is_child=false, lint=true) = begin
     @assert expr.head == :struct
     mut, head, body = expr.args
     type = head
@@ -2131,7 +2168,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         push!(result.args, :($varname = $DiskCacheLocks()))
     end
     # Prepend extracted inline child structs (processed recursively)
-    _child_handler = isnothing(child_handler) ? (s -> dynamicstruct(s; cache_type, is_child=true)) : child_handler
+    _child_handler = isnothing(child_handler) ? (s -> dynamicstruct(s; cache_type, is_child=true, lint)) : child_handler
     for s in extracted_structs
         child_result = _child_handler(s)
         # Unwrap esc() — parent handles escaping
@@ -2228,8 +2265,10 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 else
                     nothing
                 end
+                walked_rhs = walk_rhs(info.rhs; info.locals, properties, lnn=info.lnn)
+                lint && _lint_property!(name, info, walked_rhs, type)
                 block = Expr(:block,
-                    _lnn, Expr(:(=), _call(:compute_property, cp_kwargs...), Expr(:block, _lnn, walk_rhs(info.rhs; info.locals, properties, lnn=info.lnn))),
+                    _lnn, Expr(:(=), _call(:compute_property, cp_kwargs...), Expr(:block, _lnn, walked_rhs)),
                     _lnn, Expr(:(=), _call(:iscached), Expr(:block, _lnn, iscached_val)),
                     _lnn, Expr(:(=), _call(:resumes), Expr(:block, _lnn, false)),
                 )
@@ -2420,14 +2459,26 @@ passed to the computation body as the local `__status__`.
 `__substatus__` only fires on ThreadsafeDict `getindex` (bracket access).
 Call syntax and scalar property access do not trigger it.
 """
-macro dynamicstruct(expr)
-    dynamicstruct(expr)
+# Parse a single positional macro arg into a (kwarg-name => value) pair.
+# `name=value` Expr → `(name => value)`. String/`:string` → `(:docstring => …)`.
+# QuoteNode (`:parallel` / `:serial`) → `(:cache_type => sym)`. Anything else
+# is rejected with a pointer to the recognised forms.
+_parse_macro_opt(a::AbstractString) = (:docstring => a)
+_parse_macro_opt(a::QuoteNode) = (:cache_type => a.value)
+_parse_macro_opt(a::Expr) = if a.head === :string
+    (:docstring => a)
+elseif a.head === :(=) && a.args[1] isa Symbol
+    (a.args[1] => a.args[2])
+else
+    error("@dynamicstruct: unsupported option `$a` — use a docstring, `:parallel`/`:serial`, or `name=value`.")
 end
-macro dynamicstruct(docstring, expr)
-    dynamicstruct(expr; docstring)
-end
-macro dynamicstruct(docstring, cache_type, expr)
-    dynamicstruct(expr; docstring, cache_type)
+_parse_macro_opt(a) = error("@dynamicstruct: unsupported option `$a` — use a docstring, `:parallel`/`:serial`, or `name=value`.")
+
+macro dynamicstruct(args...)
+    isempty(args) && error("@dynamicstruct: missing struct definition.")
+    expr = last(args)
+    kwargs = Dict{Symbol,Any}(_parse_macro_opt(a) for a in args[1:end-1])
+    dynamicstruct(expr; kwargs...)
 end
 
 """
