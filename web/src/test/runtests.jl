@@ -157,7 +157,12 @@ _assign_in_rhs_path = Ref("")
     cache_path = _assign_in_rhs_path[]
     @cached flag = false
     toggle[req] = begin
-        flag = !flag
+        # Bare `flag = !flag` would trip the property-shadow check
+        # (post f4d7c14: error, was warn). Route the cache write
+        # through the explicit `setproperty!` path instead — same
+        # observable effect (writes to the property cache), no
+        # ambiguity for the macro's RHS walker.
+        __self__.flag = !flag
         @persist flag
         flag
     end
@@ -201,7 +206,9 @@ _persistable_path = Ref("")
     cache_path = _persistable_path[]
     @cached counter = 0
     increment[req] = begin
-        counter = counter + 1
+        # See `AssignInRhs` above — explicit `setproperty!` path
+        # avoids tripping the macro's property-shadow check.
+        __self__.counter = counter + 1
         @persist counter
         counter
     end
