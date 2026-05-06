@@ -1368,46 +1368,37 @@ end
 # `@persist`, `@lru`, …) are also exempted because the macro itself is the
 # reason the property lives in the struct.
 #
-# Self-access is detected on the *walked* RHS: `__self__.X` accesses that
-# `walk_rhs` synthesises, plus bare `Symbol` references to declared
-# property names — the latter catches the `__status__` case, which
-# `walk_rhs` leaves bare (because `__status__` is in `info.locals`, since
-# it's threaded through compute_property as a kwarg rather than read off
-# `__self__`).
+# Self-access detection has two complementary checks:
+#
+# 1. `_contains_self_ref` — any reference to `:__self__` anywhere in the
+#    body. Catches both the structured `__self__.X` accesses that
+#    `walk_rhs` synthesises and reflective patterns like
+#    `getproperty(__self__, method)`.
+# 2. `_contains_bare_prop_ref` — any bare symbol matching a declared
+#    property name. Catches the `__status__` case (and friends): names
+#    that are *also* in `info.locals`, so `walk_rhs` leaves them bare
+#    instead of rewriting to `__self__.…`. They still refer to a sibling
+#    property — via the kwarg-threaded compute_property pathway.
 #
 # Per-property opt-out is intentionally absent: if you need finer control,
 # that's a signal to split the struct.
-_collect_self_accesses!(acc::Set{Symbol}, _, _) = acc
-_collect_self_accesses!(acc::Set{Symbol}, e::Symbol, prop_names) =
-    (e in prop_names && push!(acc, e); acc)
-function _collect_self_accesses!(acc::Set{Symbol}, e::Expr, prop_names)
-    if Meta.isexpr(e, :., 2) && e.args[1] === :__self__ && e.args[2] isa QuoteNode
-        push!(acc, e.args[2].value)
-        return acc
-    end
-    for a in e.args
-        _collect_self_accesses!(acc, a, prop_names)
-    end
-    acc
-end
-_collect_self_accesses(e, prop_names) = _collect_self_accesses!(Set{Symbol}(), e, prop_names)
-
-_contains_call(_) = false
-_contains_call(e::Expr) = Meta.isexpr(e, :call) || any(_contains_call, e.args)
-
-# Any reference to `__self__` anywhere in the body counts as self-access —
-# catches `getproperty(__self__, name)` and similar reflective patterns
-# that the structured `__self__.X` detector would otherwise miss.
 _contains_self_ref(e::Symbol) = e === :__self__
 _contains_self_ref(e::Expr) = any(_contains_self_ref, e.args)
 _contains_self_ref(_) = false
+
+_contains_bare_prop_ref(e::Symbol, prop_names) = e in prop_names
+_contains_bare_prop_ref(e::Expr, prop_names) = any(a -> _contains_bare_prop_ref(a, prop_names), e.args)
+_contains_bare_prop_ref(_, _) = false
+
+_contains_call(_) = false
+_contains_call(e::Expr) = Meta.isexpr(e, :call) || any(_contains_call, e.args)
 
 function _lint_property!(name::Symbol, info, walked_rhs, type, prop_names)
     isempty(info.indices) && return
     isempty(info.macros) || return
     _contains_call(walked_rhs) || return
     _contains_self_ref(walked_rhs) && return
-    isempty(_collect_self_accesses(walked_rhs, prop_names)) || return
+    _contains_bare_prop_ref(walked_rhs, prop_names) && return
     loc = isnothing(info.lnn) ? "" : " at $(info.lnn.file):$(info.lnn.line)"
     @warn """DynamicObjects lint: property `$type.$name(…)`$loc calls functions but reads no sibling state. If its args are pre-extracted from sibling properties at every call site (e.g. callers do `s = sibling_status[k]; r = s == :ready ? sibling_result[k] : nothing; $name(label, s, r)`), the natural shape is an inline-child DO — `@struct child(keys...) = begin status = …; result = …; html = …; end` — that owns the lookups and exposes the derivations as plain properties. Scattered call sites then collapse to `child[keys...].some_derived_prop`. If the standalone form is intentional, silence with `@dynamicstruct lint=false struct $type …`."""
 end
