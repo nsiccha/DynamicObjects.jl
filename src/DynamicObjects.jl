@@ -519,23 +519,26 @@ end
 
 _no_seed!(_) = nothing
 
+_path_fn(path::AbstractString) = (let p = String(path); () -> p end)
+_path_fn(path) = path
+
 function LazyPersistentDict(path, empty_data::D = Dict{Any,Any}();
         seed! = _no_seed!) where {D<:AbstractDict}
-    path_fn = path isa AbstractString ? (let p = String(path); () -> p end) : path
-    LazyPersistentDict{D}(path_fn, empty_data, seed!, ReentrantLock(), false)
+    LazyPersistentDict{D}(_path_fn(path), empty_data, seed!, ReentrantLock(), false)
 end
+
+# If the deserialized payload's concrete type matches `d.data`'s, swap the
+# whole container in (cheaper, preserves identity semantics). Otherwise merge
+# entries into the existing one.
+_ingest_loaded!(d::LazyPersistentDict{D}, loaded::D) where {D} = (d.data = loaded)
+_ingest_loaded!(d::LazyPersistentDict, loaded) = merge!(d.data, loaded)
 
 function _ensure_loaded!(d::LazyPersistentDict)
     @lock d.lock begin
         d.loaded && return
         p = d.path_fn()
         if isfile(p)
-            loaded = Serialization.deserialize(p)
-            if loaded isa typeof(d.data)
-                d.data = loaded
-            else
-                merge!(d.data, loaded)
-            end
+            _ingest_loaded!(d, Serialization.deserialize(p))
         end
         if isempty(d.data)
             d.seed!(d.data)
@@ -1128,6 +1131,12 @@ persist(v, args...; kwargs...) = begin
     )
 end
 
+# Pop a specific (indices, kwargs) entry from an IndexableProperty's cache,
+# or no-op when the entry isn't an IP.
+_maybepop_indexed!(v::IndexableProperty, indices, kwargs) =
+    (maybepop!(v.cache, (indices, (;kwargs...))); nothing)
+_maybepop_indexed!(args...) = nothing
+
 clear_cache!(o, name::Symbol, indices...; kwargs...) = begin
     cache = getfield(o, :cache).cache
     if isempty(indices) && isempty(kwargs)
@@ -1145,12 +1154,7 @@ clear_cache!(o, name::Symbol, indices...; kwargs...) = begin
         end
     else
         # Clear specific indexed entry from in-memory cache
-        if haskey(cache, name)
-            v = cache[name]
-            if v isa IndexableProperty
-                maybepop!(v.cache, (indices, (;kwargs...)))
-            end
-        end
+        haskey(cache, name) && _maybepop_indexed!(cache[name], indices, kwargs)
         # Clear specific disk cache file
         path = get_cache_path(o, name, indices...; kwargs...)
         isfile(path) && rm(path)
@@ -2313,13 +2317,13 @@ function Base.showerror(io::IO, e::PropertyComputationError)
     cause_err = _cause_error(e)
     cause_bt = _cause_bt(e.cause)
     print(io, "  Caused by: ")
-    if cause_err isa PropertyComputationError
-        showerror(io, cause_err)
-    elseif !isnothing(cause_bt)
-        showerror(io, cause_err, cause_bt)
-    else
-        showerror(io, cause_err)
-    end
+    _show_cause(io, cause_err, cause_bt)
 end
+# PropertyComputationError prints its own filtered backtrace via the 2-arg
+# showerror; nested ones must use that path. Otherwise prefer the 3-arg form
+# when a backtrace is available.
+_show_cause(io, err::PropertyComputationError, _bt) = showerror(io, err)
+_show_cause(io, err, ::Nothing) = showerror(io, err)
+_show_cause(io, err, bt) = showerror(io, err, bt)
 
 end
