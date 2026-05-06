@@ -1359,34 +1359,49 @@ end
 # inside `_lint_property!`; add new checks there. Per-struct opt-out is
 # `@dynamicstruct lint=false struct …` (see `dynamicstruct(...)` kwarg).
 #
-# Check #1 — `:no_self_access`: a property body that has at least one call
-# expression but never reads any sibling field/property is almost always a
-# free function pasted into the struct body. Recommend extracting it.
+# Check #1 — `:no_self_access`: an indexed (call-syntax) property whose
+# body contains function calls but never reads any sibling field/property
+# is almost always a free function pasted into the struct body. Bare
+# (non-indexed) properties are exempted because they are usually
+# initializers (`cache_path = pkgdir(…)`, `__status__ = initialize_progress!(…)`,
+# `_lock = ReentrantLock()`). Properties with any macro (`@cached`, `@get`,
+# `@persist`, `@lru`, …) are also exempted because the macro itself is the
+# reason the property lives in the struct.
 #
-# To silence per-struct (e.g. for tests that intentionally use a no-state
-# body) pass `lint=false` to the macro. There is no per-property opt-out by
-# design — if you need finer control, that's a signal to split the struct.
-_collect_self_accesses!(acc::Set{Symbol}, _) = acc
-function _collect_self_accesses!(acc::Set{Symbol}, e::Expr)
+# Self-access is detected on the *walked* RHS: `__self__.X` accesses that
+# `walk_rhs` synthesises, plus bare `Symbol` references to declared
+# property names — the latter catches the `__status__` case, which
+# `walk_rhs` leaves bare (because `__status__` is in `info.locals`, since
+# it's threaded through compute_property as a kwarg rather than read off
+# `__self__`).
+#
+# Per-property opt-out is intentionally absent: if you need finer control,
+# that's a signal to split the struct.
+_collect_self_accesses!(acc::Set{Symbol}, _, _) = acc
+_collect_self_accesses!(acc::Set{Symbol}, e::Symbol, prop_names) =
+    (e in prop_names && push!(acc, e); acc)
+function _collect_self_accesses!(acc::Set{Symbol}, e::Expr, prop_names)
     if Meta.isexpr(e, :., 2) && e.args[1] === :__self__ && e.args[2] isa QuoteNode
         push!(acc, e.args[2].value)
+        return acc
     end
     for a in e.args
-        _collect_self_accesses!(acc, a)
+        _collect_self_accesses!(acc, a, prop_names)
     end
     acc
 end
-_collect_self_accesses(e) = _collect_self_accesses!(Set{Symbol}(), e)
+_collect_self_accesses(e, prop_names) = _collect_self_accesses!(Set{Symbol}(), e, prop_names)
 
 _contains_call(_) = false
 _contains_call(e::Expr) = Meta.isexpr(e, :call) || any(_contains_call, e.args)
 
-function _lint_property!(name::Symbol, info, walked_rhs, type)
-    isempty(_collect_self_accesses(walked_rhs)) || return
+function _lint_property!(name::Symbol, info, walked_rhs, type, prop_names)
+    isempty(info.indices) && return
+    isempty(info.macros) || return
     _contains_call(walked_rhs) || return
+    isempty(_collect_self_accesses(walked_rhs, prop_names)) || return
     loc = isnothing(info.lnn) ? "" : " at $(info.lnn.file):$(info.lnn.line)"
-    sig = isempty(info.indices) ? "$name = …" : "$name(…) = …"
-    @warn """DynamicObjects lint: in `$type`, property `$sig`$loc has a body that calls functions but doesn't read any sibling field/property. This is usually a free function pasted into the struct body. Either move it to module scope, or — if intentional (e.g. test scaffolding) — silence with `@dynamicstruct lint=false struct $type …`."""
+    @warn """DynamicObjects lint: in `$type`, property `$name(…) = …`$loc has a body that calls functions but doesn't read any sibling field/property. This is usually a free function pasted into the struct body. Either move it to module scope, or — if intentional — silence with `@dynamicstruct lint=false struct $type …`."""
 end
 
 function compute_property end
@@ -2266,7 +2281,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     nothing
                 end
                 walked_rhs = walk_rhs(info.rhs; info.locals, properties, lnn=info.lnn)
-                lint && _lint_property!(name, info, walked_rhs, type)
+                lint && _lint_property!(name, info, walked_rhs, type, keys(properties))
                 block = Expr(:block,
                     _lnn, Expr(:(=), _call(:compute_property, cp_kwargs...), Expr(:block, _lnn, walked_rhs)),
                     _lnn, Expr(:(=), _call(:iscached), Expr(:block, _lnn, iscached_val)),
