@@ -1461,6 +1461,53 @@ _collect_destructure_names(lhs) = begin
     end
     names
 end
+function _inject_include_kwargs!(call_expr, prop_name)
+    params_idx = findfirst(a -> a isa Expr && a.head === :parameters, call_expr.args)
+    if params_idx === nothing
+        params = Expr(:parameters)
+        insert!(call_expr.args, 2, params)
+    else
+        params = call_expr.args[params_idx]
+    end
+    has_parent = false
+    has_status = false
+    for kw in params.args
+        name = kw isa Symbol ? kw :
+               (Meta.isexpr(kw, :kw) ? kw.args[1] : nothing)
+        name === :__parent__ && (has_parent = true)
+        name === :__status__ && (has_status = true)
+    end
+    has_parent || push!(params.args, Expr(:kw, :__parent__, :__self__))
+    has_status || push!(params.args, Expr(:kw, :__status__,
+        Expr(:call, compute_property, :__self__, :(Val(:__substatus__)), QuoteNode(prop_name))))
+    call_expr
+end
+
+function _process_include_externals!(body)
+    for (i, arg) in enumerate(body.args)
+        arg isa Expr || continue
+        expr = arg
+        parent_expr = nothing
+        while Meta.isexpr(expr, :macrocall) && expr.args[1] != Symbol("@include")
+            parent_expr = expr
+            expr = expr.args[end]
+        end
+        Meta.isexpr(expr, :macrocall) && expr.args[1] == Symbol("@include") || continue
+        inner = expr.args[end]
+        inner isa Expr && inner.head == :(=) || continue
+        prop_name = inner.args[1]
+        rhs = inner.args[2]
+        Meta.isexpr(rhs, :call) || continue
+        _inject_include_kwargs!(rhs, prop_name)
+        assignment = :($prop_name = $rhs)
+        if isnothing(parent_expr)
+            body.args[i] = assignment
+        else
+            parent_expr.args[end] = assignment
+        end
+    end
+end
+
 dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothing, is_child=false) = begin
     @assert expr.head == :struct
     mut, head, body = expr.args
@@ -1504,6 +1551,8 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         body.args[i] = isnothing(doc_wrapper) ? rewritten :
             Expr(:macrocall, doc_wrapper.args[1:end-1]..., rewritten)
     end
+    # --- Process @include external structs ---
+    _process_include_externals!(body)
     # --- Extract inline struct definitions ---
     # Collect parent property names (excluding inline structs themselves)
     parent_props = Symbol[]
