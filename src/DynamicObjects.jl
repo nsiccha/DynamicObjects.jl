@@ -1394,6 +1394,11 @@ _contains_call(_) = false
 _contains_call(e::Expr) = Meta.isexpr(e, :call) || any(_contains_call, e.args)
 
 function _lint_property!(name::Symbol, info, walked_rhs, type, prop_names)
+    _lint_no_self_access!(name, info, walked_rhs, type, prop_names)
+    _lint_trivial_cached_wrapper!(name, info, type)
+end
+
+function _lint_no_self_access!(name::Symbol, info, walked_rhs, type, prop_names)
     isempty(info.indices) && return
     isempty(info.macros) || return
     _contains_call(walked_rhs) || return
@@ -1401,6 +1406,92 @@ function _lint_property!(name::Symbol, info, walked_rhs, type, prop_names)
     _contains_bare_prop_ref(walked_rhs, prop_names) && return
     loc = isnothing(info.lnn) ? "" : " at $(info.lnn.file):$(info.lnn.line)"
     @warn """DynamicObjects lint: property `$type.$name(…)`$loc calls functions but reads no sibling state. If its args are pre-extracted from sibling properties at every call site (e.g. callers do `s = sibling_status[k]; r = s == :ready ? sibling_result[k] : nothing; $name(label, s, r)`), the natural shape is an inline-child DO — `@struct child(keys...) = begin status = …; result = …; html = …; end` — that owns the lookups and exposes the derivations as plain properties. Scattered call sites then collapse to `child[keys...].some_derived_prop`. If the standalone form is intentional, silence with `@dynamicstruct lint=false struct $type …`."""
+end
+
+# Detect `@cached prop(args...) = singlefunc(args...)` — a 1-line @cached
+# wrapper that adds nothing beyond renaming. Either inline the producer's
+# body into the @cached property, or drop the wrapper and let callers
+# call the producer directly.
+function _lint_trivial_cached_wrapper!(name::Symbol, info, type)
+    Symbol("@cached") in info.macros || return
+    rhs = info.rhs
+    Meta.isexpr(rhs, :call) || return
+    # Body must be a single call passing the same positional args the
+    # property declared (kwargs are tolerated either way).
+    prop_arg_names = Symbol[]
+    for idx in info.indices
+        Meta.isexpr(idx, :parameters) && continue   # skip kwargs block
+        a = idx
+        Meta.isexpr(a, :(::)) && (a = a.args[1])
+        a isa Symbol && push!(prop_arg_names, a)
+    end
+    call_args = Symbol[]
+    for a in rhs.args[2:end]
+        Meta.isexpr(a, :parameters) && continue
+        sym = a
+        Meta.isexpr(sym, :(::)) && (sym = sym.args[1])
+        sym isa Symbol || return                    # non-symbol arg → not trivial
+        push!(call_args, sym)
+    end
+    prop_arg_names == call_args || return
+    loc = isnothing(info.lnn) ? "" : " at $(info.lnn.file):$(info.lnn.line)"
+    callee = rhs.args[1]
+    @warn """DynamicObjects lint: `@cached $type.$name(…)`$loc is a thin wrapper around `$callee(…)` — body is one call passing the same args. Either inline `$callee`'s body into the @cached property (and delete `$callee`), or drop the wrapper and have callers `@cached`-call `$callee` directly."""
+end
+
+# --- Struct-level lint passes (run once after all properties collected) ---
+
+function _lint_struct!(type, oproperties::Vector{<:Pair}, lint::Bool)
+    lint || return
+    names = Symbol[n for (n, _) in oproperties]
+    _lint_repeated_prefix!(type, names)
+    _lint_shared_arg_signature!(type, oproperties)
+end
+
+# Detect property names sharing a `<prefix>_*` shape — a strong signal that
+# they belong inside a `@struct prefix = begin … end` inline child.
+# Skips DO-convention dunder names (`__foo__`) and synthesized destructure
+# group names (`_tuple_*`), and skips empty prefixes.
+function _lint_repeated_prefix!(type, names::Vector{Symbol})
+    by_prefix = Dict{String, Vector{Symbol}}()
+    for n in names
+        s = String(n)
+        startswith(s, "__") && endswith(s, "__") && continue
+        startswith(s, "_tuple_")              && continue
+        underscore = findfirst(==('_'), s)
+        isnothing(underscore) && continue
+        underscore == 1       && continue   # leading-underscore name; skip
+        prefix = s[1:underscore-1]
+        push!(get!(by_prefix, prefix, Symbol[]), n)
+    end
+    for (prefix, group) in by_prefix
+        length(group) >= 2 || continue
+        @warn """DynamicObjects lint: `$type` has $(length(group)) properties sharing the `$(prefix)_*` prefix: $(join(group, ", ")). Consider grouping them inside an inline child — `@struct $prefix = begin …end` — so the shared-prefix names become bare members of the child (`$type.$(prefix).<member>`)."""
+    end
+end
+
+# Detect indexed properties that share an identical positional-arg name
+# tuple — a signal they all key on the same identity and should live
+# inside a single `@struct shared(args…)` inline child.
+function _lint_shared_arg_signature!(type, oproperties::Vector{<:Pair})
+    by_sig = Dict{Tuple{Vararg{Symbol}}, Vector{Symbol}}()
+    for (name, info) in oproperties
+        isempty(info.indices) && continue
+        sig = Symbol[]
+        for idx in info.indices
+            Meta.isexpr(idx, :parameters) && continue
+            a = idx
+            Meta.isexpr(a, :(::)) && (a = a.args[1])
+            a isa Symbol && push!(sig, a)
+        end
+        isempty(sig) && continue
+        push!(get!(by_sig, Tuple(sig), Symbol[]), name)
+    end
+    for (sig, group) in by_sig
+        length(group) >= 2 || continue
+        argstr = join(sig, ", ")
+        @warn """DynamicObjects lint: `$type` has $(length(group)) indexed properties sharing the `($argstr)` signature: $(join(group, ", ")). They likely all key on the same identity. Consider an inline child — `@struct shared($argstr) = begin …end` — that owns these and exposes them as plain members."""
+    end
 end
 
 function compute_property end
@@ -2154,6 +2245,11 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     end
     properties = Dict(oproperties)
     property_docs = Dict(name => doc for (name, (doc, _)) in docs if !isnothing(doc))
+
+    # Struct-level lint passes: repeated-prefix and shared-arg-signature.
+    # Per-property checks (no-self-access, trivial-cached-wrapper) run later
+    # in the codegen loop where the walked RHS is available.
+    _lint_struct!(type, oproperties, lint)
 
     docstring = something(docstring, "DynamicStruct `$type`.") * "\n\n" * join([
         "* " * (isnothing(doc) ? "" : "$(_doc_to_string(doc)): ") * "`$name" * (hasrhs ? " = ..." : "") * "`"
