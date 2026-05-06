@@ -10,7 +10,7 @@ include("test/runtests.jl")
     @get index = htmx(h.main(class="container")(
         h.h1("DynamicObjectsWeb"),
         h.p("Edit src/DynamicObjectsWeb.jl and Revise will reload automatically."),
-        h.p(h.a(href="/tests")("Tests")),
+        h.p(h.a(href=__self__/"tests")("Tests")),
     ); pico_version="2")
 
     @include tests = TestRoutes(; __req__, test_module=@__MODULE__)
