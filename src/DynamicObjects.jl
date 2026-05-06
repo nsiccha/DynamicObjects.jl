@@ -1535,8 +1535,16 @@ _collect_destructure_names(lhs) = begin
     end
     names
 end
+# Name of a single kwarg in a `:parameters` block: bare `Symbol`s are
+# their own name, `Expr(:kw, name, default)` carries the name as
+# `args[1]`, anything else has no name. Per-type methods replace the
+# `kw isa Symbol ? … : (Meta.isexpr(kw, :kw) ? … : nothing)` ternary.
+_kwarg_name(kw::Symbol) = kw
+_kwarg_name(kw::Expr) = Meta.isexpr(kw, :kw) ? kw.args[1] : nothing
+_kwarg_name(_) = nothing
+
 function _inject_include_kwargs!(call_expr, prop_name)
-    params_idx = findfirst(a -> a isa Expr && a.head === :parameters, call_expr.args)
+    params_idx = findfirst(a -> Meta.isexpr(a, :parameters), call_expr.args)
     if params_idx === nothing
         params = Expr(:parameters)
         insert!(call_expr.args, 2, params)
@@ -1546,8 +1554,7 @@ function _inject_include_kwargs!(call_expr, prop_name)
     has_parent = false
     has_status = false
     for kw in params.args
-        name = kw isa Symbol ? kw :
-               (Meta.isexpr(kw, :kw) ? kw.args[1] : nothing)
+        name = _kwarg_name(kw)
         name === :__parent__ && (has_parent = true)
         name === :__status__ && (has_status = true)
     end
@@ -1568,7 +1575,7 @@ function _process_include_externals!(body)
         end
         Meta.isexpr(expr, :macrocall) && expr.args[1] == Symbol("@include") || continue
         inner = expr.args[end]
-        inner isa Expr && inner.head == :(=) || continue
+        Meta.isexpr(inner, :(=)) || continue
         prop_name = inner.args[1]
         rhs = inner.args[2]
         Meta.isexpr(rhs, :call) || continue
