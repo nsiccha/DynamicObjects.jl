@@ -1445,6 +1445,81 @@ _replace_lnn(x, _) = x
 _validate_lru_maxsize(::Integer) = nothing
 _validate_lru_maxsize(x) = error("@lru: maxsize must be a literal Integer, got: $x")
 
+# Property-macro accumulator: doc / cache_version / lru_size / macros are
+# the four pieces of state the body-args parser threads through the
+# `while Meta.isexpr(arg, :macrocall)` peeling loop. Bundling them into a
+# small mutable struct lets per-macro logic live in dispatched methods of
+# `_apply_property_macro!` (one method per macro shape) instead of in
+# branch arms inside the loop body.
+mutable struct _PropertyMacroState
+    doc::Any
+    cache_version::Any
+    lru_size::Any
+    macros::Set{Symbol}
+end
+
+# Default: register the macro name in `state.macros` and unwrap to the
+# inner expression so the loop continues peeling.
+_apply_property_macro!(state::_PropertyMacroState, ::Val{name}, arg) where {name} =
+    (push!(state.macros, name); arg.args[end])
+
+# `@doc "str" <def>` — silently consume (don't push to macros) and capture
+# the docstring. `length(arg.args) >= 4` matches Julia's lowered shape
+# (`(:macrocall, :@doc, LNN, "str", <def>)`); shorter forms fall back to
+# the default behavior.
+function _apply_property_macro!(state::_PropertyMacroState, ::Val{Symbol("@doc")}, arg)
+    if length(arg.args) >= 4
+        docexpr = arg.args[end-1]
+        (docexpr isa AbstractString || Meta.isexpr(docexpr, :string)) && (state.doc = docexpr)
+        return arg.args[end]
+    end
+    push!(state.macros, Symbol("@doc"))
+    arg.args[end]
+end
+
+# `@cached <prop> = …` (length 3) or `@cached v"…" <prop> = …` (length 4
+# with a version argument).
+function _apply_property_macro!(state::_PropertyMacroState, ::Val{Symbol("@cached")}, arg)
+    push!(state.macros, Symbol("@cached"))
+    length(arg.args) == 4 && (state.cache_version = _parse_cache_version(arg.args[3]))
+    arg.args[end]
+end
+_parse_cache_version(v::VersionNumber) = v
+function _parse_cache_version(ver_expr::Expr)
+    Meta.isexpr(ver_expr, :macrocall) && ver_expr.args[1] == Symbol("@v_str") ||
+        error("@cached version argument must be a version string like v\"2\", got: $ver_expr")
+    VersionNumber(ver_expr.args[end])
+end
+_parse_cache_version(x) =
+    error("@cached version argument must be a version string like v\"2\", got: $x")
+
+# `@lru N <prop> = …` — N must be a literal Integer (validated via
+# `_validate_lru_maxsize`'s fallback method).
+function _apply_property_macro!(state::_PropertyMacroState, ::Val{Symbol("@lru")}, arg)
+    push!(state.macros, Symbol("@lru"))
+    if length(arg.args) == 4
+        sz = arg.args[3]
+        _validate_lru_maxsize(sz)
+        state.lru_size = Int(sz)
+    end
+    arg.args[end]
+end
+
+# Body-args metadata absorber: LineNumberNode / String / `:string` Expr
+# args are not properties — they update the `lnn` / `doc` accumulators
+# the next real property will pick up. Per-type method dispatch replaces
+# the `if arg isa LineNumberNode … end; if arg isa String || Meta.isexpr
+# (arg, :string) …` chain at the top of the body-args loop. Returns
+# `true` when the arg was absorbed (caller `continue`s) and `false`
+# otherwise. `ctx` is a NamedTuple of `lnn::Ref` / `doc::Ref`.
+_absorb_body_metadata!(_, _) = false
+_absorb_body_metadata!(arg::LineNumberNode, ctx) = (ctx.lnn[] = arg; true)
+_absorb_body_metadata!(arg::AbstractString, ctx) = (ctx.doc[] = arg; true)
+function _absorb_body_metadata!(arg::Expr, ctx)
+    arg.head === :string || return false
+    ctx.doc[] = arg; true
+end
+
 # Normalise a `let` binding: a bare Symbol `x` becomes `x = x` (so the
 # rest of the let-walker can treat every binding as an `Expr(:(=), …)`),
 # already-`=`-shaped bindings pass through.
@@ -1515,6 +1590,33 @@ function _collect_destructure_renamed!(names, target::Symbol, source::Expr)
 end
 _push_prefixed_name!(_, _, _) = nothing
 _push_prefixed_name!(names, prefix, s::Symbol) = (push!(names, Symbol(prefix, s)); nothing)
+
+# Body-loop sibling of the `_collect_destructure_*` family: same per-shape
+# dispatch, but pushes `target => source-or-prefixed-name` pairs into the
+# `members::Vector{Pair{Symbol,Any}}` accumulator the main loop hands to
+# `extract_from`. Replaces the inner `if a isa Symbol … elseif Meta.isexpr(a, :call)
+# && a.args[1] == :(<=) …` arms in the destructure-handling block.
+_emit_named_member!(_, _) = nothing
+_emit_named_member!(members, a::Symbol) = (push!(members, a => a); nothing)
+function _emit_named_member!(members, a::Expr)
+    a.head === :call && a.args[1] == :(<=) || return nothing
+    _emit_renamed_member!(members, a.args[2], a.args[3])
+    nothing
+end
+_emit_renamed_member!(_, _, _) = nothing
+_emit_renamed_member!(members, target::Symbol, source::Symbol) =
+    (push!(members, target => source); nothing)
+function _emit_renamed_member!(members, target::Symbol, source::Expr)
+    source.head === :tuple || return nothing
+    prefix = string(target)
+    for s in source.args
+        _push_prefixed_member!(members, prefix, s)
+    end
+    nothing
+end
+_push_prefixed_member!(_, _, _) = nothing
+_push_prefixed_member!(members, prefix, s::Symbol) =
+    (push!(members, Symbol(prefix, s) => s); nothing)
 
 # Flatten a destructuring LHS to the property names it introduces. Mirrors the
 # main property-parsing loop (`:tuple` branch): positional → per-index leaves
@@ -1587,6 +1689,36 @@ function _process_include_externals!(body)
             parent_expr.args[end] = assignment
         end
     end
+end
+
+# Detect an inline-method form `f(__self__, ...) = body` (or with `where`
+# clauses, qualified function names like `Base.show`, and `__self__` at any
+# positional index). Returns `(; fname, sig_args, where_params, self_idx)`
+# or `nothing` if the LHS isn't a method-shaped definition with a `__self__`
+# parameter.
+_detect_inline_method_lhs(_) = nothing
+function _detect_inline_method_lhs(lhs::Expr)
+    where_params = Any[]
+    sig = lhs
+    while Meta.isexpr(sig, :where)
+        append!(where_params, sig.args[2:end])
+        sig = sig.args[1]
+    end
+    Meta.isexpr(sig, :call) || return nothing
+    length(sig.args) >= 2 || return nothing
+    sig_args = collect(sig.args[2:end])
+    self_idx = nothing
+    for (i, a) in enumerate(sig_args)
+        Meta.isexpr(a, :parameters) && continue
+        a_sym = a
+        Meta.isexpr(a_sym, :(::)) && (a_sym = a_sym.args[1])
+        if a_sym === :__self__
+            self_idx = i
+            break
+        end
+    end
+    isnothing(self_idx) && return nothing
+    (; fname=sig.args[1], sig_args, where_params, self_idx)
 end
 
 dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothing, is_child=false) = begin
@@ -1826,19 +1958,19 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         body.args[i] = isnothing(doc_wrapper) ? constructor_assignment :
             Expr(:macrocall, doc_wrapper.args[1:end-1]..., constructor_assignment)
     end
-    lnn = nothing
-    doc = nothing
+    # `lnn` / `doc` flow across iterations via the metadata context.
+    # `_absorb_body_metadata!` dispatch fills it from LineNumberNode /
+    # AbstractString / `:string` Expr args; "real" property args read
+    # `metadata.lnn[]` / `.doc[]` at the top of each iteration and the
+    # `doc` ref is reset to `nothing` once that property consumes it.
+    metadata = (lnn = Ref{Any}(nothing), doc = Ref{Any}(nothing))
     docs = []
     oproperties = Pair[]
+    inline_methods = Any[]
     for arg in body.args
-        if arg isa LineNumberNode
-            lnn = arg
-            continue
-        end
-        if arg isa String || Meta.isexpr(arg, :string)
-            doc = arg
-            continue
-        end
+        _absorb_body_metadata!(arg, metadata) && continue
+        lnn = metadata.lnn[]
+        doc = metadata.doc[]
         macros = Set{Symbol}()
         rhs = nothing
         dependson = nothing
@@ -1847,42 +1979,37 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         indexed = false
         cache_version = nothing
         lru_size = nothing
+        # Peel `@doc` / `@cached` / `@lru` / unrecognised macros from `arg`
+        # via `_apply_property_macro!` dispatch (one method per macro
+        # shape). The state struct mutates `doc` / `cache_version` /
+        # `lru_size` / `macros` in place — `macros` is the same Set the
+        # outer loop uses, so we read it back implicitly; the other three
+        # are scalars copied back after the loop.
+        macro_state = _PropertyMacroState(doc, cache_version, lru_size, macros)
         while Meta.isexpr(arg, :macrocall)
-            # Normalise macro name: nested macro-expanded contexts can surface
-            # `GlobalRef(Core, Symbol("@doc"))` (or similar) instead of a bare
-            # `Symbol("@doc")`. Strip to the Symbol name for comparison and
-            # storage so the `Set{Symbol}` push and `== Symbol("@…")` tests
-            # both work regardless of form.
-            mname = arg.args[1]
-            mname = _resolve_macro_name(mname)
-            # `@doc "str" <def>` — consume the docstring and continue unwrapping
-            # into the real definition. Happens when Julia's docstring lowering
-            # has rewritten `"str"\n<def>` inside a deeply-nested inline struct
-            # body before our recursive pass re-enters the block.
-            if mname === Symbol("@doc") && length(arg.args) >= 4
-                docexpr = arg.args[end-1]
-                if docexpr isa String || Meta.isexpr(docexpr, :string)
-                    doc = docexpr
-                end
-                arg = arg.args[end]
+            # `_resolve_macro_name` collapses `GlobalRef(Core, :@doc)` (the
+            # form Julia's docstring lowering surfaces) to bare `:@doc`.
+            mname = _resolve_macro_name(arg.args[1])
+            arg = _apply_property_macro!(macro_state, Val(mname), arg)
+        end
+        doc = macro_state.doc
+        cache_version = macro_state.cache_version
+        lru_size = macro_state.lru_size
+        # Inline-method form: `f(__self__, ...) = body` (with optional `where`
+        # clauses and qualified `Module.f` names). Bypasses property tooling —
+        # no compute_property, no getproperty entry — but the body still gets
+        # bare-name → `__self__.<prop>` rewriting like a property RHS. Detect
+        # before the function-form error and the `:(=)` LHS/RHS split so the
+        # full LHS (which may carry `where` clauses) is intact.
+        if Meta.isexpr(arg, :(=))
+            method_info = _detect_inline_method_lhs(arg.args[1])
+            if !isnothing(method_info)
+                isempty(macros) ||
+                    error("Property-level macros (@cached, @lru, …) cannot be applied to inline methods in @dynamicstruct.")
+                push!(inline_methods, (; method_info..., body=arg.args[2], lnn))
+                metadata.doc[] = nothing
                 continue
             end
-            push!(macros, mname)
-            if mname == Symbol("@cached") && length(arg.args) == 4
-                ver_expr = arg.args[3]
-                if Meta.isexpr(ver_expr, :macrocall) && ver_expr.args[1] == Symbol("@v_str")
-                    cache_version = VersionNumber(ver_expr.args[end])
-                elseif ver_expr isa VersionNumber
-                    cache_version = ver_expr
-                else
-                    error("@cached version argument must be a version string like v\"2\", got: $ver_expr")
-                end
-            elseif mname == Symbol("@lru") && length(arg.args) == 4
-                sz = arg.args[3]
-                _validate_lru_maxsize(sz)
-                lru_size = Int(sz)
-            end
-            arg = arg.args[end]
         end
         if Meta.isexpr(arg, :function)
             fname = Meta.isexpr(arg.args[1], :call) ? arg.args[1].args[1] : arg.args[1]
@@ -1907,30 +2034,20 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 push!(oproperties, group_name => (;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, cache_version, lru_size=nothing))
                 push!(docs, (group_name => (doc, true)))
                 _emit_positional_destructure!(oproperties, docs, raw_args, group_name, lnn)
-                doc = nothing
+                metadata.doc[] = nothing
                 continue
             end
             # Build list of (property_name, extract_expr_builder) pairs
             # extract_expr_builder takes the group_name and returns the RHS expression
             members = Pair{Symbol, Any}[]  # name => source_field_or_index
             if named
+                # Per-shape dispatch via `_emit_named_member!`:
+                #   bare symbol     → `a => a`
+                #   `target <= src` → `target => src` (Symbol src)
+                #                     or `Symbol(prefix, s) => s` for each
+                #                     `s` in a `:tuple` src (prefix mode).
                 for a in raw_args
-                    if a isa Symbol
-                        # (;a) → property a, extracts .a
-                        push!(members, a => a)
-                    elseif Meta.isexpr(a, :call) && a.args[1] == :(<=)
-                        target, source = a.args[2], a.args[3]
-                        if source isa Symbol
-                            # (;x_val<=val) → property x_val, extracts .val
-                            push!(members, target => source)
-                        elseif Meta.isexpr(source, :tuple)
-                            # (;x_ <= (val, grad)) → properties x_val, x_grad
-                            prefix = string(target)
-                            for s in source.args
-                                push!(members, Symbol(prefix, s) => s)
-                            end
-                        end
-                    end
+                    _emit_named_member!(members, a)
                 end
             else
                 for (i, a) in enumerate(raw_args)
@@ -1952,7 +2069,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 push!(docs, (group_name=>(doc, true)))
                 group_name
             end
-            doc = nothing
+            metadata.doc[] = nothing
             for (prop_name, source) in members
                 extract_rhs = _extract_member(extract_from, source)
                 push!(oproperties, prop_name=>(;lhs=prop_name, macros=Set{Symbol}(), rhs=extract_rhs, lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([prop_name]), indices=tuple(), indexed=false, cache_version=nothing, lru_size=nothing))
@@ -1978,7 +2095,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         end
         @assert name isa Symbol dump(name)
         push!(docs, (name=>(doc, !isnothing(rhs))))
-        doc = nothing
+        metadata.doc[] = nothing
         !isnothing(locals) && push!(locals, name)
         !isnothing(locals) && push!(locals, :__status__)
         @assert !isnothing(rhs) || length(macros) == 0
@@ -2150,6 +2267,40 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         # directly in getorcomputeproperty (via meta check), so no zero-arg
         # compute_property methods are needed here.
     ))
+    # Emit inline-method definitions: `f(__self__, …) = body` collected from
+    # the struct body. These are plain methods on `::type` (so standard
+    # multiple dispatch on the remaining args works) — no property entry,
+    # no compute_property, not reachable via getproperty. The body is walked
+    # with the full `properties` dict so bare references to registered
+    # property names are rewritten to `__self__.<name>`, matching the
+    # rewrite that runs on property RHSs.
+    for m in inline_methods
+        sig_args = collect(m.sig_args)
+        # Type the bare `__self__` arg to `__self__::<type>`. If the user
+        # already wrote `__self__::T`, leave the user's annotation alone.
+        if sig_args[m.self_idx] === :__self__
+            sig_args[m.self_idx] = :(__self__::$type)
+        end
+        # Locals shielded from bare-name rewriting: `__self__`, every name
+        # introduced by the signature args (incl. typed/destructured/kw),
+        # and all `where`-clause type parameters.
+        method_locals = Set{Symbol}([:__self__])
+        for a in sig_args
+            union!(method_locals, extractnames([a]))
+        end
+        for wp in m.where_params
+            wp isa Symbol && push!(method_locals, wp)
+            Meta.isexpr(wp, :(<:)) && wp.args[1] isa Symbol && push!(method_locals, wp.args[1])
+            Meta.isexpr(wp, :comparison) && wp.args[1] isa Symbol && push!(method_locals, wp.args[1])
+        end
+        walked_body = walk_rhs(m.body; locals=method_locals, properties, lnn=m.lnn)
+        sig = Expr(:call, m.fname, sig_args...)
+        if !isempty(m.where_params)
+            sig = Expr(:where, sig, m.where_params...)
+        end
+        method_lnn = something(m.lnn, LineNumberNode(0, :unknown))
+        push!(result.args, Expr(:(=), sig, Expr(:block, method_lnn, walked_body)))
+    end
     esc(result)
 end
 
