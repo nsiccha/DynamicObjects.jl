@@ -50,7 +50,7 @@ _clearable_path = Ref("")
 @dynamicstruct struct Clearable
     cache_path = _clearable_path[]
     @cached result = sum(rand(10))
-    @cached indexed[k] = k ^ 2
+    @cached indexed(k) = k ^ 2
 end
 
 @dynamicstruct struct TwoFields
@@ -111,24 +111,24 @@ end
 _idx_path = Ref("")
 @dynamicstruct struct Idx
     cache_path = _idx_path[]
-    i[idx]              = idx
-    @cached ci[idx]     = idx ^ 2
-    @cached ci3[i, j, k] = i + 10 * j + 100 * k
+    i(idx)              = idx
+    @cached ci(idx)     = idx ^ 2
+    @cached ci3(i, j, k) = i + 10 * j + 100 * k
 end
 
 @dynamicstruct struct AllDefaults
-    item[x="default"] = "got: $x"
-    multi[a=1, b=2] = a + b
+    item(x="default") = "got: $x"
+    multi(a=1, b=2) = a + b
 end
 
 _call_vs_bracket_counter = Ref(0)
 @dynamicstruct struct CallVsBracket
-    counted[x] = (_call_vs_bracket_counter[] += 1; x * 2)
+    counted(x) = (_call_vs_bracket_counter[] += 1; x * 2)
 end
 
 @dynamicstruct struct Par
     slow = (sleep(0.1); randn())
-    slowi[i] = (sleep(0.05); i + randn())
+    slowi(i) = (sleep(0.05); i + randn())
 end
 
 _regression_path = Ref("")
@@ -138,14 +138,14 @@ _regression_path = Ref("")
     b = 2 * a
     @cached c = a * b
     @cached d = isnothing(d) ? 1 : d + 1
-    i[idx] = idx
-    @cached ci[idx] = idx ^ 2
-    @cached ci3[i, j, k] = i + 10 * j + 100 * k
+    i(idx) = idx
+    @cached ci(idx) = idx ^ 2
+    @cached ci3(i, j, k) = i + 10 * j + 100 * k
     parallel_test = begin
         sleep(1)
         randn()
     end
-    parallel_testi[i] = begin
+    parallel_testi(i) = begin
         sleep(1)
         i + randn()
     end
@@ -156,7 +156,7 @@ _assign_in_rhs_path = Ref("")
     x::Int
     cache_path = _assign_in_rhs_path[]
     @cached flag = false
-    toggle[req] = begin
+    toggle(req) = begin
         # Bare `flag = !flag` would trip the property-shadow check
         # (post f4d7c14: error, was warn). Route the cache write
         # through the explicit `setproperty!` path instead — same
@@ -189,11 +189,11 @@ end
 end
 
 @dynamicstruct struct AsyncApp
-    slow[key] = (sleep(0.05); key * 2)
+    slow(key) = (sleep(0.05); key * 2)
 end
 
 @dynamicstruct struct CancelApp
-    slow[key] = (sleep(10); key * 2)
+    slow(key) = (sleep(10); key * 2)
 end
 
 @dynamicstruct struct FailingProps
@@ -205,7 +205,7 @@ _persistable_path = Ref("")
 @dynamicstruct struct Persistable
     cache_path = _persistable_path[]
     @cached counter = 0
-    increment[req] = begin
+    increment(req) = begin
         # See `AssignInRhs` above — explicit `setproperty!` path
         # avoids tripping the macro's property-shadow check.
         __self__.counter = counter + 1
@@ -215,20 +215,20 @@ _persistable_path = Ref("")
 end
 
 @dynamicstruct struct EntriesApp
-    slow[key] = (sleep(0.05); key * 2)
+    slow(key) = (sleep(0.05); key * 2)
 end
 
 _cached_keys_path = Ref("")
 @dynamicstruct struct CachedKeysApp
     cache_path = _cached_keys_path[]
-    @cached result[key] = key ^ 2
+    @cached result(key) = key ^ 2
 end
 
 _clearall_path = Ref("")
 @dynamicstruct struct ClearAllApp
     cache_path = _clearall_path[]
     @cached a = 42
-    @cached b[k] = k * 2
+    @cached b(k) = k * 2
     uncached = 99
 end
 
