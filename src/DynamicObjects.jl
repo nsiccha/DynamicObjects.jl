@@ -1401,7 +1401,7 @@ function _lint_property!(name::Symbol, info, walked_rhs, type, prop_names)
     _contains_call(walked_rhs) || return
     isempty(_collect_self_accesses(walked_rhs, prop_names)) || return
     loc = isnothing(info.lnn) ? "" : " at $(info.lnn.file):$(info.lnn.line)"
-    @warn """DynamicObjects lint: in `$type`, property `$name(…) = …`$loc has a body that calls functions but doesn't read any sibling field/property. This is usually a free function pasted into the struct body. Either move it to module scope, or — if intentional — silence with `@dynamicstruct lint=false struct $type …`."""
+    @warn """DynamicObjects lint: property `$type.$name(…)`$loc calls functions but reads no sibling state. If its args are pre-extracted from sibling properties at every call site (e.g. callers do `s = sibling_status[k]; r = s == :ready ? sibling_result[k] : nothing; $name(label, s, r)`), the natural shape is an inline-child DO — `@struct child(keys...) = begin status = …; result = …; html = …; end` — that owns the lookups and exposes the derivations as plain properties. Scattered call sites then collapse to `child[keys...].some_derived_prop`. If the standalone form is intentional, silence with `@dynamicstruct lint=false struct $type …`."""
 end
 
 function compute_property end
