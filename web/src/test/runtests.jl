@@ -696,7 +696,7 @@ end
 @testset "cancel! and cancel_all!" begin
     app = CancelApp(; cache_type=:parallel)
     # Trigger a slow computation (returns Task via fetch=identity)
-    task = app.slow[42; fetch=identity]
+    task = app.slow(42; fetch=identity)
     @test task isa Task
     @test !istaskdone(task)
     # Cancel it
@@ -713,8 +713,8 @@ end
     @test cancel!(app.slow, 42) == false
 
     # cancel_all!
-    t1 = app.slow[1; fetch=identity]
-    t2 = app.slow[2; fetch=identity]
+    t1 = app.slow(1; fetch=identity)
+    t2 = app.slow(2; fetch=identity)
     @test !istaskdone(t1) && !istaskdone(t2)
     cancel_all!(app.slow)
     sleep(0.01)
