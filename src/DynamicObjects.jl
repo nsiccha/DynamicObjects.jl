@@ -1279,13 +1279,7 @@ elseif e.head in (:kw, :(=))
         # Warn if assigning to a property name inside a block — likely intended as local
         lhs = e.args[1]
         if e.head == :(=)
-            shadowed = if lhs isa Symbol
-                haskey(properties, lhs) && !(lhs in locals) ? [lhs] : Symbol[]
-            elseif Meta.isexpr(lhs, :tuple)
-                [s for s in lhs.args if s isa Symbol && haskey(properties, s) && !(s in locals)]
-            else
-                Symbol[]
-            end
+            shadowed = _shadowed_lhs(lhs, properties, locals)
             for s in shadowed
                 loc = isnothing(lnn) ? "" : " (near $(lnn.file):$(lnn.line))"
                 error("Assignment to `$s` in a property RHS shadows property `$s`$loc. This writes to the property cache, not a local variable. Declare it with `local $s` (or `local $s = ...`) or use `let $s = ...` to make it a local.")
@@ -1398,31 +1392,67 @@ fixcall(x::Expr) = if Meta.isexpr(x, :call)
 else
     Expr(x.head, fixcall.(x.args)...)
 end
-_collect_leaves(e) = if e isa Symbol
-    Symbol[e]
-elseif Meta.isexpr(e, :(::))
-    Symbol[e.args[1]]
-elseif Meta.isexpr(e, :tuple)
-    mapreduce(_collect_leaves, append!, e.args; init=Symbol[])
-else
+# Names from an `lhs` that would shadow a property when assigned. Plain symbols
+# match if they name a property and aren't already declared local; tuples
+# expand to their symbol leaves; anything else can't shadow.
+_shadowed_lhs(_, _, _) = Symbol[]
+_shadowed_lhs(lhs::Symbol, properties, locals) =
+    haskey(properties, lhs) && !(lhs in locals) ? [lhs] : Symbol[]
+function _shadowed_lhs(lhs::Expr, properties, locals)
+    lhs.head === :tuple || return Symbol[]
+    [s for s in lhs.args if s isa Symbol && haskey(properties, s) && !(s in locals)]
+end
+
+_collect_leaves(e) = error("unsupported destructuring element: $e")
+_collect_leaves(e::Symbol) = Symbol[e]
+function _collect_leaves(e::Expr)
+    e.head === :(::) && return Symbol[e.args[1]]
+    e.head === :tuple && return mapreduce(_collect_leaves, append!, e.args; init=Symbol[])
     error("unsupported destructuring element: $e")
 end
 _emit_positional_destructure!(oproperties, docs, elements, source_sym, lnn) = for (i, a) in enumerate(elements)
-    if a isa Symbol || Meta.isexpr(a, :(::))
-        leaf = Meta.isexpr(a, :(::)) ? a.args[1] : a
-        push!(oproperties, leaf => (;lhs=leaf, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([leaf]), indices=tuple(), indexed=false, cache_version=nothing, lru_size=nothing))
-        push!(docs, (leaf => (nothing, true)))
-    elseif Meta.isexpr(a, :tuple)
-        inner_leaves = _collect_leaves(a)
-        inner_name = Symbol("_tuple_", join(inner_leaves, "_"))
-        inner_locals = Set{Symbol}(inner_leaves); push!(inner_locals, inner_name)
-        push!(oproperties, inner_name => (;lhs=inner_name, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=inner_locals, indices=tuple(), indexed=false, cache_version=nothing, lru_size=nothing))
-        push!(docs, (inner_name => (nothing, true)))
-        _emit_positional_destructure!(oproperties, docs, a.args, inner_name, lnn)
-    else
-        error("unsupported destructuring element: $a")
-    end
+    _emit_positional_element!(oproperties, docs, a, i, source_sym, lnn)
 end
+_emit_positional_element!(_, _, a, _, _, _) = error("unsupported destructuring element: $a")
+_emit_positional_element!(oproperties, docs, a::Symbol, i, source_sym, lnn) =
+    _push_positional_leaf!(oproperties, docs, a, i, source_sym, lnn)
+function _emit_positional_element!(oproperties, docs, a::Expr, i, source_sym, lnn)
+    a.head === :(::) && return _push_positional_leaf!(oproperties, docs, a.args[1], i, source_sym, lnn)
+    a.head === :tuple || error("unsupported destructuring element: $a")
+    inner_leaves = _collect_leaves(a)
+    inner_name = Symbol("_tuple_", join(inner_leaves, "_"))
+    inner_locals = Set{Symbol}(inner_leaves); push!(inner_locals, inner_name)
+    push!(oproperties, inner_name => (;lhs=inner_name, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=inner_locals, indices=tuple(), indexed=false, cache_version=nothing, lru_size=nothing))
+    push!(docs, (inner_name => (nothing, true)))
+    _emit_positional_destructure!(oproperties, docs, a.args, inner_name, lnn)
+end
+function _push_positional_leaf!(oproperties, docs, leaf::Symbol, i, source_sym, lnn)
+    push!(oproperties, leaf => (;lhs=leaf, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([leaf]), indices=tuple(), indexed=false, cache_version=nothing, lru_size=nothing))
+    push!(docs, (leaf => (nothing, true)))
+end
+# One element of a named-destructure LHS: either a bare Symbol leaf or a
+# `target <= source` rename (Symbol or :tuple source). Anything else is
+# silently ignored — the main parsing loop already errors on bad shapes.
+_collect_destructure_named!(_, _) = nothing
+_collect_destructure_named!(names, a::Symbol) = (push!(names, a); nothing)
+function _collect_destructure_named!(names, a::Expr)
+    a.head === :call && a.args[1] == :(<=) || return nothing
+    _collect_destructure_renamed!(names, a.args[2], a.args[3])
+    nothing
+end
+_collect_destructure_renamed!(_, _, _) = nothing
+_collect_destructure_renamed!(names, target::Symbol, ::Symbol) = (push!(names, target); nothing)
+function _collect_destructure_renamed!(names, target::Symbol, source::Expr)
+    source.head === :tuple || return nothing
+    prefix = string(target)
+    for s in source.args
+        _push_prefixed_name!(names, prefix, s)
+    end
+    nothing
+end
+_push_prefixed_name!(_, _, _) = nothing
+_push_prefixed_name!(names, prefix, s::Symbol) = (push!(names, Symbol(prefix, s)); nothing)
+
 # Flatten a destructuring LHS to the property names it introduces. Mirrors the
 # main property-parsing loop (`:tuple` branch): positional → per-index leaves
 # (recursing into nested tuples), named → per-member name with `<=` rename and
@@ -1435,19 +1465,7 @@ _collect_destructure_names(lhs) = begin
     raw_args = named ? lhs.args[1].args : lhs.args
     if named
         for a in raw_args
-            if isa(a, Symbol)
-                push!(names, a)
-            elseif Meta.isexpr(a, :call) && a.args[1] == :(<=)
-                target, source = a.args[2], a.args[3]
-                if isa(source, Symbol)
-                    target isa Symbol && push!(names, target)
-                elseif Meta.isexpr(source, :tuple)
-                    prefix = string(target)
-                    for s in source.args
-                        s isa Symbol && push!(names, Symbol(prefix, s))
-                    end
-                end
-            end
+            _collect_destructure_named!(names, a)
         end
     else
         append!(names, _collect_leaves(lhs))
