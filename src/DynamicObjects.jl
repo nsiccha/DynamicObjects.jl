@@ -1406,6 +1406,43 @@ _contains_call(e::Expr) = Meta.isexpr(e, :call) || any(_contains_call, e.args)
 function _lint_property!(name::Symbol, info, walked_rhs, type, prop_names)
     _lint_no_self_access!(name, info, walked_rhs, type, prop_names)
     _lint_trivial_cached_wrapper!(name, info, type)
+    _lint_cryptic_arg_names!(name, info, type)
+end
+
+# Common short identifiers that ARE meaningful — full English words, or
+# unambiguous in any code context. Anything else under 4 characters is
+# almost always cryptic on a public-facing IP signature / route param.
+const _OK_SHORT_NAMES = Set{Symbol}([
+    :id, :to, :at, :as, :ok, :it, :in, :on, :up, :by, :of, :no,
+    :url, :uri, :key, :val, :err, :tag, :now, :all, :any, :len,
+])
+
+# Indexed properties on `@dynamicstruct`/`@htmx` structs are the public
+# API of those structs — IP signatures and route parameter names show up
+# in URLs, docs, and call sites, so they must communicate intent. Flag
+# 1-letter names (`x`, `n`, …) and 2-3 letter abbreviations (`pn`, `df`,
+# `ctx`, …) on indexed property arg lists. Local loop counters
+# (`for i in 1:n`) are unaffected — they live in property bodies, not
+# in declared signatures.
+function _lint_cryptic_arg_names!(name::Symbol, info, type)
+    isempty(info.indices) && return
+    bad = String[]
+    for idx in info.indices
+        Meta.isexpr(idx, :parameters) && continue
+        a = idx
+        Meta.isexpr(a, :kw) && (a = a.args[1])
+        Meta.isexpr(a, :(::)) && (a = a.args[1])
+        a isa Symbol || continue
+        s = String(a)
+        startswith(s, "_") && continue   # `_ignore` convention
+        len = length(s)
+        len >= 4 && continue              # 4+ chars likely meaningful
+        a in _OK_SHORT_NAMES && continue  # explicit allowlist
+        push!(bad, s)
+    end
+    isempty(bad) && return
+    loc = isnothing(info.lnn) ? "" : " at $(info.lnn.file):$(info.lnn.line)"
+    @warn """DynamicObjects lint: property `$type.$name(…)`$loc has cryptic parameter name(s) $(join(map(s -> "`$s`", bad), ", ")). Indexed-property args are part of the struct's public API (they show up in URLs, IP cache keys, and call sites) and must communicate intent. Rename them to meaningful English names — e.g. `posterior_name` not `pn`, `dataframe` not `df`, `value` not `x`. Single-letter names belong in tight algorithmic locals (loop counters, math indices), not on a declared signature."""
 end
 
 function _lint_no_self_access!(name::Symbol, info, walked_rhs, type, prop_names)
