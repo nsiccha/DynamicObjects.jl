@@ -1499,8 +1499,34 @@ function _lint_struct!(type, oproperties::Vector{<:Pair}, lint::Bool)
     # every nested type.
     own = Pair[n => info for (n, info) in oproperties if !_is_forwarded(info.rhs)]
     names = Symbol[n for (n, _) in own]
+    _lint_singleton_struct!(type, own)
     _lint_repeated_prefix!(type, names)
     _lint_shared_arg_signature!(type, own)
+end
+
+# A struct that owns exactly one user-declared property is over-engineered:
+# the property's body should live directly on the parent (as a property if
+# the struct is bare, or as an indexed property / function if the struct
+# takes args). Skips DO-convention dunder names (`__page__`, `__status__`,
+# …), synthesized destructure groups (`_tuple_*`), and `hash_fields`.
+function _lint_singleton_struct!(type, oproperties::Vector{<:Pair})
+    user = Pair[]
+    for (n, info) in oproperties
+        s = String(n)
+        startswith(s, "__") && endswith(s, "__") && continue
+        startswith(s, "_tuple_")              && continue
+        n === :hash_fields                    && continue
+        push!(user, n => info)
+    end
+    length(user) == 1 || return
+    (only_name, only_info) = first(user)
+    loc = isnothing(only_info.lnn) ? "" : " (defined at $(only_info.lnn.file):$(only_info.lnn.line))"
+    advice = if only_info.indexed
+        "Replace the struct with a plain indexed property `$only_name(args…) = …` (or a top-level function) on the enclosing scope — it carries no other state, so the struct shell adds nothing."
+    else
+        "Replace the struct with a plain property `$only_name = …` on the enclosing scope — it carries no other state, so the struct shell adds nothing."
+    end
+    @warn """DynamicObjects lint: `$type` has exactly one user-declared property: `$only_name`$loc. $advice"""
 end
 
 # Forwarded inline-child props have `rhs == __parent__.x`, courtesy of the
