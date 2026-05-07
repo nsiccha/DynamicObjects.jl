@@ -3120,31 +3120,151 @@ function _caller_scope(caller_T::Type, caller_prop::Symbol, parents)
     names
 end
 
-# Worst-case-bound annotation for one IP. Finds all (caller_T, caller_prop)
-# pairs in the tree whose body contains a call to this IP, unions their
-# scopes, and returns "[⊆ {…}]". When no callers exist in the tree, the
-# bound can't be tightened from external evidence, so we say so.
+# Worst-case-bound for one IP. Returns a tagged result so the caller can
+# emit each scope name individually (each colored by identity). `:bound, names`
+# carries the upper-bound set; `:none` means no callers in the tree.
 function _print_struct_worst_case(types_in_tree, parents, T::Type,
                                   prop_name::Symbol, info)
-    isempty(_ip_positional_args(info.indices)) && return ""
+    isempty(_ip_positional_args(info.indices)) && return nothing
     callers = Set{Tuple{Type,Symbol}}()
     for U in types_in_tree
         uprops = try meta(U) catch; nothing end
         uprops === nothing && continue
-        cprops = uprops
         for (uname, uinfo) in uprops
             uinfo.rhs === nothing && continue
             (U === T && uname === prop_name) && continue
-            _has_call_to(uinfo.rhs, prop_name, cprops) || continue
+            _has_call_to(uinfo.rhs, prop_name, uprops) || continue
             push!(callers, (U, uname))
         end
     end
-    isempty(callers) && return "  [no callers in tree]"
+    isempty(callers) && return (:none,)
     bound = Set{Symbol}()
     for (cT, cp) in callers
         union!(bound, _caller_scope(cT, cp, parents))
     end
-    "  [⊆ {" * join(sort!(collect(bound)), ", ") * "}]"
+    (:bound, sort!(collect(bound)))
+end
+
+# --- Identity coloring --------------------------------------------------------
+# Each "scope identifier" (constructor field, @param name, IP positional arg)
+# is colored deterministically by its name so the same name reads as the same
+# color everywhere it appears — in `fields:` / `@param:` lists, in IP
+# signatures, and in worst-case bound sets. Lets you visually trace bonds:
+# spot `formula` once, then scan for matching color anywhere else.
+
+# 32 distinct hues from the xterm 256-color cube — wide enough to avoid most
+# collisions in practice, ordered so consecutive entries are visually distinct.
+const _IDENT_PALETTE = (
+    196, 220,  46,  51,  21, 201, 208, 226, 118,  87,
+     75, 165, 129, 213, 197, 173, 154,  82,  39,  93,
+    214, 190,  86,  81, 105, 207, 161, 142,  45, 135,
+    213, 109,
+)
+
+# A name → palette-index map, built by deterministic pre-walk of the tree on
+# the outermost `print_structure` call so identical names get identical colors
+# without hash collisions (until we exceed palette size). The walk visits
+# constructor fields, @param names, and IP positional args in tree order.
+function _build_color_map(root::Type)
+    seen = Vector{Symbol}()
+    visited = Set{Type}()
+    function visit_type(T)
+        T in visited && return
+        push!(visited, T)
+        for f in fieldnames(T)
+            f === :cache && continue
+            s = String(f); (startswith(s, "__") && endswith(s, "__")) && continue
+            f in seen || push!(seen, f)
+        end
+        for p in _print_struct_param_names(T)
+            p in seen || push!(seen, p)
+        end
+        props = try meta(T) catch; nothing end
+        props === nothing && return
+        for name in sort!(collect(keys(props)))
+            _print_struct_skip(name) && continue
+            info = props[name]
+            for a in _ip_positional_args(info.indices)
+                a in seen || push!(seen, a)
+            end
+            nested = _nested_struct_type(T, Val(name))
+            nested === nothing || visit_type(nested)
+        end
+    end
+    visit_type(root)
+    Dict{Symbol,Int}(n => i for (i, n) in enumerate(seen))
+end
+
+_ident_color(name::Symbol, color_map::Dict{Symbol,Int}) =
+    haskey(color_map, name) ?
+        _IDENT_PALETTE[mod1(color_map[name], length(_IDENT_PALETTE))] :
+        :default
+
+# Emit a scope identifier with its identity color.
+_emit_ident(io::IO, name::Symbol, color_map) =
+    printstyled(io, name; color=_ident_color(name, color_map))
+
+# Emit an IP signature `(pos1, pos2; kw1=val, kw2)` with each argument name
+# colored by identity. Defaults / type annotations are dim.
+function _emit_signature(io::IO, indices, color_map)
+    isempty(indices) && return
+    pos = []
+    kw  = []
+    for idx in indices
+        if Meta.isexpr(idx, :parameters)
+            for a in idx.args; push!(kw, a) end
+        else
+            push!(pos, idx)
+        end
+    end
+    printstyled(io, "("; color=:light_black)
+    for (i, a) in enumerate(pos)
+        i == 1 || printstyled(io, ", "; color=:light_black)
+        _emit_sig_arg(io, a, color_map)
+    end
+    if !isempty(kw)
+        printstyled(io, "; "; color=:light_black)
+        for (i, a) in enumerate(kw)
+            i == 1 || printstyled(io, ", "; color=:light_black)
+            _emit_sig_arg(io, a, color_map)
+        end
+    end
+    printstyled(io, ")"; color=:light_black)
+end
+function _emit_sig_arg(io::IO, a, color_map)
+    if a isa Symbol
+        _emit_ident(io, a, color_map)
+    elseif Meta.isexpr(a, :kw)
+        _emit_sig_arg(io, a.args[1], color_map)
+        printstyled(io, "="; color=:light_black)
+        printstyled(io, _print_struct_short(a.args[2]); color=:light_black)
+    elseif Meta.isexpr(a, :(::))
+        if length(a.args) == 1
+            printstyled(io, "::", a.args[1]; color=:light_black)
+        else
+            _emit_sig_arg(io, a.args[1], color_map)
+            printstyled(io, "::", _print_struct_short(a.args[2]); color=:light_black)
+        end
+    else
+        print(io, _print_struct_short(a))
+    end
+end
+
+# Emit `[⊆ {a, b, c}]` or `[no callers in tree]` for the worst-case bound.
+function _emit_dep(io::IO, dep, color_map)
+    dep === nothing && return
+    printstyled(io, "  ["; color=:light_black)
+    if dep[1] === :none
+        printstyled(io, "no callers in tree"; color=:light_black, italic=true)
+    else
+        printstyled(io, "⊆ {"; color=:light_black)
+        for (i, n) in enumerate(dep[2])
+            i == 1 || printstyled(io, ", "; color=:light_black)
+            _emit_ident(io, n, color_map)
+        end
+        printstyled(io, "}"; color=:light_black)
+    end
+    printstyled(io, "]"; color=:light_black)
 end
 
 """    print_structure([io::IO=stdout,] T::Type; max_depth=typemax(Int))
@@ -3168,42 +3288,67 @@ print_structure(T::Type; kwargs...) = print_structure(stdout, T; kwargs...)
 function print_structure(io::IO, T::Type;
                          max_depth::Int=typemax(Int),
                          indent::String="",
-                         header::Union{Nothing,String}=nothing,
+                         header_prop::Union{Nothing,Tuple}=nothing,
                          visited::Set{Type}=Set{Type}(),
                          types_in_tree=nothing,
-                         parent_map=nothing)
+                         parent_map=nothing,
+                         color_map=nothing)
     # Build the tree-level indices once, on the outermost call.
     if types_in_tree === nothing
         types_in_tree = _all_types_in_tree(T)
         parent_map = _build_parent_map(T)
+        color_map = _build_color_map(T)
     end
-    println(io, indent, header === nothing ? string(nameof(T)) :
-                       header * " = " * string(nameof(T)))
-    T in visited && (println(io, indent, "  (cycle)"); return)
+    print(io, indent)
+    if header_prop === nothing
+        printstyled(io, nameof(T); color=:cyan, bold=true)
+        println(io)
+    else
+        _emit_prop_line(io, header_prop..., color_map)
+        printstyled(io, " = "; color=:light_black)
+        printstyled(io, nameof(T); color=:cyan, bold=true)
+        println(io)
+    end
+    if T in visited
+        printstyled(io, indent, "  (cycle)\n"; color=:light_black)
+        return
+    end
     push!(visited, T)
     inner = indent * "  "
 
-    # Constructor fields (positional args of the generated struct).
+    # Constructor fields — each name colored by identity.
     fixed = filter(n -> n !== :cache, collect(fieldnames(T)))
-    isempty(fixed) || println(io, inner, "fields: ", join(fixed, ", "))
+    if !isempty(fixed)
+        print(io, inner)
+        printstyled(io, "fields: "; color=:light_black)
+        for (i, f) in enumerate(fixed)
+            i == 1 || printstyled(io, ", "; color=:light_black)
+            _emit_ident(io, f, color_map)
+        end
+        println(io)
+    end
 
-    # @param-declared names (HTMXO only).
+    # @param-declared names — each colored by identity.
     params = _print_struct_param_names(T)
-    isempty(params) || println(io, inner, "@param: ", join(params, ", "))
+    if !isempty(params)
+        print(io, inner)
+        printstyled(io, "@param: "; color=:yellow)
+        for (i, p) in enumerate(params)
+            i == 1 || printstyled(io, ", "; color=:light_black)
+            _emit_ident(io, p, color_map)
+        end
+        println(io)
+    end
 
-    # Properties from meta(T). Iterate in a stable order so output is diffable.
     props = try meta(T) catch; nothing end
     props === nothing && return
     for name in sort!(collect(keys(props)))
         _print_struct_skip(name) && continue
         info = props[name]
-        # Fixed fields (no RHS) are already listed on the `fields:` line above —
-        # don't repeat them as properties.
         info.rhs === nothing && continue
         _print_struct_is_forwarded(info.rhs) && continue
 
         nested = _nested_struct_type(T, Val(name))
-        sig = _print_struct_signature(info.indices)
         route_tag = ""
         for m in info.macros
             if m in _PRINT_STRUCT_ROUTE_MACROS
@@ -3211,22 +3356,32 @@ function print_structure(io::IO, T::Type;
                 break
             end
         end
-        cached_tag = Symbol("@cached") in info.macros ? "@cached " : ""
-        prefix = route_tag * cached_tag
-        # IP arg worst-case dependency bound — only for IPs with positional args.
-        dep_summary = info.indexed ?
-            _print_struct_worst_case(types_in_tree, parent_map, T, name, info) : ""
+        cached = Symbol("@cached") in info.macros
+        dep = info.indexed ?
+            _print_struct_worst_case(types_in_tree, parent_map, T, name, info) : nothing
 
         if nested !== nothing && max_depth > 0
             print_structure(io, nested;
                             max_depth=max_depth-1, indent=inner,
-                            header=string(prefix, name, sig, dep_summary),
+                            header_prop=(route_tag, cached, name, info.indices, dep),
                             visited=copy(visited),
-                            types_in_tree, parent_map)
+                            types_in_tree, parent_map, color_map)
         else
-            println(io, inner, prefix, name, sig, dep_summary)
+            print(io, inner)
+            _emit_prop_line(io, route_tag, cached, name, info.indices, dep, color_map)
+            println(io)
         end
     end
+end
+
+# Emit "<route> <@cached> <name><sig><dep>" with semantic coloring.
+function _emit_prop_line(io::IO, route_tag::String, cached::Bool,
+                         name::Symbol, indices, dep, color_map)
+    isempty(route_tag) || printstyled(io, route_tag; color=:green)
+    cached && printstyled(io, "@cached "; color=:yellow)
+    print(io, name)
+    _emit_signature(io, indices, color_map)
+    _emit_dep(io, dep, color_map)
 end
 export print_structure
 
