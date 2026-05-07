@@ -2973,6 +2973,180 @@ function _print_struct_param_names(T::Type)
     try htmxo._param_names(T) catch; () end
 end
 
+# --- IP arg worst-case dependency bound ---------------------------------------
+# For each IP, find its call sites in the DO tree. Each caller is some property
+# of some type. Take the union of every caller's *static identity scope* — its
+# own IP positional args, plus the ancestor types' constructor fields and
+# `@param` names walking up to root. That set is an honest *upper bound*: the
+# IP arg's value can be derived from no more than these names (modulo dynamic
+# inputs from outside the tree, like HTTP request bodies).
+#
+# Static and cheap — no AST walking of caller bodies, no dataflow, no
+# substitution. The annotation reads "at most depends on {names}", which is
+# what `print_structure` advertises.
+
+# Extract bare positional arg names from an `info.indices` tuple. Drops kwargs
+# (the `:parameters` slot) and unwraps `name::T` annotations.
+function _ip_positional_args(indices)
+    names = Symbol[]
+    for idx in indices
+        Meta.isexpr(idx, :parameters) && continue
+        n = Meta.isexpr(idx, :(::)) ? idx.args[1] : idx
+        n isa Symbol && push!(names, n)
+    end
+    names
+end
+
+# Reachable types from a root via _nested_struct_type. Used to bound the
+# call-site search so we don't chase outside the DO tree print_structure
+# is rendering.
+function _all_types_in_tree(root::Type)
+    seen = Set{Type}([root])
+    queue = Type[root]
+    while !isempty(queue)
+        T = popfirst!(queue)
+        props = try meta(T) catch; nothing end
+        props === nothing && continue
+        for name in keys(props)
+            nested = _nested_struct_type(T, Val(name))
+            nested === nothing && continue
+            nested in seen && continue
+            push!(seen, nested)
+            push!(queue, nested)
+        end
+    end
+    seen
+end
+
+# Map child_type → (parent_type, prop_name_in_parent) — built by walking the
+# tree from the root via `_nested_struct_type`. Lets us climb the type chain
+# for static-scope lookup. The root has no entry in this map.
+function _build_parent_map(root::Type)
+    parents = Dict{Type, Tuple{Type, Symbol}}()
+    seen = Set{Type}([root])
+    queue = Type[root]
+    while !isempty(queue)
+        T = popfirst!(queue)
+        props = try meta(T) catch; nothing end
+        props === nothing && continue
+        for name in keys(props)
+            nested = _nested_struct_type(T, Val(name))
+            nested === nothing && continue
+            nested in seen && continue
+            push!(seen, nested)
+            push!(queue, nested)
+            parents[nested] = (T, name)
+        end
+    end
+    parents
+end
+
+# Names visible as "root identity" at a property body inside type T:
+# constructor fields and `@param` names, walking parent_map up to root. If
+# `T` is reached via an IP property of its parent, that IP's positional arg
+# names are also in scope.
+function _enclosing_scope(T::Type, parents)
+    names = Set{Symbol}()
+    cur = T
+    while true
+        for f in fieldnames(cur)
+            f === :cache && continue
+            s = String(f)
+            (startswith(s, "__") && endswith(s, "__")) && continue
+            push!(names, f)
+        end
+        for p in _print_struct_param_names(cur)
+            push!(names, p)
+        end
+        haskey(parents, cur) || break
+        parent_T, parent_prop = parents[cur]
+        try
+            info = meta(parent_T)[parent_prop]
+            for a in _ip_positional_args(info.indices)
+                push!(names, a)
+            end
+        catch
+        end
+        cur = parent_T
+    end
+    names
+end
+
+# Dot-chain leftmost Symbol — `render.stan.code` → `:render`; bare `code` →
+# `:code`. `nothing` for non-symbol roots.
+function _dot_chain_root(expr)
+    expr isa Symbol && return expr
+    Meta.isexpr(expr, :., 2) && return _dot_chain_root(expr.args[1])
+    nothing
+end
+
+# Conservative call-site detector: matches `target(…)` and `parent.target(…)`
+# only when the leftmost symbol resolves to a property of the caller's type
+# or one of the macro-injected names. Excludes unrelated namespaces (`h.code`,
+# `Base.length`, …) that happen to share a property name.
+function _has_call_to(expr, target::Symbol, cprops)
+    expr isa Expr || return false
+    if Meta.isexpr(expr, :call) && length(expr.args) >= 1
+        callee = expr.args[1]
+        if callee === target
+            cprops !== nothing && haskey(cprops, target) && return true
+        elseif Meta.isexpr(callee, :., 2) && callee.args[2] isa QuoteNode &&
+               callee.args[2].value === target
+            root = _dot_chain_root(callee.args[1])
+            if root !== nothing &&
+               (root === :__self__ || root === :__parent__ || root === :__appdata__ ||
+                (cprops !== nothing && haskey(cprops, root)))
+                return true
+            end
+        end
+    end
+    for a in expr.args
+        _has_call_to(a, target, cprops) && return true
+    end
+    false
+end
+
+# Scope of a caller property: enclosing static scope of its type, plus its own
+# IP positional args (so `name` from `@get stage(name)` flows through into the
+# bound for any IP called from inside `stage`'s body).
+function _caller_scope(caller_T::Type, caller_prop::Symbol, parents)
+    names = _enclosing_scope(caller_T, parents)
+    info = try meta(caller_T)[caller_prop] catch; nothing end
+    if info !== nothing
+        for a in _ip_positional_args(info.indices)
+            push!(names, a)
+        end
+    end
+    names
+end
+
+# Worst-case-bound annotation for one IP. Finds all (caller_T, caller_prop)
+# pairs in the tree whose body contains a call to this IP, unions their
+# scopes, and returns "[⊆ {…}]". When no callers exist in the tree, the
+# bound can't be tightened from external evidence, so we say so.
+function _print_struct_worst_case(types_in_tree, parents, T::Type,
+                                  prop_name::Symbol, info)
+    isempty(_ip_positional_args(info.indices)) && return ""
+    callers = Set{Tuple{Type,Symbol}}()
+    for U in types_in_tree
+        uprops = try meta(U) catch; nothing end
+        uprops === nothing && continue
+        cprops = uprops
+        for (uname, uinfo) in uprops
+            uinfo.rhs === nothing && continue
+            (U === T && uname === prop_name) && continue
+            _has_call_to(uinfo.rhs, prop_name, cprops) || continue
+            push!(callers, (U, uname))
+        end
+    end
+    isempty(callers) && return "  [no callers in tree]"
+    bound = Set{Symbol}()
+    for (cT, cp) in callers
+        union!(bound, _caller_scope(cT, cp, parents))
+    end
+    "  [⊆ {" * join(sort!(collect(bound)), ", ") * "}]"
+end
+
 """    print_structure([io::IO=stdout,] T::Type; max_depth=typemax(Int))
 
 Render the DO/HTMXO structure of `T` as an indented tree:
@@ -2995,7 +3169,14 @@ function print_structure(io::IO, T::Type;
                          max_depth::Int=typemax(Int),
                          indent::String="",
                          header::Union{Nothing,String}=nothing,
-                         visited::Set{Type}=Set{Type}())
+                         visited::Set{Type}=Set{Type}(),
+                         types_in_tree=nothing,
+                         parent_map=nothing)
+    # Build the tree-level indices once, on the outermost call.
+    if types_in_tree === nothing
+        types_in_tree = _all_types_in_tree(T)
+        parent_map = _build_parent_map(T)
+    end
     println(io, indent, header === nothing ? string(nameof(T)) :
                        header * " = " * string(nameof(T)))
     T in visited && (println(io, indent, "  (cycle)"); return)
@@ -3032,14 +3213,18 @@ function print_structure(io::IO, T::Type;
         end
         cached_tag = Symbol("@cached") in info.macros ? "@cached " : ""
         prefix = route_tag * cached_tag
+        # IP arg worst-case dependency bound — only for IPs with positional args.
+        dep_summary = info.indexed ?
+            _print_struct_worst_case(types_in_tree, parent_map, T, name, info) : ""
 
         if nested !== nothing && max_depth > 0
             print_structure(io, nested;
                             max_depth=max_depth-1, indent=inner,
-                            header=string(prefix, name, sig),
-                            visited=copy(visited))
+                            header=string(prefix, name, sig, dep_summary),
+                            visited=copy(visited),
+                            types_in_tree, parent_map)
         else
-            println(io, inner, prefix, name, sig)
+            println(io, inner, prefix, name, sig, dep_summary)
         end
     end
 end
