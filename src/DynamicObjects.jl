@@ -942,13 +942,23 @@ end
 maybehash(x::Number) = x
 maybehash(x::Symbol) = x
 maybehash(x) = persistent_hash(x)
+
+# Build a single path-segment identifier for a (name, args, kwargs) triple,
+# joining the parts with "_" via `maybehash`. Used in two places:
+#   1. As the file-name body of `get_cache_path` (with ".sjl" appended).
+#   2. As the per-level directory name in the inline-child cache_path
+#      auto-wiring, so the on-disk layout mirrors the DO hierarchy.
+# Kwargs are sorted by name so callers passing the same kwargs in different
+# syntactic order land in the same segment.
+cache_segment(name, args...; kwargs...) = begin
+    parts = length(kwargs) == 0 ? (name, args...) : (name, args..., sort(collect(kwargs); by=first)...)
+    join(map(maybehash, parts), "_")
+end
 get_cache_path(o, name, args...; kwargs...) = begin
-    parts = length(kwargs) == 0 ? (name, args...) : (name, args..., sort(collect(kwargs); by=first))
+    seg = cache_segment(name, args...; kwargs...)
     ver = cache_version(o, Val(name))
-    if !isnothing(ver)
-        parts = (parts..., Symbol("v", ver))
-    end
-    joinpath(o.cache_path, join(map(maybehash, parts), "_") * ".sjl")
+    !isnothing(ver) && (seg = seg * "_v" * string(ver))
+    joinpath(o.cache_path, seg * ".sjl")
 end
 get_cache_status(o, args...; kwargs...) = get_cache_status(get_cache_path(o, args...; kwargs...)) 
 get_cache_status(cache_path::AbstractString) = begin
@@ -1405,7 +1415,46 @@ function _lint_no_self_access!(name::Symbol, info, walked_rhs, type, prop_names)
     _contains_self_ref(walked_rhs) && return
     _contains_bare_prop_ref(walked_rhs, prop_names) && return
     loc = isnothing(info.lnn) ? "" : " at $(info.lnn.file):$(info.lnn.line)"
-    @warn """DynamicObjects lint: property `$type.$name(…)`$loc calls functions but reads no sibling state. If its args are pre-extracted from sibling properties at every call site (e.g. callers do `s = sibling_status[k]; r = s == :ready ? sibling_result[k] : nothing; $name(label, s, r)`), the natural shape is an inline-child DO — `@struct child(keys...) = begin status = …; result = …; html = …; end` — that owns the lookups and exposes the derivations as plain properties. Scattered call sites then collapse to `child[keys...].some_derived_prop`. If the standalone form is intentional, silence with `@dynamicstruct lint=false struct $type …`."""
+    @warn """
+    DynamicObjects lint: property `$type.$name(…)`$loc
+    calls functions but reads no sibling state.
+
+    Almost always, the fix is to LIFT IT TO AN INLINE-CHILD DO that owns
+    the underlying object/key and exposes the derivations as bare properties.
+
+    Two correct shapes:
+
+      (A) Args key on a "thing" the struct isn't modelling yet.
+          Callers do something like
+              c = compile_status[k]; s = sample_status[k]
+              html = $name(label, c, s)
+          The keys `k` and their lookups want a home:
+              @struct entry(k::Symbol) = begin
+                  compile = compile_status[k]
+                  sample  = sample_status[k]
+                  html    = …                # was $name(label, compile, sample)
+              end
+          Call sites collapse to `entry(k).html`.
+
+      (B) Args all come from one existing object (e.g. a plot, a posterior).
+          Lift `$name` to be a property OF that object:
+              @struct demo(name::Symbol) = begin
+                  href = …; title = …; description = …
+                  card = …                    # was demo_card(href, title, description)
+              end
+          Call sites collapse to `demo(name).card`.
+
+    ANTIPATTERNS — do NOT do any of these to silence this lint:
+
+      (1) `let f = (args…) -> body end` inside another property.
+          Same problem with extra ceremony.
+      (2) Extracting `$name` to a top-level function called from multiple sites.
+          If the args all key on the same identity, that identity wants to
+          OWN the derivation, not have it passed around.
+      (3) `lint=false` to avoid the warning instead of fixing it.
+          Only legitimate if the standalone form is genuinely intentional
+          and (A)/(B) truly don't fit.
+    """
 end
 
 # Detect `@cached prop(args...) = singlefunc(args...)` — a 1-line @cached
@@ -1466,7 +1515,11 @@ function _lint_repeated_prefix!(type, names::Vector{Symbol})
     end
     for (prefix, group) in by_prefix
         length(group) >= 2 || continue
-        @warn """DynamicObjects lint: `$type` has $(length(group)) properties sharing the `$(prefix)_*` prefix: $(join(group, ", ")). Consider grouping them inside an inline child — `@struct $prefix = begin …end` — so the shared-prefix names become bare members of the child (`$type.$(prefix).<member>`)."""
+        # Disabled pending redesign: standalone prefix-only signal produced
+        # too many false positives (n_*, record_*, current_*, …). The intent
+        # is to combine this with `_lint_shared_arg_signature!` so the prefix
+        # only fires when paired with a shared signature. See discussion.
+        # @warn """DynamicObjects lint: `$type` has $(length(group)) properties sharing the `$(prefix)_*` prefix: $(join(group, ", ")). Consider grouping them inside an inline child — `@struct $prefix = begin …end` — so the shared-prefix names become bare members of the child (`$type.$(prefix).<member>`)."""
     end
 end
 
@@ -1491,6 +1544,21 @@ function _lint_shared_arg_signature!(type, oproperties::Vector{<:Pair})
         length(group) >= 2 || continue
         argstr = join(sig, ", ")
         @warn """DynamicObjects lint: `$type` has $(length(group)) indexed properties sharing the `($argstr)` signature: $(join(group, ", ")). They likely all key on the same identity. Consider an inline child — `@struct shared($argstr) = begin …end` — that owns these and exposes them as plain members."""
+        # Within this signature group, find any subsets sharing a name prefix.
+        # Same signature alone is a hint; same signature + shared prefix is a
+        # near-certainty those siblings should be folded into one inline
+        # child named for the prefix — escalate to @error.
+        by_prefix = Dict{String, Vector{Symbol}}()
+        for n in group
+            s = String(n)
+            underscore = findfirst(==('_'), s)
+            (isnothing(underscore) || underscore == 1) && continue
+            push!(get!(by_prefix, s[1:underscore-1], Symbol[]), n)
+        end
+        for (prefix, sub) in by_prefix
+            length(sub) >= 2 || continue
+            @error """DynamicObjects lint: `$type` has $(length(sub)) indexed properties that share BOTH the `($argstr)` signature AND the `$(prefix)_*` prefix: $(join(sub, ", ")). Fold them into `@struct $prefix($argstr) = begin …end` and expose the suffixes as bare members (`$type.$(prefix)($argstr).<suffix>`)."""
+        end
     end
 end
 
@@ -1820,11 +1888,23 @@ function _process_include_externals!(body)
         Meta.isexpr(expr, :macrocall) && expr.args[1] == Symbol("@include") || continue
         inner = expr.args[end]
         Meta.isexpr(inner, :(=)) || continue
-        prop_name = inner.args[1]
+        lhs = inner.args[1]
         rhs = inner.args[2]
         Meta.isexpr(rhs, :call) || continue
+        # LHS is a bare prop name `prop` for the classic non-indexed form, or a
+        # call expression `prop(args…)` for the indexed-include form
+        # (`@include foo(x, y) = External(x, y)`). Either way, the LHS expression
+        # is preserved verbatim in the rewritten assignment so DO sees the
+        # property as either bare or indexed accordingly.
+        prop_name = if lhs isa Symbol
+            lhs
+        elseif Meta.isexpr(lhs, :call) && lhs.args[1] isa Symbol
+            lhs.args[1]
+        else
+            continue
+        end
         _inject_include_kwargs!(rhs, prop_name)
-        assignment = :($prop_name = $rhs)
+        assignment = :($lhs = $rhs)
         if isnothing(parent_expr)
             body.args[i] = assignment
         else
@@ -2062,6 +2142,24 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         end
         if !isempty(forwarded)
             push!(prepend, :($(Expr(:tuple, Expr(:parameters, forwarded...))) = __parent__))
+        end
+        # Auto-derive a hierarchical cache_path: extend the parent's path by a
+        # per-child directory whose name is the same flat segment that
+        # `get_cache_path` would use as the file-name body for this property.
+        # On disk this nests as "base/<parent_segment>/<child_segment>/…",
+        # ending at the leaf "<property>_<args>.sjl". Skipped when the child
+        # body explicitly declares cache_path — explicit wins.
+        if !(:cache_path in child_props)
+            # Expr(:call) layout: (func, [parameters], positional...). The
+            # parameters expression must come right after the function, not
+            # after positional args, otherwise Julia's parser rejects it.
+            seg_call_args = Any[:(DynamicObjects.cache_segment)]
+            !isempty(index_kwargs) && push!(seg_call_args,
+                Expr(:parameters, [Expr(:kw, kn, kn) for (kn, _) in index_kwargs]...))
+            push!(seg_call_args, QuoteNode(prop_name))
+            append!(seg_call_args, index_params)
+            seg_call = Expr(:call, seg_call_args...)
+            push!(prepend, :(cache_path = joinpath(__parent__.cache_path, $seg_call)))
         end
         child_body.args = vcat(prepend, child_body.args)
         push!(extracted_structs, child_struct)
