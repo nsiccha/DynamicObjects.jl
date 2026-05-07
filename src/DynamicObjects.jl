@@ -1417,12 +1417,11 @@ function _lint_no_self_access!(name::Symbol, info, walked_rhs, type, prop_names)
     loc = isnothing(info.lnn) ? "" : " at $(info.lnn.file):$(info.lnn.line)"
     @warn """
     DynamicObjects lint: property `$type.$name(…)`$loc
-    calls functions but reads no sibling state.
-
-    Almost always, the fix is to LIFT IT TO AN INLINE-CHILD DO that owns
-    the underlying object/key and exposes the derivations as bare properties.
-
-    Two correct shapes:
+    calls functions but reads no sibling state. This property does not
+    belong on `$type`. Fix it by lifting it to an inline-child DO that
+    owns the underlying object/key and exposes the derivations as bare
+    properties. Pick whichever shape fits — both are mandatory patterns,
+    not suggestions:
 
       (A) Args key on a "thing" the struct isn't modelling yet.
           Callers do something like
@@ -1444,16 +1443,17 @@ function _lint_no_self_access!(name::Symbol, info, walked_rhs, type, prop_names)
               end
           Call sites collapse to `demo(name).card`.
 
-    ANTIPATTERNS — do NOT do any of these to silence this lint:
+    ANTIPATTERNS — these do NOT count as fixing the lint:
 
       (1) `let f = (args…) -> body end` inside another property.
           Same problem with extra ceremony.
-      (2) Extracting `$name` to a top-level function called from multiple sites.
-          If the args all key on the same identity, that identity wants to
-          OWN the derivation, not have it passed around.
-      (3) `lint=false` to avoid the warning instead of fixing it.
-          Only legitimate if the standalone form is genuinely intentional
-          and (A)/(B) truly don't fit.
+      (2) Moving `$name` to a top-level function called from multiple sites.
+          If the args key on a struct identity, that identity must own the
+          derivation. A top-level function pushes the work outside the type
+          system that should be capturing it.
+      (3) `lint=false` to silence the lint instead of fixing it. The
+          standalone form is almost never genuinely intentional; if it
+          really is, document why inline.
     """
 end
 
@@ -1485,24 +1485,46 @@ function _lint_trivial_cached_wrapper!(name::Symbol, info, type)
     prop_arg_names == call_args || return
     loc = isnothing(info.lnn) ? "" : " at $(info.lnn.file):$(info.lnn.line)"
     callee = rhs.args[1]
-    @warn """DynamicObjects lint: `@cached $type.$name(…)`$loc is a thin wrapper around `$callee(…)` — body is one call passing the same args. Either inline `$callee`'s body into the @cached property (and delete `$callee`), or drop the wrapper and have callers `@cached`-call `$callee` directly."""
+    @warn """DynamicObjects lint: `@cached $type.$name(…)`$loc is a thin wrapper around `$callee(…)` — body is one call passing the same args. Pick one: inline `$callee`'s body into the @cached property and delete `$callee`, or drop the wrapper and have callers `@cached`-call `$callee` directly. The current shape is doing both."""
 end
 
 # --- Struct-level lint passes (run once after all properties collected) ---
 
 function _lint_struct!(type, oproperties::Vector{<:Pair}, lint::Bool)
     lint || return
-    names = Symbol[n for (n, _) in oproperties]
+    # Inline children forward parent properties via `(;a, b) = __parent__`,
+    # which leaves entries in `oproperties` whose `rhs` is `__parent__.x`.
+    # These are scoped views of parent props — not owned by this struct —
+    # and would otherwise produce false-positive prefix/signature lints on
+    # every nested type.
+    own = Pair[n => info for (n, info) in oproperties if !_is_forwarded(info.rhs)]
+    names = Symbol[n for (n, _) in own]
     _lint_repeated_prefix!(type, names)
-    _lint_shared_arg_signature!(type, oproperties)
+    _lint_shared_arg_signature!(type, own)
 end
 
-# Detect property names sharing a `<prefix>_*` shape — a strong signal that
-# they belong inside a `@struct prefix = begin … end` inline child.
+# Forwarded inline-child props have `rhs == __parent__.x`, courtesy of the
+# `(;a, b) = __parent__` destructure inserted by the inline-include desugar.
+# Filter them out of struct-level lints — they're scoped views, not owned.
+_is_forwarded(rhs::Expr) = rhs.head === :. && length(rhs.args) == 2 &&
+                            rhs.args[1] === :__parent__
+_is_forwarded(::Any) = false
+
+# Detect property names sharing a `<prefix>_*` shape — these belong inside a
+# `@struct prefix = begin … end` inline child. Two firing levels:
+#
+# - `@warn` when ≥2 properties share `prefix_*` and there's no bare `prefix`:
+#   they should move into `@struct prefix = begin …end` and the suffixes
+#   become bare members of the child.
+# - `@error` when ≥2 `prefix_*` names AND a bare `prefix` property both
+#   exist on the struct: this is unambiguous — `prefix` is the existing
+#   destination, `prefix_*` are scaffolding that was never moved into it.
+#
 # Skips DO-convention dunder names (`__foo__`) and synthesized destructure
 # group names (`_tuple_*`), and skips empty prefixes.
 function _lint_repeated_prefix!(type, names::Vector{Symbol})
     by_prefix = Dict{String, Vector{Symbol}}()
+    name_set = Set(names)
     for n in names
         s = String(n)
         startswith(s, "__") && endswith(s, "__") && continue
@@ -1515,11 +1537,11 @@ function _lint_repeated_prefix!(type, names::Vector{Symbol})
     end
     for (prefix, group) in by_prefix
         length(group) >= 2 || continue
-        # Disabled pending redesign: standalone prefix-only signal produced
-        # too many false positives (n_*, record_*, current_*, …). The intent
-        # is to combine this with `_lint_shared_arg_signature!` so the prefix
-        # only fires when paired with a shared signature. See discussion.
-        # @warn """DynamicObjects lint: `$type` has $(length(group)) properties sharing the `$(prefix)_*` prefix: $(join(group, ", ")). Consider grouping them inside an inline child — `@struct $prefix = begin …end` — so the shared-prefix names become bare members of the child (`$type.$(prefix).<member>`)."""
+        if Symbol(prefix) in name_set
+            @error """DynamicObjects lint: `$type` has $(length(group)) properties named `$(prefix)_*` ($(join(group, ", "))) AND a bare `$prefix` property. Move the `$(prefix)_*` members INTO `$prefix` as bare suffixes (`$type.$prefix.<suffix>`). Their existence as flat siblings of `$prefix` is leftover scaffolding — the destination already exists."""
+        else
+            @warn """DynamicObjects lint: `$type` has $(length(group)) properties sharing the `$(prefix)_*` prefix: $(join(group, ", ")). Group them inside an inline child — `@struct $prefix = begin …end` — so the shared-prefix names become bare members of the child (`$type.$prefix.<member>`)."""
+        end
     end
 end
 
@@ -1543,11 +1565,10 @@ function _lint_shared_arg_signature!(type, oproperties::Vector{<:Pair})
     for (sig, group) in by_sig
         length(group) >= 2 || continue
         argstr = join(sig, ", ")
-        @warn """DynamicObjects lint: `$type` has $(length(group)) indexed properties sharing the `($argstr)` signature: $(join(group, ", ")). They likely all key on the same identity. Consider an inline child — `@struct shared($argstr) = begin …end` — that owns these and exposes them as plain members."""
+        @warn """DynamicObjects lint: `$type` has $(length(group)) indexed properties sharing the `($argstr)` signature: $(join(group, ", ")). They all key on the same identity. Move them into an inline child — `@struct shared($argstr) = begin …end` — that owns these and exposes them as plain members."""
         # Within this signature group, find any subsets sharing a name prefix.
-        # Same signature alone is a hint; same signature + shared prefix is a
-        # near-certainty those siblings should be folded into one inline
-        # child named for the prefix — escalate to @error.
+        # Same signature + shared prefix is unambiguous: those siblings
+        # belong in one inline child named for the prefix — escalate to @error.
         by_prefix = Dict{String, Vector{Symbol}}()
         for n in group
             s = String(n)
@@ -1557,7 +1578,7 @@ function _lint_shared_arg_signature!(type, oproperties::Vector{<:Pair})
         end
         for (prefix, sub) in by_prefix
             length(sub) >= 2 || continue
-            @error """DynamicObjects lint: `$type` has $(length(sub)) indexed properties that share BOTH the `($argstr)` signature AND the `$(prefix)_*` prefix: $(join(sub, ", ")). Fold them into `@struct $prefix($argstr) = begin …end` and expose the suffixes as bare members (`$type.$(prefix)($argstr).<suffix>`)."""
+            @error """DynamicObjects lint: `$type` has $(length(sub)) indexed properties that share BOTH the `($argstr)` signature AND the `$(prefix)_*` prefix: $(join(sub, ", ")). Fold them into `@struct $prefix($argstr) = begin …end` and expose the suffixes as bare members (`$type.$prefix($argstr).<suffix>`)."""
         end
     end
 end
