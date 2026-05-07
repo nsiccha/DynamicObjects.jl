@@ -1670,6 +1670,14 @@ end
 is_generated_property(o, name) = false
 is_indexed_property(o, name) = false
 _disk_cache(o, name) = nothing
+"""    _nested_struct_type(::Type{T}, ::Val{name})
+
+Return the type of the nested struct exposed under property `name` on `T`,
+or `nothing` if `name` is not backed by a nested struct. Methods are emitted
+by `@dynamicstruct` for every inline `@struct` child, and by `@htmx` for
+each `@include` external. Used by `print_structure` to walk the type tree.
+"""
+_nested_struct_type(::Type, ::Val) = nothing
 extractnames(x::Vector) = mapreduce(extractnames, union, x; init=Set())
 extractnames(x::Symbol) = Set((x,))
 extractnames(x::Expr) = if Meta.isexpr(x, :(::))
@@ -2101,6 +2109,10 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         append!(parent_props, _collect_lhs_names(lhs))
     end
     extracted_structs = Expr[]
+    # Parallel record of (parent-property-name => generated-child-type-name) for
+    # each inline `@struct` child, used to emit `_nested_struct_type` methods so
+    # `print_structure` can walk the inline-child tree.
+    inline_child_pairs = Pair{Symbol,Symbol}[]
     for (i, arg) in enumerate(body.args)
         arg isa Expr || continue
         # Peel a `Core.@doc "str" <inner>` wrapper if present, so that
@@ -2253,6 +2265,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         end
         child_body.args = vcat(prepend, child_body.args)
         push!(extracted_structs, child_struct)
+        push!(inline_child_pairs, prop_name => gen_name)
         # Replace with parent property definition. For indexed form, emit an
         # indexed property `prop(idx...; kw=default, ...)`; for the plain
         # form, a bare `prop`.
@@ -2508,6 +2521,9 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             $([:(
                 $DynamicObjects._disk_cache(::$type, ::Val{$(QuoteNode(name))}) = $varname
             ) for (name, varname) in cached_names]...)
+            $([:(
+                $DynamicObjects._nested_struct_type(::Type{$type}, ::Val{$(QuoteNode(prop_name))}) = $gen_name
+            ) for (prop_name, gen_name) in inline_child_pairs]...)
             $Base.show(io::IO, __self__::$type) = begin
                 print(io, $(string(type)), "(")
                 $([let sep = i == 1 ? :() : :(print(io, ", "))
@@ -2881,5 +2897,152 @@ end
 _show_cause(io, err::PropertyComputationError, _bt) = showerror(io, err)
 _show_cause(io, err, ::Nothing) = showerror(io, err)
 _show_cause(io, err, bt) = showerror(io, err, bt)
+
+# ---------- print_structure ----------------------------------------------------
+# Programmatic rendering of a DO/HTMXO type's structure, suitable for spotting
+# IPs, inline children, routes, @param decls, and constructor fields at a glance.
+# Walks `meta(T)` for properties + `_nested_struct_type(T, Val(name))` for inline
+# children. HTMXO-specific introspection (`_param_names`, route macro tags) is
+# read defensively so DO-only types print cleanly too.
+
+const _PRINT_STRUCT_ROUTE_MACROS = Set([
+    Symbol("@get"), Symbol("@post"), Symbol("@put"),
+    Symbol("@patch"), Symbol("@delete"), Symbol("@ws"),
+])
+
+# Skip auto-generated and DO-internal property names.
+_print_struct_skip(name::Symbol) = begin
+    s = String(name)
+    (startswith(s, "__") && endswith(s, "__")) ||
+        startswith(s, "_tuple_") ||
+        name === :hash_fields ||
+        name === :cache_path ||
+        name === :hash ||
+        name === :cache
+end
+
+# A property whose RHS is just `__parent__.something` — auto-forwarded into an
+# inline child by the macro. Not a user-authored property of the child.
+_print_struct_is_forwarded(rhs) =
+    Meta.isexpr(rhs, :.) && length(rhs.args) == 2 &&
+    rhs.args[1] === :__parent__ && rhs.args[2] isa QuoteNode
+
+# Render an `info.indices` tuple back into a `(a, b; k=v)` signature string.
+function _print_struct_signature(indices)
+    isempty(indices) && return ""
+    pos = String[]
+    kw  = String[]
+    for idx in indices
+        if Meta.isexpr(idx, :parameters)
+            for a in idx.args
+                push!(kw, _print_struct_arg(a))
+            end
+        else
+            push!(pos, _print_struct_arg(idx))
+        end
+    end
+    parts = String[]
+    isempty(pos) || push!(parts, join(pos, ", "))
+    isempty(kw)  || push!(parts, "; " * join(kw, ", "))
+    "(" * join(parts, "") * ")"
+end
+_print_struct_arg(a::Symbol) = String(a)
+function _print_struct_arg(a::Expr)
+    if Meta.isexpr(a, :kw)
+        "$(_print_struct_arg(a.args[1]))=$(_print_struct_short(a.args[2]))"
+    elseif Meta.isexpr(a, :(::))
+        length(a.args) == 1 ? "::$(a.args[1])" :
+            "$(a.args[1])::$(_print_struct_short(a.args[2]))"
+    else
+        _print_struct_short(a)
+    end
+end
+_print_struct_arg(a) = string(a)
+# Compact one-line render of a default expression — chops noisy whitespace.
+_print_struct_short(x) = replace(string(x), r"\s+" => " ")
+
+# Defensive HTMXO `_param_names(T)` lookup — the function lives in HTMXObjects;
+# DO-only types don't have it. Empty tuple if the binding isn't loaded.
+function _print_struct_param_names(T::Type)
+    htmxo = get(Base.loaded_modules,
+        Base.PkgId(Base.UUID("b12ef442-5798-4353-80f3-9562b03a0cb6"),
+                   "HTMXObjects"),
+        nothing)
+    htmxo === nothing && return ()
+    isdefined(htmxo, :_param_names) || return ()
+    try htmxo._param_names(T) catch; () end
+end
+
+"""    print_structure([io::IO=stdout,] T::Type; max_depth=typemax(Int))
+
+Render the DO/HTMXO structure of `T` as an indented tree:
+
+    TypeName
+      fields: f1, f2
+      @param: p1, p2
+      @get  index            ← HTMXO route
+      @post run(name)        ← HTMXO route with positional arg
+      prop                   ← plain property
+      ip(args; kwargs)       ← indexed property
+      @cached cached_prop
+      child = Type            ← inline @struct or @include external (recurses)
+
+Skips DO/HTMXO internals (`__*__`, `cache`, `hash_fields`, …) and properties
+auto-forwarded into inline children (`name = __parent__.name`).
+"""
+print_structure(T::Type; kwargs...) = print_structure(stdout, T; kwargs...)
+function print_structure(io::IO, T::Type;
+                         max_depth::Int=typemax(Int),
+                         indent::String="",
+                         header::Union{Nothing,String}=nothing,
+                         visited::Set{Type}=Set{Type}())
+    println(io, indent, header === nothing ? string(nameof(T)) :
+                       header * " = " * string(nameof(T)))
+    T in visited && (println(io, indent, "  (cycle)"); return)
+    push!(visited, T)
+    inner = indent * "  "
+
+    # Constructor fields (positional args of the generated struct).
+    fixed = filter(n -> n !== :cache, collect(fieldnames(T)))
+    isempty(fixed) || println(io, inner, "fields: ", join(fixed, ", "))
+
+    # @param-declared names (HTMXO only).
+    params = _print_struct_param_names(T)
+    isempty(params) || println(io, inner, "@param: ", join(params, ", "))
+
+    # Properties from meta(T). Iterate in a stable order so output is diffable.
+    props = try meta(T) catch; nothing end
+    props === nothing && return
+    for name in sort!(collect(keys(props)))
+        _print_struct_skip(name) && continue
+        info = props[name]
+        # Fixed fields (no RHS) are already listed on the `fields:` line above —
+        # don't repeat them as properties.
+        info.rhs === nothing && continue
+        _print_struct_is_forwarded(info.rhs) && continue
+
+        nested = _nested_struct_type(T, Val(name))
+        sig = _print_struct_signature(info.indices)
+        route_tag = ""
+        for m in info.macros
+            if m in _PRINT_STRUCT_ROUTE_MACROS
+                route_tag = String(m) * " "
+                break
+            end
+        end
+        cached_tag = Symbol("@cached") in info.macros ? "@cached " : ""
+        prefix = route_tag * cached_tag
+
+        if nested !== nothing && max_depth > 0
+            print_structure(io, nested;
+                            max_depth=max_depth-1, indent=inner,
+                            header=string(prefix, name, sig),
+                            visited=copy(visited))
+        else
+            println(io, inner, prefix, name, sig)
+        end
+    end
+end
+export print_structure
 
 end
