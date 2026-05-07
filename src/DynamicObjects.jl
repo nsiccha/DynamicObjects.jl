@@ -1504,16 +1504,22 @@ function _lint_struct!(type, oproperties::Vector{<:Pair}, lint::Bool)
     _lint_shared_arg_signature!(type, own)
 end
 
+# Dunders auto-injected by DO/HTMXO machinery — never user-state regardless
+# of whether the user wrote the line or not. Other `__name__` props
+# (`__status__`, `__page__`, `__appdata__` initializers, …) DO count as
+# user state — the user wrote a non-trivial body for them.
+const _AUTO_DUNDERS = Set([:__parent__, :__prefix__, :__req__, :__route__])
+
 # A struct that owns exactly one user-declared property is over-engineered:
 # the property's body should live directly on the parent (as a property if
 # the struct is bare, or as an indexed property / function if the struct
-# takes args). Skips DO-convention dunder names (`__page__`, `__status__`,
-# …), synthesized destructure groups (`_tuple_*`), and `hash_fields`.
+# takes args). Skips auto-injected dunders, synthesized destructure groups
+# (`_tuple_*`), and `hash_fields`.
 function _lint_singleton_struct!(type, oproperties::Vector{<:Pair})
     user = Pair[]
     for (n, info) in oproperties
+        n in _AUTO_DUNDERS                    && continue
         s = String(n)
-        startswith(s, "__") && endswith(s, "__") && continue
         startswith(s, "_tuple_")              && continue
         n === :hash_fields                    && continue
         push!(user, n => info)
