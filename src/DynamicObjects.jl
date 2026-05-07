@@ -2927,37 +2927,6 @@ _print_struct_is_forwarded(rhs) =
     Meta.isexpr(rhs, :.) && length(rhs.args) == 2 &&
     rhs.args[1] === :__parent__ && rhs.args[2] isa QuoteNode
 
-# Render an `info.indices` tuple back into a `(a, b; k=v)` signature string.
-function _print_struct_signature(indices)
-    isempty(indices) && return ""
-    pos = String[]
-    kw  = String[]
-    for idx in indices
-        if Meta.isexpr(idx, :parameters)
-            for a in idx.args
-                push!(kw, _print_struct_arg(a))
-            end
-        else
-            push!(pos, _print_struct_arg(idx))
-        end
-    end
-    parts = String[]
-    isempty(pos) || push!(parts, join(pos, ", "))
-    isempty(kw)  || push!(parts, "; " * join(kw, ", "))
-    "(" * join(parts, "") * ")"
-end
-_print_struct_arg(a::Symbol) = String(a)
-function _print_struct_arg(a::Expr)
-    if Meta.isexpr(a, :kw)
-        "$(_print_struct_arg(a.args[1]))=$(_print_struct_short(a.args[2]))"
-    elseif Meta.isexpr(a, :(::))
-        length(a.args) == 1 ? "::$(a.args[1])" :
-            "$(a.args[1])::$(_print_struct_short(a.args[2]))"
-    else
-        _print_struct_short(a)
-    end
-end
-_print_struct_arg(a) = string(a)
 # Compact one-line render of a default expression — chops noisy whitespace.
 _print_struct_short(x) = replace(string(x), r"\s+" => " ")
 
@@ -3161,12 +3130,29 @@ const _IDENT_PALETTE = (
     213, 109,
 )
 
-# A name → palette-index map, built by deterministic pre-walk of the tree on
-# the outermost `print_structure` call so identical names get identical colors
-# without hash collisions (until we exceed palette size). The walk visits
-# constructor fields, @param names, and IP positional args in tree order.
+# Color-by-bond: each name in the tree maps to a *fingerprint* — its upstream
+# worst-case bound set if it's an IP positional arg, or its own name (treated
+# as a root identity) if it's a @param / fixed field / IP arg without callers.
+# Two names with the same fingerprint render in the same color, so two args
+# named differently but with identical upstream identity slices (`bundle1` /
+# `bundle2`) still bond visually.
+#
+# The fingerprint approach over-groups in the worst case (two unrelated args
+# that happen to share the same upstream scope collide), but matches the
+# "same identity = same color" intent the static analyzer can actually
+# justify, with no dataflow cost.
 function _build_color_map(root::Type)
-    seen = Vector{Symbol}()
+    types_in_tree = _all_types_in_tree(root)
+    parent_map = _build_parent_map(root)
+    # Pass 1 — collect all names that exist in the tree and assign each its
+    # fingerprint. Root identities (@params, fixed fields) fingerprint as
+    # singletons; IP args with a tightenable bound fingerprint as the bound.
+    fingerprint = Dict{Symbol, Any}()
+    function set_root!(n::Symbol)
+        # Root identities take precedence over IP-arg-bound fingerprints when
+        # the same name appears in both roles — a @param IS its own identity.
+        fingerprint[n] = (:name, n)
+    end
     visited = Set{Type}()
     function visit_type(T)
         T in visited && return
@@ -3174,25 +3160,39 @@ function _build_color_map(root::Type)
         for f in fieldnames(T)
             f === :cache && continue
             s = String(f); (startswith(s, "__") && endswith(s, "__")) && continue
-            f in seen || push!(seen, f)
+            set_root!(f)
         end
-        for p in _print_struct_param_names(T)
-            p in seen || push!(seen, p)
-        end
+        for p in _print_struct_param_names(T); set_root!(p); end
         props = try meta(T) catch; nothing end
         props === nothing && return
         for name in sort!(collect(keys(props)))
             _print_struct_skip(name) && continue
             info = props[name]
-            for a in _ip_positional_args(info.indices)
-                a in seen || push!(seen, a)
+            args = _ip_positional_args(info.indices)
+            if !isempty(args)
+                wc = _print_struct_worst_case(types_in_tree, parent_map, T, name, info)
+                fp = (wc !== nothing && wc[1] === :bound) ?
+                     (:bound, Tuple(wc[2])) : nothing
+                for a in args
+                    haskey(fingerprint, a) && continue   # @param/field wins
+                    fingerprint[a] = fp === nothing ? (:name, a) : fp
+                end
             end
             nested = _nested_struct_type(T, Val(name))
             nested === nothing || visit_type(nested)
         end
     end
     visit_type(root)
-    Dict{Symbol,Int}(n => i for (i, n) in enumerate(seen))
+    # Pass 2 — assign each unique fingerprint a palette index in stable order
+    # (sorted by name of the first member to encounter it).
+    fp_to_idx = Dict{Any, Int}()
+    name_to_idx = Dict{Symbol, Int}()
+    for n in sort!(collect(keys(fingerprint)))
+        fp = fingerprint[n]
+        idx = get!(fp_to_idx, fp, length(fp_to_idx) + 1)
+        name_to_idx[n] = idx
+    end
+    name_to_idx
 end
 
 _ident_color(name::Symbol, color_map::Dict{Symbol,Int}) =
@@ -3204,8 +3204,9 @@ _ident_color(name::Symbol, color_map::Dict{Symbol,Int}) =
 _emit_ident(io::IO, name::Symbol, color_map) =
     printstyled(io, name; color=_ident_color(name, color_map))
 
-# Emit an IP signature `(pos1, pos2; kw1=val, kw2)` with each argument name
-# colored by identity. Defaults / type annotations are dim.
+# Emit an IP signature `(pos1, pos2; kw1=val, kw2)`. Only positional arg names
+# get bond-color; type annotations / defaults stay default-styled, italic for
+# the secondary slots (`::T`, `=val`).
 function _emit_signature(io::IO, indices, color_map)
     isempty(indices) && return
     pos = []
@@ -3217,54 +3218,53 @@ function _emit_signature(io::IO, indices, color_map)
             push!(pos, idx)
         end
     end
-    printstyled(io, "("; color=:light_black)
+    print(io, "(")
     for (i, a) in enumerate(pos)
-        i == 1 || printstyled(io, ", "; color=:light_black)
+        i == 1 || print(io, ", ")
         _emit_sig_arg(io, a, color_map)
     end
     if !isempty(kw)
-        printstyled(io, "; "; color=:light_black)
+        print(io, "; ")
         for (i, a) in enumerate(kw)
-            i == 1 || printstyled(io, ", "; color=:light_black)
+            i == 1 || print(io, ", ")
             _emit_sig_arg(io, a, color_map)
         end
     end
-    printstyled(io, ")"; color=:light_black)
+    print(io, ")")
 end
 function _emit_sig_arg(io::IO, a, color_map)
     if a isa Symbol
         _emit_ident(io, a, color_map)
     elseif Meta.isexpr(a, :kw)
         _emit_sig_arg(io, a.args[1], color_map)
-        printstyled(io, "="; color=:light_black)
-        printstyled(io, _print_struct_short(a.args[2]); color=:light_black)
+        printstyled(io, "=", _print_struct_short(a.args[2]); italic=true)
     elseif Meta.isexpr(a, :(::))
         if length(a.args) == 1
-            printstyled(io, "::", a.args[1]; color=:light_black)
+            printstyled(io, "::", a.args[1]; italic=true)
         else
             _emit_sig_arg(io, a.args[1], color_map)
-            printstyled(io, "::", _print_struct_short(a.args[2]); color=:light_black)
+            printstyled(io, "::", _print_struct_short(a.args[2]); italic=true)
         end
     else
         print(io, _print_struct_short(a))
     end
 end
 
-# Emit `[⊆ {a, b, c}]` or `[no callers in tree]` for the worst-case bound.
+# Emit `[⊆ {a, b, c}]` or `[no callers in tree]`. Bound names get bond-color.
 function _emit_dep(io::IO, dep, color_map)
     dep === nothing && return
-    printstyled(io, "  ["; color=:light_black)
+    print(io, "  [")
     if dep[1] === :none
-        printstyled(io, "no callers in tree"; color=:light_black, italic=true)
+        printstyled(io, "no callers in tree"; italic=true)
     else
-        printstyled(io, "⊆ {"; color=:light_black)
+        print(io, "⊆ {")
         for (i, n) in enumerate(dep[2])
-            i == 1 || printstyled(io, ", "; color=:light_black)
+            i == 1 || print(io, ", ")
             _emit_ident(io, n, color_map)
         end
-        printstyled(io, "}"; color=:light_black)
+        print(io, "}")
     end
-    printstyled(io, "]"; color=:light_black)
+    print(io, "]")
 end
 
 """    print_structure([io::IO=stdout,] T::Type; max_depth=typemax(Int))
@@ -3301,40 +3301,38 @@ function print_structure(io::IO, T::Type;
     end
     print(io, indent)
     if header_prop === nothing
-        printstyled(io, nameof(T); color=:cyan, bold=true)
+        printstyled(io, nameof(T); bold=true)
         println(io)
     else
         _emit_prop_line(io, header_prop..., color_map)
-        printstyled(io, " = "; color=:light_black)
-        printstyled(io, nameof(T); color=:cyan, bold=true)
+        print(io, " = ")
+        printstyled(io, nameof(T); bold=true)
         println(io)
     end
     if T in visited
-        printstyled(io, indent, "  (cycle)\n"; color=:light_black)
+        printstyled(io, indent, "  (cycle)\n"; italic=true)
         return
     end
     push!(visited, T)
     inner = indent * "  "
 
-    # Constructor fields — each name colored by identity.
     fixed = filter(n -> n !== :cache, collect(fieldnames(T)))
     if !isempty(fixed)
         print(io, inner)
-        printstyled(io, "fields: "; color=:light_black)
+        printstyled(io, "fields: "; italic=true)
         for (i, f) in enumerate(fixed)
-            i == 1 || printstyled(io, ", "; color=:light_black)
+            i == 1 || print(io, ", ")
             _emit_ident(io, f, color_map)
         end
         println(io)
     end
 
-    # @param-declared names — each colored by identity.
     params = _print_struct_param_names(T)
     if !isempty(params)
         print(io, inner)
-        printstyled(io, "@param: "; color=:yellow)
+        printstyled(io, "@param: "; italic=true)
         for (i, p) in enumerate(params)
-            i == 1 || printstyled(io, ", "; color=:light_black)
+            i == 1 || print(io, ", ")
             _emit_ident(io, p, color_map)
         end
         println(io)
@@ -3374,11 +3372,12 @@ function print_structure(io::IO, T::Type;
     end
 end
 
-# Emit "<route> <@cached> <name><sig><dep>" with semantic coloring.
+# Emit "<route> <@cached> <name><sig><dep>". Bond color is the only color;
+# route / @cached markers are bold-italic to stand out without competing.
 function _emit_prop_line(io::IO, route_tag::String, cached::Bool,
                          name::Symbol, indices, dep, color_map)
-    isempty(route_tag) || printstyled(io, route_tag; color=:green)
-    cached && printstyled(io, "@cached "; color=:yellow)
+    isempty(route_tag) || printstyled(io, route_tag; bold=true, italic=true)
+    cached && printstyled(io, "@cached "; bold=true, italic=true)
     print(io, name)
     _emit_signature(io, indices, color_map)
     _emit_dep(io, dep, color_map)
