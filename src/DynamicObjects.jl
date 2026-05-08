@@ -103,7 +103,12 @@ struct PropertyCache{D<:AbstractDict{Symbol,Any}}
     PropertyCache(D, c::NamedTuple) = new{D{Symbol,Any}}(D{Symbol,Any}(pairs(c)))
 end
 
-Base.get!(f::Function, c::PropertyCache, key) = get!((_...) -> f(), c.cache, key)
+# Bare-prop path: forwards `substatus` so the inner `ThreadsafeDict.get!`
+# creates a Treebars node + lifecycle just like it does for IPs. Closure
+# takes `s` (the substatus the spawn wrapper passes) so the body can
+# attach work to it.
+Base.get!(f::Function, c::PropertyCache, key; substatus=nothing, kwargs...) =
+    get!(s -> f(s), c.cache, key; substatus, kwargs...)
 Base.get!(f::Function, ::PropertyCache, key, indices...; kwargs...) = f()
 Base.setindex!(c::PropertyCache, args...) = setindex!(c.cache, args...)
 Base.show(io::IO, pc::PropertyCache) = print(io, "PropertyCache(", length(pc.cache), " properties)")
@@ -946,7 +951,23 @@ getorcomputeproperty(o, name, indices...; kwargs...) = if hasfield(typeof(o), na
     @assert length(indices) == length(kwargs) == 0
     getfield(o, name)
 else
-    get!(getfield(o, :cache), name, indices...; kwargs...) do
+    # For plain (non-indexed) generated user-facing properties, build a
+    # substatus closure so the spawn wrapper attaches a Treebars node to
+    # the parent's __status__ for the duration of the compute. Skip
+    # dunder names (`__status__`, `__appdata__`, …) and IPs (which get
+    # their own substatus via `Base.getindex(::IndexableProperty, …)`).
+    substatus_f = if isempty(indices) && isempty(kwargs) &&
+                     name != :__substatus__ && name != :__status__ &&
+                     !(startswith(string(name), "__") && endswith(string(name), "__")) &&
+                     is_generated_property(o, name) && !is_indexed_property(o, name)
+        () -> begin
+            root = o.__status__
+            compute_property(o, Val(:__substatus__), name; __status__=root)
+        end
+    else
+        nothing
+    end
+    get!(getfield(o, :cache), name, indices...; substatus=substatus_f, kwargs...) do s
         # When called with no indices on an indexed property (declared with
         # call/ref syntax, e.g. `x() = ...` or `x[i] = ...`), return an
         # IndexableProperty wrapper instead of calling compute_property.
@@ -955,7 +976,10 @@ else
                 return IndexableProperty(name, o, subcache(getfield(o, :cache), typeof(o), Val(name)))
             end
         end
-        _computeproperty(o, name, indices...; kwargs...)
+        # `s` is the substatus the spawn wrapper passed (or `nothing` when
+        # `substatus_f` was nothing). Pass it as `__status__` so the body
+        # — and any IP/property accesses inside — attach to it.
+        _computeproperty(o, name, indices...; __status__=s, kwargs...)
     end
 end
 maybehash(x::Number) = x
