@@ -2022,9 +2022,50 @@ Override generated per-property when a docstring is present in @dynamicstruct.
 Default: "name(arg1,arg2,...; k1=v1,k2=v2)" — kwargs section is omitted when empty.
 """
 _property_description(o, ::Val{name}, args...; kwargs...) where {name} = begin
+    # Bubble: if `name` is a registered nested-struct property and the
+    # nested type carries a user docstring, use that as the description.
+    # Inline `@struct child = begin "doc" … end` declarations emit their
+    # own per-prop `_property_description` override which wins; bare
+    # @include externals and typed properties fall through to here.
+    nested = _walk_nested_type(typeof(o), name)
+    if nested !== nothing
+        desc = _type_description(nested, args...; kwargs...)
+        desc !== nothing && return desc
+    end
     argstr = join(args, ",")
     kwstr = isempty(kwargs) ? "" : "; " * join(("$k=$v" for (k, v) in kwargs), ",")
     "$name($argstr$kwstr)"
+end
+
+"""    _type_description(::Type{T}, args...; kwargs...) -> Union{String,Nothing}
+
+Return a description for an instance of `T` constructed with the given args.
+`@dynamicstruct` emits an override for every type it defines that delegates
+to `_resolve_type_description(T, args, kwargs)` — this reads the user-attached
+docstring (if any) at runtime via `Base.Docs.meta`. Returns `nothing` when
+`T` has no user docstring; callers (e.g. `@include`-emitted
+`_property_description` overrides) should fall through to a per-property
+default in that case.
+"""
+_type_description(::Type, args...; kwargs...) = nothing
+
+# Runtime: read the user-registered docstring for `T` (if any), strip it,
+# format with the construction args. Returns `nothing` when no doc is set —
+# the auto-generated property-list fallback installed at line ~2556 lives
+# in `Base.Docs.getdoc(::Type{T})`, NOT in `Base.Docs.meta`, so this only
+# fires when the user explicitly attached a docstring via `"…"` syntax.
+function _resolve_type_description(::Type{T}, args, kwargs) where {T}
+    binding  = Base.Docs.Binding(parentmodule(T), nameof(T))
+    docs_meta = Base.Docs.meta(binding.mod)
+    multidoc = get(docs_meta, binding, nothing)
+    (multidoc === nothing || isempty(multidoc.docs)) && return nothing
+    raw = first(values(multidoc.docs))
+    txt = raw isa Base.Docs.DocStr ? join(raw.text, "") : string(raw)
+    label = strip(txt)
+    isempty(label) && return nothing
+    argstr = join(args, ",")
+    kwstr  = isempty(kwargs) ? "" : "; " * join(("$k=$v" for (k, v) in kwargs), ",")
+    "$label($argstr$kwstr)"
 end
 is_generated_property(o, name) = false
 is_indexed_property(o, name) = false
@@ -2431,6 +2472,20 @@ function _detect_inline_method_lhs(lhs::Expr)
 end
 
 dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothing, is_child=false, lint=true) = begin
+    # Short-form sugar: `T(arg1::T1, arg2::T2) = begin … end` is shorthand
+    # for `struct T; arg1::T1; arg2::T2; … end`. Args become fixed/constructor
+    # fields; body becomes property declarations. Standard Julia docstrings
+    # bind to `T` via `Base.@__doc__` exactly like the long form.
+    if Meta.isexpr(expr, :(=)) && length(expr.args) == 2 &&
+       Meta.isexpr(expr.args[1], :call) &&
+       Meta.isexpr(expr.args[2], :block)
+        call = expr.args[1]
+        body_block = expr.args[2]
+        type_name = call.args[1]
+        type_args = call.args[2:end]
+        expr = Expr(:struct, false, type_name,
+                    Expr(:block, type_args..., body_block.args...))
+    end
     @assert expr.head == :struct
     mut, head, body = expr.args
     type = head
@@ -2937,6 +2992,13 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             $([:(
                 $DynamicObjects._analysis_nested_type(::Type{$type}, ::Val{$(QuoteNode(prop_name))}) = $gen_name
             ) for (prop_name, gen_name) in analysis_child_pairs]...)
+            # Per-T `_type_description` override — delegates to a runtime
+            # resolver that reads the user-attached docstring (if any). Lets
+            # `@include`-emitted `_property_description` overrides bubble
+            # `T`'s docstring up as the progress label when `T(args)` is
+            # constructed via an IP.
+            $DynamicObjects._type_description(::Type{$type}, args...; kwargs...) =
+                $DynamicObjects._resolve_type_description($type, args, (; kwargs...))
             $Base.show(io::IO, __self__::$type) = begin
                 print(io, $(string(type)), "(")
                 $([let sep = i == 1 ? :() : :(print(io, ", "))
