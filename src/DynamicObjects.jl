@@ -2994,7 +2994,18 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             elseif Meta.isexpr(name, :tuple)
                 "Tuple LHS (e.g. `(a, b) = ...`) destructuring at struct-level is not supported as a property name; either split into separate property declarations or use `let` inside another property's RHS."
             else
-                "Each property in @dynamicstruct must have a Symbol name on the LHS (e.g. `name = rhs`, `name(idx) = rhs`, or `name::T = rhs`)."
+                """\
+                Each property in @dynamicstruct must have a Symbol name on the LHS — e.g. `name = rhs`, `name(idx) = rhs`, or `name::T = rhs`. \
+                Looks like a side-effecting/anonymous statement at struct top-level — DO doesn't run those at construction. To keep the check, either:
+                  (a) bind it to a named property and reference that property from a downstream RHS:
+                      _check = $arg
+                      result = (_check; …)         # forces evaluation when `result` is accessed
+                  (b) fold the assertion directly into the RHS of a property that needs to enforce it:
+                      result = begin
+                          $arg
+                          …
+                      end
+                """
             end
             error("@dynamicstruct $type: cannot interpret `$arg` as a property declaration$loc. $hint")
         end
