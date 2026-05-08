@@ -1525,12 +1525,12 @@ function _check_repeated_prefix!(msgs, type, oproperties)
     for (prefix, group) in by_prefix
         length(group) >= 2 || continue
         if Symbol(prefix) in name_set
-            short = "$(length(group)) `$(prefix)_*` siblings + bare `$prefix` — fold into it"
-            long  = "`$type` has $(length(group)) properties named `$(prefix)_*` ($(join(group, ", "))) AND a bare `$prefix` property. Move the `$(prefix)_*` members INTO `$prefix` as bare suffixes (`$type.$prefix.<suffix>`)."
+            short = "$(length(group)) `$(prefix)_*` siblings + bare `$prefix` — fold into it (`@struct`/`@include` body)"
+            long  = "`$type` has $(length(group)) properties named `$(prefix)_*` ($(join(group, ", "))) AND a bare `$prefix` property. Move the `$(prefix)_*` members INTO `$prefix` as bare suffixes (`$type.$prefix.<suffix>`). Use `@struct $prefix = begin …end` for data, `@include $prefix = begin …end` for routes."
             push!(msgs, LintMessage(type, nothing, :error, short, long, nothing))
         else
-            short = "$(length(group)) `$(prefix)_*` siblings — group as `@struct $prefix`"
-            long  = "`$type` has $(length(group)) properties sharing `$(prefix)_*` prefix: $(join(group, ", ")). Group inside `@struct $prefix = begin …end` so the shared-prefix names become bare members of the child."
+            short = "$(length(group)) `$(prefix)_*` siblings — group as `@struct $prefix` (or `@include $prefix` if routes)"
+            long  = "`$type` has $(length(group)) properties sharing `$(prefix)_*` prefix: $(join(group, ", ")). Group inside `@struct $prefix = begin …end` (data) or `@include $prefix = begin …end` (routes) so the shared-prefix names become bare members of the child."
             push!(msgs, LintMessage(type, nothing, :warn, short, long, nothing))
         end
     end
