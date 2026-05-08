@@ -1673,6 +1673,92 @@ _show_normalized(v::Tuple) = isempty(v[2:end]) ? string(nameof(v[1])) :
                              string(nameof(v[1]), ".", join(v[2:end], "."))
 _show_normalized(v) = string(v)
 
+# --- Top-level pollution: AppData property used only in one subtree -------
+# A property of the type registered as `__appdata__` should ideally live at
+# the LCA of its callers' subtree, not above. If every reference to
+# `__appdata__.X` comes from a single non-root subtree, X is misplaced —
+# move it under that subtree's data domain.
+
+function _appdata_top_field(expr)
+    expr isa Expr || return nothing
+    cur = expr
+    accessors = Symbol[]
+    while Meta.isexpr(cur, :., 2) && cur.args[2] isa QuoteNode
+        pushfirst!(accessors, cur.args[2].value)
+        cur = cur.args[1]
+    end
+    cur === :__appdata__ || return nothing
+    isempty(accessors) ? nothing : accessors[1]
+end
+
+function _collect_appdata_refs!(out::Set{Symbol}, expr)
+    expr isa Expr || return
+    field = _appdata_top_field(expr)
+    field !== nothing && push!(out, field)
+    for a in expr.args
+        _collect_appdata_refs!(out, a)
+    end
+end
+
+function _ancestor_chain(T, parent_map)
+    chain = Type[T]
+    cur = T
+    while haskey(parent_map, cur)
+        cur = parent_map[cur][1]
+        push!(chain, cur)
+    end
+    chain
+end
+
+function _lca_of(types, parent_map)
+    isempty(types) && return nothing
+    types_arr = collect(types)
+    chains = [_ancestor_chain(T, parent_map) for T in types_arr]
+    common = reduce(intersect, [Set(c) for c in chains])
+    isempty(common) && return nothing
+    for T in chains[1]
+        T in common && return T
+    end
+    nothing
+end
+
+function _check_appdata_placement!(msgs, root::Type, types_in_tree, parent_map)
+    appdata_T = _walk_nested_type(root, :__appdata__)
+    appdata_T === nothing && return
+    appdata_props = try meta(appdata_T) catch; nothing end
+    appdata_props === nothing && return
+    # For each AppData property name, collect set of types whose property
+    # bodies reference `__appdata__.<name>` (directly or via destructure).
+    callers_of = Dict{Symbol, Set{Type}}()
+    for U in types_in_tree
+        U === appdata_T && continue
+        uprops = try meta(U) catch; nothing end
+        uprops === nothing && continue
+        for (_, uinfo) in uprops
+            uinfo.rhs === nothing && continue
+            refs = Set{Symbol}()
+            _collect_appdata_refs!(refs, uinfo.rhs)
+            for r in refs
+                push!(get!(callers_of, r, Set{Type}()), U)
+            end
+        end
+    end
+    for (name, info) in appdata_props
+        # Only flag structural sub-trees (registered nested types) — primitive
+        # config like `server_id::Int = …` doesn't have a "data domain" to move
+        # under.
+        _walk_nested_type(appdata_T, name) === nothing && continue
+        callers = get(callers_of, name, Set{Type}())
+        isempty(callers) && continue
+        lca = _lca_of(callers, parent_map)
+        (lca === nothing || lca === root) && continue
+        ncallers = length(callers)
+        short = "only referenced from `$(nameof(lca))`'s subtree ($(ncallers) caller$(ncallers == 1 ? "" : "s")) — move under that domain instead of `__appdata__` top"
+        long  = "Property `$(nameof(appdata_T)).$name` is at the `__appdata__` top level but every reference goes through types under `$(nameof(lca))`'s subtree. Move it into `$(nameof(lca))`'s data domain (e.g. as a property of a paired data type) so placement matches actual usage."
+        push!(msgs, LintMessage(appdata_T, name, :warn, short, long, info.lnn))
+    end
+end
+
 function _check_redundant_args!(msgs, types_in_tree, parent_map, type, name::Symbol, info)
     pos = _ip_positional_args(info.indices)
     isempty(pos) && return
@@ -1786,6 +1872,7 @@ function analyze_structure(T::Type)
     end
 
     _check_identical_bound_siblings!(msgs, bound_groups, types_in_tree, parent_map)
+    _check_appdata_placement!(msgs, T, types_in_tree, parent_map)
     msgs
 end
 
