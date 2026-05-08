@@ -3195,193 +3195,347 @@ function _build_color_map(root::Type)
     name_to_idx
 end
 
-_ident_color(name::Symbol, color_map::Dict{Symbol,Int}) =
-    haskey(color_map, name) ?
-        _IDENT_PALETTE[mod1(color_map[name], length(_IDENT_PALETTE))] :
-        :default
+# --- Structured representation ------------------------------------------------
+# A minimal HTML-tag-shaped DOM. `Tag` is a Symbol type parameter (Val-like,
+# so dispatch happens at compile time); `content` is whatever the tag holds
+# (string, single node, vector of nodes, or nothing); `attributes` is a
+# NamedTuple of HTML-style attrs (`class="…"`, `color=…`, etc.).
+#
+# Generic HTML rendering is `<tag attrs>content</tag>` — overrides per tag
+# when the default isn't right. Markdown / terminal fall back to "just emit
+# the content" with overrides for the tags that actually carry meaning in
+# those formats (`:strong` → ANSI bold / `**…**`; etc.).
 
-# Emit a scope identifier with its identity color.
-_emit_ident(io::IO, name::Symbol, color_map) =
-    printstyled(io, name; color=_ident_color(name, color_map))
-
-# Emit an IP signature `(pos1, pos2; kw1=val, kw2)`. Only positional arg names
-# get bond-color; type annotations / defaults stay default-styled, italic for
-# the secondary slots (`::T`, `=val`).
-function _emit_signature(io::IO, indices, color_map)
-    isempty(indices) && return
-    pos = []
-    kw  = []
-    for idx in indices
-        if Meta.isexpr(idx, :parameters)
-            for a in idx.args; push!(kw, a) end
-        else
-            push!(pos, idx)
-        end
+struct Node{Tag, C<:Tuple, A<:NamedTuple}
+    content::C
+    attributes::A
+    function Node(tag::Symbol, args...; kwargs...)
+        a = (;kwargs...)
+        new{tag, typeof(args), typeof(a)}(args, a)
     end
-    print(io, "(")
-    for (i, a) in enumerate(pos)
-        i == 1 || print(io, ", ")
-        _emit_sig_arg(io, a, color_map)
-    end
-    if !isempty(kw)
-        print(io, "; ")
-        for (i, a) in enumerate(kw)
-            i == 1 || print(io, ", ")
-            _emit_sig_arg(io, a, color_map)
-        end
-    end
-    print(io, ")")
 end
-function _emit_sig_arg(io::IO, a, color_map)
+
+# Cobweb-style builder: `h.tag(args...; attrs...)` constructs a Node. The
+# `getproperty` overload on `typeof(h)` turns any tag-name access into a
+# constructor closure.
+function h end
+Base.getproperty(::typeof(h), tag::Symbol) =
+    (args...; kwargs...) -> Node(tag, args...; kwargs...)
+Base.propertynames(::typeof(h)) = ()   # all symbols are valid; no autocomplete
+
+# === Builder ==================================================================
+
+# Build a single styled token from a string + style flags. Wraps innermost-out
+# so the on-the-wire nesting matches CSS-style cascade ordering: span > u >
+# strong > em > text.
+function _tok(s::AbstractString; bold=false, italic=false, underline=false, color=nothing)
+    n = h.text(String(s))
+    italic    && (n = h.em(n))
+    bold      && (n = h.strong(n))
+    underline && (n = h.u(n))
+    color === nothing || (n = h.span(n; color))
+    n
+end
+_tok_ident(name::Symbol, color_map) =
+    _tok(string(name); color=get(color_map, name, nothing))
+
+function _build_sig_arg(a, color_map)
     if a isa Symbol
-        _emit_ident(io, a, color_map)
+        [_tok_ident(a, color_map)]
     elseif Meta.isexpr(a, :kw)
-        _emit_sig_arg(io, a.args[1], color_map)
-        printstyled(io, "=", _print_struct_short(a.args[2]); italic=true)
+        nodes = _build_sig_arg(a.args[1], color_map)
+        push!(nodes, _tok("=" * _print_struct_short(a.args[2]); italic=true))
+        nodes
     elseif Meta.isexpr(a, :(::))
         if length(a.args) == 1
-            printstyled(io, "::", a.args[1]; italic=true)
+            [_tok("::" * string(a.args[1]); italic=true)]
         else
-            _emit_sig_arg(io, a.args[1], color_map)
-            printstyled(io, "::", _print_struct_short(a.args[2]); italic=true)
+            nodes = _build_sig_arg(a.args[1], color_map)
+            push!(nodes, _tok("::" * _print_struct_short(a.args[2]); italic=true))
+            nodes
         end
     else
-        print(io, _print_struct_short(a))
+        [_tok(_print_struct_short(a))]
     end
 end
 
-# Emit `[⊆ {a, b, c}]` or `[no callers in tree]`. Bound names get bond-color.
-function _emit_dep(io::IO, dep, color_map)
-    dep === nothing && return
-    print(io, "  [")
+function _signature_nodes(indices, color_map)
+    isempty(indices) && return Any[]
+    out = Any[_tok("(")]
+    pos = []; kw = []
+    for idx in indices
+        Meta.isexpr(idx, :parameters) ? append!(kw, idx.args) : push!(pos, idx)
+    end
+    for (i, a) in enumerate(pos)
+        i == 1 || push!(out, _tok(", "))
+        append!(out, _build_sig_arg(a, color_map))
+    end
+    if !isempty(kw)
+        push!(out, _tok("; "))
+        for (i, a) in enumerate(kw)
+            i == 1 || push!(out, _tok(", "))
+            append!(out, _build_sig_arg(a, color_map))
+        end
+    end
+    push!(out, _tok(")"))
+    out
+end
+
+function _dep_nodes(dep, color_map)
+    dep === nothing && return Any[]
+    out = Any[_tok("  [")]
     if dep[1] === :none
-        printstyled(io, "no callers in tree"; italic=true)
+        push!(out, _tok("no callers in tree"; italic=true))
     else
-        print(io, "⊆ {")
+        push!(out, _tok("⊆ {"))
         for (i, n) in enumerate(dep[2])
-            i == 1 || print(io, ", ")
-            _emit_ident(io, n, color_map)
+            i == 1 || push!(out, _tok(", "))
+            push!(out, _tok_ident(n, color_map))
         end
-        print(io, "}")
+        push!(out, _tok("}"))
     end
-    print(io, "]")
+    push!(out, _tok("]"))
+    out
 end
 
-"""    print_structure([io::IO=stdout,] T::Type; max_depth=typemax(Int))
+function _prop_nodes(route_tag::String, cached::Bool, name::Symbol,
+                     indices, dep, color_map)
+    out = Any[]
+    isempty(route_tag) || push!(out, _tok(route_tag; bold=true, italic=true))
+    cached && push!(out, _tok("@cached "; bold=true, italic=true))
+    push!(out, _tok(string(name)))
+    append!(out, _signature_nodes(indices, color_map))
+    append!(out, _dep_nodes(dep, color_map))
+    out
+end
 
-Render the DO/HTMXO structure of `T` as an indented tree:
-
-    TypeName
-      fields: f1, f2
-      @param: p1, p2
-      @get  index            ← HTMXO route
-      @post run(name)        ← HTMXO route with positional arg
-      prop                   ← plain property
-      ip(args; kwargs)       ← indexed property
-      @cached cached_prop
-      child = Type            ← inline @struct or @include external (recurses)
-
-Skips DO/HTMXO internals (`__*__`, `cache`, `hash_fields`, …) and properties
-auto-forwarded into inline children (`name = __parent__.name`).
-"""
-print_structure(T::Type; kwargs...) = print_structure(stdout, T; kwargs...)
-function print_structure(io::IO, T::Type;
-                         max_depth::Int=typemax(Int),
-                         indent::String="",
-                         header_prop::Union{Nothing,Tuple}=nothing,
-                         visited::Set{Type}=Set{Type}(),
-                         types_in_tree=nothing,
-                         parent_map=nothing,
-                         color_map=nothing)
-    # Build the tree-level indices once, on the outermost call.
-    if types_in_tree === nothing
-        types_in_tree = _all_types_in_tree(T)
-        parent_map = _build_parent_map(T)
-        color_map = _build_color_map(T)
-    end
-    print(io, indent)
-    if header_prop === nothing
-        printstyled(io, nameof(T); bold=true)
-        println(io)
-    else
-        _emit_prop_line(io, header_prop..., color_map)
-        print(io, " = ")
-        printstyled(io, nameof(T); bold=true)
-        println(io)
-    end
+function _build_section(T::Type, header;
+                        max_depth, types_in_tree, parent_map, color_map, visited)
+    header === nothing && (header = h.line(_tok(string(nameof(T)); bold=true)))
+    body = Any[]
     if T in visited
-        printstyled(io, indent, "  (cycle)\n"; italic=true)
-        return
+        push!(body, h.line(_tok("(cycle)"; italic=true)))
+        return h.section(body...; header)
     end
     push!(visited, T)
-    inner = indent * "  "
 
     fixed = filter(n -> n !== :cache, collect(fieldnames(T)))
     if !isempty(fixed)
-        print(io, inner)
-        printstyled(io, "fields: "; italic=true)
+        toks = Any[_tok("fields: "; italic=true)]
         for (i, f) in enumerate(fixed)
-            i == 1 || print(io, ", ")
-            _emit_ident(io, f, color_map)
+            i == 1 || push!(toks, _tok(", "))
+            push!(toks, _tok_ident(f, color_map))
         end
-        println(io)
+        push!(body, h.line(toks...))
     end
 
     params = _print_struct_param_names(T)
     if !isempty(params)
-        print(io, inner)
-        printstyled(io, "@param: "; italic=true)
+        toks = Any[_tok("@param: "; italic=true)]
         for (i, p) in enumerate(params)
-            i == 1 || print(io, ", ")
-            _emit_ident(io, p, color_map)
+            i == 1 || push!(toks, _tok(", "))
+            push!(toks, _tok_ident(p, color_map))
         end
-        println(io)
+        push!(body, h.line(toks...))
     end
 
     props = try meta(T) catch; nothing end
-    props === nothing && return
-    for name in sort!(collect(keys(props)))
-        _print_struct_skip(name) && continue
-        info = props[name]
-        info.rhs === nothing && continue
-        _print_struct_is_forwarded(info.rhs) && continue
+    if props !== nothing
+        for name in sort!(collect(keys(props)))
+            _print_struct_skip(name) && continue
+            info = props[name]
+            info.rhs === nothing && continue
+            _print_struct_is_forwarded(info.rhs) && continue
 
-        nested = _nested_struct_type(T, Val(name))
-        route_tag = ""
-        for m in info.macros
-            if m in _PRINT_STRUCT_ROUTE_MACROS
-                route_tag = String(m) * " "
-                break
+            nested = _nested_struct_type(T, Val(name))
+            route_tag = ""
+            for m in info.macros
+                if m in _PRINT_STRUCT_ROUTE_MACROS
+                    route_tag = String(m) * " "
+                    break
+                end
+            end
+            cached = Symbol("@cached") in info.macros
+            dep = info.indexed ?
+                _print_struct_worst_case(types_in_tree, parent_map, T, name, info) :
+                nothing
+            nodes = _prop_nodes(route_tag, cached, name, info.indices, dep, color_map)
+
+            if nested !== nothing && max_depth > 0
+                push!(nodes, _tok(" = "))
+                push!(nodes, _tok(string(nameof(nested)); bold=true))
+                nested_sec = _build_section(nested, h.line(nodes...);
+                    max_depth=max_depth-1, types_in_tree, parent_map, color_map,
+                    visited=copy(visited))
+                push!(body, nested_sec)
+            else
+                push!(body, h.line(nodes...))
             end
         end
-        cached = Symbol("@cached") in info.macros
-        dep = info.indexed ?
-            _print_struct_worst_case(types_in_tree, parent_map, T, name, info) : nothing
-
-        if nested !== nothing && max_depth > 0
-            print_structure(io, nested;
-                            max_depth=max_depth-1, indent=inner,
-                            header_prop=(route_tag, cached, name, info.indices, dep),
-                            visited=copy(visited),
-                            types_in_tree, parent_map, color_map)
-        else
-            print(io, inner)
-            _emit_prop_line(io, route_tag, cached, name, info.indices, dep, color_map)
-            println(io)
-        end
     end
+    h.section(body...; header)
 end
 
-# Emit "<route> <@cached> <name><sig><dep>". Bond color is the only color;
-# route / @cached markers are bold-italic to stand out without competing.
-function _emit_prop_line(io::IO, route_tag::String, cached::Bool,
-                         name::Symbol, indices, dep, color_map)
-    isempty(route_tag) || printstyled(io, route_tag; bold=true, italic=true)
-    cached && printstyled(io, "@cached "; bold=true, italic=true)
-    print(io, name)
-    _emit_signature(io, indices, color_map)
-    _emit_dep(io, dep, color_map)
+function _build_structure(T::Type;
+                          max_depth=typemax(Int),
+                          types_in_tree=_all_types_in_tree(T),
+                          parent_map=_build_parent_map(T),
+                          color_map=_build_color_map(T))
+    sec = _build_section(T, nothing; max_depth, types_in_tree, parent_map, color_map,
+                         visited=Set{Type}())
+    h.pre(sec; class="do-structure")
 end
-export print_structure
+
+# === Rendering via Base.show / MIME ===========================================
+
+# Palette index → xterm-256 code (text/plain) or #rrggbb (text/html).
+_palette_xterm(idx::Int) = _IDENT_PALETTE[mod1(idx, length(_IDENT_PALETTE))]
+function _xterm_to_rgb(n::Integer)
+    n < 16 && return ((0,0,0),(170,0,0),(0,170,0),(170,85,0),(0,0,170),(170,0,170),
+                       (0,170,170),(170,170,170),(85,85,85),(255,85,85),(85,255,85),
+                       (255,255,85),(85,85,255),(255,85,255),(85,255,255),(255,255,255))[n+1]
+    if n < 232
+        n -= 16
+        steps = (0,95,135,175,215,255)
+        return (steps[(n÷36)%6+1], steps[(n÷6)%6+1], steps[n%6+1])
+    end
+    v = 8 + (n - 232) * 10
+    (v, v, v)
+end
+function _palette_hex(idx::Int)
+    r, g, b = _xterm_to_rgb(_palette_xterm(idx))
+    string("#", lpad(string(r, base=16), 2, '0'),
+                lpad(string(g, base=16), 2, '0'),
+                lpad(string(b, base=16), 2, '0'))
+end
+_html_escape(s::AbstractString) =
+    replace(s, '&'=>"&amp;", '<'=>"&lt;", '>'=>"&gt;",
+               '"'=>"&quot;", '\''=>"&#39;")
+
+# --- Generic content emission (used by all formats) ---
+# Content is always a Tuple of items — typically Strings (text leaves) or
+# Nodes (children). Iterate and dispatch each via `_show_one`.
+_show_content(io, m, content::Tuple) = for c in content; _show_one(io, m, c) end
+_show_one(io, m, n::Node) = show(io, m, n)
+_show_one(io, ::MIME"text/html", s::AbstractString) = print(io, _html_escape(s))
+_show_one(io, m, s::AbstractString) = print(io, s)
+
+# --- Generic show fallbacks ------------------------------------------------
+
+# text/plain default: just emit the content with no wrapping.
+Base.show(io::IO, m::MIME"text/plain", n::Node) = _show_content(io, m, n.content)
+
+# text/markdown default: same — emit content, no wrapping.
+Base.show(io::IO, m::MIME"text/markdown", n::Node) = _show_content(io, m, n.content)
+
+# text/html default: <tag attrs>content</tag>.
+function Base.show(io::IO, m::MIME"text/html", n::Node{Tag}) where {Tag}
+    print(io, "<", Tag)
+    for (k, v) in pairs(n.attributes)
+        v === nothing && continue
+        print(io, " ", k, "=\"", _html_escape(string(v)), "\"")
+    end
+    print(io, ">")
+    _show_content(io, m, n.content)
+    print(io, "</", Tag, ">")
+end
+
+# Convenience: bare `show(io, ::Node)` defaults to text/plain.
+Base.show(io::IO, n::Node) = show(io, MIME"text/plain"(), n)
+
+# --- Tag-specific overrides ------------------------------------------------
+
+# `:text` is a leaf — never wrap, just emit the string.
+Base.show(io::IO, m::MIME"text/html", n::Node{:text}) = _show_content(io, m, n.content)
+
+# Inline style wrappers for terminal — emit ANSI start/end around content.
+function _ansi_wrap(io, m, n, on, off)
+    color = get(io, :color, false)
+    color && print(io, on)
+    _show_content(io, m, n.content)
+    color && print(io, off)
+end
+Base.show(io::IO, m::MIME"text/plain", n::Node{:strong}) = _ansi_wrap(io, m, n, "\e[1m", "\e[22m")
+Base.show(io::IO, m::MIME"text/plain", n::Node{:em})     = _ansi_wrap(io, m, n, "\e[3m", "\e[23m")
+Base.show(io::IO, m::MIME"text/plain", n::Node{:u})      = _ansi_wrap(io, m, n, "\e[4m", "\e[24m")
+function Base.show(io::IO, m::MIME"text/plain", n::Node{:span})
+    color = get(n.attributes, :color, nothing)
+    color === nothing && return _show_content(io, m, n.content)
+    _ansi_wrap(io, m, n, "\e[38;5;$(_palette_xterm(color))m", "\e[39m")
+end
+
+# HTML override for `:span` — translate `color` attr to inline style. Other
+# inline tags (`:strong`, `:em`, `:u`) fall through to the generic fallback,
+# which produces the right `<strong>…</strong>` shape with no attrs.
+function Base.show(io::IO, m::MIME"text/html", n::Node{:span})
+    color = get(n.attributes, :color, nothing)
+    if color === nothing
+        # No color — no need for a span wrapper, just emit content.
+        return _show_content(io, m, n.content)
+    end
+    print(io, "<span style=\"color:", _palette_hex(color), "\">")
+    _show_content(io, m, n.content)
+    print(io, "</span>")
+end
+
+# `:line` — indent (from IOContext) + content + newline. Same shape across
+# all three formats.
+function _show_line(io, m, n)
+    print(io, "  "^get(io, :do_struct_depth, 0))
+    _show_content(io, m, n.content)
+    println(io)
+end
+Base.show(io::IO, m::MIME"text/plain",    n::Node{:line}) = _show_line(io, m, n)
+Base.show(io::IO, m::MIME"text/markdown", n::Node{:line}) = _show_line(io, m, n)
+Base.show(io::IO, m::MIME"text/html",     n::Node{:line}) = _show_line(io, m, n)
+
+# `:section` — render header at current depth, content one level deeper.
+function _show_section(io, m, n)
+    hdr = get(n.attributes, :header, nothing)
+    hdr === nothing || show(io, m, hdr)
+    depth = get(io, :do_struct_depth, 0)
+    body_io = IOContext(io, :do_struct_depth => hdr === nothing ? depth : depth + 1)
+    _show_content(body_io, m, n.content)
+end
+Base.show(io::IO, m::MIME"text/plain",    n::Node{:section}) = _show_section(io, m, n)
+Base.show(io::IO, m::MIME"text/markdown", n::Node{:section}) = _show_section(io, m, n)
+Base.show(io::IO, m::MIME"text/html",     n::Node{:section}) = _show_section(io, m, n)
+
+# `:pre` — markdown fences, terminal passes through, HTML uses default
+# (which produces `<pre class="…">…</pre>`).
+function Base.show(io::IO, m::MIME"text/markdown", n::Node{:pre})
+    println(io, "```")
+    _show_content(io, m, n.content)
+    println(io, "```")
+end
+
+# Tell the display system the root (a `:pre` node) supports all three MIMEs.
+Base.showable(::MIME"text/plain",    ::Node{:pre}) = true
+Base.showable(::MIME"text/markdown", ::Node{:pre}) = true
+Base.showable(::MIME"text/html",     ::Node{:pre}) = true
+
+# === Public API ===============================================================
+
+"""    structure(T::Type; max_depth=typemax(Int)) -> Node{:pre}
+
+Build a target-agnostic DOM-ish representation of `T`'s DO/HTMXO tree. The
+root is a `Node{:pre}` so it renders as `<pre class="do-structure">…</pre>`
+in HTML, fenced ` ``` ` blocks in markdown, and bare indented text in the
+terminal. `display(s)` picks the right MIME for the active display.
+"""
+structure(T::Type; max_depth::Int=typemax(Int)) =
+    _build_structure(T; max_depth)
+
+"""    print_structure([io::IO=stdout,] T::Type; max_depth=typemax(Int))
+
+Convenience: `show(io, MIME"text/plain"(), structure(T))`. For markdown or
+HTML output, build the structure with `structure(T)` and `show` it under
+the desired MIME.
+"""
+print_structure(T::Type; kwargs...) = print_structure(stdout, T; kwargs...)
+print_structure(io::IO, T::Type; max_depth::Int=typemax(Int)) =
+    show(io, MIME"text/plain"(), structure(T; max_depth))
+
+export print_structure, structure
 
 end
