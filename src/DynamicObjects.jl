@@ -208,10 +208,12 @@ end
 Base.getindex(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...; fetch=Base.fetch, retry_failed=true, kwargs...) where {name} = begin
     (;o, cache) = ip
     substatus_f = if name != :__substatus__ && name != :__status__
-        () -> begin
-            root = o.__status__
-            compute_property(o, Val(:__substatus__), name, indices...; __status__=root, kwargs...)
-        end
+        # Capture `root` eagerly: the closure runs INSIDE the cache lock, and
+        # for plain-prop call sites (getorcomputeproperty) the cache is the
+        # same lock — lazy `o.__status__` would spawn a nested task that waits
+        # on the lock the parent holds → deadlock.
+        root = o.__status__
+        () -> compute_property(o, Val(:__substatus__), name, indices...; __status__=root, kwargs...)
     else
         nothing
     end
@@ -960,10 +962,10 @@ else
                      name != :__substatus__ && name != :__status__ &&
                      !(startswith(string(name), "__") && endswith(string(name), "__")) &&
                      is_generated_property(o, name) && !is_indexed_property(o, name)
-        () -> begin
-            root = o.__status__
-            compute_property(o, Val(:__substatus__), name; __status__=root)
-        end
+        # Eager `root` capture — see IP getindex comment for the deadlock this
+        # avoids when the substatus closure runs inside the cache lock.
+        root = o.__status__
+        () -> compute_property(o, Val(:__substatus__), name; __status__=root)
     else
         nothing
     end
