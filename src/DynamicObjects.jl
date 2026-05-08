@@ -81,6 +81,23 @@ _finalize_substatus!(::Nothing) = nothing
 _fail_substatus!(s, e) = nothing
 _fail_substatus!(::Nothing, e) = nothing
 
+# Disk-load reporting hook — TreebarsExt overrides to set the substatus
+# message to "from disk: <size>". Default no-op. Called from
+# `_computeproperty` just before `Serialization.deserialize` when the cache
+# is `:ready` so the user sees something flash up for big-file loads
+# instead of a silent stall.
+_report_disk_load!(s, cache_path, size_bytes) = nothing
+_report_disk_load!(::Nothing, _, _) = nothing
+
+# Format a byte count as "1.2 MB" / "850 KB" / "42 B" for human-readable
+# progress messages.
+function _format_size(n::Integer)
+    n < 1024            && return "$n B"
+    n < 1024^2          && return string(round(n / 1024,        digits=1), " KB")
+    n < 1024^3          && return string(round(n / 1024^2,      digits=1), " MB")
+    string(round(n / 1024^3, digits=1), " GB")
+end
+
 struct PropertyCache{D<:AbstractDict{Symbol,Any}}
     cache::D
     PropertyCache(D, c::NamedTuple) = new{D{Symbol,Any}}(D{Symbol,Any}(pairs(c)))
@@ -859,6 +876,7 @@ If multiple objects with the same hash are writing here concurrently, this may i
                 lock(path_lock) do
                     cache_status = get_cache_status(cache_path)
                     rv = if cache_status == :ready
+                        _report_disk_load!(__status__, cache_path, filesize(cache_path))
                         try
                             Serialization.deserialize(cache_path)
                         catch e
@@ -880,6 +898,7 @@ If multiple objects with the same hash are writing here concurrently, this may i
                 # Non-strict or no disk locks: original flow
                 cache_status = get_cache_status(cache_path)
                 rv = if cache_status == :ready
+                    _report_disk_load!(__status__, cache_path, filesize(cache_path))
                     try
                         Serialization.deserialize(cache_path)
                     catch e
