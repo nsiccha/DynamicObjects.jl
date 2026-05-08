@@ -109,7 +109,7 @@ end
 # attach work to it.
 Base.get!(f::Function, c::PropertyCache, key; substatus=nothing, kwargs...) =
     get!(s -> f(s), c.cache, key; substatus, kwargs...)
-Base.get!(f::Function, ::PropertyCache, key, indices...; kwargs...) = f()
+Base.get!(f::Function, ::PropertyCache, key, indices...; kwargs...) = f(nothing)
 Base.setindex!(c::PropertyCache, args...) = setindex!(c.cache, args...)
 Base.show(io::IO, pc::PropertyCache) = print(io, "PropertyCache(", length(pc.cache), " properties)")
 struct IndexableProperty{N,O,D<:AbstractDict}
