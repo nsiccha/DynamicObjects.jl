@@ -1109,29 +1109,54 @@ macro persist(x)
 end
 
 """
-    @memo f(args...; kwargs...)
+    maybegetindex(f, args...; kwargs...)
 
-Rewrite `f(args...; kwargs...)` as `getindex(f, args...; kwargs...)`. This makes
-memoization explicit at the call site for `IndexableProperty` properties defined
-inside a `@dynamicstruct`.
+Dispatch helper used by `@memo`. The default just calls `f(args...; kwargs...)`,
+so non-IP callees (functions, types, callable structs) behave like normal
+calls. The specialization for `IndexableProperty` routes through `getindex`,
+hitting the in-memory cache.
+"""
+maybegetindex(f, args...; kwargs...) = f(args...; kwargs...)
+maybegetindex(p::IndexableProperty, args...; kwargs...) = getindex(p, args...; kwargs...)
 
-Inside a `@dynamicstruct`, an indexable property `prop(i) = ...` can be invoked
-two different ways:
+"""
+    @memo expr
+
+Rewrite every call inside `expr` as `maybegetindex(callee, args…)`. At
+runtime `maybegetindex` dispatches: `IndexableProperty` callees go through
+`getindex` (cached); everything else just calls normally.
+
+Inside a `@dynamicstruct`, an indexable property `prop(i) = ...` can be
+invoked two different ways:
 
 - `o.prop(i)` — recompute on every call, no caching.
 - `o.prop[i]` — look up in the in-memory cache, compute (and cache) on miss.
 
-The bracket-vs-paren distinction is easy to miss when reading code. `@memo` lets
-you keep the call syntax while still going through the cached path:
-
 ```julia
-@memo o.prop(i)        # equivalent to o.prop[i]
-@memo o.prop(i; k=v)   # equivalent to getindex(o.prop, i; k=v)
+@memo o.prop(i)                          # → o.prop[i]
+@memo o.prop(i; k=v)                     # → getindex(o.prop, i; k=v)
+
+# Chained IP calls all get memoized; intermediate non-IP calls (e.g.
+# top-level helpers) just call normally:
+@memo qt.loaded(dataset; data_version).filtered(; src).eda.counts
+@memo sort(x.prop(i))
 ```
 """
 macro memo(x)
-    Meta.isexpr(x, :call) || error("@memo expects a call expression `f(args...; kwargs...)`, got: $x")
-    fixcall(Expr(:call, GlobalRef(Base, :getindex), x.args...)) |> esc
+    esc(_memo_rewrite(x))
+end
+
+# Recursively rewrite every call site to `maybegetindex(...)`. Plain property
+# accesses (`.foo`, `.bar.baz`) are left untouched — only `:call` heads are
+# transformed. `maybegetindex`'s dispatch decides at runtime whether to
+# memoize (IP) or just call (everything else).
+_memo_rewrite(x) = x
+function _memo_rewrite(x::Expr)
+    if Meta.isexpr(x, :call) && length(x.args) >= 1
+        rewritten = Any[_memo_rewrite(a) for a in x.args]
+        return fixcall(Expr(:call, GlobalRef(@__MODULE__, :maybegetindex), rewritten...))
+    end
+    Expr(x.head, Any[_memo_rewrite(a) for a in x.args]...)
 end
 
 persist(v, args...; kwargs...) = begin
