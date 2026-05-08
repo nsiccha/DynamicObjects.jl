@@ -1691,7 +1691,8 @@ end
 function _normalize_dot_chain(expr, caller_T::Type, parent_map)
     accessors = Symbol[]
     cur = expr
-    while Meta.isexpr(cur, :., 2) && cur.args[2] isa QuoteNode
+    while Meta.isexpr(cur, :., 2) && cur.args[2] isa QuoteNode &&
+          cur.args[2].value isa Symbol
         pushfirst!(accessors, cur.args[2].value)
         cur = cur.args[1]
     end
@@ -1731,7 +1732,8 @@ function _appdata_top_field(expr)
     expr isa Expr || return nothing
     cur = expr
     accessors = Symbol[]
-    while Meta.isexpr(cur, :., 2) && cur.args[2] isa QuoteNode
+    while Meta.isexpr(cur, :., 2) && cur.args[2] isa QuoteNode &&
+          cur.args[2].value isa Symbol
         pushfirst!(accessors, cur.args[2].value)
         cur = cur.args[1]
     end
