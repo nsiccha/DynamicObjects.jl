@@ -1440,14 +1440,23 @@ function _check_cryptic_arg_names!(msgs, type, name::Symbol, info)
     push!(msgs, LintMessage(type, name, :warn, short, long, info.lnn))
 end
 
-function _check_no_self_access!(msgs, type, name::Symbol, info, prop_names)
+function _check_no_self_access!(msgs, type, name::Symbol, info, prop_names,
+                                bound_siblings, bound)
     isempty(info.indices) && return
     isempty(info.macros) || return
     info.rhs === nothing && return
     _contains_call(info.rhs) || return
     _contains_self_ref(info.rhs) && return
     _contains_bare_prop_ref(info.rhs, prop_names) && return
-    short = "stateless — body uses no sibling state. If `same bond as …` also fires, fold the cluster instead of just this one. If args derive from upstream (see bond), key on the upstream identity. Else fold to `@struct $name(<args>)` if args own an identity, or accept as helper"
+    args = _ip_positional_args(info.indices)
+    argstr = join(string.(args), ", ")
+    if !isempty(bound_siblings)
+        slist   = join(map(s -> "`$s`", bound_siblings), ", ")
+        depsstr = join(string.(bound), ", ")
+        short = "stateless — body uses no sibling state; shares deps `{$depsstr}` with $slist, fold the cluster into one inline child keyed on `($depsstr)` rather than each on its own args"
+    else
+        short = "stateless — body uses no sibling state; fold to `@struct $name($argstr) = begin … end` if args own an identity, or accept as helper"
+    end
     long  = "Property `$type.$name(…)` calls functions but reads no sibling state. This property does not belong on `$type`. Lift it to an inline-child DO that owns the underlying object/key and exposes the derivations as bare properties. (A) Args key on a 'thing' the struct isn't modelling yet → introduce `@struct entry(k) = begin …end`. (B) Args all come from one existing object → lift `$name` to be a property OF that object."
     push!(msgs, LintMessage(type, name, :warn, short, long, info.lnn))
 end
@@ -1591,25 +1600,26 @@ end
 # Group IPs at the SAME scope by bound; if 2+ share a bound, they likely
 # belong in one inline child keyed on that shared identity.
 
-function _check_identical_bound_siblings!(msgs, types_in_tree, parent_map)
-    for T in types_in_tree
+function _check_identical_bound_siblings!(msgs, bound_groups, types_in_tree, parent_map)
+    for (T, by_bound) in bound_groups
         props = try meta(T) catch; nothing end
         props === nothing && continue
-        by_bound = Dict{Tuple{Vararg{Symbol}}, Vector{Symbol}}()
-        for (name, info) in props
-            isempty(_ip_positional_args(info.indices)) && continue
-            wc = _print_struct_worst_case(types_in_tree, parent_map, T, name, info)
-            (wc === nothing || wc[1] !== :bound) && continue
-            push!(get!(by_bound, Tuple(wc[2]), Symbol[]), name)
-        end
+        scope = _enclosing_scope(T, parent_map)
         for (bound, group) in by_bound
             length(group) >= 2 || continue
+            # Fire only when the shared bound represents a real upstream
+            # identity — i.e. extend BEYOND the type's local scope. Empty
+            # bound and bound fully within local scope (e.g. siblings
+            # sharing only auto-forwarded `@param`s) have no identity to
+            # fold around.
+            isempty(bound) && continue
+            all(n -> n in scope, bound) && continue
             argstr = join(string.(bound), ", ")
             for member in group
                 others = filter(!=(member), group)
                 olist = join(map(o -> "`$o`", others), ", ")
-                short = "same bond as $olist — fold all $(length(group)) into `@struct shared($argstr) = begin … end`, callers `.shared($argstr).<member>`"
-                long  = "`$T.$member(…)` has the same upstream bound `{$argstr}` as $olist. They share an identity that isn't currently modelled; fold them into one inline child keyed on `($argstr)` and expose the per-member derivations as bare properties of it."
+                short = "same deps as $olist — fold all $(length(group)) into `@struct shared($argstr) = begin … end`, callers `.shared($argstr).<member>`"
+                long  = "`$T.$member(…)` has the same upstream deps `{$argstr}` as $olist. They share an identity that isn't currently modelled; fold them into one inline child keyed on `($argstr)` and expose the per-member derivations as bare properties of it."
                 info = props[member]
                 push!(msgs, LintMessage(T, member, :warn, short, long, info.lnn))
             end
@@ -1630,17 +1640,20 @@ function analyze_structure(T::Type)
     msgs = LintMessage[]
     types_in_tree = _all_types_in_tree(T)
     parent_map    = _build_parent_map(T)
+    bound_groups  = _bound_groups(types_in_tree, parent_map)
 
     for U in types_in_tree
         props = try meta(U) catch; nothing end
         props === nothing && continue
         oproperties = collect(props)
         prop_names  = Set(keys(props))
+        type_bound  = get(bound_groups, U, Dict{Tuple{Vararg{Symbol}},Vector{Symbol}}())
 
         # Per-property
         for (n, info) in oproperties
+            siblings, bound = _siblings_in_bound(type_bound, n)
             _check_cryptic_arg_names!(msgs, U, n, info)
-            _check_no_self_access!(msgs, U, n, info, prop_names)
+            _check_no_self_access!(msgs, U, n, info, prop_names, siblings, bound)
             _check_trivial_cached_wrapper!(msgs, U, n, info)
             _check_hierarchical_placement!(msgs, types_in_tree, parent_map, U, n, info)
         end
@@ -1653,8 +1666,40 @@ function analyze_structure(T::Type)
         _check_shared_arg_signature!(msgs, U, own)
     end
 
-    _check_identical_bound_siblings!(msgs, types_in_tree, parent_map)
+    _check_identical_bound_siblings!(msgs, bound_groups, types_in_tree, parent_map)
     msgs
+end
+
+# bond_groups: Type → Dict{bound::Tuple → group::Vector{Symbol}}.
+# Computed once per analyze pass; reused by both `_check_no_self_access!`
+# (to name same-bound siblings in its message) and
+# `_check_identical_bound_siblings!` (for cluster emission).
+function _bound_groups(types_in_tree, parent_map)
+    out = Dict{Type, Dict{Tuple{Vararg{Symbol}}, Vector{Symbol}}}()
+    for T in types_in_tree
+        props = try meta(T) catch; nothing end
+        props === nothing && continue
+        by_bound = Dict{Tuple{Vararg{Symbol}}, Vector{Symbol}}()
+        for (name, info) in props
+            isempty(_ip_positional_args(info.indices)) && continue
+            wc = _print_struct_worst_case(types_in_tree, parent_map, T, name, info)
+            (wc === nothing || wc[1] !== :bound) && continue
+            push!(get!(by_bound, Tuple(wc[2]), Symbol[]), name)
+        end
+        out[T] = by_bound
+    end
+    out
+end
+
+# For (type, prop), return (siblings, bound) — siblings are other props in
+# the same bound group (size ≥2), or empty if prop isn't in any group.
+function _siblings_in_bound(type_bonds, name::Symbol)
+    for (bound, group) in type_bonds
+        name in group || continue
+        length(group) >= 2 || continue
+        return filter(!=(name), group), collect(bound)
+    end
+    Symbol[], Symbol[]
 end
 
 function compute_property end
@@ -3193,12 +3238,12 @@ const _IDENT_PALETTE = (
     "#454545", "#252525",
 )
 
-# Color-by-bond: each name in the tree maps to a *fingerprint* — its upstream
+# Color-by-bound: each name in the tree maps to a *fingerprint* — its upstream
 # worst-case bound set if it's an IP positional arg, or its own name (treated
 # as a root identity) if it's a @param / fixed field / IP arg without callers.
 # Two names with the same fingerprint render in the same color, so two args
 # named differently but with identical upstream identity slices (`bundle1` /
-# `bundle2`) still bond visually.
+# `bundle2`) still bound visually.
 #
 # The fingerprint approach over-groups in the worst case (two unrelated args
 # that happen to share the same upstream scope collide), but matches the
@@ -3594,7 +3639,7 @@ function _show_node(io::IO, m::MIME"text/html", n::Semantic{:colored})
 end
 
 # `:underlined` (Semantic) — default-color text with a thick colored
-# underline. Used for bond identities so the bond hue marks identity
+# underline. Used for bound identities so the bound hue marks identity
 # without dominating the text. Terminal: ANSI `\e[4m` (underline on) +
 # `\e[58;2;R;G;Bm` (truecolor underline color). HTML: `text-decoration:
 # underline` + `text-decoration-color` + `text-decoration-thickness:2px`.
@@ -3634,7 +3679,7 @@ function _show_node(io::IO, m::MIME"text/markdown", n::Node{:pre})
 end
 
 # `:lint` (Semantic) — bold + colored severity icon + message. Composes the
-# existing `Node{:strong}` (bold) with `Semantic{:colored}` (bond palette
+# existing `Node{:strong}` (bold) with `Semantic{:colored}` (bound palette
 # color machinery) — no per-format rendering code here. Colors are muted
 # brick / ochre that read on light and dark backgrounds.
 function _show_node(io::IO, m::MIME, n::Semantic{:lint})
