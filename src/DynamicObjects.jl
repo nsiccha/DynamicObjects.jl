@@ -1447,7 +1447,9 @@ function _check_no_self_access!(msgs, type, name::Symbol, info, prop_names)
     _contains_call(info.rhs) || return
     _contains_self_ref(info.rhs) && return
     _contains_bare_prop_ref(info.rhs, prop_names) && return
-    short = "calls functions but reads no sibling state — lift to inline child"
+    args = _ip_positional_args(info.indices)
+    argstr = join(string.(args), ", ")
+    short = "stateless — wrap as `@struct $name($argstr) = begin html = …; end`, callers use `.html`"
     long  = "Property `$type.$name(…)` calls functions but reads no sibling state. This property does not belong on `$type`. Lift it to an inline-child DO that owns the underlying object/key and exposes the derivations as bare properties. (A) Args key on a 'thing' the struct isn't modelling yet → introduce `@struct entry(k) = begin …end`. (B) Args all come from one existing object → lift `$name` to be a property OF that object."
     push!(msgs, LintMessage(type, name, :warn, short, long, info.lnn))
 end
@@ -1581,8 +1583,9 @@ function _check_hierarchical_placement!(msgs, types_in_tree, parent_map, type, n
     end
     misplaced = filter(n -> n ∉ scope, bound)
     isempty(misplaced) && return
-    short = "depends on " * join(map(n -> "`$n`", misplaced), ", ") * " — sibling scope"
-    long  = "`$type.$name(…)` depends on " * join(map(n -> "`$n`", misplaced), ", ") * ", which is not in `$type`'s enclosing scope (fields, `@param`s, parent IP args). The IP is reaching across the tree. Either relocate the IP under the subtree that introduces these names, or take them as explicit args of an enclosing IP."
+    nlist = join(map(n -> "`$n`", misplaced), ", ")
+    short = "depends on $nlist (not in scope) — relocate under the subtree that introduces $(length(misplaced) == 1 ? "it" : "them"), or pass as arg of an enclosing IP"
+    long  = "`$type.$name(…)` depends on $nlist, which is not in `$type`'s enclosing scope (fields, `@param`s, parent IP args). The IP is reaching across the tree. Either relocate the IP under the subtree that introduces these names, or take them as explicit args of an enclosing IP."
     push!(msgs, LintMessage(type, name, :warn, short, long, info.lnn))
 end
 
@@ -1594,6 +1597,7 @@ function _check_identical_bound_siblings!(msgs, types_in_tree, parent_map)
     for T in types_in_tree
         props = try meta(T) catch; nothing end
         props === nothing && continue
+        scope = _enclosing_scope(T, parent_map)
         by_bound = Dict{Tuple{Vararg{Symbol}}, Vector{Symbol}}()
         for (name, info) in props
             isempty(_ip_positional_args(info.indices)) && continue
@@ -1603,10 +1607,17 @@ function _check_identical_bound_siblings!(msgs, types_in_tree, parent_map)
         end
         for (bound, group) in by_bound
             length(group) >= 2 || continue
+            # Suppress when the shared bond is fully within the enclosing
+            # scope — the bond is just "everything available locally", which
+            # gives no actionable identity to fold around. Fires only when
+            # the bond extends beyond local scope (i.e. sibling-tree leak).
+            all(n -> n in scope, bound) && continue
+            argstr = join(string.(bound), ", ")
             for member in group
                 others = filter(!=(member), group)
-                short = "same bond as " * join(map(o -> "`$o`", others), ", ")
-                long  = "`$T.$member(…)` has the same upstream bound `{$(join(bound, ", "))}` as $(join(map(o -> "`$o`", others), ", ")). They likely belong inside one inline child keyed on the shared identity, not as flat siblings."
+                olist = join(map(o -> "`$o`", others), ", ")
+                short = "same bond as $olist — fold all $(length(group)) into `@struct shared($argstr) = begin … end`, callers `.shared($argstr).<member>`"
+                long  = "`$T.$member(…)` has the same upstream bound `{$argstr}` as $olist. They share an identity that isn't currently modelled; fold them into one inline child keyed on `($argstr)` and expose the per-member derivations as bare properties of it."
                 info = props[member]
                 push!(msgs, LintMessage(T, member, :warn, short, long, info.lnn))
             end
