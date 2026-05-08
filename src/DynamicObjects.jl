@@ -1449,7 +1449,7 @@ function _check_no_self_access!(msgs, type, name::Symbol, info, prop_names)
     _contains_bare_prop_ref(info.rhs, prop_names) && return
     args = _ip_positional_args(info.indices)
     argstr = join(string.(args), ", ")
-    short = "stateless — wrap as `@struct $name($argstr) = begin html = …; end`, callers use `.html`"
+    short = "stateless — body uses no sibling state; if args own an identity, fold to `@struct $name($argstr) = begin … end` and access fields, else accept as helper"
     long  = "Property `$type.$name(…)` calls functions but reads no sibling state. This property does not belong on `$type`. Lift it to an inline-child DO that owns the underlying object/key and exposes the derivations as bare properties. (A) Args key on a 'thing' the struct isn't modelling yet → introduce `@struct entry(k) = begin …end`. (B) Args all come from one existing object → lift `$name` to be a property OF that object."
     push!(msgs, LintMessage(type, name, :warn, short, long, info.lnn))
 end
