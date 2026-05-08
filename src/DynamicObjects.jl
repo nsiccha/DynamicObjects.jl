@@ -3121,13 +3121,16 @@ end
 # signatures, and in worst-case bound sets. Lets you visually trace bonds:
 # spot `formula` once, then scan for matching color anywhere else.
 
-# 32 distinct hues from the xterm 256-color cube — wide enough to avoid most
-# collisions in practice, ordered so consecutive entries are visually distinct.
+# 32 distinct hues, stored as `#rrggbb` so they drop straight into CSS and
+# need only a hex→RGB parse for the terminal's truecolor escape. Ordered so
+# consecutive entries read visually distinct.
 const _IDENT_PALETTE = (
-    196, 220,  46,  51,  21, 201, 208, 226, 118,  87,
-     75, 165, 129, 213, 197, 173, 154,  82,  39,  93,
-    214, 190,  86,  81, 105, 207, 161, 142,  45, 135,
-    213, 109,
+    "#d70000", "#ffd700", "#00ff00", "#00ffff", "#0000ff", "#ff00d7",
+    "#ff8700", "#ffff00", "#87ff00", "#5fffff", "#5fafff", "#d700d7",
+    "#af00ff", "#ff87ff", "#ff005f", "#d7875f", "#afff00", "#5fff5f",
+    "#00afff", "#8700ff", "#ffaf00", "#d7ff00", "#5fffd7", "#5fd7ff",
+    "#8787ff", "#ff5fff", "#d7005f", "#afaf00", "#00d7ff", "#af5fff",
+    "#ff5f87", "#87afaf",
 )
 
 # Color-by-bond: each name in the tree maps to a *fingerprint* — its upstream
@@ -3183,16 +3186,16 @@ function _build_color_map(root::Type)
         end
     end
     visit_type(root)
-    # Pass 2 — assign each unique fingerprint a palette index in stable order
+    # Pass 2 — assign each unique fingerprint a hex color in stable order
     # (sorted by name of the first member to encounter it).
     fp_to_idx = Dict{Any, Int}()
-    name_to_idx = Dict{Symbol, Int}()
+    name_to_color = Dict{Symbol, String}()
     for n in sort!(collect(keys(fingerprint)))
         fp = fingerprint[n]
         idx = get!(fp_to_idx, fp, length(fp_to_idx) + 1)
-        name_to_idx[n] = idx
+        name_to_color[n] = _IDENT_PALETTE[mod1(idx, length(_IDENT_PALETTE))]
     end
-    name_to_idx
+    name_to_color
 end
 
 # --- Structured representation ------------------------------------------------
@@ -3229,7 +3232,7 @@ Base.propertynames(::typeof(h)) = ()   # all symbols are valid; no autocomplete
 # so the on-the-wire nesting matches CSS-style cascade ordering: span > u >
 # strong > em > text.
 function _tok(s::AbstractString; bold=false, italic=false, underline=false, color=nothing)
-    n = h.text(String(s))
+    n = String(s)
     italic    && (n = h.em(n))
     bold      && (n = h.strong(n))
     underline && (n = h.u(n))
@@ -3388,25 +3391,12 @@ end
 
 # === Rendering via Base.show / MIME ===========================================
 
-# Palette index → xterm-256 code (text/plain) or #rrggbb (text/html).
-_palette_xterm(idx::Int) = _IDENT_PALETTE[mod1(idx, length(_IDENT_PALETTE))]
-function _xterm_to_rgb(n::Integer)
-    n < 16 && return ((0,0,0),(170,0,0),(0,170,0),(170,85,0),(0,0,170),(170,0,170),
-                       (0,170,170),(170,170,170),(85,85,85),(255,85,85),(85,255,85),
-                       (255,255,85),(85,85,255),(255,85,255),(85,255,255),(255,255,255))[n+1]
-    if n < 232
-        n -= 16
-        steps = (0,95,135,175,215,255)
-        return (steps[(n÷36)%6+1], steps[(n÷6)%6+1], steps[n%6+1])
-    end
-    v = 8 + (n - 232) * 10
-    (v, v, v)
-end
-function _palette_hex(idx::Int)
-    r, g, b = _xterm_to_rgb(_palette_xterm(idx))
-    string("#", lpad(string(r, base=16), 2, '0'),
-                lpad(string(g, base=16), 2, '0'),
-                lpad(string(b, base=16), 2, '0'))
+# Parse `#rrggbb` → (R, G, B). Used for the terminal's truecolor escape.
+function _hex_to_rgb(hex::AbstractString)
+    @assert length(hex) == 7 && hex[1] == '#' "expected #rrggbb, got $hex"
+    parse(Int, hex[2:3], base=16),
+    parse(Int, hex[4:5], base=16),
+    parse(Int, hex[6:7], base=16)
 end
 _html_escape(s::AbstractString) =
     replace(s, '&'=>"&amp;", '<'=>"&lt;", '>'=>"&gt;",
@@ -3445,9 +3435,6 @@ Base.show(io::IO, n::Node) = show(io, MIME"text/plain"(), n)
 
 # --- Tag-specific overrides ------------------------------------------------
 
-# `:text` is a leaf — never wrap, just emit the string.
-Base.show(io::IO, m::MIME"text/html", n::Node{:text}) = _show_content(io, m, n.content)
-
 # Inline style wrappers for terminal — emit ANSI start/end around content.
 function _ansi_wrap(io, m, n, on, off)
     color = get(io, :color, false)
@@ -3459,27 +3446,22 @@ Base.show(io::IO, m::MIME"text/plain", n::Node{:strong}) = _ansi_wrap(io, m, n, 
 Base.show(io::IO, m::MIME"text/plain", n::Node{:em})     = _ansi_wrap(io, m, n, "\e[3m", "\e[23m")
 Base.show(io::IO, m::MIME"text/plain", n::Node{:u})      = _ansi_wrap(io, m, n, "\e[4m", "\e[24m")
 function Base.show(io::IO, m::MIME"text/plain", n::Node{:span})
-    color = get(n.attributes, :color, nothing)
-    color === nothing && return _show_content(io, m, n.content)
-    _ansi_wrap(io, m, n, "\e[38;5;$(_palette_xterm(color))m", "\e[39m")
+    r, g, b = _hex_to_rgb(n.attributes.color)
+    _ansi_wrap(io, m, n, "\e[38;2;$r;$g;$(b)m", "\e[39m")
 end
 
-# HTML override for `:span` — translate `color` attr to inline style. Other
-# inline tags (`:strong`, `:em`, `:u`) fall through to the generic fallback,
-# which produces the right `<strong>…</strong>` shape with no attrs.
+# HTML override for `:span` — drop the color hex straight into inline style.
+# Other inline tags (`:strong`, `:em`, `:u`) fall through to the generic
+# fallback, which produces the right `<strong>…</strong>` shape with no attrs.
 function Base.show(io::IO, m::MIME"text/html", n::Node{:span})
-    color = get(n.attributes, :color, nothing)
-    if color === nothing
-        # No color — no need for a span wrapper, just emit content.
-        return _show_content(io, m, n.content)
-    end
-    print(io, "<span style=\"color:", _palette_hex(color), "\">")
+    print(io, "<span style=\"color:", n.attributes.color, "\">")
     _show_content(io, m, n.content)
     print(io, "</span>")
 end
 
 # `:line` — indent (from IOContext) + content + newline. Same shape across
-# all three formats.
+# all three formats; the per-MIME methods are needed to disambiguate against
+# the per-MIME generic Node fallbacks.
 function _show_line(io, m, n)
     print(io, "  "^get(io, :do_struct_depth, 0))
     _show_content(io, m, n.content)
@@ -3508,11 +3490,6 @@ function Base.show(io::IO, m::MIME"text/markdown", n::Node{:pre})
     _show_content(io, m, n.content)
     println(io, "```")
 end
-
-# Tell the display system the root (a `:pre` node) supports all three MIMEs.
-Base.showable(::MIME"text/plain",    ::Node{:pre}) = true
-Base.showable(::MIME"text/markdown", ::Node{:pre}) = true
-Base.showable(::MIME"text/html",     ::Node{:pre}) = true
 
 # === Public API ===============================================================
 
