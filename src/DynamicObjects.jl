@@ -1537,8 +1537,9 @@ function _check_repeated_prefix!(msgs, type, oproperties)
     end
 end
 
-function _check_shared_arg_signature!(msgs, type, oproperties)
+function _check_shared_arg_signature!(msgs, type, oproperties, types_in_tree, parent_map, wc_cache)
     by_sig = Dict{Tuple{Vararg{Symbol}}, Vector{Symbol}}()
+    info_of = Dict{Symbol, Any}()
     for (name, info) in oproperties
         _is_forwarded(info.rhs) && continue
         isempty(info.indices) && continue
@@ -1551,14 +1552,38 @@ function _check_shared_arg_signature!(msgs, type, oproperties)
         end
         isempty(sig) && continue
         push!(get!(by_sig, Tuple(sig), Symbol[]), name)
+        info_of[name] = info
     end
     for (sig, group) in by_sig
         length(group) >= 2 || continue
         argstr  = join(sig, ", ")
         members = join(map(g -> "`$g`", group), ", ")
-        short = "$(length(group)) IPs share `($argstr)` ($members) — if `($argstr)` are proper keys (independent identities), fold to `@struct shared($argstr)`; if derived values (depending on upstream keys), refactor to key on the upstream instead"
-        long  = "`$type` has $(length(group)) indexed properties sharing the `($argstr)` signature: $(join(group, ", ")). Two cases: (a) `($argstr)` are independent identities — `@struct shared($argstr) = begin …end` is the right fold and the IP bodies become bare members. (b) `($argstr)` are derived values that come from some upstream identity (e.g. a `df` extracted from a bundle keyed by `name`) — folding into `@struct shared($argstr)` just shifts the redundancy; refactor the IPs to key on the upstream identity directly, so callers don't have to thread the derived values through."
-        push!(msgs, LintMessage(type, nothing, :warn, short, long, nothing))
+        # Aggregate the worst-case bound across the group. If callers had
+        # additional scope identities beyond the args themselves, the args
+        # are likely derived FROM those identities. The bound names here
+        # name the actual upstream keys.
+        upstream = Set{Symbol}()
+        for member in group
+            wc = _print_struct_worst_case(types_in_tree, parent_map, type,
+                                          member, info_of[member], wc_cache)
+            wc !== nothing && wc[1] === :bound && union!(upstream, wc[2])
+        end
+        # Args themselves aren't in the bound (only caller scope is), so
+        # any non-empty bound implies derived. Empty bound = proper keys.
+        derived  = !isempty(upstream)
+        upnames  = sort!(collect(upstream))
+        upstr    = join(map(n -> "`$n`", upnames), ", ")
+        short, severity = if derived
+            ("$(length(group)) IPs share `($argstr)` ($members) — args derived from $upstr; refactor to key on those upstream identities instead of threading `($argstr)` through",
+             :warn)
+        else
+            ("$(length(group)) IPs share `($argstr)` ($members) — `($argstr)` look like proper keys; fold to `@struct shared($argstr)`",
+             :warn)
+        end
+        long = derived ?
+            "`$type` has $(length(group)) indexed properties sharing the `($argstr)` signature: $(join(group, ", ")). Their worst-case bound includes $upstr, meaning every call site computes `($argstr)` from those upstream identities. Folding into `@struct shared($argstr)` just shifts the redundancy. Refactor the IPs to key on the upstream identities ($upstr) directly so callers don't have to thread the derived values through." :
+            "`$type` has $(length(group)) indexed properties sharing the `($argstr)` signature: $(join(group, ", ")). Worst-case bound is empty — callers pass `($argstr)` without additional scope contributions, so they're independent identities. `@struct shared($argstr) = begin …end` is the right fold; the IP bodies become bare members."
+        push!(msgs, LintMessage(type, nothing, severity, short, long, nothing))
         by_prefix = Dict{String, Vector{Symbol}}()
         for n in group
             s = String(n)
@@ -1569,8 +1594,12 @@ function _check_shared_arg_signature!(msgs, type, oproperties)
         for (prefix, sub) in by_prefix
             length(sub) >= 2 || continue
             sub_members = join(map(g -> "`$g`", sub), ", ")
-            short_e = "$(length(sub)) IPs share `($argstr)` AND `$(prefix)_*` ($sub_members) — if `($argstr)` are proper keys, fold to `@struct $prefix($argstr)`; if derived values, refactor to key on the upstream instead"
-            long_e  = "`$type` has $(length(sub)) indexed properties that share BOTH the `($argstr)` signature AND the `$(prefix)_*` prefix: $(join(sub, ", ")). If `($argstr)` are independent identities, fold them into `@struct $prefix($argstr) = begin …end` and let the suffixes become bare members. If `($argstr)` are derived from an upstream identity, the right move is to refactor the IPs to key on that upstream — the shared-prefix + shared-derived-args pattern usually means the IPs are stretching across a layer they should be sitting under."
+            short_e = derived ?
+                "$(length(sub)) IPs share `($argstr)` AND `$(prefix)_*` ($sub_members) — args derived from $upstr; refactor to key on those upstream identities, possibly via `@struct $prefix($(join(upnames, ", "))) = begin … end`" :
+                "$(length(sub)) IPs share `($argstr)` AND `$(prefix)_*` ($sub_members) — `($argstr)` look like proper keys; fold to `@struct $prefix($argstr)`"
+            long_e  = derived ?
+                "`$type` has $(length(sub)) indexed properties that share BOTH the `($argstr)` signature AND the `$(prefix)_*` prefix: $(join(sub, ", ")). Args derive from $upstr; refactor to key on those upstream identities and let the suffixes become bare members of the resulting child." :
+                "`$type` has $(length(sub)) indexed properties that share BOTH the `($argstr)` signature AND the `$(prefix)_*` prefix: $(join(sub, ", ")). Fold them into `@struct $prefix($argstr) = begin …end` and let the suffixes become bare members."
             push!(msgs, LintMessage(type, nothing, :error, short_e, long_e, nothing))
         end
     end
@@ -1917,7 +1946,7 @@ function analyze_structure(T::Type)
                if info.rhs === nothing || !_is_forwarded(info.rhs)]
         _check_singleton_struct!(msgs, U, own)
         _check_repeated_prefix!(msgs, U, own)
-        _check_shared_arg_signature!(msgs, U, own)
+        _check_shared_arg_signature!(msgs, U, own, types_in_tree, parent_map, wc_cache)
     end
 
     _check_identical_bound_siblings!(msgs, bound_groups, types_in_tree, parent_map)
