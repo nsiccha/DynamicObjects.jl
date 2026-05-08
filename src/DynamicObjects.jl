@@ -1695,6 +1695,10 @@ function _check_redundant_args!(msgs, types_in_tree, parent_map, type, name::Sym
         all(length(a) >= i for a in all_caller_args) || continue
         vals = [a[i] for a in all_caller_args]
         all(v -> v == vals[1], vals) || continue
+        # Only flag if the value is addressable from the IP's own scope
+        # (i.e. `_normalize_dot_chain` resolved it to (BaseType, accessors...)).
+        # Raw Symbols / Exprs are caller-locals — IP body can't read them.
+        vals[1] isa Tuple || continue
         push!(redundant, (pos[i], vals[1]))
     end
     isempty(redundant) && return
