@@ -1524,12 +1524,13 @@ function _check_repeated_prefix!(msgs, type, oproperties)
     end
     for (prefix, group) in by_prefix
         length(group) >= 2 || continue
+        members = join(map(g -> "`$g`", group), ", ")
         if Symbol(prefix) in name_set
-            short = "$(length(group)) `$(prefix)_*` siblings + bare `$prefix` — fold into it (`@struct`/`@include` body)"
+            short = "$(length(group)) `$(prefix)_*` siblings ($members) + bare `$prefix` — fold into it (`@struct`/`@include` body)"
             long  = "`$type` has $(length(group)) properties named `$(prefix)_*` ($(join(group, ", "))) AND a bare `$prefix` property. Move the `$(prefix)_*` members INTO `$prefix` as bare suffixes (`$type.$prefix.<suffix>`). Use `@struct $prefix = begin …end` for data, `@include $prefix = begin …end` for routes."
             push!(msgs, LintMessage(type, nothing, :error, short, long, nothing))
         else
-            short = "$(length(group)) `$(prefix)_*` siblings — group as `@struct $prefix` (or `@include $prefix` if routes)"
+            short = "$(length(group)) `$(prefix)_*` siblings ($members) — group as `@struct $prefix` (or `@include $prefix` if routes)"
             long  = "`$type` has $(length(group)) properties sharing `$(prefix)_*` prefix: $(join(group, ", ")). Group inside `@struct $prefix = begin …end` (data) or `@include $prefix = begin …end` (routes) so the shared-prefix names become bare members of the child."
             push!(msgs, LintMessage(type, nothing, :warn, short, long, nothing))
         end
@@ -1553,8 +1554,9 @@ function _check_shared_arg_signature!(msgs, type, oproperties)
     end
     for (sig, group) in by_sig
         length(group) >= 2 || continue
-        argstr = join(sig, ", ")
-        short = "$(length(group)) IPs share `($argstr)` — group as `@struct shared($argstr)`"
+        argstr  = join(sig, ", ")
+        members = join(map(g -> "`$g`", group), ", ")
+        short = "$(length(group)) IPs share `($argstr)` ($members) — group as `@struct shared($argstr)`"
         long  = "`$type` has $(length(group)) indexed properties sharing the `($argstr)` signature: $(join(group, ", ")). They all key on the same identity. Move them into an inline child `@struct shared($argstr) = begin …end`."
         push!(msgs, LintMessage(type, nothing, :warn, short, long, nothing))
         by_prefix = Dict{String, Vector{Symbol}}()
@@ -1566,7 +1568,8 @@ function _check_shared_arg_signature!(msgs, type, oproperties)
         end
         for (prefix, sub) in by_prefix
             length(sub) >= 2 || continue
-            short_e = "$(length(sub)) IPs share `($argstr)` AND `$(prefix)_*` — fold to `@struct $prefix($argstr)`"
+            sub_members = join(map(g -> "`$g`", sub), ", ")
+            short_e = "$(length(sub)) IPs share `($argstr)` AND `$(prefix)_*` ($sub_members) — fold to `@struct $prefix($argstr)`"
             long_e  = "`$type` has $(length(sub)) indexed properties that share BOTH the `($argstr)` signature AND the `$(prefix)_*` prefix: $(join(sub, ", ")). Fold them into `@struct $prefix($argstr) = begin …end`."
             push!(msgs, LintMessage(type, nothing, :error, short_e, long_e, nothing))
         end
