@@ -2162,6 +2162,15 @@ function _inject_include_kwargs!(call_expr, prop_name)
 end
 
 function _process_include_externals!(body)
+    # Returned: (prop_name, type_expr) for each `@include`'d external. Used
+    # to emit `_analysis_nested_type` so `analyze_structure` walks the
+    # included type's tree even when the enclosing struct is
+    # `@dynamicstruct` (and therefore HTMXObjects' route walker — which
+    # would otherwise emit `_nested_struct_type` — never runs). For `@htmx`
+    # structs HTMXObjects also emits `_nested_struct_type`, which
+    # `_walk_nested_type` queries first; the duplicate `_analysis_nested_type`
+    # entry is redundant but harmless.
+    externals = Pair{Symbol, Any}[]
     for (i, arg) in enumerate(body.args)
         arg isa Expr || continue
         expr = arg
@@ -2188,6 +2197,8 @@ function _process_include_externals!(body)
         else
             continue
         end
+        type_expr = rhs.args[1]
+        push!(externals, prop_name => type_expr)
         _inject_include_kwargs!(rhs, prop_name)
         assignment = :($lhs = $rhs)
         if isnothing(parent_expr)
@@ -2196,6 +2207,7 @@ function _process_include_externals!(body)
             parent_expr.args[end] = assignment
         end
     end
+    externals
 end
 
 # Detect an inline-method form `f(__self__, ...) = body` (or with `where`
@@ -2272,7 +2284,11 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             Expr(:macrocall, doc_wrapper.args[1:end-1]..., rewritten)
     end
     # --- Process @include external structs ---
-    _process_include_externals!(body)
+    # Returned (prop, type) pairs feed `_analysis_nested_type` so the
+    # analyzer walks @include'd externals even when the enclosing struct
+    # is `@dynamicstruct` (no HTMXObjects route walker = no
+    # `_nested_struct_type` for these unless we add it here).
+    include_externals_pairs = _process_include_externals!(body)
     # --- Extract inline struct definitions ---
     # Collect parent property names (excluding inline structs themselves)
     parent_props = Symbol[]
@@ -2306,6 +2322,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     # primitives like `port::Int = 8080` would otherwise crash route
     # registration on `meta(::Type{Int})`).
     analysis_child_pairs = Pair{Symbol,Any}[]
+    append!(analysis_child_pairs, include_externals_pairs)
     for (i, arg) in enumerate(body.args)
         arg isa Expr || continue
         # Peel a `Core.@doc "str" <inner>` wrapper if present, so that
