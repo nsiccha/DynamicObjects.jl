@@ -1596,6 +1596,120 @@ function _check_hierarchical_placement!(msgs, types_in_tree, parent_map, type, n
     push!(msgs, LintMessage(type, name, :warn, short, long, info.lnn))
 end
 
+# --- New: redundant-args lint --------------------------------------------
+# For an IP with positional args, walk every in-tree caller and collect the
+# arg expressions actually passed. If at every detected call site the same
+# (parent-chain-normalized) expression is passed for arg position `i`, then
+# arg `i` is constant across callers — drop it and have the IP body read
+# the value directly.
+
+# Collect all `target(args…)` call sites in `expr` matching `_has_call_to`'s
+# rules; return Vector of positional-arg expression lists (one per call).
+function _collect_call_args!(out::Vector{Vector{Any}}, expr, target::Symbol, cprops)
+    expr isa Expr || return
+    if Meta.isexpr(expr, :call) && length(expr.args) >= 1
+        callee = expr.args[1]
+        match = false
+        if callee === target
+            match = cprops !== nothing && haskey(cprops, target)
+        elseif Meta.isexpr(callee, :., 2) && callee.args[2] isa QuoteNode &&
+               callee.args[2].value === target
+            root = _dot_chain_root(callee.args[1])
+            match = root !== nothing &&
+                    (root === :__self__ || root === :__parent__ || root === :__appdata__ ||
+                     (cprops !== nothing && haskey(cprops, root)))
+        end
+        if match
+            args = Any[]
+            for a in expr.args[2:end]
+                Meta.isexpr(a, :parameters) && continue   # drop kwargs
+                push!(args, a)
+            end
+            push!(out, args)
+        end
+    end
+    for a in expr.args
+        _collect_call_args!(out, a, target, cprops)
+    end
+end
+
+_collect_call_args(expr, target, cprops) =
+    (out = Vector{Vector{Any}}(); _collect_call_args!(out, expr, target, cprops); out)
+
+# Normalize a `__self__.X…` / `__parent__[.__parent__]*.X…` dot chain to
+# `(BaseType, :a, :b, ...)` where BaseType is reached by walking parent_map
+# off `caller_T` once per leading `__parent__`. Returns `nothing` for any
+# other shape so callers fall back to comparing the raw `Expr`.
+function _normalize_dot_chain(expr, caller_T::Type, parent_map)
+    accessors = Symbol[]
+    cur = expr
+    while Meta.isexpr(cur, :., 2) && cur.args[2] isa QuoteNode
+        pushfirst!(accessors, cur.args[2].value)
+        cur = cur.args[1]
+    end
+    cur isa Symbol || return nothing
+    root = cur
+    base_T = caller_T
+    if root === :__parent__
+        base_T = haskey(parent_map, caller_T) ? parent_map[caller_T][1] : caller_T
+        while !isempty(accessors) && accessors[1] === :__parent__
+            popfirst!(accessors)
+            base_T = haskey(parent_map, base_T) ? parent_map[base_T][1] : base_T
+        end
+    elseif root === :__self__
+        base_T = caller_T
+    else
+        return nothing
+    end
+    (base_T, accessors...)
+end
+
+function _normalize_arg(expr, caller_T::Type, parent_map)
+    r = _normalize_dot_chain(expr, caller_T, parent_map)
+    r === nothing ? expr : r
+end
+
+_show_normalized(v::Tuple) = isempty(v[2:end]) ? string(nameof(v[1])) :
+                             string(nameof(v[1]), ".", join(v[2:end], "."))
+_show_normalized(v) = string(v)
+
+function _check_redundant_args!(msgs, types_in_tree, parent_map, type, name::Symbol, info)
+    pos = _ip_positional_args(info.indices)
+    isempty(pos) && return
+    all_caller_args = Vector{Vector{Any}}()
+    for U in types_in_tree
+        uprops = try meta(U) catch; nothing end
+        uprops === nothing && continue
+        for (uname, uinfo) in uprops
+            uinfo.rhs === nothing && continue
+            (U === type && uname === name) && continue
+            for argset in _collect_call_args(uinfo.rhs, name, uprops)
+                push!(all_caller_args,
+                      Any[_normalize_arg(a, U, parent_map) for a in argset])
+            end
+        end
+    end
+    length(all_caller_args) >= 2 || return
+    redundant = Tuple{Symbol,Any}[]
+    for i in eachindex(pos)
+        all(length(a) >= i for a in all_caller_args) || continue
+        vals = [a[i] for a in all_caller_args]
+        all(v -> v == vals[1], vals) || continue
+        push!(redundant, (pos[i], vals[1]))
+    end
+    isempty(redundant) && return
+    parts = ["`$n` always passed `$(_show_normalized(v))`" for (n, v) in redundant]
+    short = "redundant arg$(length(redundant) == 1 ? "" : "s"): " * join(parts, ", ") *
+            " — drop from signature, read directly in body"
+    long  = "Across $(length(all_caller_args)) detected call site(s) of `$type.$name(…)`, " *
+            "$(length(redundant) == 1 ? "this argument is" : "these arguments are") always " *
+            "passed the same expression. Drop $(length(redundant) == 1 ? "it" : "them") from " *
+            "the signature and have the body read the value directly via `__self__.…` / " *
+            "`__parent__.…`. Refines the same-bound / no-self-access guidance: the bound " *
+            "shows what the callers' SCOPES carry; this lint shows what they actually PASS."
+    push!(msgs, LintMessage(type, name, :warn, short, long, info.lnn))
+end
+
 # --- New: identical-bound siblings (lint #3) -----------------------------
 # Group IPs at the SAME scope by bound; if 2+ share a bound, they likely
 # belong in one inline child keyed on that shared identity.
@@ -1656,6 +1770,7 @@ function analyze_structure(T::Type)
             _check_no_self_access!(msgs, U, n, info, prop_names, siblings, bound)
             _check_trivial_cached_wrapper!(msgs, U, n, info)
             _check_hierarchical_placement!(msgs, types_in_tree, parent_map, U, n, info)
+            _check_redundant_args!(msgs, types_in_tree, parent_map, U, n, info)
         end
 
         # Struct-level (skip forwarded entries from singleton/prefix views)
