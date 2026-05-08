@@ -1840,9 +1840,27 @@ _disk_cache(o, name) = nothing
 Return the type of the nested struct exposed under property `name` on `T`,
 or `nothing` if `name` is not backed by a nested struct. Methods are emitted
 by `@dynamicstruct` for every inline `@struct` child, and by `@htmx` for
-each `@include` external. Used by `print_structure` to walk the type tree.
+each `@include` external. Used both by `print_structure` and by
+HTMXObjects' route-walking machinery.
 """
 _nested_struct_type(::Type, ::Val) = nothing
+
+"""    _analysis_nested_type(::Type{T}, ::Val{name})
+
+Like `_nested_struct_type`, but registered for `prop::T = rhs` typed
+computed properties only — the analyzer's tree walk follows them while
+HTMXObjects' route walker does not (so typed primitives like
+`port::Int = 8080` don't crash route registration on `meta(::Type{Int})`).
+"""
+_analysis_nested_type(::Type, ::Val) = nothing
+
+# Union of both hooks for analyzer + render code paths. `_nested_struct_type`
+# wins if both are defined for the same property (shouldn't normally happen).
+function _walk_nested_type(T, name::Symbol)
+    t = _nested_struct_type(T, Val(name))
+    t !== nothing && return t
+    _analysis_nested_type(T, Val(name))
+end
 extractnames(x::Vector) = mapreduce(extractnames, union, x; init=Set())
 extractnames(x::Symbol) = Set((x,))
 extractnames(x::Expr) = if Meta.isexpr(x, :(::))
@@ -2278,6 +2296,12 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     # each inline `@struct` child, used to emit `_nested_struct_type` methods so
     # `print_structure` can walk the inline-child tree.
     inline_child_pairs = Pair{Symbol,Any}[]
+    # Typed computed properties (`prop::T = rhs`) register T only with
+    # `_analysis_nested_type` (not `_nested_struct_type`), so the analyzer's
+    # tree walk follows them but HTMXObjects' route walker doesn't (typed
+    # primitives like `port::Int = 8080` would otherwise crash route
+    # registration on `meta(::Type{Int})`).
+    analysis_child_pairs = Pair{Symbol,Any}[]
     for (i, arg) in enumerate(body.args)
         arg isa Expr || continue
         # Peel a `Core.@doc "str" <inner>` wrapper if present, so that
@@ -2603,14 +2627,15 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         end
         @assert name isa Symbol dump(name)
         # `prop::T = rhs` (computed property with a type annotation) registers
-        # T with `_nested_struct_type` so `analyze_structure` walks into T's
-        # tree alongside the enclosing struct's. Lets external DO references
-        # like `__appdata__::AppData = APPDATA` be linted in the same pass
-        # without macro-side magic. Indexed properties and fixed fields keep
-        # the annotation's existing semantics (Julia field type for fixed,
-        # ignored for indexed).
+        # T with `_analysis_nested_type` so `analyze_structure` walks into
+        # T's tree alongside the enclosing struct's. Separate hook from
+        # `_nested_struct_type` (which HTMXObjects walks for route mounting)
+        # — typed primitives like `port::Int` would otherwise wedge route
+        # registration on `meta(Int)`. Indexed properties and fixed fields
+        # keep the annotation's existing semantics (Julia field type for
+        # fixed, ignored for indexed).
         if ext_type !== nothing && !isnothing(rhs) && !indexed
-            push!(inline_child_pairs, name => ext_type)
+            push!(analysis_child_pairs, name => ext_type)
         end
         push!(docs, (name=>(doc, !isnothing(rhs))))
         metadata.doc[] = nothing
@@ -2698,6 +2723,9 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             $([:(
                 $DynamicObjects._nested_struct_type(::Type{$type}, ::Val{$(QuoteNode(prop_name))}) = $gen_name
             ) for (prop_name, gen_name) in inline_child_pairs]...)
+            $([:(
+                $DynamicObjects._analysis_nested_type(::Type{$type}, ::Val{$(QuoteNode(prop_name))}) = $gen_name
+            ) for (prop_name, gen_name) in analysis_child_pairs]...)
             $Base.show(io::IO, __self__::$type) = begin
                 print(io, $(string(type)), "(")
                 $([let sep = i == 1 ? :() : :(print(io, ", "))
@@ -3095,7 +3123,7 @@ const _PRINT_STRUCT_ROUTE_MACROS = Set([
 _print_struct_skip(::Type{T}, name::Symbol) where {T} = begin
     s = String(name)
     is_dunder = startswith(s, "__") && endswith(s, "__")
-    is_dunder && _nested_struct_type(T, Val(name)) !== nothing && return false
+    is_dunder && _walk_nested_type(T, name) !== nothing && return false
     is_dunder ||
         startswith(s, "_tuple_") ||
         name === :hash_fields ||
@@ -3160,7 +3188,7 @@ function _all_types_in_tree(root::Type)
         props = try meta(T) catch; nothing end
         props === nothing && continue
         for name in keys(props)
-            nested = _nested_struct_type(T, Val(name))
+            nested = _walk_nested_type(T, name)
             nested === nothing && continue
             nested in seen && continue
             push!(seen, nested)
@@ -3182,7 +3210,7 @@ function _build_parent_map(root::Type)
         props = try meta(T) catch; nothing end
         props === nothing && continue
         for name in keys(props)
-            nested = _nested_struct_type(T, Val(name))
+            nested = _walk_nested_type(T, name)
             nested === nothing && continue
             nested in seen && continue
             push!(seen, nested)
@@ -3421,7 +3449,7 @@ function _build_color_map(root::Type)
                     fingerprint[a] = fp === nothing ? (:name, a) : fp
                 end
             end
-            nested = _nested_struct_type(T, Val(name))
+            nested = _walk_nested_type(T, name)
             nested === nothing || visit_type(nested)
         end
     end
@@ -3636,7 +3664,7 @@ function _build_section(T::Type, header;
             info.rhs === nothing && continue
             _print_struct_is_forwarded(info.rhs) && continue
 
-            nested = _nested_struct_type(T, Val(name))
+            nested = _walk_nested_type(T, name)
             route_tag = ""
             for m in info.macros
                 if m in _PRINT_STRUCT_ROUTE_MACROS
