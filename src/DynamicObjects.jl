@@ -1365,33 +1365,22 @@ end
 
 # --- Linter ----------------------------------------------------------------
 #
-# Single-pass checks over a property's already-walked RHS. Each check runs
-# inside `_lint_property!`; add new checks there. Per-struct opt-out is
-# `@dynamicstruct lint=false struct …` (see `dynamicstruct(...)` kwarg).
-#
-# Check #1 — `:no_self_access`: an indexed (call-syntax) property whose
-# body contains function calls but never reads any sibling field/property
-# is almost always a free function pasted into the struct body. Bare
-# (non-indexed) properties are exempted because they are usually
-# initializers (`cache_path = pkgdir(…)`, `__status__ = initialize_progress!(…)`,
-# `_lock = ReentrantLock()`). Properties with any macro (`@cached`, `@get`,
-# `@persist`, `@lru`, …) are also exempted because the macro itself is the
-# reason the property lives in the struct.
-#
-# Self-access detection has two complementary checks:
-#
-# 1. `_contains_self_ref` — any reference to `:__self__` anywhere in the
-#    body. Catches both the structured `__self__.X` accesses that
-#    `walk_rhs` synthesises and reflective patterns like
-#    `getproperty(__self__, method)`.
-# 2. `_contains_bare_prop_ref` — any bare symbol matching a declared
-#    property name. Catches the `__status__` case (and friends): names
-#    that are *also* in `info.locals`, so `walk_rhs` leaves them bare
-#    instead of rewriting to `__self__.…`. They still refer to a sibling
-#    property — via the kwarg-threaded compute_property pathway.
-#
-# Per-property opt-out is intentionally absent: if you need finer control,
-# that's a signal to split the struct.
+# Lints are computed by `analyze_structure(T)` — a tree-walk over `meta(T)`
+# that produces a `Vector{LintMessage}`. `print_structure(T)` weaves these
+# messages inline next to the affected property/struct. There is no
+# automatic stderr/error emission from the macro; lints surface only when
+# you render the structure.
+
+struct LintMessage
+    type::Type
+    prop::Union{Symbol,Nothing}     # nothing = struct-level lint
+    severity::Symbol                # :warn or :error
+    short::String                   # 1-line summary for inline rendering
+    long::String                    # full message
+    lnn::Union{LineNumberNode,Nothing}
+end
+
+# --- Bare-rhs scanners (used by no-self-access check) ---
 _contains_self_ref(e::Symbol) = e === :__self__
 _contains_self_ref(e::Expr) = any(_contains_self_ref, e.args)
 _contains_self_ref(_) = false
@@ -1402,12 +1391,6 @@ _contains_bare_prop_ref(_, _) = false
 
 _contains_call(_) = false
 _contains_call(e::Expr) = Meta.isexpr(e, :call) || any(_contains_call, e.args)
-
-function _lint_property!(name::Symbol, info, walked_rhs, type, prop_names)
-    _lint_no_self_access!(name, info, walked_rhs, type, prop_names)
-    _lint_trivial_cached_wrapper!(name, info, type)
-    _lint_cryptic_arg_names!(name, info, type)
-end
 
 # Common short identifiers that ARE meaningful — full English words, or
 # unambiguous in any code context. Anything else under 4 characters is
@@ -1424,7 +1407,19 @@ const _OK_SHORT_NAMES = Set{Symbol}([
 # `ctx`, …) on indexed property arg lists. Local loop counters
 # (`for i in 1:n`) are unaffected — they live in property bodies, not
 # in declared signatures.
-function _lint_cryptic_arg_names!(name::Symbol, info, type)
+# Forwarded inline-child props have `rhs == __parent__.x`, courtesy of the
+# `(;a, b) = __parent__` destructure inserted by the inline-include desugar.
+# Filter them out of struct-level lints — they're scoped views, not owned.
+_is_forwarded(rhs::Expr) = rhs.head === :. && length(rhs.args) == 2 &&
+                            rhs.args[1] === :__parent__
+_is_forwarded(::Any) = false
+
+# Dunders auto-injected by DO/HTMXO machinery — never user-state.
+const _AUTO_DUNDERS = Set([:__parent__, :__prefix__, :__req__, :__route__])
+
+# --- Per-property checks ---------------------------------------------------
+
+function _check_cryptic_arg_names!(msgs, type, name::Symbol, info)
     isempty(info.indices) && return
     bad = String[]
     for idx in info.indices
@@ -1434,79 +1429,36 @@ function _lint_cryptic_arg_names!(name::Symbol, info, type)
         Meta.isexpr(a, :(::)) && (a = a.args[1])
         a isa Symbol || continue
         s = String(a)
-        startswith(s, "_") && continue   # `_ignore` convention
-        len = length(s)
-        len >= 4 && continue              # 4+ chars likely meaningful
-        a in _OK_SHORT_NAMES && continue  # explicit allowlist
+        startswith(s, "_") && continue
+        length(s) >= 4 && continue
+        a in _OK_SHORT_NAMES && continue
         push!(bad, s)
     end
     isempty(bad) && return
-    loc = isnothing(info.lnn) ? "" : " at $(info.lnn.file):$(info.lnn.line)"
-    @warn """DynamicObjects lint: property `$type.$name(…)`$loc has cryptic parameter name(s) $(join(map(s -> "`$s`", bad), ", ")). Indexed-property args are part of the struct's public API (they show up in URLs, IP cache keys, and call sites) and must communicate intent. Rename them to meaningful English names — e.g. `posterior_name` not `pn`, `dataframe` not `df`, `value` not `x`. Single-letter names belong in tight algorithmic locals (loop counters, math indices), not on a declared signature."""
+    short = "cryptic arg name(s): " * join(map(s -> "`$s`", bad), ", ")
+    long  = "Property `$type.$name(…)` has cryptic parameter name(s) $(join(map(s -> "`$s`", bad), ", ")). Indexed-property args are public API (URLs, IP cache keys, call sites) and must communicate intent. Rename to meaningful English names — `posterior_name` not `pn`, `dataframe` not `df`, `value` not `x`. Single-letter names belong in tight algorithmic locals, not declared signatures."
+    push!(msgs, LintMessage(type, name, :warn, short, long, info.lnn))
 end
 
-function _lint_no_self_access!(name::Symbol, info, walked_rhs, type, prop_names)
+function _check_no_self_access!(msgs, type, name::Symbol, info, prop_names)
     isempty(info.indices) && return
     isempty(info.macros) || return
-    _contains_call(walked_rhs) || return
-    _contains_self_ref(walked_rhs) && return
-    _contains_bare_prop_ref(walked_rhs, prop_names) && return
-    loc = isnothing(info.lnn) ? "" : " at $(info.lnn.file):$(info.lnn.line)"
-    @warn """
-    DynamicObjects lint: property `$type.$name(…)`$loc
-    calls functions but reads no sibling state. This property does not
-    belong on `$type`. Fix it by lifting it to an inline-child DO that
-    owns the underlying object/key and exposes the derivations as bare
-    properties. Pick whichever shape fits — both are mandatory patterns,
-    not suggestions:
-
-      (A) Args key on a "thing" the struct isn't modelling yet.
-          Callers do something like
-              c = compile_status[k]; s = sample_status[k]
-              html = $name(label, c, s)
-          The keys `k` and their lookups want a home:
-              @struct entry(k::Symbol) = begin
-                  compile = compile_status[k]
-                  sample  = sample_status[k]
-                  html    = …                # was $name(label, compile, sample)
-              end
-          Call sites collapse to `entry(k).html`.
-
-      (B) Args all come from one existing object (e.g. a plot, a posterior).
-          Lift `$name` to be a property OF that object:
-              @struct demo(name::Symbol) = begin
-                  href = …; title = …; description = …
-                  card = …                    # was demo_card(href, title, description)
-              end
-          Call sites collapse to `demo(name).card`.
-
-    ANTIPATTERNS — these do NOT count as fixing the lint:
-
-      (1) `let f = (args…) -> body end` inside another property.
-          Same problem with extra ceremony.
-      (2) Moving `$name` to a top-level function called from multiple sites.
-          If the args key on a struct identity, that identity must own the
-          derivation. A top-level function pushes the work outside the type
-          system that should be capturing it.
-      (3) `lint=false` to silence the lint instead of fixing it. The
-          standalone form is almost never genuinely intentional; if it
-          really is, document why inline.
-    """
+    info.rhs === nothing && return
+    _contains_call(info.rhs) || return
+    _contains_self_ref(info.rhs) && return
+    _contains_bare_prop_ref(info.rhs, prop_names) && return
+    short = "calls functions but reads no sibling state — lift to inline child"
+    long  = "Property `$type.$name(…)` calls functions but reads no sibling state. This property does not belong on `$type`. Lift it to an inline-child DO that owns the underlying object/key and exposes the derivations as bare properties. (A) Args key on a 'thing' the struct isn't modelling yet → introduce `@struct entry(k) = begin …end`. (B) Args all come from one existing object → lift `$name` to be a property OF that object."
+    push!(msgs, LintMessage(type, name, :warn, short, long, info.lnn))
 end
 
-# Detect `@cached prop(args...) = singlefunc(args...)` — a 1-line @cached
-# wrapper that adds nothing beyond renaming. Either inline the producer's
-# body into the @cached property, or drop the wrapper and let callers
-# call the producer directly.
-function _lint_trivial_cached_wrapper!(name::Symbol, info, type)
+function _check_trivial_cached_wrapper!(msgs, type, name::Symbol, info)
     Symbol("@cached") in info.macros || return
     rhs = info.rhs
     Meta.isexpr(rhs, :call) || return
-    # Body must be a single call passing the same positional args the
-    # property declared (kwargs are tolerated either way).
     prop_arg_names = Symbol[]
     for idx in info.indices
-        Meta.isexpr(idx, :parameters) && continue   # skip kwargs block
+        Meta.isexpr(idx, :parameters) && continue
         a = idx
         Meta.isexpr(a, :(::)) && (a = a.args[1])
         a isa Symbol && push!(prop_arg_names, a)
@@ -1516,110 +1468,69 @@ function _lint_trivial_cached_wrapper!(name::Symbol, info, type)
         Meta.isexpr(a, :parameters) && continue
         sym = a
         Meta.isexpr(sym, :(::)) && (sym = sym.args[1])
-        sym isa Symbol || return                    # non-symbol arg → not trivial
+        sym isa Symbol || return
         push!(call_args, sym)
     end
     prop_arg_names == call_args || return
-    loc = isnothing(info.lnn) ? "" : " at $(info.lnn.file):$(info.lnn.line)"
     callee = rhs.args[1]
-    @warn """DynamicObjects lint: `@cached $type.$name(…)`$loc is a thin wrapper around `$callee(…)` — body is one call passing the same args. Pick one: inline `$callee`'s body into the @cached property and delete `$callee`, or drop the wrapper and have callers `@cached`-call `$callee` directly. The current shape is doing both."""
+    short = "thin @cached wrapper around `$callee(…)`"
+    long  = "`@cached $type.$name(…)` is a thin wrapper around `$callee(…)` — body is one call passing the same args. Inline `$callee`'s body into the @cached property, or drop the wrapper and have callers `@cached`-call `$callee` directly. The current shape is doing both."
+    push!(msgs, LintMessage(type, name, :warn, short, long, info.lnn))
 end
 
-# --- Struct-level lint passes (run once after all properties collected) ---
+# --- Per-struct checks ----------------------------------------------------
 
-function _lint_struct!(type, oproperties::Vector{<:Pair}, lint::Bool)
-    lint || return
-    # Inline children forward parent properties via `(;a, b) = __parent__`,
-    # which leaves entries in `oproperties` whose `rhs` is `__parent__.x`.
-    # These are scoped views of parent props — not owned by this struct —
-    # and would otherwise produce false-positive prefix/signature lints on
-    # every nested type.
-    own = Pair[n => info for (n, info) in oproperties if !_is_forwarded(info.rhs)]
-    names = Symbol[n for (n, _) in own]
-    _lint_singleton_struct!(type, own)
-    _lint_repeated_prefix!(type, names)
-    _lint_shared_arg_signature!(type, own)
-end
-
-# Dunders auto-injected by DO/HTMXO machinery — never user-state regardless
-# of whether the user wrote the line or not. Other `__name__` props
-# (`__status__`, `__page__`, `__appdata__` initializers, …) DO count as
-# user state — the user wrote a non-trivial body for them.
-const _AUTO_DUNDERS = Set([:__parent__, :__prefix__, :__req__, :__route__])
-
-# A struct that owns exactly one user-declared property is over-engineered:
-# the property's body should live directly on the parent (as a property if
-# the struct is bare, or as an indexed property / function if the struct
-# takes args). Skips auto-injected dunders, synthesized destructure groups
-# (`_tuple_*`), and `hash_fields`.
-function _lint_singleton_struct!(type, oproperties::Vector{<:Pair})
-    user = Pair[]
+function _check_singleton_struct!(msgs, type, oproperties)
+    user = []
     for (n, info) in oproperties
-        n in _AUTO_DUNDERS                    && continue
+        n in _AUTO_DUNDERS && continue
         s = String(n)
-        startswith(s, "_tuple_")              && continue
-        n === :hash_fields                    && continue
-        push!(user, n => info)
+        startswith(s, "_tuple_") && continue
+        n === :hash_fields && continue
+        push!(user, (n, info))
     end
     length(user) == 1 || return
     (only_name, only_info) = first(user)
-    loc = isnothing(only_info.lnn) ? "" : " (defined at $(only_info.lnn.file):$(only_info.lnn.line))"
-    advice = if only_info.indexed
-        "Replace the struct with a plain indexed property `$only_name(args…) = …` (or a top-level function) on the enclosing scope — it carries no other state, so the struct shell adds nothing."
-    else
-        "Replace the struct with a plain property `$only_name = …` on the enclosing scope — it carries no other state, so the struct shell adds nothing."
-    end
-    @warn """DynamicObjects lint: `$type` has exactly one user-declared property: `$only_name`$loc. $advice"""
+    advice = only_info.indexed ?
+        "Replace with `$only_name(args…) = …` on the enclosing scope." :
+        "Replace with `$only_name = …` on the enclosing scope."
+    short = "singleton: only one user property `$only_name`"
+    long  = "`$type` has exactly one user-declared property: `$only_name`. $advice The struct shell adds nothing."
+    push!(msgs, LintMessage(type, nothing, :warn, short, long, only_info.lnn))
 end
 
-# Forwarded inline-child props have `rhs == __parent__.x`, courtesy of the
-# `(;a, b) = __parent__` destructure inserted by the inline-include desugar.
-# Filter them out of struct-level lints — they're scoped views, not owned.
-_is_forwarded(rhs::Expr) = rhs.head === :. && length(rhs.args) == 2 &&
-                            rhs.args[1] === :__parent__
-_is_forwarded(::Any) = false
-
-# Detect property names sharing a `<prefix>_*` shape — these belong inside a
-# `@struct prefix = begin … end` inline child. Two firing levels:
-#
-# - `@warn` when ≥2 properties share `prefix_*` and there's no bare `prefix`:
-#   they should move into `@struct prefix = begin …end` and the suffixes
-#   become bare members of the child.
-# - `@error` when ≥2 `prefix_*` names AND a bare `prefix` property both
-#   exist on the struct: this is unambiguous — `prefix` is the existing
-#   destination, `prefix_*` are scaffolding that was never moved into it.
-#
-# Skips DO-convention dunder names (`__foo__`) and synthesized destructure
-# group names (`_tuple_*`), and skips empty prefixes.
-function _lint_repeated_prefix!(type, names::Vector{Symbol})
+function _check_repeated_prefix!(msgs, type, oproperties)
+    own_names = Symbol[n for (n, info) in oproperties if !_is_forwarded(info.rhs)]
+    name_set = Set(own_names)
     by_prefix = Dict{String, Vector{Symbol}}()
-    name_set = Set(names)
-    for n in names
+    for n in own_names
         s = String(n)
         startswith(s, "__") && endswith(s, "__") && continue
-        startswith(s, "_tuple_")              && continue
+        startswith(s, "_tuple_") && continue
         underscore = findfirst(==('_'), s)
         isnothing(underscore) && continue
-        underscore == 1       && continue   # leading-underscore name; skip
+        underscore == 1       && continue
         prefix = s[1:underscore-1]
         push!(get!(by_prefix, prefix, Symbol[]), n)
     end
     for (prefix, group) in by_prefix
         length(group) >= 2 || continue
         if Symbol(prefix) in name_set
-            @error """DynamicObjects lint: `$type` has $(length(group)) properties named `$(prefix)_*` ($(join(group, ", "))) AND a bare `$prefix` property. Move the `$(prefix)_*` members INTO `$prefix` as bare suffixes (`$type.$prefix.<suffix>`). Their existence as flat siblings of `$prefix` is leftover scaffolding — the destination already exists."""
+            short = "$(length(group)) `$(prefix)_*` siblings + bare `$prefix` — fold into it"
+            long  = "`$type` has $(length(group)) properties named `$(prefix)_*` ($(join(group, ", "))) AND a bare `$prefix` property. Move the `$(prefix)_*` members INTO `$prefix` as bare suffixes (`$type.$prefix.<suffix>`)."
+            push!(msgs, LintMessage(type, nothing, :error, short, long, nothing))
         else
-            @warn """DynamicObjects lint: `$type` has $(length(group)) properties sharing the `$(prefix)_*` prefix: $(join(group, ", ")). Group them inside an inline child — `@struct $prefix = begin …end` — so the shared-prefix names become bare members of the child (`$type.$prefix.<member>`)."""
+            short = "$(length(group)) `$(prefix)_*` siblings — group as `@struct $prefix`"
+            long  = "`$type` has $(length(group)) properties sharing `$(prefix)_*` prefix: $(join(group, ", ")). Group inside `@struct $prefix = begin …end` so the shared-prefix names become bare members of the child."
+            push!(msgs, LintMessage(type, nothing, :warn, short, long, nothing))
         end
     end
 end
 
-# Detect indexed properties that share an identical positional-arg name
-# tuple — a signal they all key on the same identity and should live
-# inside a single `@struct shared(args…)` inline child.
-function _lint_shared_arg_signature!(type, oproperties::Vector{<:Pair})
+function _check_shared_arg_signature!(msgs, type, oproperties)
     by_sig = Dict{Tuple{Vararg{Symbol}}, Vector{Symbol}}()
     for (name, info) in oproperties
+        _is_forwarded(info.rhs) && continue
         isempty(info.indices) && continue
         sig = Symbol[]
         for idx in info.indices
@@ -1634,10 +1545,9 @@ function _lint_shared_arg_signature!(type, oproperties::Vector{<:Pair})
     for (sig, group) in by_sig
         length(group) >= 2 || continue
         argstr = join(sig, ", ")
-        @warn """DynamicObjects lint: `$type` has $(length(group)) indexed properties sharing the `($argstr)` signature: $(join(group, ", ")). They all key on the same identity. Move them into an inline child — `@struct shared($argstr) = begin …end` — that owns these and exposes them as plain members."""
-        # Within this signature group, find any subsets sharing a name prefix.
-        # Same signature + shared prefix is unambiguous: those siblings
-        # belong in one inline child named for the prefix — escalate to @error.
+        short = "$(length(group)) IPs share `($argstr)` — group as `@struct shared($argstr)`"
+        long  = "`$type` has $(length(group)) indexed properties sharing the `($argstr)` signature: $(join(group, ", ")). They all key on the same identity. Move them into an inline child `@struct shared($argstr) = begin …end`."
+        push!(msgs, LintMessage(type, nothing, :warn, short, long, nothing))
         by_prefix = Dict{String, Vector{Symbol}}()
         for n in group
             s = String(n)
@@ -1647,9 +1557,98 @@ function _lint_shared_arg_signature!(type, oproperties::Vector{<:Pair})
         end
         for (prefix, sub) in by_prefix
             length(sub) >= 2 || continue
-            @error """DynamicObjects lint: `$type` has $(length(sub)) indexed properties that share BOTH the `($argstr)` signature AND the `$(prefix)_*` prefix: $(join(sub, ", ")). Fold them into `@struct $prefix($argstr) = begin …end` and expose the suffixes as bare members (`$type.$prefix($argstr).<suffix>`)."""
+            short_e = "$(length(sub)) IPs share `($argstr)` AND `$(prefix)_*` — fold to `@struct $prefix($argstr)`"
+            long_e  = "`$type` has $(length(sub)) indexed properties that share BOTH the `($argstr)` signature AND the `$(prefix)_*` prefix: $(join(sub, ", ")). Fold them into `@struct $prefix($argstr) = begin …end`."
+            push!(msgs, LintMessage(type, nothing, :error, short_e, long_e, nothing))
         end
     end
+end
+
+# --- New: hierarchical placement (lint #1) -------------------------------
+# For an IP at T.prop with worst-case bound {k1, k2, ...}, every name in the
+# bound should be visible in T's enclosing static scope (constructor fields,
+# `@param`s, IP positional args along the parent chain). Anything outside
+# that scope means the IP is reaching across the tree.
+
+function _check_hierarchical_placement!(msgs, types_in_tree, parent_map, type, name, info)
+    isempty(_ip_positional_args(info.indices)) && return
+    wc = _print_struct_worst_case(types_in_tree, parent_map, type, name, info)
+    (wc === nothing || wc[1] !== :bound) && return
+    bound = wc[2]
+    scope = _enclosing_scope(type, parent_map)
+    misplaced = filter(n -> n ∉ scope, bound)
+    isempty(misplaced) && return
+    short = "depends on " * join(map(n -> "`$n`", misplaced), ", ") * " — sibling scope"
+    long  = "`$type.$name(…)` depends on " * join(map(n -> "`$n`", misplaced), ", ") * ", which is not in `$type`'s enclosing scope (fields, `@param`s, parent IP args). The IP is reaching across the tree. Either relocate the IP under the subtree that introduces these names, or take them as explicit args of an enclosing IP."
+    push!(msgs, LintMessage(type, name, :warn, short, long, info.lnn))
+end
+
+# --- New: identical-bound siblings (lint #3) -----------------------------
+# Group IPs at the SAME scope by bound; if 2+ share a bound, they likely
+# belong in one inline child keyed on that shared identity.
+
+function _check_identical_bound_siblings!(msgs, types_in_tree, parent_map)
+    for T in types_in_tree
+        props = try meta(T) catch; nothing end
+        props === nothing && continue
+        by_bound = Dict{Tuple{Vararg{Symbol}}, Vector{Symbol}}()
+        for (name, info) in props
+            isempty(_ip_positional_args(info.indices)) && continue
+            wc = _print_struct_worst_case(types_in_tree, parent_map, T, name, info)
+            (wc === nothing || wc[1] !== :bound) && continue
+            push!(get!(by_bound, Tuple(wc[2]), Symbol[]), name)
+        end
+        for (bound, group) in by_bound
+            length(group) >= 2 || continue
+            for member in group
+                others = filter(!=(member), group)
+                short = "same bond as " * join(map(o -> "`$o`", others), ", ")
+                long  = "`$T.$member(…)` has the same upstream bound `{$(join(bound, ", "))}` as $(join(map(o -> "`$o`", others), ", ")). They likely belong inside one inline child keyed on the shared identity, not as flat siblings."
+                info = props[member]
+                push!(msgs, LintMessage(T, member, :warn, short, long, info.lnn))
+            end
+        end
+    end
+end
+
+# --- Top-level analyzer ---------------------------------------------------
+
+"""    analyze_structure(T::Type) -> Vector{LintMessage}
+
+Walk T's DO/HTMXO type tree and run all lint checks. Pure analysis pass —
+no side effects, no logging. `print_structure(T)` calls this internally and
+weaves the messages inline. Callers wanting CI-style output can iterate the
+returned vector themselves.
+"""
+function analyze_structure(T::Type)
+    msgs = LintMessage[]
+    types_in_tree = _all_types_in_tree(T)
+    parent_map    = _build_parent_map(T)
+
+    for U in types_in_tree
+        props = try meta(U) catch; nothing end
+        props === nothing && continue
+        oproperties = collect(props)
+        prop_names  = Set(keys(props))
+
+        # Per-property
+        for (n, info) in oproperties
+            _check_cryptic_arg_names!(msgs, U, n, info)
+            _check_no_self_access!(msgs, U, n, info, prop_names)
+            _check_trivial_cached_wrapper!(msgs, U, n, info)
+            _check_hierarchical_placement!(msgs, types_in_tree, parent_map, U, n, info)
+        end
+
+        # Struct-level (skip forwarded entries from singleton/prefix views)
+        own = [n => info for (n, info) in oproperties
+               if info.rhs === nothing || !_is_forwarded(info.rhs)]
+        _check_singleton_struct!(msgs, U, own)
+        _check_repeated_prefix!(msgs, U, own)
+        _check_shared_arg_signature!(msgs, U, own)
+    end
+
+    _check_identical_bound_siblings!(msgs, types_in_tree, parent_map)
+    msgs
 end
 
 function compute_property end
@@ -2448,9 +2447,8 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     property_docs = Dict(name => doc for (name, (doc, _)) in docs if !isnothing(doc))
 
     # Struct-level lint passes: repeated-prefix and shared-arg-signature.
-    # Per-property checks (no-self-access, trivial-cached-wrapper) run later
-    # in the codegen loop where the walked RHS is available.
-    _lint_struct!(type, oproperties, lint)
+    # Lints have moved to `analyze_structure(T)` — run from `print_structure`,
+    # not at definition time. The macro no longer emits any lint warnings.
 
     docstring = something(docstring, "DynamicStruct `$type`.") * "\n\n" * join([
         "* " * (isnothing(doc) ? "" : "$(_doc_to_string(doc)): ") * "`$name" * (hasrhs ? " = ..." : "") * "`"
@@ -2580,7 +2578,6 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     nothing
                 end
                 walked_rhs = walk_rhs(info.rhs; info.locals, properties, lnn=info.lnn)
-                lint && _lint_property!(name, info, walked_rhs, type, keys(properties))
                 block = Expr(:block,
                     _lnn, Expr(:(=), _call(:compute_property, cp_kwargs...), Expr(:block, _lnn, walked_rhs)),
                     _lnn, Expr(:(=), _call(:iscached), Expr(:block, _lnn, iscached_val)),
@@ -3089,11 +3086,10 @@ function _caller_scope(caller_T::Type, caller_prop::Symbol, parents)
     names
 end
 
-# Worst-case-bound for one IP. Returns a tagged result so the caller can
-# emit each scope name individually (each colored by identity). `:bound, names`
-# carries the upper-bound set; `:none` means no callers in the tree.
-function _print_struct_worst_case(types_in_tree, parents, T::Type,
-                                  prop_name::Symbol, info)
+# Raw worst-case bound — the union of callers' static identity scopes,
+# possibly containing intermediate IP-arg names (like `bundle` from an
+# enclosing IP). `_print_struct_worst_case` expands these to root identities.
+function _raw_worst_case(types_in_tree, parents, T::Type, prop_name::Symbol, info)
     isempty(_ip_positional_args(info.indices)) && return nothing
     callers = Set{Tuple{Type,Symbol}}()
     for U in types_in_tree
@@ -3114,6 +3110,61 @@ function _print_struct_worst_case(types_in_tree, parents, T::Type,
     (:bound, sort!(collect(bound)))
 end
 
+# Expand a single name to its root identities (@param / field / unbounded
+# IP arg). If the name is itself an IP arg with an in-tree caller bound,
+# recurse into that bound. Cycle protection via `visited`.
+function _expand_name!(out::Set{Symbol}, name::Symbol,
+                      types_in_tree, parents, visited::Set{Symbol})
+    name in visited && return
+    push!(visited, name)
+    # Root identity: @param or constructor field anywhere in the tree.
+    for T in types_in_tree
+        for f in fieldnames(T)
+            f === name && (push!(out, name); return)
+        end
+        for p in _print_struct_param_names(T)
+            p === name && (push!(out, name); return)
+        end
+    end
+    # IP arg: replace with its IP's bound (recursively).
+    for T in types_in_tree
+        props = try meta(T) catch; nothing end
+        props === nothing && continue
+        for (pn, pinfo) in props
+            for a in _ip_positional_args(pinfo.indices)
+                a === name || continue
+                raw = _raw_worst_case(types_in_tree, parents, T, pn, pinfo)
+                if raw !== nothing && raw[1] === :bound
+                    for n in raw[2]
+                        _expand_name!(out, n, types_in_tree, parents, visited)
+                    end
+                else
+                    # IP has no in-tree callers — treat as root.
+                    push!(out, name)
+                end
+                return
+            end
+        end
+    end
+    # Unrecognized — keep as-is.
+    push!(out, name)
+end
+
+# Public worst-case bound: returns the EXPANDED form. Every name in the
+# result is a root identity (@param, field, or IP arg of an unbounded IP);
+# intermediate IP-arg names are unfolded to their own bounds.
+function _print_struct_worst_case(types_in_tree, parents, T::Type,
+                                  prop_name::Symbol, info)
+    raw = _raw_worst_case(types_in_tree, parents, T, prop_name, info)
+    raw === nothing && return nothing
+    raw[1] === :none && return raw
+    expanded = Set{Symbol}()
+    for n in raw[2]
+        _expand_name!(expanded, n, types_in_tree, parents, Set{Symbol}())
+    end
+    (:bound, sort!(collect(expanded)))
+end
+
 # --- Identity coloring --------------------------------------------------------
 # Each "scope identifier" (constructor field, @param name, IP positional arg)
 # is colored deterministically by its name so the same name reads as the same
@@ -3121,16 +3172,19 @@ end
 # signatures, and in worst-case bound sets. Lets you visually trace bonds:
 # spot `formula` once, then scan for matching color anywhere else.
 
-# 32 distinct hues, stored as `#rrggbb` so they drop straight into CSS and
-# need only a hex→RGB parse for the terminal's truecolor escape. Ordered so
-# consecutive entries read visually distinct.
+# 32 deeply-saturated DARK hues (lightness ≈ 20-30%) — readable as text on
+# white without washing out, while still distinguishable from each other.
+# Skewed to blue / red / orange / purple / brown / gray; no cyans, greens,
+# or yellows. Stored as `#rrggbb` so they drop into CSS directly and need
+# only a hex→RGB parse for the terminal's truecolor escape.
 const _IDENT_PALETTE = (
-    "#d70000", "#ffd700", "#00ff00", "#00ffff", "#0000ff", "#ff00d7",
-    "#ff8700", "#ffff00", "#87ff00", "#5fffff", "#5fafff", "#d700d7",
-    "#af00ff", "#ff87ff", "#ff005f", "#d7875f", "#afff00", "#5fff5f",
-    "#00afff", "#8700ff", "#ffaf00", "#d7ff00", "#5fffd7", "#5fd7ff",
-    "#8787ff", "#ff5fff", "#d7005f", "#afaf00", "#00d7ff", "#af5fff",
-    "#ff5f87", "#87afaf",
+    "#0a3263", "#7c4012", "#7d1a1a", "#502c66", "#502d28",
+    "#1a4078", "#90551c", "#8b2828", "#5f3678", "#5d3833",
+    "#274b85", "#a06425", "#9a3838", "#704380", "#6a4035",
+    "#0d4a73", "#7c5026", "#7d2a2a", "#473256", "#3e2722",
+    "#37528a", "#6b441f", "#6b1a1a", "#5b3868", "#37241f",
+    "#1f3a55", "#5e3010", "#601515", "#3a2148", "#2a1c19",
+    "#454545", "#252525",
 )
 
 # Color-by-bond: each name in the tree maps to a *fingerprint* — its upstream
@@ -3209,7 +3263,9 @@ end
 # the content" with overrides for the tags that actually carry meaning in
 # those formats (`:strong` → ANSI bold / `**…**`; etc.).
 
-struct Node{Tag, C<:Tuple, A<:NamedTuple}
+abstract type AbstractNode end
+
+struct Node{Tag, C<:Tuple, A<:NamedTuple} <: AbstractNode
     content::C
     attributes::A
     function Node(tag::Symbol, args...; kwargs...)
@@ -3218,13 +3274,32 @@ struct Node{Tag, C<:Tuple, A<:NamedTuple}
     end
 end
 
-# Cobweb-style builder: `h.tag(args...; attrs...)` constructs a Node. The
-# `getproperty` overload on `typeof(h)` turns any tag-name access into a
-# constructor closure.
+# `Semantic` mirrors `Node`'s shape but is NOT an HTML element — it carries
+# our domain concepts (`:line`, `:section`, `:colored`, `:lint`) that have
+# format-specific renderings but no faithful HTML tag. The split means the
+# generic HTML fallback for `Node` can never accidentally produce invalid
+# `<line>` / `<section>` markup for a Semantic tag.
+struct Semantic{Tag, C<:Tuple, A<:NamedTuple} <: AbstractNode
+    content::C
+    attributes::A
+    function Semantic(tag::Symbol, args...; kwargs...)
+        a = (;kwargs...)
+        new{tag, typeof(args), typeof(a)}(args, a)
+    end
+end
+
+# Cobweb-style builders: `h.tag(args...; attrs...)` for HTML elements;
+# `s.tag(args...; attrs...)` for Semantic nodes. Each `getproperty` overload
+# turns any tag-name access into a constructor closure.
 function h end
 Base.getproperty(::typeof(h), tag::Symbol) =
     (args...; kwargs...) -> Node(tag, args...; kwargs...)
-Base.propertynames(::typeof(h)) = ()   # all symbols are valid; no autocomplete
+Base.propertynames(::typeof(h)) = ()
+
+function sem end
+Base.getproperty(::typeof(sem), tag::Symbol) =
+    (args...; kwargs...) -> Semantic(tag, args...; kwargs...)
+Base.propertynames(::typeof(sem)) = ()
 
 # === Builder ==================================================================
 
@@ -3236,29 +3311,33 @@ function _tok(s::AbstractString; bold=false, italic=false, underline=false, colo
     italic    && (n = h.em(n))
     bold      && (n = h.strong(n))
     underline && (n = h.u(n))
-    color === nothing || (n = h.span(n; color))
+    color === nothing || (n = sem.underlined(n; color))
     n
 end
 _tok_ident(name::Symbol, color_map) =
     _tok(string(name); color=get(color_map, name, nothing))
 
 function _build_sig_arg(a, color_map)
+    # Use Any[] — recursive calls mix element types (`:colored` from
+    # `_tok_ident`, plain Strings from `_tok` with no styling, `:em` from
+    # `_tok(...; italic=true)`), and a typed literal would lock to whichever
+    # came first.
     if a isa Symbol
-        [_tok_ident(a, color_map)]
+        Any[_tok_ident(a, color_map)]
     elseif Meta.isexpr(a, :kw)
         nodes = _build_sig_arg(a.args[1], color_map)
         push!(nodes, _tok("=" * _print_struct_short(a.args[2]); italic=true))
         nodes
     elseif Meta.isexpr(a, :(::))
         if length(a.args) == 1
-            [_tok("::" * string(a.args[1]); italic=true)]
+            Any[_tok("::" * string(a.args[1]); italic=true)]
         else
             nodes = _build_sig_arg(a.args[1], color_map)
             push!(nodes, _tok("::" * _print_struct_short(a.args[2]); italic=true))
             nodes
         end
     else
-        [_tok(_print_struct_short(a))]
+        Any[_tok(_print_struct_short(a))]
     end
 end
 
@@ -3312,15 +3391,36 @@ function _prop_nodes(route_tag::String, cached::Bool, name::Symbol,
     out
 end
 
+# Build the lint index — `Dict{(Type, Union{Symbol,Nothing}), Vector{LintMessage}}` —
+# from a flat lint list. `_build_section` looks up `(T, prop_name)` for IP-level
+# annotations and `(T, nothing)` for struct-level ones.
+function _build_lint_index(msgs::Vector{LintMessage})
+    idx = Dict{Tuple{Type,Union{Symbol,Nothing}}, Vector{LintMessage}}()
+    for m in msgs
+        push!(get!(idx, (m.type, m.prop), LintMessage[]), m)
+    end
+    idx
+end
+
+# Build a `Semantic{:lint}` node for one LintMessage. The severity attribute
+# drives format-specific rendering (color/icon).
+_lint_node(msg::LintMessage) =
+    sem.lint(msg.short; severity=msg.severity)
+
 function _build_section(T::Type, header;
-                        max_depth, types_in_tree, parent_map, color_map, visited)
-    header === nothing && (header = h.line(_tok(string(nameof(T)); bold=true)))
+                        max_depth, types_in_tree, parent_map, color_map, lint_index, visited)
+    header === nothing && (header = sem.line(_tok(string(nameof(T)); bold=true)))
     body = Any[]
     if T in visited
-        push!(body, h.line(_tok("(cycle)"; italic=true)))
-        return h.section(body...; header)
+        push!(body, sem.line(_tok("(cycle)"; italic=true)))
+        return sem.section(body...; header)
     end
     push!(visited, T)
+
+    # Struct-level lints (prop=nothing) emitted as their own lines after the header.
+    for msg in get(lint_index, (T, nothing), LintMessage[])
+        push!(body, sem.line(_lint_node(msg)))
+    end
 
     fixed = filter(n -> n !== :cache, collect(fieldnames(T)))
     if !isempty(fixed)
@@ -3329,7 +3429,7 @@ function _build_section(T::Type, header;
             i == 1 || push!(toks, _tok(", "))
             push!(toks, _tok_ident(f, color_map))
         end
-        push!(body, h.line(toks...))
+        push!(body, sem.line(toks...))
     end
 
     params = _print_struct_param_names(T)
@@ -3339,7 +3439,7 @@ function _build_section(T::Type, header;
             i == 1 || push!(toks, _tok(", "))
             push!(toks, _tok_ident(p, color_map))
         end
-        push!(body, h.line(toks...))
+        push!(body, sem.line(toks...))
     end
 
     props = try meta(T) catch; nothing end
@@ -3363,29 +3463,35 @@ function _build_section(T::Type, header;
                 _print_struct_worst_case(types_in_tree, parent_map, T, name, info) :
                 nothing
             nodes = _prop_nodes(route_tag, cached, name, info.indices, dep, color_map)
+            prop_lints = get(lint_index, (T, name), LintMessage[])
 
             if nested !== nothing && max_depth > 0
                 push!(nodes, _tok(" = "))
                 push!(nodes, _tok(string(nameof(nested)); bold=true))
-                nested_sec = _build_section(nested, h.line(nodes...);
+                nested_sec = _build_section(nested, sem.line(nodes...);
                     max_depth=max_depth-1, types_in_tree, parent_map, color_map,
-                    visited=copy(visited))
+                    lint_index, visited=copy(visited))
                 push!(body, nested_sec)
             else
-                push!(body, h.line(nodes...))
+                push!(body, sem.line(nodes...))
+            end
+            # One line per lint message, after the IP's line/section.
+            for msg in prop_lints
+                push!(body, sem.line(_lint_node(msg)))
             end
         end
     end
-    h.section(body...; header)
+    sem.section(body...; header)
 end
 
 function _build_structure(T::Type;
                           max_depth=typemax(Int),
                           types_in_tree=_all_types_in_tree(T),
                           parent_map=_build_parent_map(T),
-                          color_map=_build_color_map(T))
+                          color_map=_build_color_map(T),
+                          lint_index=_build_lint_index(analyze_structure(T)))
     sec = _build_section(T, nothing; max_depth, types_in_tree, parent_map, color_map,
-                         visited=Set{Type}())
+                         lint_index, visited=Set{Type}())
     h.pre(sec; class="do-structure")
 end
 
@@ -3398,40 +3504,58 @@ function _hex_to_rgb(hex::AbstractString)
     parse(Int, hex[4:5], base=16),
     parse(Int, hex[6:7], base=16)
 end
-_html_escape(s::AbstractString) =
-    replace(s, '&'=>"&amp;", '<'=>"&lt;", '>'=>"&gt;",
-               '"'=>"&quot;", '\''=>"&#39;")
+_html_escape(io::IO, s::AbstractString) = replace(io, s,
+    '&'  => "&amp;",
+    '<'  => "&lt;",
+    '>'  => "&gt;",
+    '"'  => "&quot;",
+    '\'' => "&#39;")
+_html_escape(io::IO, x) = _html_escape(io, string(x))
 
 # --- Generic content emission (used by all formats) ---
 # Content is always a Tuple of items — typically Strings (text leaves) or
 # Nodes (children). Iterate and dispatch each via `_show_one`.
 _show_content(io, m, content::Tuple) = for c in content; _show_one(io, m, c) end
-_show_one(io, m, n::Node) = show(io, m, n)
-_show_one(io, ::MIME"text/html", s::AbstractString) = print(io, _html_escape(s))
+_show_one(io, m, n::AbstractNode) = show(io, m, n)
+_show_one(io, ::MIME"text/html", s::AbstractString) = _html_escape(io, s)
 _show_one(io, m, s::AbstractString) = print(io, s)
 
-# --- Generic show fallbacks ------------------------------------------------
+# --- Show dispatch via `_show_node` ----------------------------------------
+# Every Base.show on an AbstractNode delegates to `_show_node`. Inside
+# `_show_node` there are no Base stdlib methods to disambiguate against, so
+# per-tag overrides on generic MIME work without the per-(MIME, Tag) bloat
+# we'd otherwise need to break Base's text/plain ambiguity.
+Base.show(io::IO, m::MIME"text/plain",    n::AbstractNode) = _show_node(io, m, n)
+Base.show(io::IO, m::MIME"text/markdown", n::AbstractNode) = _show_node(io, m, n)
+Base.show(io::IO, m::MIME"text/html",     n::AbstractNode) = _show_node(io, m, n)
+Base.show(io::IO, n::AbstractNode) = _show_node(io, MIME"text/plain"(), n)
 
-# text/plain default: just emit the content with no wrapping.
-Base.show(io::IO, m::MIME"text/plain", n::Node) = _show_content(io, m, n.content)
+# --- Defaults ---
 
-# text/markdown default: same — emit content, no wrapping.
-Base.show(io::IO, m::MIME"text/markdown", n::Node) = _show_content(io, m, n.content)
+# Node text/plain & text/markdown: emit content, no wrapping.
+_show_node(io::IO, m::MIME"text/plain",    n::Node) = _show_content(io, m, n.content)
+_show_node(io::IO, m::MIME"text/markdown", n::Node) = _show_content(io, m, n.content)
 
-# text/html default: <tag attrs>content</tag>.
-function Base.show(io::IO, m::MIME"text/html", n::Node{Tag}) where {Tag}
+# Node text/html: <tag attrs>content</tag> — the only format that needs the
+# tag in the output.
+function _show_node(io::IO, m::MIME"text/html", n::Node{Tag}) where {Tag}
     print(io, "<", Tag)
     for (k, v) in pairs(n.attributes)
         v === nothing && continue
-        print(io, " ", k, "=\"", _html_escape(string(v)), "\"")
+        print(io, " ", k, "=\"")
+        _html_escape(io, v)
+        print(io, "\"")
     end
     print(io, ">")
     _show_content(io, m, n.content)
     print(io, "</", Tag, ">")
 end
 
-# Convenience: bare `show(io, ::Node)` defaults to text/plain.
-Base.show(io::IO, n::Node) = show(io, MIME"text/plain"(), n)
+# Semantic default: emit content with no wrapping in every format. Per-tag
+# overrides on `_show_node(io, ::MIME, ::Semantic{:tag})` add format-specific
+# behavior; thanks to the `_show_node` indirection, one method covers all
+# three MIMEs without ambiguity.
+_show_node(io::IO, m::MIME, n::Semantic) = _show_content(io, m, n.content)
 
 # --- Tag-specific overrides ------------------------------------------------
 
@@ -3442,53 +3566,75 @@ function _ansi_wrap(io, m, n, on, off)
     _show_content(io, m, n.content)
     color && print(io, off)
 end
-Base.show(io::IO, m::MIME"text/plain", n::Node{:strong}) = _ansi_wrap(io, m, n, "\e[1m", "\e[22m")
-Base.show(io::IO, m::MIME"text/plain", n::Node{:em})     = _ansi_wrap(io, m, n, "\e[3m", "\e[23m")
-Base.show(io::IO, m::MIME"text/plain", n::Node{:u})      = _ansi_wrap(io, m, n, "\e[4m", "\e[24m")
-function Base.show(io::IO, m::MIME"text/plain", n::Node{:span})
+_show_node(io::IO, m::MIME"text/plain", n::Node{:strong}) = _ansi_wrap(io, m, n, "\e[1m", "\e[22m")
+_show_node(io::IO, m::MIME"text/plain", n::Node{:em})     = _ansi_wrap(io, m, n, "\e[3m", "\e[23m")
+_show_node(io::IO, m::MIME"text/plain", n::Node{:u})      = _ansi_wrap(io, m, n, "\e[4m", "\e[24m")
+
+function _show_node(io::IO, m::MIME"text/markdown", n::Node{:strong})
+    print(io, "**"); _show_content(io, m, n.content); print(io, "**")
+end
+function _show_node(io::IO, m::MIME"text/markdown", n::Node{:em})
+    print(io, "*"); _show_content(io, m, n.content); print(io, "*")
+end
+
+# `:colored` (Semantic) — content with the foreground in the given color.
+# Used for emphasis where the whole token should pop (lint warnings).
+function _show_node(io::IO, m::MIME"text/plain", n::Semantic{:colored})
     r, g, b = _hex_to_rgb(n.attributes.color)
     _ansi_wrap(io, m, n, "\e[38;2;$r;$g;$(b)m", "\e[39m")
 end
-
-# HTML override for `:span` — drop the color hex straight into inline style.
-# Other inline tags (`:strong`, `:em`, `:u`) fall through to the generic
-# fallback, which produces the right `<strong>…</strong>` shape with no attrs.
-function Base.show(io::IO, m::MIME"text/html", n::Node{:span})
-    print(io, "<span style=\"color:", n.attributes.color, "\">")
-    _show_content(io, m, n.content)
-    print(io, "</span>")
+function _show_node(io::IO, m::MIME"text/html", n::Semantic{:colored})
+    show(io, m, Node(:span, n.content...; style="color:$(n.attributes.color)"))
 end
 
-# `:line` — indent (from IOContext) + content + newline. Same shape across
-# all three formats; the per-MIME methods are needed to disambiguate against
-# the per-MIME generic Node fallbacks.
-function _show_line(io, m, n)
+# `:underlined` (Semantic) — default-color text with a thick colored
+# underline. Used for bond identities so the bond hue marks identity
+# without dominating the text. Terminal: ANSI `\e[4m` (underline on) +
+# `\e[58;2;R;G;Bm` (truecolor underline color). HTML: `text-decoration:
+# underline` + `text-decoration-color` + `text-decoration-thickness:2px`.
+function _show_node(io::IO, m::MIME"text/plain", n::Semantic{:underlined})
+    r, g, b = _hex_to_rgb(n.attributes.color)
+    _ansi_wrap(io, m, n, "\e[4m\e[58;2;$r;$g;$(b)m", "\e[59m\e[24m")
+end
+function _show_node(io::IO, m::MIME"text/html", n::Semantic{:underlined})
+    show(io, m, Node(:span, n.content...;
+        style="text-decoration:underline; text-decoration-color:$(n.attributes.color); text-decoration-thickness:2px; text-underline-offset:2px"))
+end
+
+# `:line` (Semantic) — indent + content + newline. One method covers all
+# three formats thanks to the `_show_node` indirection.
+function _show_node(io::IO, m::MIME, n::Semantic{:line})
     print(io, "  "^get(io, :do_struct_depth, 0))
     _show_content(io, m, n.content)
     println(io)
 end
-Base.show(io::IO, m::MIME"text/plain",    n::Node{:line}) = _show_line(io, m, n)
-Base.show(io::IO, m::MIME"text/markdown", n::Node{:line}) = _show_line(io, m, n)
-Base.show(io::IO, m::MIME"text/html",     n::Node{:line}) = _show_line(io, m, n)
 
-# `:section` — render header at current depth, content one level deeper.
-function _show_section(io, m, n)
+# `:section` (Semantic) — render header at current depth, content one level
+# deeper.
+function _show_node(io::IO, m::MIME, n::Semantic{:section})
     hdr = get(n.attributes, :header, nothing)
     hdr === nothing || show(io, m, hdr)
     depth = get(io, :do_struct_depth, 0)
     body_io = IOContext(io, :do_struct_depth => hdr === nothing ? depth : depth + 1)
     _show_content(body_io, m, n.content)
 end
-Base.show(io::IO, m::MIME"text/plain",    n::Node{:section}) = _show_section(io, m, n)
-Base.show(io::IO, m::MIME"text/markdown", n::Node{:section}) = _show_section(io, m, n)
-Base.show(io::IO, m::MIME"text/html",     n::Node{:section}) = _show_section(io, m, n)
 
-# `:pre` — markdown fences, terminal passes through, HTML uses default
-# (which produces `<pre class="…">…</pre>`).
-function Base.show(io::IO, m::MIME"text/markdown", n::Node{:pre})
+# `:pre` (Node, real HTML element) — markdown fences. Terminal and HTML use
+# the generic Node defaults (just-content / `<pre class=…>…</pre>`).
+function _show_node(io::IO, m::MIME"text/markdown", n::Node{:pre})
     println(io, "```")
     _show_content(io, m, n.content)
     println(io, "```")
+end
+
+# `:lint` (Semantic) — bold + colored severity icon + message. Composes the
+# existing `Node{:strong}` (bold) with `Semantic{:colored}` (bond palette
+# color machinery) — no per-format rendering code here. Colors are muted
+# brick / ochre that read on light and dark backgrounds.
+function _show_node(io::IO, m::MIME, n::Semantic{:lint})
+    icon  = n.attributes.severity === :error ? "✗"       : "⚠"
+    color = n.attributes.severity === :error ? "#922b21" : "#b7791f"
+    show(io, m, sem.colored(h.strong(icon, " ", n.content...); color))
 end
 
 # === Public API ===============================================================
