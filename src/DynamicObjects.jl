@@ -1579,9 +1579,9 @@ end
 # `@param`s, IP positional args along the parent chain). Anything outside
 # that scope means the IP is reaching across the tree.
 
-function _check_hierarchical_placement!(msgs, types_in_tree, parent_map, type, name, info)
+function _check_hierarchical_placement!(msgs, types_in_tree, parent_map, type, name, info, wc_cache)
     isempty(_ip_positional_args(info.indices)) && return
-    wc = _print_struct_worst_case(types_in_tree, parent_map, type, name, info)
+    wc = _print_struct_worst_case(types_in_tree, parent_map, type, name, info, wc_cache)
     (wc === nothing || wc[1] !== :bound) && return
     bound = wc[2]
     scope = _enclosing_scope(type, parent_map)
@@ -1883,11 +1883,11 @@ weaves the messages inline. Callers wanting CI-style output can iterate the
 returned vector themselves.
 """
 function analyze_structure(T::Type)
-    empty!(_WC_CACHE)   # fresh per call; different roots can yield different bounds
     msgs = LintMessage[]
     types_in_tree = _all_types_in_tree(T)
     parent_map    = _build_parent_map(T)
-    bound_groups  = _bound_groups(types_in_tree, parent_map)
+    wc_cache      = _WCCache()
+    bound_groups  = _bound_groups(types_in_tree, parent_map, wc_cache)
     call_index    = _build_call_index(types_in_tree)
 
     for U in types_in_tree
@@ -1903,7 +1903,7 @@ function analyze_structure(T::Type)
             _check_cryptic_arg_names!(msgs, U, n, info)
             _check_no_self_access!(msgs, U, n, info, prop_names, siblings, bound)
             _check_trivial_cached_wrapper!(msgs, U, n, info)
-            _check_hierarchical_placement!(msgs, types_in_tree, parent_map, U, n, info)
+            _check_hierarchical_placement!(msgs, types_in_tree, parent_map, U, n, info, wc_cache)
             _check_redundant_args!(msgs, call_index, parent_map, U, n, info)
         end
 
@@ -1924,7 +1924,7 @@ end
 # Computed once per analyze pass; reused by both `_check_no_self_access!`
 # (to name same-bound siblings in its message) and
 # `_check_identical_bound_siblings!` (for cluster emission).
-function _bound_groups(types_in_tree, parent_map)
+function _bound_groups(types_in_tree, parent_map, wc_cache=_WCCache())
     out = Dict{Type, Dict{Tuple{Vararg{Symbol}}, Vector{Symbol}}}()
     for T in types_in_tree
         props = try meta(T) catch; nothing end
@@ -1932,7 +1932,7 @@ function _bound_groups(types_in_tree, parent_map)
         by_bound = Dict{Tuple{Vararg{Symbol}}, Vector{Symbol}}()
         for (name, info) in props
             isempty(_ip_positional_args(info.indices)) && continue
-            wc = _print_struct_worst_case(types_in_tree, parent_map, T, name, info)
+            wc = _print_struct_worst_case(types_in_tree, parent_map, T, name, info, wc_cache)
             (wc === nothing || wc[1] !== :bound) && continue
             push!(get!(by_bound, Tuple(wc[2]), Symbol[]), name)
         end
@@ -3519,19 +3519,26 @@ end
 # Public worst-case bound: returns the EXPANDED form. Every name in the
 # result is a root identity (@param, field, or IP arg of an unbounded IP);
 # intermediate IP-arg names are unfolded to their own bounds.
-# Per-process memoization for the expanded worst-case bound. `analyze_structure`
-# / `structure(T)` invoke this from multiple call sites for the same (T, prop)
-# — bound-group precompute, hierarchical-placement check, render annotations,
-# and (transitively) `_expand_name!` recursion. Without caching we re-walk the
-# whole `types_in_tree × props_per_type` cross product several times. Cache key
-# is `(T, prop_name)`; entries are deterministic per-type so cross-call reuse
-# is safe.
-const _WC_CACHE = IdDict{Tuple{Type,Symbol}, Any}()
+# Memoized expanded worst-case bound. `analyze_structure` / `structure(T)`
+# invoke this from multiple call sites for the same (T, prop) — bound-group
+# precompute, hierarchical-placement check, and render annotations. Without
+# caching we re-walk the whole `types_in_tree × props_per_type` cross product
+# several times.
+#
+# Cache is **per-call**, passed explicitly. No global state — concurrent
+# requests get their own cache so there are no races on `setindex!` / shared
+# entries. The default-arg form creates a fresh dict for callers that don't
+# care about cross-call reuse; hot callers inside `analyze_structure` /
+# `_build_structure` thread a single dict through to amortize the work.
+const _WCCache = IdDict{Tuple{Type,Symbol}, Any}
+
+_print_struct_worst_case(types_in_tree, parents, T::Type, prop_name::Symbol, info) =
+    _print_struct_worst_case(types_in_tree, parents, T, prop_name, info, _WCCache())
 
 function _print_struct_worst_case(types_in_tree, parents, T::Type,
-                                  prop_name::Symbol, info)
+                                  prop_name::Symbol, info, cache::_WCCache)
     key = (T, prop_name)
-    haskey(_WC_CACHE, key) && return _WC_CACHE[key]
+    haskey(cache, key) && return cache[key]
     raw = _raw_worst_case(types_in_tree, parents, T, prop_name, info)
     result = if raw === nothing
         nothing
@@ -3544,7 +3551,7 @@ function _print_struct_worst_case(types_in_tree, parents, T::Type,
         end
         (:bound, sort!(collect(expanded)))
     end
-    _WC_CACHE[key] = result
+    cache[key] = result
     result
 end
 
@@ -4031,10 +4038,8 @@ root is a `Node{:pre}` so it renders as `<pre class="do-structure">…</pre>`
 in HTML, fenced ` ``` ` blocks in markdown, and bare indented text in the
 terminal. `display(s)` picks the right MIME for the active display.
 """
-function structure(T::Type; max_depth::Int=typemax(Int))
-    empty!(_WC_CACHE)   # fresh per call; different roots can yield different bounds
+structure(T::Type; max_depth::Int=typemax(Int)) =
     _build_structure(T; max_depth)
-end
 
 """    print_structure([io::IO=stdout,] T::Type; max_depth=typemax(Int))
 
