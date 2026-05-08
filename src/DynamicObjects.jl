@@ -1636,6 +1636,54 @@ end
 _collect_call_args(expr, target, cprops) =
     (out = Vector{Vector{Any}}(); _collect_call_args!(out, expr, target, cprops); out)
 
+# Inverted call index: walk every property body in the tree once and bucket
+# call sites by callee target. Replaces N×P walks (one per IP target) with
+# a single pass; lookups for `_check_redundant_args!` are O(1).
+function _build_call_index(types_in_tree)
+    out = Dict{Symbol, Vector{Tuple{Type,Symbol,Vector{Any}}}}()
+    for U in types_in_tree
+        uprops = try meta(U) catch; nothing end
+        uprops === nothing && continue
+        for (uname, uinfo) in uprops
+            uinfo.rhs === nothing && continue
+            _index_calls!(out, uinfo.rhs, uprops, U, uname)
+        end
+    end
+    out
+end
+
+function _index_calls!(out, expr, cprops, caller_T::Type, caller_prop::Symbol)
+    expr isa Expr || return
+    if Meta.isexpr(expr, :call) && length(expr.args) >= 1
+        callee = expr.args[1]
+        target = nothing
+        if callee isa Symbol
+            cprops !== nothing && haskey(cprops, callee) && (target = callee)
+        elseif Meta.isexpr(callee, :., 2) && callee.args[2] isa QuoteNode
+            potential = callee.args[2].value
+            root = _dot_chain_root(callee.args[1])
+            if root !== nothing &&
+               (root === :__self__ || root === :__parent__ || root === :__appdata__ ||
+                (cprops !== nothing && haskey(cprops, root)))
+                target = potential
+            end
+        end
+        if target isa Symbol
+            args = Any[]
+            for a in expr.args[2:end]
+                Meta.isexpr(a, :parameters) && continue
+                push!(args, a)
+            end
+            push!(get!(out, target,
+                       Vector{Tuple{Type,Symbol,Vector{Any}}}()),
+                  (caller_T, caller_prop, args))
+        end
+    end
+    for a in expr.args
+        _index_calls!(out, a, cprops, caller_T, caller_prop)
+    end
+end
+
 # Normalize a `__self__.X…` / `__parent__[.__parent__]*.X…` dot chain to
 # `(BaseType, :a, :b, ...)` where BaseType is reached by walking parent_map
 # off `caller_T` once per leading `__parent__`. Returns `nothing` for any
@@ -1759,21 +1807,15 @@ function _check_appdata_placement!(msgs, root::Type, types_in_tree, parent_map)
     end
 end
 
-function _check_redundant_args!(msgs, types_in_tree, parent_map, type, name::Symbol, info)
+function _check_redundant_args!(msgs, call_index, parent_map, type, name::Symbol, info)
     pos = _ip_positional_args(info.indices)
     isempty(pos) && return
+    sites = get(call_index, name, Vector{Tuple{Type,Symbol,Vector{Any}}}())
     all_caller_args = Vector{Vector{Any}}()
-    for U in types_in_tree
-        uprops = try meta(U) catch; nothing end
-        uprops === nothing && continue
-        for (uname, uinfo) in uprops
-            uinfo.rhs === nothing && continue
-            (U === type && uname === name) && continue
-            for argset in _collect_call_args(uinfo.rhs, name, uprops)
-                push!(all_caller_args,
-                      Any[_normalize_arg(a, U, parent_map) for a in argset])
-            end
-        end
+    for (cT, cp, argset) in sites
+        (cT === type && cp === name) && continue
+        push!(all_caller_args,
+              Any[_normalize_arg(a, cT, parent_map) for a in argset])
     end
     isempty(all_caller_args) && return
     redundant = Tuple{Symbol,Any}[]
@@ -1846,6 +1888,7 @@ function analyze_structure(T::Type)
     types_in_tree = _all_types_in_tree(T)
     parent_map    = _build_parent_map(T)
     bound_groups  = _bound_groups(types_in_tree, parent_map)
+    call_index    = _build_call_index(types_in_tree)
 
     for U in types_in_tree
         props = try meta(U) catch; nothing end
@@ -1861,7 +1904,7 @@ function analyze_structure(T::Type)
             _check_no_self_access!(msgs, U, n, info, prop_names, siblings, bound)
             _check_trivial_cached_wrapper!(msgs, U, n, info)
             _check_hierarchical_placement!(msgs, types_in_tree, parent_map, U, n, info)
-            _check_redundant_args!(msgs, types_in_tree, parent_map, U, n, info)
+            _check_redundant_args!(msgs, call_index, parent_map, U, n, info)
         end
 
         # Struct-level (skip forwarded entries from singleton/prefix views)
