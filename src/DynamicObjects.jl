@@ -1576,6 +1576,9 @@ function _check_hierarchical_placement!(msgs, types_in_tree, parent_map, type, n
     (wc === nothing || wc[1] !== :bound) && return
     bound = wc[2]
     scope = _enclosing_scope(type, parent_map)
+    for a in _ip_positional_args(info.indices)
+        push!(scope, a)
+    end
     misplaced = filter(n -> n ∉ scope, bound)
     isempty(misplaced) && return
     short = "depends on " * join(map(n -> "`$n`", misplaced), ", ") * " — sibling scope"
