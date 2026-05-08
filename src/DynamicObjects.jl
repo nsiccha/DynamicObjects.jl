@@ -1841,6 +1841,7 @@ weaves the messages inline. Callers wanting CI-style output can iterate the
 returned vector themselves.
 """
 function analyze_structure(T::Type)
+    empty!(_WC_CACHE)   # fresh per call; different roots can yield different bounds
     msgs = LintMessage[]
     types_in_tree = _all_types_in_tree(T)
     parent_map    = _build_parent_map(T)
@@ -3475,16 +3476,33 @@ end
 # Public worst-case bound: returns the EXPANDED form. Every name in the
 # result is a root identity (@param, field, or IP arg of an unbounded IP);
 # intermediate IP-arg names are unfolded to their own bounds.
+# Per-process memoization for the expanded worst-case bound. `analyze_structure`
+# / `structure(T)` invoke this from multiple call sites for the same (T, prop)
+# — bound-group precompute, hierarchical-placement check, render annotations,
+# and (transitively) `_expand_name!` recursion. Without caching we re-walk the
+# whole `types_in_tree × props_per_type` cross product several times. Cache key
+# is `(T, prop_name)`; entries are deterministic per-type so cross-call reuse
+# is safe.
+const _WC_CACHE = IdDict{Tuple{Type,Symbol}, Any}()
+
 function _print_struct_worst_case(types_in_tree, parents, T::Type,
                                   prop_name::Symbol, info)
+    key = (T, prop_name)
+    haskey(_WC_CACHE, key) && return _WC_CACHE[key]
     raw = _raw_worst_case(types_in_tree, parents, T, prop_name, info)
-    raw === nothing && return nothing
-    raw[1] === :none && return raw
-    expanded = Set{Symbol}()
-    for n in raw[2]
-        _expand_name!(expanded, n, types_in_tree, parents, Set{Symbol}())
+    result = if raw === nothing
+        nothing
+    elseif raw[1] === :none
+        raw
+    else
+        expanded = Set{Symbol}()
+        for n in raw[2]
+            _expand_name!(expanded, n, types_in_tree, parents, Set{Symbol}())
+        end
+        (:bound, sort!(collect(expanded)))
     end
-    (:bound, sort!(collect(expanded)))
+    _WC_CACHE[key] = result
+    result
 end
 
 # --- Identity coloring --------------------------------------------------------
@@ -3970,8 +3988,10 @@ root is a `Node{:pre}` so it renders as `<pre class="do-structure">…</pre>`
 in HTML, fenced ` ``` ` blocks in markdown, and bare indented text in the
 terminal. `display(s)` picks the right MIME for the active display.
 """
-structure(T::Type; max_depth::Int=typemax(Int)) =
+function structure(T::Type; max_depth::Int=typemax(Int))
+    empty!(_WC_CACHE)   # fresh per call; different roots can yield different bounds
     _build_structure(T; max_depth)
+end
 
 """    print_structure([io::IO=stdout,] T::Type; max_depth=typemax(Int))
 
