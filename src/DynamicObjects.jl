@@ -1689,7 +1689,7 @@ function _check_redundant_args!(msgs, types_in_tree, parent_map, type, name::Sym
             end
         end
     end
-    length(all_caller_args) >= 2 || return
+    isempty(all_caller_args) && return
     redundant = Tuple{Symbol,Any}[]
     for i in eachindex(pos)
         all(length(a) >= i for a in all_caller_args) || continue
