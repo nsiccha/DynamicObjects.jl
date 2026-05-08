@@ -2162,7 +2162,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     # Parallel record of (parent-property-name => generated-child-type-name) for
     # each inline `@struct` child, used to emit `_nested_struct_type` methods so
     # `print_structure` can walk the inline-child tree.
-    inline_child_pairs = Pair{Symbol,Symbol}[]
+    inline_child_pairs = Pair{Symbol,Any}[]
     for (i, arg) in enumerate(body.args)
         arg isa Expr || continue
         # Peel a `Core.@doc "str" <inner>` wrapper if present, so that
@@ -2481,12 +2481,22 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             indexed = true
             union!(locals, extractnames(indices))
         end
-        name = if Meta.isexpr(arg, :(::))
-            arg.args[1]
+        name, ext_type = if Meta.isexpr(arg, :(::))
+            arg.args[1], arg.args[2]
         else
-            arg
+            arg, nothing
         end
         @assert name isa Symbol dump(name)
+        # `prop::T = rhs` (computed property with a type annotation) registers
+        # T with `_nested_struct_type` so `analyze_structure` walks into T's
+        # tree alongside the enclosing struct's. Lets external DO references
+        # like `__appdata__::AppData = APPDATA` be linted in the same pass
+        # without macro-side magic. Indexed properties and fixed fields keep
+        # the annotation's existing semantics (Julia field type for fixed,
+        # ignored for indexed).
+        if ext_type !== nothing && !isnothing(rhs) && !indexed
+            push!(inline_child_pairs, name => ext_type)
+        end
         push!(docs, (name=>(doc, !isnothing(rhs))))
         metadata.doc[] = nothing
         !isnothing(locals) && push!(locals, name)
@@ -2624,7 +2634,11 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 iscached_val = Symbol("@cached") in info.macros
                 desc_expr = if haskey(property_docs, name)
                     pdoc = property_docs[name]
-                    _lnn, Expr(:(=), _call(:_property_description, :(kwargs...)), Expr(:block, _lnn, pdoc))
+                    has_user_kw_splat = any(walked_indices) do idx
+                        Meta.isexpr(idx, :parameters) && any(a -> Meta.isexpr(a, :...), idx.args)
+                    end
+                    desc_extras = has_user_kw_splat ? () : (:(kwargs...),)
+                    _lnn, Expr(:(=), _call(:_property_description, desc_extras...), Expr(:block, _lnn, pdoc))
                 else
                     nothing
                 end
@@ -2958,10 +2972,16 @@ const _PRINT_STRUCT_ROUTE_MACROS = Set([
     Symbol("@patch"), Symbol("@delete"), Symbol("@ws"),
 ])
 
-# Skip auto-generated and DO-internal property names.
-_print_struct_skip(name::Symbol) = begin
+# Skip auto-generated and DO-internal property names. Dunder names
+# (`__self__`, `__parent__`, `__status__`, …) are normally hidden, but
+# `prop::T = rhs` registrations on a dunder name (e.g. `__appdata__::AppData`)
+# represent a real user-declared nested DO subtree the user wants to see —
+# the registered `_nested_struct_type` is the signal.
+_print_struct_skip(::Type{T}, name::Symbol) where {T} = begin
     s = String(name)
-    (startswith(s, "__") && endswith(s, "__")) ||
+    is_dunder = startswith(s, "__") && endswith(s, "__")
+    is_dunder && _nested_struct_type(T, Val(name)) !== nothing && return false
+    is_dunder ||
         startswith(s, "_tuple_") ||
         name === :hash_fields ||
         name === :cache_path ||
@@ -3274,7 +3294,7 @@ function _build_color_map(root::Type)
         props = try meta(T) catch; nothing end
         props === nothing && return
         for name in sort!(collect(keys(props)))
-            _print_struct_skip(name) && continue
+            _print_struct_skip(T, name) && continue
             info = props[name]
             args = _ip_positional_args(info.indices)
             if !isempty(args)
@@ -3496,7 +3516,7 @@ function _build_section(T::Type, header;
     props = try meta(T) catch; nothing end
     if props !== nothing
         for name in sort!(collect(keys(props)))
-            _print_struct_skip(name) && continue
+            _print_struct_skip(T, name) && continue
             info = props[name]
             info.rhs === nothing && continue
             _print_struct_is_forwarded(info.rhs) && continue
