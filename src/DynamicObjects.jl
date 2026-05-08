@@ -208,12 +208,10 @@ end
 Base.getindex(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...; fetch=Base.fetch, retry_failed=true, kwargs...) where {name} = begin
     (;o, cache) = ip
     substatus_f = if name != :__substatus__ && name != :__status__
-        # Capture `root` eagerly: the closure runs INSIDE the cache lock, and
-        # for plain-prop call sites (getorcomputeproperty) the cache is the
-        # same lock — lazy `o.__status__` would spawn a nested task that waits
-        # on the lock the parent holds → deadlock.
-        root = o.__status__
-        () -> compute_property(o, Val(:__substatus__), name, indices...; __status__=root, kwargs...)
+        () -> begin
+            root = o.__status__
+            compute_property(o, Val(:__substatus__), name, indices...; __status__=root, kwargs...)
+        end
     else
         nothing
     end
@@ -221,44 +219,76 @@ Base.getindex(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indice
         getorcomputeproperty(o, name, indices...; __status__=s, kwargs...)
     end
 end
+# `substatus()` is invoked OUTSIDE the cache lock. Calling it under the
+# lock is unsafe: substatus factories can recurse into other DO properties
+# (e.g. user-defined `_property_description` reads `o.foo`) which spawn a
+# task on the SAME `c`, and that task's `lock(c.lock)` write-back blocks
+# behind the lock the parent holds while fetching → deadlock.
+# Slow path: do a fast-path check first; only if we genuinely need to spawn
+# do we drop the lock, build `s`, and re-take the lock to install. A race
+# (someone else won between phases) means we discard `s` via finalize.
 Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substatus=nothing, retry_failed=true) = begin
+    fast = lock(c.lock) do
+        v = get(c.cache, key, _missing_sentinel)
+        if v !== _missing_sentinel
+            _on_hit!(c, key)
+            return (:value, v)
+        end
+        if retry_failed && haskey(c.tasks, key) && istaskdone(c.tasks[key]) && istaskfailed(c.tasks[key])
+            pop!(c.tasks, key)
+            haskey(c.status, key) && pop!(c.status, key)
+        end
+        haskey(c.tasks, key) && return (:task, c.tasks[key])
+        nothing
+    end
+    if fast !== nothing
+        kind, x = fast
+        return kind === :value ? x : fetch(x)
+    end
+    # No value, no in-flight task — build substatus outside the lock.
+    s = isnothing(substatus) ? nothing : substatus()
     rv = lock(c.lock) do
         v = get(c.cache, key, _missing_sentinel)
         if v !== _missing_sentinel
             _on_hit!(c, key)
-            v
-        else
-            # Clean up failed tasks so they can be retried (only when retry_failed=true)
-            if retry_failed && haskey(c.tasks, key) && istaskdone(c.tasks[key]) && istaskfailed(c.tasks[key])
-                pop!(c.tasks, key)
-                haskey(c.status, key) && pop!(c.status, key)
-            end
-            get!(c.tasks, key) do
-                s = isnothing(substatus) ? nothing : substatus()
-                if !isnothing(s)
-                    c.status[key] = s
+            return (:lost_value, v)
+        end
+        if retry_failed && haskey(c.tasks, key) && istaskdone(c.tasks[key]) && istaskfailed(c.tasks[key])
+            pop!(c.tasks, key)
+            haskey(c.status, key) && pop!(c.status, key)
+        end
+        haskey(c.tasks, key) && return (:lost_task, c.tasks[key])
+        if !isnothing(s)
+            c.status[key] = s
+        end
+        task = Threads.@spawn begin
+            try
+                tmp = f(s)
+                lock(c.lock) do
+                    c.cache[key] = tmp
+                    pop!(c.tasks, key)
+                    _on_store!(c, key)
                 end
-                Threads.@spawn begin
-                    try
-                        tmp = f(s)
-                        lock(c.lock) do
-                            c.cache[key] = tmp
-                            pop!(c.tasks, key)
-                            _on_store!(c, key)
-                        end
-                        _finalize_substatus!(s)
-                        tmp
-                    catch e
-                        # Leave c.tasks/c.status populated so entries()/getstatus()
-                        # can surface the failure until retry_failed clears it.
-                        _fail_substatus!(s, e)
-                        rethrow()
-                    end
-                end
+                _finalize_substatus!(s)
+                tmp
+            catch e
+                # Leave c.tasks/c.status populated so entries()/getstatus()
+                # can surface the failure until retry_failed clears it.
+                _fail_substatus!(s, e)
+                rethrow()
             end
         end
+        c.tasks[key] = task
+        return (:won, task)
     end
-    fetch(rv)
+    kind, x = rv
+    if kind === :lost_value || kind === :lost_task
+        # We built `s` but didn't install it — finalize so the Treebars
+        # node (if any) detaches instead of leaking.
+        !isnothing(s) && _finalize_substatus!(s)
+        return kind === :lost_value ? x : fetch(x)
+    end
+    fetch(x)
 end
 
 # Singleton sentinel so a single `get` lookup distinguishes "key absent" from
@@ -962,10 +992,10 @@ else
                      name != :__substatus__ && name != :__status__ &&
                      !(startswith(string(name), "__") && endswith(string(name), "__")) &&
                      is_generated_property(o, name) && !is_indexed_property(o, name)
-        # Eager `root` capture — see IP getindex comment for the deadlock this
-        # avoids when the substatus closure runs inside the cache lock.
-        root = o.__status__
-        () -> compute_property(o, Val(:__substatus__), name; __status__=root)
+        () -> begin
+            root = o.__status__
+            compute_property(o, Val(:__substatus__), name; __status__=root)
+        end
     else
         nothing
     end
