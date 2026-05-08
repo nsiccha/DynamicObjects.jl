@@ -3386,19 +3386,21 @@ end
 # signatures, and in worst-case bound sets. Lets you visually trace bonds:
 # spot `formula` once, then scan for matching color anywhere else.
 
-# 32 deeply-saturated DARK hues (lightness ≈ 20-30%) — readable as text on
-# white without washing out, while still distinguishable from each other.
-# Skewed to blue / red / orange / purple / brown / gray; no cyans, greens,
-# or yellows. Stored as `#rrggbb` so they drop into CSS directly and need
-# only a hex→RGB parse for the terminal's truecolor escape.
+# 32 vivid full-spectrum hues — saturation high enough that adjacent
+# identities are easy to tell apart at a glance. Identity coloring is
+# applied as an underline-only mark (`Semantic{:underlined}`), not as
+# foreground text color, so bright/saturated values are fine — the text
+# itself stays at default contrast. Stored as `#rrggbb` so they drop into
+# CSS directly and need only a hex→RGB parse for the terminal's truecolor
+# escape.
 const _IDENT_PALETTE = (
-    "#0a3263", "#7c4012", "#7d1a1a", "#502c66", "#502d28",
-    "#1a4078", "#90551c", "#8b2828", "#5f3678", "#5d3833",
-    "#274b85", "#a06425", "#9a3838", "#704380", "#6a4035",
-    "#0d4a73", "#7c5026", "#7d2a2a", "#473256", "#3e2722",
-    "#37528a", "#6b441f", "#6b1a1a", "#5b3868", "#37241f",
-    "#1f3a55", "#5e3010", "#601515", "#3a2148", "#2a1c19",
-    "#454545", "#252525",
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+    "#aec7e8", "#ffbb78", "#98df8a", "#ff9896", "#c5b0d5",
+    "#c49c94", "#f7b6d2", "#c7c7c7", "#dbdb8d", "#9edae5",
+    "#393b79", "#637939", "#8c6d31", "#843c39", "#7b4173",
+    "#5254a3", "#8ca252", "#bd9e39", "#ad494a", "#a55194",
+    "#6b6ecf", "#cedb9c",
 )
 
 # Color-by-bound: each name in the tree maps to a *fingerprint* — its upstream
