@@ -1556,8 +1556,8 @@ function _check_shared_arg_signature!(msgs, type, oproperties)
         length(group) >= 2 || continue
         argstr  = join(sig, ", ")
         members = join(map(g -> "`$g`", group), ", ")
-        short = "$(length(group)) IPs share `($argstr)` ($members) — group as `@struct shared($argstr)`"
-        long  = "`$type` has $(length(group)) indexed properties sharing the `($argstr)` signature: $(join(group, ", ")). They all key on the same identity. Move them into an inline child `@struct shared($argstr) = begin …end`."
+        short = "$(length(group)) IPs share `($argstr)` ($members) — if `($argstr)` are proper keys (independent identities), fold to `@struct shared($argstr)`; if derived values (depending on upstream keys), refactor to key on the upstream instead"
+        long  = "`$type` has $(length(group)) indexed properties sharing the `($argstr)` signature: $(join(group, ", ")). Two cases: (a) `($argstr)` are independent identities — `@struct shared($argstr) = begin …end` is the right fold and the IP bodies become bare members. (b) `($argstr)` are derived values that come from some upstream identity (e.g. a `df` extracted from a bundle keyed by `name`) — folding into `@struct shared($argstr)` just shifts the redundancy; refactor the IPs to key on the upstream identity directly, so callers don't have to thread the derived values through."
         push!(msgs, LintMessage(type, nothing, :warn, short, long, nothing))
         by_prefix = Dict{String, Vector{Symbol}}()
         for n in group
@@ -1569,8 +1569,8 @@ function _check_shared_arg_signature!(msgs, type, oproperties)
         for (prefix, sub) in by_prefix
             length(sub) >= 2 || continue
             sub_members = join(map(g -> "`$g`", sub), ", ")
-            short_e = "$(length(sub)) IPs share `($argstr)` AND `$(prefix)_*` ($sub_members) — fold to `@struct $prefix($argstr)`"
-            long_e  = "`$type` has $(length(sub)) indexed properties that share BOTH the `($argstr)` signature AND the `$(prefix)_*` prefix: $(join(sub, ", ")). Fold them into `@struct $prefix($argstr) = begin …end`."
+            short_e = "$(length(sub)) IPs share `($argstr)` AND `$(prefix)_*` ($sub_members) — if `($argstr)` are proper keys, fold to `@struct $prefix($argstr)`; if derived values, refactor to key on the upstream instead"
+            long_e  = "`$type` has $(length(sub)) indexed properties that share BOTH the `($argstr)` signature AND the `$(prefix)_*` prefix: $(join(sub, ", ")). If `($argstr)` are independent identities, fold them into `@struct $prefix($argstr) = begin …end` and let the suffixes become bare members. If `($argstr)` are derived from an upstream identity, the right move is to refactor the IPs to key on that upstream — the shared-prefix + shared-derived-args pattern usually means the IPs are stretching across a layer they should be sitting under."
             push!(msgs, LintMessage(type, nothing, :error, short_e, long_e, nothing))
         end
     end
