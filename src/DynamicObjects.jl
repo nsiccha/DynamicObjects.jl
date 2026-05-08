@@ -2548,9 +2548,12 @@ end
 
 dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothing, is_child=false, lint=true) = begin
     # Short-form sugar: `T(arg1::T1, arg2::T2) = begin … end` is shorthand
-    # for `struct T; arg1::T1; arg2::T2; … end`. Args become fixed/constructor
-    # fields; body becomes property declarations. Standard Julia docstrings
-    # bind to `T` via `Base.@__doc__` exactly like the long form.
+    # for `struct T; arg1::T1; arg2::T2; … end`. Positional args become
+    # fixed/constructor fields. `;`-separated kwargs become regular DO
+    # properties — bare `kw` errors at access time if the construction
+    # kwarg wasn't supplied; `kw=default` makes the default the property
+    # RHS (overridable via the same kwarg at construction). Standard Julia
+    # docstrings bind to `T` via `Base.@__doc__` exactly like the long form.
     if Meta.isexpr(expr, :(=)) && length(expr.args) == 2 &&
        Meta.isexpr(expr.args[1], :call) &&
        Meta.isexpr(expr.args[2], :block)
@@ -2558,8 +2561,26 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         body_block = expr.args[2]
         type_name = call.args[1]
         type_args = call.args[2:end]
+        body_extras = Any[]
+        positional = Any[]
+        for a in type_args
+            if Meta.isexpr(a, :parameters)
+                for kw in a.args
+                    if kw isa Symbol
+                        msg = "$(type_name)(; $kw, …): required kwarg `$kw` was not provided at construction."
+                        push!(body_extras, Expr(:(=), kw, :($error($msg))))
+                    elseif Meta.isexpr(kw, :kw, 2)
+                        push!(body_extras, Expr(:(=), kw.args[1], kw.args[2]))
+                    else
+                        error("@dynamicstruct $type_name(...): unsupported kwarg form `$kw` in short-form signature. Use `name` (required) or `name=default`.")
+                    end
+                end
+            else
+                push!(positional, a)
+            end
+        end
         expr = Expr(:struct, false, type_name,
-                    Expr(:block, type_args..., body_block.args...))
+                    Expr(:block, positional..., body_extras..., body_block.args...))
     end
     @assert expr.head == :struct
     mut, head, body = expr.args
@@ -2966,7 +2987,17 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         else
             arg, nothing
         end
-        @assert name isa Symbol dump(name)
+        if !(name isa Symbol)
+            loc = isnothing(lnn) ? "" : " (near $(lnn.file):$(lnn.line))"
+            hint = if Meta.isexpr(name, :parameters)
+                "Looks like a `;`-kwargs clause leaked into the body. If you wrote `@dynamicstruct $type(...; kw, kw=default) = begin … end`, that's now supported — make sure DynamicObjects is up to date."
+            elseif Meta.isexpr(name, :tuple)
+                "Tuple LHS (e.g. `(a, b) = ...`) destructuring at struct-level is not supported as a property name; either split into separate property declarations or use `let` inside another property's RHS."
+            else
+                "Each property in @dynamicstruct must have a Symbol name on the LHS (e.g. `name = rhs`, `name(idx) = rhs`, or `name::T = rhs`)."
+            end
+            error("@dynamicstruct $type: cannot interpret `$arg` as a property declaration$loc. $hint")
+        end
         # `prop::T = rhs` (computed property with a type annotation) registers
         # T with `_analysis_nested_type` so `analyze_structure` walks into
         # T's tree alongside the enclosing struct's. Separate hook from
