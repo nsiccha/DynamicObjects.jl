@@ -1597,7 +1597,6 @@ function _check_identical_bound_siblings!(msgs, types_in_tree, parent_map)
     for T in types_in_tree
         props = try meta(T) catch; nothing end
         props === nothing && continue
-        scope = _enclosing_scope(T, parent_map)
         by_bound = Dict{Tuple{Vararg{Symbol}}, Vector{Symbol}}()
         for (name, info) in props
             isempty(_ip_positional_args(info.indices)) && continue
@@ -1607,11 +1606,6 @@ function _check_identical_bound_siblings!(msgs, types_in_tree, parent_map)
         end
         for (bound, group) in by_bound
             length(group) >= 2 || continue
-            # Suppress when the shared bond is fully within the enclosing
-            # scope — the bond is just "everything available locally", which
-            # gives no actionable identity to fold around. Fires only when
-            # the bond extends beyond local scope (i.e. sibling-tree leak).
-            all(n -> n in scope, bound) && continue
             argstr = join(string.(bound), ", ")
             for member in group
                 others = filter(!=(member), group)
