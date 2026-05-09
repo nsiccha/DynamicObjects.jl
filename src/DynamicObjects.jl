@@ -4289,6 +4289,106 @@ print_structure(T::Type; kwargs...) = print_structure(stdout, T; kwargs...)
 print_structure(io::IO, T::Type; max_depth::Int=typemax(Int)) =
     show(io, MIME"text/plain"(), structure(T; max_depth))
 
+"""    tree_children_map(root::Type) -> Dict{Type, Vector{Tuple{Symbol, Type}}}
+
+Build a `parent → [(prop_name, child_type), …]` map for every DO/HTMXO
+type reachable from `root`. Children are sorted alphabetically by `prop_name`.
+The inverse of `_build_parent_map`. Pure data — no rendering.
+"""
+function tree_children_map(root::Type)
+    parent_map = _build_parent_map(root)
+    children = Dict{Type, Vector{Tuple{Symbol, Type}}}()
+    for (child, (parent, prop)) in parent_map
+        push!(get!(children, parent, Tuple{Symbol, Type}[]), (prop, child))
+    end
+    for v in values(children)
+        sort!(v; by = p -> string(p[1]))
+    end
+    children
+end
+
+"""    lint_index(root::Type) -> Dict{Type, NamedTuple{(:warns, :errors, :msgs), …}}
+
+Group `analyze_structure(root)` output by `LintMessage.type`. Each entry
+carries warn/error counts and the underlying messages. Returns an empty
+Dict if `analyze_structure` throws (e.g. partially-defined tree).
+"""
+function lint_index(root::Type)
+    msgs = try analyze_structure(root) catch; LintMessage[] end
+    out = Dict{Type, NamedTuple{(:warns, :errors, :msgs), Tuple{Int, Int, Vector{LintMessage}}}}()
+    for m in msgs
+        e = get!(() -> (warns=0, errors=0, msgs=LintMessage[]), out, m.type)
+        push!(e.msgs, m)
+        out[m.type] = (
+            warns  = e.warns  + (m.severity === :warn  ? 1 : 0),
+            errors = e.errors + (m.severity === :error ? 1 : 0),
+            msgs   = e.msgs,
+        )
+    end
+    out
+end
+
+"""    lookup_type(root::Type, name::AbstractString) -> Union{Type, Nothing}
+
+Find a DO/HTMXO type in the tree rooted at `root` by its bare `nameof`
+string. Returns `nothing` if no match.
+"""
+function lookup_type(root::Type, name::AbstractString)
+    for T in _all_types_in_tree(root)
+        string(nameof(T)) == name && return T
+    end
+    nothing
+end
+
+"""    callers_by_name(prop::Symbol, root::Type) -> Vector{Tuple{Type, Symbol, Vector{Any}}}
+
+Return every site (caller_type, caller_prop, arg_exprs) that calls a
+property *named* `prop` anywhere in the tree rooted at `root`. Matches by
+callee NAME, not by resolved owner type, so cross-type name collisions
+appear together. Backed by `_build_call_index`.
+"""
+function callers_by_name(prop::Symbol, root::Type)
+    types_in_tree = _all_types_in_tree(root)
+    call_index = _build_call_index(types_in_tree)
+    get(call_index, prop, Vector{Tuple{Type,Symbol,Vector{Any}}}())
+end
+
+"""    property_source_info(T::Type, prop::Symbol)
+        -> Union{Nothing, NamedTuple{(:rhs_string, :signature, :macros, :dependson), …}}
+
+Extract a property's RHS expression, signature, macro chain, and
+dependson set from `meta(T)`. Returns:
+
+- `nothing` if `meta(T)` is undefined,
+- `(; rhs_string=:meta_missing, signature, …)` if the prop isn't on `T`,
+- otherwise a NamedTuple with:
+  - `rhs_string::String` — the lnn-stripped expression as a string, or
+    `"(no rhs — forwarded/typed property)"` if `info.rhs === nothing`.
+  - `signature::String` — `"name"` or `"name(arg, …)"`.
+  - `macros::String` — `"@cached "` etc. (trailing space if non-empty).
+  - `dependson::Vector{Symbol}` — sorted dependency names.
+
+Pure data extraction. Renderers turn this into HTML / markdown /
+terminal output.
+"""
+function property_source_info(T::Type, prop::Symbol)
+    props = try meta(T) catch; nothing end
+    props === nothing && return nothing
+    haskey(props, prop) || return (; rhs_string="(property $prop not found on $(nameof(T)))",
+                                     signature=string(prop),
+                                     macros="",
+                                     dependson=Symbol[])
+    info = props[prop]
+    rhs_string = info.rhs === nothing ? "(no rhs — forwarded/typed property)" :
+                 string(Base.remove_linenums!(deepcopy(info.rhs)))
+    signature = isempty(info.indices) ? string(info.lhs) :
+                string(info.lhs, "(", join(info.indices, ", "), ")")
+    macros = isempty(info.macros) ? "" : join(string.(info.macros), " ") * " "
+    dependson = isempty(info.dependson) ? Symbol[] : sort!(collect(info.dependson))
+    (; rhs_string, signature, macros, dependson)
+end
+
 export print_structure, structure
+export tree_children_map, lint_index, lookup_type, callers_by_name, property_source_info, LintMessage
 
 end
