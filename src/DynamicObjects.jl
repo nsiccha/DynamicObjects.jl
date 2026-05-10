@@ -1457,7 +1457,7 @@ else
     walked = map(arg -> _walk_with_lnn_tracking!(arg, ref_lnn, locals, properties), e.args)
     Expr(e.head, walked...)
 end
-walk_rhs(e::Symbol; locals, properties, lnn=nothing) = if haskey(properties, e) && !(e in locals)
+walk_rhs(e::Symbol; locals, properties, lnn=nothing) = if (e in properties) && !(e in locals)
     :(__self__.$e)
 else
     e
@@ -1735,6 +1735,12 @@ end
 # arg `i` is constant across callers — drop it and have the IP body read
 # the value directly.
 
+# Membership test for the `meta(T)` introspection vector — replaces the
+# `haskey(cprops, name)` dict lookups that were correct when `meta(T)` was a
+# `Dict`. With the per-declaration vector, duplicates are preserved but a
+# membership check still only cares whether the name appears at all.
+_cprops_has(cprops, name::Symbol) = any(p -> first(p) === name, cprops)
+
 # Collect all `target(args…)` call sites in `expr` matching `_has_call_to`'s
 # rules; return Vector of positional-arg expression lists (one per call).
 function _collect_call_args!(out::Vector{Vector{Any}}, expr, target::Symbol, cprops)
@@ -1743,13 +1749,13 @@ function _collect_call_args!(out::Vector{Vector{Any}}, expr, target::Symbol, cpr
         callee = expr.args[1]
         match = false
         if callee === target
-            match = cprops !== nothing && haskey(cprops, target)
+            match = cprops !== nothing && _cprops_has(cprops, target)
         elseif Meta.isexpr(callee, :., 2) && callee.args[2] isa QuoteNode &&
                callee.args[2].value === target
             root = _dot_chain_root(callee.args[1])
             match = root !== nothing &&
                     (root === :__self__ || root === :__parent__ || root === :__appdata__ ||
-                     (cprops !== nothing && haskey(cprops, root)))
+                     (cprops !== nothing && _cprops_has(cprops, root)))
         end
         if match
             args = Any[]
@@ -1790,13 +1796,13 @@ function _index_calls!(out, expr, cprops, caller_T::Type, caller_prop::Symbol)
         callee = expr.args[1]
         target = nothing
         if callee isa Symbol
-            cprops !== nothing && haskey(cprops, callee) && (target = callee)
+            cprops !== nothing && _cprops_has(cprops, callee) && (target = callee)
         elseif Meta.isexpr(callee, :., 2) && callee.args[2] isa QuoteNode
             potential = callee.args[2].value
             root = _dot_chain_root(callee.args[1])
             if root !== nothing &&
                (root === :__self__ || root === :__parent__ || root === :__appdata__ ||
-                (cprops !== nothing && haskey(cprops, root)))
+                (cprops !== nothing && _cprops_has(cprops, root)))
                 target = potential
             end
         end
@@ -2000,7 +2006,10 @@ function _check_identical_bound_siblings!(msgs, bound_groups, types_in_tree, par
                 olist = join(map(o -> "`$o`", others), ", ")
                 short = "same deps as $olist — fold all $(length(group)) into `@struct shared($argstr) = begin … end`, callers `.shared($argstr).<member>`"
                 long  = "`$T.$member(…)` has the same upstream deps `{$argstr}` as $olist. They share an identity that isn't currently modelled; fold them into one inline child keyed on `($argstr)` and expose the per-member derivations as bare properties of it."
-                info = props[member]
+                # `metafirst` is fine here: this lint groups properties by
+                # bound, and even with future duplicate-name declarations the
+                # lnn we want is the first occurrence's.
+                info = metafirst(T, member)
                 push!(msgs, LintMessage(T, member, :warn, short, long, info.lnn))
             end
         end
@@ -2028,7 +2037,7 @@ function analyze_structure(T::Type)
         props = try meta(U) catch; nothing end
         props === nothing && continue
         oproperties = collect(props)
-        prop_names  = Set(keys(props))
+        prop_names  = Set(first(p) for p in props)
         type_bound  = get(bound_groups, U, Dict{Tuple{Vararg{Symbol}},Vector{Symbol}}())
 
         # Per-property
@@ -2090,6 +2099,27 @@ function compute_property end
 function iscached end
 function resumes end
 function meta end
+
+"""
+    metafirst(T, name::Symbol) -> Union{Nothing, NamedTuple}
+
+Return the first info for `name` in `meta(T)`, or `nothing` if absent. Use when you
+expect at most one entry and don't care about duplicates.
+"""
+metafirst(T::Type, name::Symbol) = let m = meta(T)
+    for (n, info) in m
+        n === name && return info
+    end
+    nothing
+end
+
+"""
+    metaall(T, name::Symbol) -> Vector{NamedTuple}
+
+Return all infos for `name` in `meta(T)` in declaration order. Empty if absent.
+Use when duplicates are expected (e.g. coexisting route + indexed include).
+"""
+metaall(T::Type, name::Symbol) = NamedTuple[info for (n, info) in meta(T) if n === name]
 """    _property_description(o, ::Val{name}, args...; kwargs...)
 
 Return a human-readable description for the property `name` with the given arguments.
@@ -2332,7 +2362,7 @@ _normalize_let_binding(arg) = arg
 # expand to their symbol leaves; anything else can't shadow.
 _shadowed_lhs(_, _, _) = Symbol[]
 _shadowed_lhs(lhs::Symbol, properties, locals) =
-    haskey(properties, lhs) && !(lhs in locals) ? [lhs] : Symbol[]
+    (lhs in properties) && !(lhs in locals) ? [lhs] : Symbol[]
 function _shadowed_lhs(lhs::Expr, properties, locals)
     lhs.head === :tuple || return Symbol[]
     out = Symbol[]
@@ -3027,7 +3057,12 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         @assert !isnothing(rhs) || length(macros) == 0
         push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices, indexed, cache_version, lru_size))
     end
-    properties = Dict(oproperties)
+    # `properties` holds the per-declaration list (preserves order AND duplicate
+    # names — e.g. a future `@get foo()` + `@include foo(x::String)` pair). It's
+    # what `meta(T)` returns; macro-internal lookups that just need "is `x` a
+    # property name?" use the `prop_names` set built from it.
+    properties = collect(oproperties)
+    prop_names = Set{Symbol}(first.(oproperties))
     property_docs = Dict(name => doc for (name, (doc, _)) in docs if !isnothing(doc))
 
     # Struct-level lint passes: repeated-prefix and shared-arg-signature.
@@ -3093,7 +3128,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         end),
         (is_child ? :($type) : :(Base.@__doc__ $type)),
         quote
-            $Base.hasproperty(__self__::$type, name::Symbol) = name in $(Tuple(keys(properties)))
+            $Base.hasproperty(__self__::$type, name::Symbol) = name in $(Tuple(prop_names))
             $Base.getproperty(__self__::$type, name::Symbol) = $getorcomputeproperty(__self__, name)
             $Base.setproperty!(__self__::$type, name::Symbol, value) = getfield(__self__, :cache)[name] = value
             $DynamicObjects.meta(::Type{$type}) = $properties
@@ -3150,7 +3185,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     if Meta.isexpr(idx, :parameters)
                         Expr(:parameters, map(idx.args) do a
                             if Meta.isexpr(a, :kw)
-                                Expr(:kw, a.args[1], walk_rhs(a.args[2]; locals=defaults_locals, properties, lnn=info.lnn))
+                                Expr(:kw, a.args[1], walk_rhs(a.args[2]; locals=defaults_locals, properties=prop_names, lnn=info.lnn))
                             else
                                 a
                             end
@@ -3175,7 +3210,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 else
                     nothing
                 end
-                walked_rhs = walk_rhs(info.rhs; info.locals, properties, lnn=info.lnn)
+                walked_rhs = walk_rhs(info.rhs; info.locals, properties=prop_names, lnn=info.lnn)
                 block = Expr(:block,
                     _lnn, Expr(:(=), _call(:compute_property, cp_kwargs...), Expr(:block, _lnn, walked_rhs)),
                     _lnn, Expr(:(=), _call(:iscached), Expr(:block, _lnn, iscached_val)),
@@ -3219,9 +3254,9 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     # the struct body. These are plain methods on `::type` (so standard
     # multiple dispatch on the remaining args works) — no property entry,
     # no compute_property, not reachable via getproperty. The body is walked
-    # with the full `properties` dict so bare references to registered
-    # property names are rewritten to `__self__.<name>`, matching the
-    # rewrite that runs on property RHSs.
+    # with the `prop_names` set so bare references to registered property
+    # names are rewritten to `__self__.<name>`, matching the rewrite that
+    # runs on property RHSs.
     for m in inline_methods
         sig_args = collect(m.sig_args)
         # Type the bare `__self__` arg to `__self__::<type>`. If the user
@@ -3241,7 +3276,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             Meta.isexpr(wp, :(<:)) && wp.args[1] isa Symbol && push!(method_locals, wp.args[1])
             Meta.isexpr(wp, :comparison) && wp.args[1] isa Symbol && push!(method_locals, wp.args[1])
         end
-        walked_body = walk_rhs(m.body; locals=method_locals, properties, lnn=m.lnn)
+        walked_body = walk_rhs(m.body; locals=method_locals, properties=prop_names, lnn=m.lnn)
         sig = Expr(:call, m.fname, sig_args...)
         if !isempty(m.where_params)
             sig = Expr(:where, sig, m.where_params...)
@@ -3577,7 +3612,10 @@ function _all_types_in_tree(root::Type)
         T = popfirst!(queue)
         props = try meta(T) catch; nothing end
         props === nothing && continue
-        for name in keys(props)
+        seen_names = Set{Symbol}()
+        for (name, _) in props
+            name in seen_names && continue
+            push!(seen_names, name)
             nested = _walk_nested_type(T, name)
             nested === nothing && continue
             nested in seen && continue
@@ -3599,7 +3637,10 @@ function _build_parent_map(root::Type)
         T = popfirst!(queue)
         props = try meta(T) catch; nothing end
         props === nothing && continue
-        for name in keys(props)
+        seen_names = Set{Symbol}()
+        for (name, _) in props
+            name in seen_names && continue
+            push!(seen_names, name)
             nested = _walk_nested_type(T, name)
             nested === nothing && continue
             nested in seen && continue
@@ -3631,9 +3672,13 @@ function _enclosing_scope(T::Type, parents)
         haskey(parents, cur) || break
         parent_T, parent_prop = parents[cur]
         try
-            info = meta(parent_T)[parent_prop]
-            for a in _ip_positional_args(info.indices)
-                push!(names, a)
+            # `metafirst` is fine: scope walk only needs one parent IP's positional
+            # args; if duplicate declarations ever exist they share the IP signature.
+            info = metafirst(parent_T, parent_prop)
+            if info !== nothing
+                for a in _ip_positional_args(info.indices)
+                    push!(names, a)
+                end
             end
         catch
         end
@@ -3659,13 +3704,13 @@ function _has_call_to(expr, target::Symbol, cprops)
     if Meta.isexpr(expr, :call) && length(expr.args) >= 1
         callee = expr.args[1]
         if callee === target
-            cprops !== nothing && haskey(cprops, target) && return true
+            cprops !== nothing && _cprops_has(cprops, target) && return true
         elseif Meta.isexpr(callee, :., 2) && callee.args[2] isa QuoteNode &&
                callee.args[2].value === target
             root = _dot_chain_root(callee.args[1])
             if root !== nothing &&
                (root === :__self__ || root === :__parent__ || root === :__appdata__ ||
-                (cprops !== nothing && haskey(cprops, root)))
+                (cprops !== nothing && _cprops_has(cprops, root)))
                 return true
             end
         end
@@ -3681,7 +3726,7 @@ end
 # bound for any IP called from inside `stage`'s body).
 function _caller_scope(caller_T::Type, caller_prop::Symbol, parents)
     names = _enclosing_scope(caller_T, parents)
-    info = try meta(caller_T)[caller_prop] catch; nothing end
+    info = try metafirst(caller_T, caller_prop) catch; nothing end
     if info !== nothing
         for a in _ip_positional_args(info.indices)
             push!(names, a)
@@ -3852,9 +3897,18 @@ function _build_color_map(root::Type)
         for p in _print_struct_param_names(T); set_root!(p); end
         props = try meta(T) catch; nothing end
         props === nothing && return
-        for name in sort!(collect(keys(props)))
+        # Color fingerprint cares about per-name identity; iterate the unique
+        # names in the order `meta(T)` declared them (sorted for stable color
+        # assignment), then look up the first matching info.
+        seen_names = Set{Symbol}()
+        unique_names = Symbol[]
+        for (n, _) in props
+            n in seen_names && continue
+            push!(seen_names, n); push!(unique_names, n)
+        end
+        for name in sort!(unique_names)
             _print_struct_skip(T, name) && continue
-            info = props[name]
+            info = metafirst(T, name)
             args = _ip_positional_args(info.indices)
             if !isempty(args)
                 wc = _print_struct_worst_case(types_in_tree, parent_map, T, name, info)
@@ -4074,9 +4128,14 @@ function _build_section(T::Type, header;
 
     props = try meta(T) catch; nothing end
     if props !== nothing
-        for name in sort!(collect(keys(props)))
+        # Render every declaration in declaration order — duplicates are kept,
+        # since each yields its own `compute_property` method and deserves its
+        # own line. Sorting by name groups duplicates together; secondary key
+        # is the original index for a stable order within a group.
+        pairs_with_idx = [(i, name, info) for (i, (name, info)) in enumerate(props)]
+        sort!(pairs_with_idx; by=t -> (t[2], t[1]))
+        for (_, name, info) in pairs_with_idx
             _print_struct_skip(T, name) && continue
-            info = props[name]
             info.rhs === nothing && continue
             _print_struct_is_forwarded(info.rhs) && continue
 
@@ -4374,11 +4433,13 @@ terminal output.
 function property_source_info(T::Type, prop::Symbol)
     props = try meta(T) catch; nothing end
     props === nothing && return nothing
-    haskey(props, prop) || return (; rhs_string="(property $prop not found on $(nameof(T)))",
-                                     signature=string(prop),
-                                     macros="",
-                                     dependson=Symbol[])
-    info = props[prop]
+    # `metafirst` matches the previous `props[prop]` semantics: if duplicate
+    # declarations exist, callers of `property_source_info` get the first.
+    info = metafirst(T, prop)
+    info === nothing && return (; rhs_string="(property $prop not found on $(nameof(T)))",
+                                  signature=string(prop),
+                                  macros="",
+                                  dependson=Symbol[])
     rhs_string = info.rhs === nothing ? "(no rhs — forwarded/typed property)" :
                  string(Base.remove_linenums!(deepcopy(info.rhs)))
     signature = isempty(info.indices) ? string(info.lhs) :
@@ -4390,5 +4451,6 @@ end
 
 export print_structure, structure
 export tree_children_map, lint_index, lookup_type, callers_by_name, property_source_info, LintMessage
+export metafirst, metaall
 
 end
