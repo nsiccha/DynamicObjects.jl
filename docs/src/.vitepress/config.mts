@@ -34,12 +34,31 @@ export default defineConfig({
   description: 'REPLACE_ME_DOCUMENTER_VITEPRESS',
   lastUpdated: true,
   cleanUrls: true,
+  // Ignore localhost dead links (gallery cards link to /entries/<id> on the
+  // local DO web app) — vitepress build flags them as dead links otherwise.
+  ignoreDeadLinks: [/^https?:\/\/localhost(:\d+)?(\/|$)/],
   outDir: 'REPLACE_ME_DOCUMENTER_VITEPRESS', // This is required for MarkdownVitepress to work correctly...
   head: [
     ['link', { rel: 'icon', href: 'REPLACE_ME_DOCUMENTER_VITEPRESS_FAVICON' }],
     ['script', {src: `${getBaseRepository(baseTemp.base)}versions.js`}],
     // ['script', {src: '/versions.js'], for custom domains, I guess if deploy_url is available.
-    ['script', {src: `${baseTemp.base}siteinfo.js`}]
+    ['script', {src: `${baseTemp.base}siteinfo.js`}],
+    // HTMX runtime — for inlining live DO gallery fragments via
+    // `<div class="htmxo-embed" data-hx-base="…">` placeholders.
+    ['script', {src: 'https://cdn.jsdelivr.net/npm/htmx.org@2.0.8/dist/htmx.min.js'}],
+    // Map HTMXObjects' --htmxo-* theme variables to VitePress's
+    // brand/state tokens so embedded gallery components match the docs
+    // theme automatically. HTMXO defaults remain as fallback.
+    ['style', {}, `
+:root {
+    --htmxo-accent:  var(--vp-c-brand-1, #4a90d9);
+    --htmxo-success: var(--vp-c-success-1, #2a9d8f);
+    --htmxo-warning: var(--vp-c-warning-1, #e9a23b);
+    --htmxo-error:   var(--vp-c-danger-1, #e76f51);
+    --htmxo-border:  var(--vp-c-divider, currentColor);
+    --htmxo-muted:   var(--vp-c-text-3, color-mix(in srgb, currentColor 60%, transparent));
+}
+    `]
   ],
   
   markdown: {
@@ -64,6 +83,19 @@ export default defineConfig({
       // Bind to all interfaces so the dev server is reachable from
       // other devices on the local network.
       host: true,
+      proxy: {
+        // Live DO gallery embedding (dev only). `<div class="htmxo-embed"
+        // data-hx-base="live-do/…">` forwards to the running DynamicObjectsWeb
+        // app on :8100 so the docs page shows live state. In production,
+        // point the same path at recordings produced by `record!` —
+        // committed under `docs/src/public/live-do/`. Override the target
+        // via `DO_DEV_TARGET=http://host:port` env.
+        '/live-do': {
+          target: process.env.DO_DEV_TARGET || 'http://localhost:8100',
+          changeOrigin: true,
+          rewrite: (path) => path.replace(/^\/live-do/, ''),
+        }
+      }
     },
     resolve: {
       alias: {

@@ -1,0 +1,1 @@
+title: Inline nested structs
