@@ -2716,6 +2716,12 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         prop_name = nothing
         child_struct = nothing
         index_params = Symbol[]
+        # Parallel list to `index_params` preserving the raw positional-arg
+        # expression (`:name` or `:(name::T)`). Used only when emitting the
+        # parent property's method signature so `info.indices` carries the
+        # type annotation for downstream readers (notably HTMXObjects'
+        # `_nested_prefix_and_step`, which feeds URL-segment conversion).
+        index_param_exprs = Any[]
         # (name, default_or_nothing) — `nothing` here means "no user-supplied
         # default" (required kwarg); any explicit default (even a literal
         # `nothing` written by the user) is wrapped in Some(...).
@@ -2751,6 +2757,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                         pname = Meta.isexpr(p, :(::)) ? p.args[1] : p
                         @assert pname isa Symbol "indexed inline struct: index param must be a Symbol, got $p"
                         push!(index_params, pname)
+                        push!(index_param_exprs, p)
                     end
                 end
                 child_struct = rhs_expr
@@ -2866,17 +2873,21 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 Expr(:kw, :__status__, Expr(:call, compute_property, :__self__, :(Val(:__substatus__)), QuoteNode(prop_name), index_params...)))
         end
         constructor = Expr(:call, gen_name, Expr(:parameters, constructor_kwargs...))
+        # Use `index_param_exprs` (typed `:(name::T)` when annotated, bare
+        # `:name` otherwise) for the method signature so downstream readers
+        # of `info.indices` see the URL-segment Julia Type. Internal uses
+        # of `index_params` above stay on bare Symbols.
         lhs_expr = if isempty(index_params) && isempty(index_kwargs)
             prop_name
         elseif isempty(index_kwargs)
-            Expr(:call, prop_name, index_params...)
+            Expr(:call, prop_name, index_param_exprs...)
         else
             # Emit kwargs as an Expr(:parameters, ...) on the parent-property
             # call signature. Required kwargs stay as bare Symbols; defaulted
             # kwargs become Expr(:kw, name, default).
             kw_nodes = Any[kdefault === nothing ? kname : Expr(:kw, kname, something(kdefault))
                            for (kname, kdefault) in index_kwargs]
-            Expr(:call, prop_name, Expr(:parameters, kw_nodes...), index_params...)
+            Expr(:call, prop_name, Expr(:parameters, kw_nodes...), index_param_exprs...)
         end
         constructor_assignment = Expr(:(=), lhs_expr, constructor)
         body.args[i] = isnothing(doc_wrapper) ? constructor_assignment :
