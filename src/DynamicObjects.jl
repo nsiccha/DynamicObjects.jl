@@ -1059,7 +1059,7 @@ cache_f_expr(x; f) = begin
 end
 """
     @cache_status o.prop
-    @cache_status o.prop[indices...]
+    @cache_status o.prop(indices...)
 
 Return the disk-cache status of a `@cached` property as a `Symbol`:
 - `:unstarted` — no cache file exists yet.
@@ -1067,21 +1067,26 @@ Return the disk-cache status of a `@cached` property as a `Symbol`:
 - `:ready`     — a complete cache file exists and can be deserialized.
 
 Can be used both outside and inside a `@dynamicstruct` body. Inside a struct
-definition, omit the object prefix — just use the property name:
+definition, omit the object prefix — just use the property name (with parens
+for indexed properties).
 
 ```julia
 # Outside the struct:
 @cache_status e.result          # :unstarted (before first access)
 e.result
 @cache_status e.result          # :ready
-@cache_status e.ci[2]           # for indexable properties
+@cache_status e.ci(2)           # for indexed properties — call syntax
 
 # Inside the struct body:
 @dynamicstruct struct App
     @cached result(key) = expensive(key)
-    status(key) = @cache_status result[key]   # :unstarted, :started, or :ready
+    status(key) = @cache_status result(key)   # :unstarted, :started, or :ready
 end
 ```
+
+The legacy bracket form (`@cache_status o.prop[indices...]`) still works for
+backward compatibility but is discouraged in new code — prefer call syntax,
+which mirrors the way the property is invoked.
 """
 macro cache_status(x)
     cache_f_expr(x; f=get_cache_status) |> esc
@@ -1089,13 +1094,14 @@ end
 
 """
     @is_cached o.prop
-    @is_cached o.prop[indices...]
+    @is_cached o.prop(indices...)
 
-Return `true` if the disk cache for `o.prop` (or `o.prop[indices...]`) is
+Return `true` if the disk cache for `o.prop` (or `o.prop(indices...)`) is
 `:ready`, i.e. the cached value can be loaded from disk without recomputation.
 
 Can be used both outside and inside a `@dynamicstruct` body. Inside a struct
-definition, omit the object prefix — just use the property name:
+definition, omit the object prefix — just use the property name (with parens
+for indexed properties).
 
 ```julia
 # Outside the struct:
@@ -1104,13 +1110,16 @@ definition, omit the object prefix — just use the property name:
 # Inside the struct body:
 @dynamicstruct struct App
     @cached result(key) = expensive(key)
-    summary(key) = if @is_cached result[key]
-        "cached: \$(result[key])"
+    summary(key) = if @is_cached result(key)
+        "cached: \$(@memo result(key))"
     else
         "not yet computed"
     end
 end
 ```
+
+The legacy bracket form (`@is_cached o.prop[indices...]`) still works for
+backward compatibility but is discouraged in new code.
 """
 macro is_cached(x)
     :($(cache_f_expr(x; f=get_cache_status)) == :ready) |> esc
@@ -1118,15 +1127,17 @@ end
 
 """
     @cache_path o.prop
-    @cache_path o.prop[indices...]
+    @cache_path o.prop(indices...)
 
 Return the file path where the disk-cached value of `o.prop` (or
-`o.prop[indices...]`) is (or would be) stored.
+`o.prop(indices...)`) is (or would be) stored.
 
 ```julia
 @cache_path e.result          # e.g. "cache/<hash>/result.sjl"
-@cache_path e.ci[2]           # "cache/<hash>/2.sjl"
+@cache_path e.ci(2)           # "cache/<hash>/ci_2.sjl"
 ```
+
+The legacy bracket form is still accepted but discouraged.
 """
 macro cache_path(x)
     cache_f_expr(x; f=get_cache_path) |> esc
@@ -1165,12 +1176,15 @@ end
 
 """
     @persist o.prop
-    @persist o.prop[indices...]
+    @persist o.prop(indices...)
 
-Write the in-memory value of `o.prop` (or the indexed entry `o.prop[indices...]`)
+Write the in-memory value of `o.prop` (or the indexed entry `o.prop(indices...)`)
 back to its disk cache. Use after mutating a value in place when the property
 was declared with `@cached` and the on-disk copy is now stale relative to the
 in-memory copy.
+
+The legacy bracket form (`@persist o.prop[indices...]`) still works but is
+discouraged in new code — prefer call syntax.
 """
 macro persist(x)
     x, indices = if Meta.isexpr(x, (:ref, :call))
@@ -1201,21 +1215,29 @@ Rewrite every call inside `expr` as `maybegetindex(callee, args…)`. At
 runtime `maybegetindex` dispatches: `IndexableProperty` callees go through
 `getindex` (cached); everything else just calls normally.
 
+`@memo` is the preferred way to ask for cached access at a call site — the
+marker makes the caching visible to the reader. It is what an indexed-property
+call site should use whenever the result should be memoized.
+
 Inside a `@dynamicstruct`, an indexable property `prop(i) = ...` can be
 invoked two different ways:
 
 - `o.prop(i)` — recompute on every call, no caching.
-- `o.prop[i]` — look up in the in-memory cache, compute (and cache) on miss.
+- `@memo o.prop(i)` — look up in the in-memory cache, compute (and cache) on miss.
 
 ```julia
-@memo o.prop(i)                          # → o.prop[i]
-@memo o.prop(i; k=v)                     # → getindex(o.prop, i; k=v)
+@memo o.prop(i)                          # cached access
+@memo o.prop(i; k=v)                     # kwargs participate in the cache key
 
 # Chained IP calls all get memoized; intermediate non-IP calls (e.g.
 # top-level helpers) just call normally:
 @memo qt.loaded(dataset; data_version).filtered(; src).eda.counts
 @memo sort(x.prop(i))
 ```
+
+Outside a `@dynamicstruct` body, `@memo` is also exposed as a process-wide
+function memoizer (`@memo expensive(x) = …`) — that form is a separate, older
+overload kept for compatibility with simple memoize-a-function use cases.
 """
 macro memo(x)
     esc(_memo_rewrite(x))
@@ -1273,7 +1295,7 @@ clear_cache!(o, name::Symbol, indices...; kwargs...) = begin
 end
 """
     @clear_cache! o.prop
-    @clear_cache! o.prop[indices...]
+    @clear_cache! o.prop(indices...)
 
 Clear the disk cache (and in-memory cache) for a `@cached` property.
 
@@ -1283,8 +1305,10 @@ With indices, clears only the specific entry.
 
 ```julia
 @clear_cache! e.result        # clear all cached entries for `result`
-@clear_cache! e.ci[3]         # clear only the ci[3] entry
+@clear_cache! e.ci(3)         # clear only the (3,) entry
 ```
+
+The legacy bracket form is still accepted but discouraged.
 """
 macro clear_cache!(x)
     cache_f_expr(x; f=clear_cache!) |> esc
@@ -3309,6 +3333,21 @@ function setlnn(lnn::Union{LineNumberNode,Nothing})
     end
 end
 
+# Parse a single positional macro arg into a (kwarg-name => value) pair.
+# `name=value` Expr → `(name => value)`. String/`:string` → `(:docstring => …)`.
+# QuoteNode (`:parallel` / `:serial`) → `(:cache_type => sym)`. Anything else
+# is rejected with a pointer to the recognised forms.
+_parse_macro_opt(a::AbstractString) = (:docstring => a)
+_parse_macro_opt(a::QuoteNode) = (:cache_type => a.value)
+_parse_macro_opt(a::Expr) = if a.head === :string
+    (:docstring => a)
+elseif a.head === :(=) && a.args[1] isa Symbol
+    (a.args[1] => a.args[2])
+else
+    error("@dynamicstruct: unsupported option `$a` — use a docstring, `:parallel`/`:serial`, or `name=value`.")
+end
+_parse_macro_opt(a) = error("@dynamicstruct: unsupported option `$a` — use a docstring, `:parallel`/`:serial`, or `name=value`.")
+
 """
     @dynamicstruct [docstring] [cache_type] struct Name
         field                     # fixed field (constructor argument)
@@ -3371,18 +3410,17 @@ e2.result  # loaded from disk (same n → same hash → same cache path)
 ```
 
 ```julia
-# Indexed properties with bracket and call syntax.
+# Indexed properties. `obj.prop(args)` is fresh; `@memo obj.prop(args)` is cached.
 # Properties reference each other by bare name (auto-rewritten to __self__.<name>).
 @dynamicstruct struct DataSet
     items = ["apple", "banana", "cherry"]
-    matches(query) = filter(x -> occursin(query, x), items)   # call: fresh each time
-    search(query) = filter(x -> occursin(query, x), items)   # call: fresh each time
-    top(query; n=1) = first(search(query), n)                # call with kwargs
+    matches(query)   = filter(x -> occursin(query, x), items)   # call: fresh each time
+    top(query; n=1)  = first(matches(query), n)                 # call with kwargs
 end
 
 ds = DataSet()
-ds.matches["an"]        # ["banana"] — cached per query
-ds.search("an")         # ["banana"] — fresh each call
+ds.matches("an")        # ["banana"] — fresh each call
+@memo ds.matches("an")  # ["banana"] — cached in the per-property dict
 ds.top("a"; n=2)        # ["apple", "banana"] — kwargs supported
 ```
 
@@ -3396,7 +3434,7 @@ nodes when Treebars is loaded (via the TreebarsExt extension):
 ```julia
 @dynamicstruct struct MyApp
     __status__ = initialize_progress!(:state; description="MyApp")
-    results[key] = expensive_computation(__status__)  # __status__ is the substatus
+    results(key) = expensive_computation(__status__)  # __status__ is the substatus
 end
 app = MyApp(; cache_type=:parallel)
 
@@ -3414,21 +3452,6 @@ passed to the computation body as the local `__status__`.
 `__substatus__` only fires on ThreadsafeDict `getindex` (bracket access).
 Call syntax and scalar property access do not trigger it.
 """
-# Parse a single positional macro arg into a (kwarg-name => value) pair.
-# `name=value` Expr → `(name => value)`. String/`:string` → `(:docstring => …)`.
-# QuoteNode (`:parallel` / `:serial`) → `(:cache_type => sym)`. Anything else
-# is rejected with a pointer to the recognised forms.
-_parse_macro_opt(a::AbstractString) = (:docstring => a)
-_parse_macro_opt(a::QuoteNode) = (:cache_type => a.value)
-_parse_macro_opt(a::Expr) = if a.head === :string
-    (:docstring => a)
-elseif a.head === :(=) && a.args[1] isa Symbol
-    (a.args[1] => a.args[2])
-else
-    error("@dynamicstruct: unsupported option `$a` — use a docstring, `:parallel`/`:serial`, or `name=value`.")
-end
-_parse_macro_opt(a) = error("@dynamicstruct: unsupported option `$a` — use a docstring, `:parallel`/`:serial`, or `name=value`.")
-
 macro dynamicstruct(args...)
     isempty(args) && error("@dynamicstruct: missing struct definition.")
     expr = last(args)
