@@ -225,6 +225,7 @@ resolve_cache_type(T::Type) = T.name.wrapper
 resolve_cache_type(T::UnionAll) = T
 
 Base.length(c::AbstractThreadsafeDict) = lock(c.lock) do; length(c.cache); end
+Base.haskey(c::AbstractThreadsafeDict, key) = lock(c.lock) do; haskey(c.cache, key); end
 # NOTE: iteration is NOT truly thread-safe — each iterate call locks independently,
 # so the dict can mutate between calls. For thread-safe iteration, use
 # lock(c.lock) do ... end or entries(ip) which holds the lock for the full sweep.
