@@ -1569,35 +1569,49 @@ elseif e.head in (:kw, :(=))
         Expr(e.head, walked_lhs, walk_rhs.(e.args[2:end]; locals, properties, lnn, deps)...)
     end
 elseif e.head == :macrocall && _resolve_macro_name(e.args[1]) === Symbol("@progress")
-    # In-body `@progress "label" expr` / `@progress "label" begin … end` —
-    # body-local escape hatch for ad-hoc phase markers. Lowers to
-    # `with_prepared_progress(prepare_progress!(__status__; description=label)) do __progress__
-    #     <walked expr>
-    # end`, binding the new pending node to `__progress__` for nested use.
-    # Works inside any property body (member, displayed-or-not, marked-or-not).
-    # Macro args: [name, LineNumberNode, user_args...]. Recognise `@progress
-    # "label" expr` (length-2 user args). Bare `@progress expr` is an error —
-    # labels are mandatory inside bodies (the bare form is the property-level
-    # marker recognised by the body classifier, not by `walk_rhs`).
+    # In-body `@progress …` — pass through to `Treebars.@progress` (which
+    # wraps the whole property body at emission time; see §3.5 of do-dev).
+    # All six Tb in-body forms are accepted verbatim:
+    #
+    #   @progress "label"               — phase marker (must sit at the
+    #                                     top level of an enclosing begin
+    #                                     block inside the outer wrap)
+    #   @progress "label" expr          — single-stmt wrap
+    #   @progress "label" begin … end   — labeled sub-block
+    #   @progress "label" for … end     — labeled child for-loop
+    #   @progress begin … end           — transparent sub-block
+    #   @progress for … end             — bare for-loop, auto-labeled
+    #
+    # We do NOT expand the macrocall here — Tb's `@progress` at the
+    # property-body outer wrap will see this node and lower it correctly
+    # (phase-splitting, iterable progress, etc.). We DO walk the user-
+    # supplied body expression(s) for `__self__` rewriting so sibling-
+    # property references inside `@progress`-wrapped statements still
+    # resolve.
     user_args = e.args[3:end]
-    if length(user_args) != 2 || !(user_args[1] isa AbstractString || Meta.isexpr(user_args[1], :string))
+    walked_args = if length(user_args) == 1 && (user_args[1] isa AbstractString || Meta.isexpr(user_args[1], :string))
+        # `@progress "label"` phase marker — leave the label alone (it
+        # gets spliced into a `description=` kwarg by Tb verbatim).
+        user_args
+    elseif length(user_args) == 1
+        # `@progress body` — walk the body.
+        [walk_rhs(user_args[1]; locals, properties, lnn, deps)]
+    elseif length(user_args) == 2
+        # `@progress "label" body` — walk only the body. Label is a
+        # source-level literal that Tb wants verbatim. (If it's an
+        # interpolated string `"step $i"`, the interpolation refers to
+        # a local — Tb's emitter passes it through as an `Expr(:string,
+        # …)` unchanged. We still walk it for `__self__`-rewrite so a
+        # sibling-property reference like `"$some_prop"` resolves.)
+        label, body_expr = user_args
+        walked_label = walk_rhs(label; locals, properties, lnn, deps)
+        walked_body = walk_rhs(body_expr; locals, properties, lnn, deps)
+        [walked_label, walked_body]
+    else
         loc = isnothing(lnn) ? "" : " (near $(lnn.file):$(lnn.line))"
-        error("@progress in a property body must be `@progress \"label\" expr` (or `@progress \"label\" begin … end`)$loc. Bare `@progress expr` is not supported inside a body; the no-label form is only valid as a property-level marker at @dynamicstruct top level.")
+        error("@progress in a property body takes 1 or 2 args (label, body, or both)$loc; got $(length(user_args)).")
     end
-    label = user_args[1]
-    body_expr = user_args[2]
-    # `__progress__` is a fresh local inside the do-block — exclude it from
-    # any outer-scope rewrite so the body can reference it directly.
-    body_locals = union(locals, Set{Symbol}([:__progress__]))
-    walked_body = walk_rhs(body_expr; locals=body_locals, properties, lnn, deps)
-    walked_label = walk_rhs(label; locals, properties, lnn, deps)
-    Expr(:call, GlobalRef(Treebars, :with_prepared_progress),
-        Expr(:->, :__progress__, Expr(:block,
-            something(lnn, LineNumberNode(0, :unknown)),
-            walked_body)),
-        Expr(:call, GlobalRef(Treebars, :prepare_progress!),
-            :__status__,
-            Expr(:parameters, Expr(:kw, :description, walked_label))))
+    Expr(:macrocall, e.args[1], e.args[2], walked_args...)
 elseif e.head == :local
     # `local x`, `local x, y, z`, or `local x = expr` — add names to the local
     # scope so subsequent assignments don't hit the property cache.
@@ -2432,6 +2446,18 @@ end
 # Julia's docstring lowering or a direct user write.
 _resolve_macro_name(m::GlobalRef) = m.name
 _resolve_macro_name(m) = m
+
+# True iff `e` (or any sub-expression) is an `@progress` macrocall.
+# Used at property-body emission to decide whether to wrap the body in
+# `Treebars.@progress __status__ <body>` so the in-body `@progress` forms
+# (phase markers, for-loop wraps, sub-blocks, single-stmt wraps) get
+# lowered by Treebars at the property's outer scope.
+_contains_progress_macrocall(::Any) = false
+function _contains_progress_macrocall(e::Expr)
+    e.head === :macrocall && length(e.args) >= 1 &&
+        _resolve_macro_name(e.args[1]) === Symbol("@progress") && return true
+    any(_contains_progress_macrocall, e.args)
+end
 
 # Property names introduced by an `arg`'s LHS — bare symbols, typed
 # fields, and tuple destructures. Inline structs and other shapes
@@ -3446,6 +3472,20 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     nothing
                 end
                 walked_rhs = walk_rhs(info.rhs; info.locals, properties=prop_names, lnn=info.lnn)
+                # Wrap the body in `Treebars.@progress __status__ <body>` when
+                # either (a) the property carries the `@progress` top-level
+                # marker, or (b) the body uses any of the Tb in-body `@progress`
+                # forms (phase markers, for-loop wraps, sub-blocks, single-stmt
+                # wraps). Tb's `@progress` macro handles all six forms; we leave
+                # the inner macrocalls alone (walk_rhs only rewrote `__self__`
+                # references) and let Tb expand them at the outer scope.
+                if Symbol("@progress") in info.macros || _contains_progress_macrocall(info.rhs)
+                    walked_rhs = Expr(:macrocall,
+                        GlobalRef(Treebars, Symbol("@progress")),
+                        something(info.lnn, LineNumberNode(0, :unknown)),
+                        :__status__,
+                        walked_rhs)
+                end
                 # Emit `_dependencies(::Type{T}, ::Val{:name}, walked_indices...) = Set{Symbol}((…))`.
                 # The Set literal is built explicitly as an Expr so the macro
                 # output is a self-contained constructor call rather than a
