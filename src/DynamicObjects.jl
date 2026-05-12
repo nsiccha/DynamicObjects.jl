@@ -97,10 +97,14 @@ _default_substatus(status, o, name, args...; kwargs...) = nothing
 # `transient` is consumed here (default true → substatus auto-detaches on finalize);
 # it does not reach the property body. Pass transient=false to keep finished substatuses
 # pinned to the parent tree (e.g. for historical "N finished" pill display).
-_default_substatus(status::Treebars.ProgressNode, o, name, args...; transient=true, kwargs...) =
+# `displayed` is a render-only flag (consumed by Treebars' transparent-passthrough
+# mode, commit 926ca36): docstring-bearing properties render normally, while
+# undocumented properties materialise as transparent nodes whose children hoist
+# up at render time. Drawn from `info.displayed` at the force-time call site.
+_default_substatus(status::Treebars.ProgressNode, o, name, args...; transient=true, displayed=true, kwargs...) =
     Treebars.initialize_progress!(status;
         description=something(_property_description(o, Val(name), args...; kwargs...), string(name)),
-        transient)
+        transient, displayed)
 
 # Substatus lifecycle hooks — Treebars overrides forward to
 # `Treebars.finalize_progress!` / `Treebars.fail_progress!`. Default is no-op
@@ -245,7 +249,13 @@ Base.getindex(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indice
     substatus_f = if name != :__substatus__ && name != :__status__
         () -> begin
             root = o.__status__
-            compute_property(o, Val(:__substatus__), name, indices...; __status__=root, kwargs...)
+            # `displayed` from `meta(typeof(o))`: docstring-bearing properties
+            # render normally; undocumented ones materialise as transparent
+            # passthrough nodes (Treebars 926ca36). Default `true` when meta is
+            # missing (foreign type, or property not in meta).
+            _info = metafirst(typeof(o), name)
+            _displayed = _info === nothing ? true : get(_info, :displayed, true)
+            compute_property(o, Val(:__substatus__), name, indices...; __status__=root, displayed=_displayed, kwargs...)
         end
     else
         nothing
@@ -935,17 +945,25 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
     vname = Val(name)
     isnothing(__status__) && name != :__status__ && (__status__ = getorcomputeproperty(o, :__status__))
     _status_kw = is_generated_property(o, name) ? (; __status__) : (;)
-    # Auto-progress instrumentation. A property is "announced" iff
-    # `_property_description(o, Val(name), indices…)` returns non-nothing
-    # (docstring-bearing, set via `@dynamicstruct`'s `_property_description`
-    # emission). For announced properties we (a) pre-enumerate level-1
-    # announced dependencies — those statically discovered by `walk_rhs`
-    # and emitted as `_dependencies(typeof(o), Val(name))` — as pending
-    # children of `__status__`, and (b) bracket the body in
-    # start_progress!/finalize_progress!/fail_progress!. The level-1
-    # pre-enumeration is a best-effort preview: bodies with top-level
-    # conditionals may force different deps at runtime, in which case
-    # unforced pending children simply remain in their pending state.
+    # Auto-progress instrumentation — three orthogonal axes (see do-dev §3.5,
+    # ~/Claude/drafts/autoprogress/feature_design.md §0):
+    #
+    # 1. **Membership**: every generated-property force unconditionally drives
+    #    the lifecycle bracket (start/finalize/fail) on `__status__`. The node
+    #    itself was materialised by the substatus closure in
+    #    `getorcomputeproperty` / `IP.getindex` with its `displayed` flag set
+    #    from `meta(typeof(o))`.
+    # 2. **Rendering**: gated by docstring presence — `info.displayed=true`
+    #    when a property carries a `"""docstring"""`, else `false`. The
+    #    rendering gate is enforced by Treebars (926ca36) via the `displayed`
+    #    flag plumbed through the substatus closures; this function does not
+    #    re-read it.
+    # 3. **Pre-enumeration**: gated by the `@progress` property-level marker.
+    #    When `Symbol("@progress") in info.macros`, before the body runs we
+    #    drive `_dependencies(typeof(o), Val(name))` (statically discovered by
+    #    `walk_rhs`) to register pending placeholder children of `__status__`.
+    #    Pending children whose deps the body never forces remain pending;
+    #    Treebars' transient cleanup on `finalize_progress!` handles them.
     #
     # `start_progress!` is idempotent (no-op when the node has already
     # started — which it has, since the threadsafe spawn wrapper creates
@@ -957,12 +975,14 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
     # lifecycle hook on `__status__`. `__status__ === nothing` and other
     # non-`ProgressNode` carriers degrade to no-ops via the Treebars
     # interface fallbacks at `interface.jl`.
-    _announced = _property_description(o, vname, indices...; kwargs...) !== nothing
-    if _announced && __status__ isa Treebars.ProgressNode
-        for dep in _dependencies(typeof(o), vname)
-            dep_desc = _property_description(o, Val(dep))
-            dep_desc === nothing && continue
-            Treebars.prepare_progress!(__status__; description=dep_desc, transient=true)
+    if __status__ isa Treebars.ProgressNode
+        _info = metafirst(typeof(o), name)
+        if _info !== nothing && Symbol("@progress") in get(_info, :macros, Set{Symbol}())
+            for dep in _dependencies(typeof(o), vname)
+                dep_desc = _property_description(o, Val(dep))
+                dep_desc === nothing && continue
+                Treebars.prepare_progress!(__status__; description=dep_desc, transient=true)
+            end
         end
         Treebars.start_progress!(__status__)
     end
@@ -1039,18 +1059,19 @@ If multiple objects with the same hash are writing here concurrently, this may i
             compute_property(o, vname, indices...; _status_kw..., kwargs...)
         end
         # Auto-progress: mark the property's status node finished on
-        # success. Idempotent with the threadsafe spawn wrapper's later
-        # `_finalize_substatus!`; the sole-finaliser for non-threadsafe
-        # paths. No-op when `_announced` is false or `__status__` isn't a
-        # `Treebars.ProgressNode`.
-        _announced && __status__ isa Treebars.ProgressNode &&
+        # success. Always-on (membership axis): every force runs the
+        # lifecycle bracket. Idempotent with the threadsafe spawn
+        # wrapper's later `_finalize_substatus!`; sole-finaliser for
+        # non-threadsafe paths. No-op when `__status__` isn't a
+        # `Treebars.ProgressNode` (Treebars `::Nothing` overloads).
+        __status__ isa Treebars.ProgressNode &&
             Treebars.finalize_progress!(__status__)
         rv
     catch e
         # Auto-progress: surface the failure on the property's status node
         # before wrapping into `PropertyComputationError`. Idempotent with
         # the spawn wrapper's `_fail_substatus!`.
-        _announced && __status__ isa Treebars.ProgressNode &&
+        __status__ isa Treebars.ProgressNode &&
             Treebars.fail_progress!(__status__, e)
         kw_tuple = isempty(kwargs) ? () : Tuple(pairs(kwargs))
         bt = catch_backtrace()
@@ -1078,7 +1099,12 @@ else
                      is_generated_property(o, name) && !is_indexed_property(o, name)
         () -> begin
             root = o.__status__
-            compute_property(o, Val(:__substatus__), name; __status__=root)
+            # `displayed` from `meta(typeof(o))`: docstring-bearing properties
+            # render normally; undocumented ones materialise as transparent
+            # passthrough nodes (Treebars 926ca36).
+            _info = metafirst(typeof(o), name)
+            _displayed = _info === nothing ? true : get(_info, :displayed, true)
+            compute_property(o, Val(:__substatus__), name; __status__=root, displayed=_displayed)
         end
     else
         nothing
@@ -1540,6 +1566,36 @@ elseif e.head in (:kw, :(=))
         walked_lhs = Meta.isexpr(lhs, (:ref, :.)) ? walk_rhs(lhs; locals, properties, lnn, deps) : lhs
         Expr(e.head, walked_lhs, walk_rhs.(e.args[2:end]; locals, properties, lnn, deps)...)
     end
+elseif e.head == :macrocall && _resolve_macro_name(e.args[1]) === Symbol("@progress")
+    # In-body `@progress "label" expr` / `@progress "label" begin … end` —
+    # body-local escape hatch for ad-hoc phase markers. Lowers to
+    # `with_prepared_progress(prepare_progress!(__status__; description=label)) do __progress__
+    #     <walked expr>
+    # end`, binding the new pending node to `__progress__` for nested use.
+    # Works inside any property body (member, displayed-or-not, marked-or-not).
+    # Macro args: [name, LineNumberNode, user_args...]. Recognise `@progress
+    # "label" expr` (length-2 user args). Bare `@progress expr` is an error —
+    # labels are mandatory inside bodies (the bare form is the property-level
+    # marker recognised by the body classifier, not by `walk_rhs`).
+    user_args = e.args[3:end]
+    if length(user_args) != 2 || !(user_args[1] isa AbstractString || Meta.isexpr(user_args[1], :string))
+        loc = isnothing(lnn) ? "" : " (near $(lnn.file):$(lnn.line))"
+        error("@progress in a property body must be `@progress \"label\" expr` (or `@progress \"label\" begin … end`)$loc. Bare `@progress expr` is not supported inside a body; the no-label form is only valid as a property-level marker at @dynamicstruct top level.")
+    end
+    label = user_args[1]
+    body_expr = user_args[2]
+    # `__progress__` is a fresh local inside the do-block — exclude it from
+    # any outer-scope rewrite so the body can reference it directly.
+    body_locals = union(locals, Set{Symbol}([:__progress__]))
+    walked_body = walk_rhs(body_expr; locals=body_locals, properties, lnn, deps)
+    walked_label = walk_rhs(label; locals, properties, lnn, deps)
+    Expr(:call, GlobalRef(Treebars, :with_prepared_progress),
+        Expr(:->, :__progress__, Expr(:block,
+            something(lnn, LineNumberNode(0, :unknown)),
+            walked_body)),
+        Expr(:call, GlobalRef(Treebars, :prepare_progress!),
+            :__status__,
+            Expr(:parameters, Expr(:kw, :description, walked_label))))
 elseif e.head == :local
     # `local x`, `local x, y, z`, or `local x = expr` — add names to the local
     # scope so subsequent assignments don't hit the property cache.
@@ -2516,12 +2572,12 @@ function _emit_positional_element!(oproperties, docs, a::Expr, i, source_sym, ln
     inner_leaves = _collect_leaves(a)
     inner_name = Symbol("_tuple_", join(inner_leaves, "_"))
     inner_locals = Set{Symbol}(inner_leaves); push!(inner_locals, inner_name)
-    push!(oproperties, inner_name => (;lhs=inner_name, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=inner_locals, indices=tuple(), indexed=false, cache_version=nothing, lru_size=nothing))
+    push!(oproperties, inner_name => (;lhs=inner_name, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=inner_locals, indices=tuple(), indexed=false, cache_version=nothing, lru_size=nothing, displayed=false))
     push!(docs, (inner_name => (nothing, true)))
     _emit_positional_destructure!(oproperties, docs, a.args, inner_name, lnn)
 end
 function _push_positional_leaf!(oproperties, docs, leaf::Symbol, i, source_sym, lnn)
-    push!(oproperties, leaf => (;lhs=leaf, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([leaf]), indices=tuple(), indexed=false, cache_version=nothing, lru_size=nothing))
+    push!(oproperties, leaf => (;lhs=leaf, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([leaf]), indices=tuple(), indexed=false, cache_version=nothing, lru_size=nothing, displayed=false))
     push!(docs, (leaf => (nothing, true)))
 end
 # One element of a named-destructure LHS: either a bare Symbol leaf or a
@@ -3091,7 +3147,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 all_leaves = _collect_leaves(arg)
                 group_name = Symbol("_tuple_", join(all_leaves, "_"))
                 group_locals = Set{Symbol}(all_leaves); push!(group_locals, group_name)
-                push!(oproperties, group_name => (;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, cache_version, lru_size=nothing))
+                push!(oproperties, group_name => (;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, cache_version, lru_size=nothing, displayed=!isnothing(doc)))
                 push!(docs, (group_name => (doc, true)))
                 _emit_positional_destructure!(oproperties, docs, raw_args, group_name, lnn)
                 metadata.doc[] = nothing
@@ -3125,14 +3181,14 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 group_name = Symbol("_tuple_", join(prop_names, "_"))
                 group_locals = Set{Symbol}(prop_names)
                 push!(group_locals, group_name)
-                push!(oproperties, group_name=>(;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, cache_version, lru_size=nothing))
+                push!(oproperties, group_name=>(;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, cache_version, lru_size=nothing, displayed=!isnothing(doc)))
                 push!(docs, (group_name=>(doc, true)))
                 group_name
             end
             metadata.doc[] = nothing
             for (prop_name, source) in members
                 extract_rhs = _extract_member(extract_from, source)
-                push!(oproperties, prop_name=>(;lhs=prop_name, macros=Set{Symbol}(), rhs=extract_rhs, lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([prop_name]), indices=tuple(), indexed=false, cache_version=nothing, lru_size=nothing))
+                push!(oproperties, prop_name=>(;lhs=prop_name, macros=Set{Symbol}(), rhs=extract_rhs, lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([prop_name]), indices=tuple(), indexed=false, cache_version=nothing, lru_size=nothing, displayed=false))
                 push!(docs, (prop_name=>(nothing, true)))
             end
             continue
@@ -3191,7 +3247,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         !isnothing(locals) && push!(locals, name)
         !isnothing(locals) && push!(locals, :__status__)
         @assert !isnothing(rhs) || length(macros) == 0
-        push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices, indexed, cache_version, lru_size))
+        push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices, indexed, cache_version, lru_size, displayed=!isnothing(doc)))
     end
     # `properties` holds the per-declaration list (preserves order AND duplicate
     # names — e.g. a future `@get foo()` + `@include foo(x::String)` pair). It's
