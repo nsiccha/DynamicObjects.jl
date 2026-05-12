@@ -10,6 +10,9 @@ optionally disk-cached properties.
 - [`@is_cached`](@ref): Check whether a property's disk cache is ready.
 - [`@cache_path`](@ref): Get the file path used for a property's disk cache.
 - [`@lru`](@ref): Bound an indexed property's in-memory cache via LRU eviction.
+- [`@memo!`](@ref): Wrap a call site so `IndexableProperty` callees are cached.
+- [`memoize!`](@ref): Explicit cached call into an `IndexableProperty`.
+- [`maybememoize!`](@ref): Dispatch helper behind `@memo!`; cached on IPs, plain call otherwise.
 - [`remake`](@ref): Create a new instance of a `@dynamicstruct` type with some fields changed.
 - [`fetchindex`](@ref): Non-blocking access to `ThreadsafeDict`-backed properties with `(rv, status)` callback.
 - [`getstatus`](@ref): Read the status object for an in-flight computation.
@@ -33,7 +36,7 @@ optionally disk-cached properties.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo, @lru, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, ThreadsafeLRUDict, LRUDict
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, memoize!, maybememoize!, @lru, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, ThreadsafeLRUDict, LRUDict
 
 import SHA, Serialization
 
@@ -121,9 +124,26 @@ name(::IndexableProperty{N}) where {N} = N
 Base.show(io::IO, ip::IndexableProperty{N}) where {N} = print(io, "IndexableProperty :", N, " (", ip.cache, ")")
 ((;o)::IndexableProperty{name})(indices...; kwargs...) where {name} =
     _computeproperty(o, name, indices...; kwargs...)
-Base.getindex(ip::IndexableProperty, indices...; fetch=Base.fetch, kwargs...) =
-    get!(ip.cache, (indices, (;kwargs...))) do
-        ip(indices...; kwargs...)
+"""
+    memoize!(ip::IndexableProperty, args...; kwargs...)
+
+Cached call into an `IndexableProperty`'s per-key dict. Returns the cached
+value if `(args, kwargs)` was seen before; otherwise calls `ip(args...; kwargs...)`,
+stores the result, and returns it. This is the explicit, exported function
+form of cached IP access — use it whenever you'd previously have written
+`ip[args...]`, *especially* in kwargs-only call sites (`memoize!(ip; k=v)`)
+which the legacy bracket syntax couldn't express at all (`ip[; k=v]` doesn't
+parse as Julia).
+
+For two-phase access (returning a `Task` while computing) on
+`ThreadsafeDict`-backed IPs, see [`fetchindex`](@ref). Inside a
+`@dynamicstruct` body, the convenience macro [`@memo!`](@ref) wraps every
+call-site in `maybememoize!(callee, args...; kwargs...)` so cached IPs and
+plain functions can share the same syntax.
+"""
+memoize!(ip::IndexableProperty, args...; fetch=Base.fetch, kwargs...) =
+    get!(ip.cache, (args, (;kwargs...))) do
+        ip(args...; kwargs...)
     end
 """
     AbstractThreadsafeDict{K,V}
@@ -205,7 +225,7 @@ end
 Base.show(io::IO, c::ThreadsafeLRUDict{K,V}) where {K,V} = lock(c.lock) do
     print(io, "ThreadsafeLRUDict{", K, ",", V, "}(", length(c.cache), "/", c.maxsize, " cached, ", length(c.tasks), " running)")
 end
-Base.getindex(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...; fetch=Base.fetch, retry_failed=true, kwargs...) where {name} = begin
+memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...; fetch=Base.fetch, retry_failed=true, kwargs...) where {name} = begin
     (;o, cache) = ip
     substatus_f = if name != :__substatus__ && name != :__status__
         () -> begin
@@ -447,15 +467,15 @@ cancel_all!(::IndexableProperty) = nothing
 """
     fetchindex(fetch, ip, indices...; kwargs...)
 
-Call `getindex(ip, indices...; kwargs...)` with a custom `fetch` function.
+Call `memoize!(ip, indices...; kwargs...)` with a custom `fetch` function.
 
-For `IndexableProperty` backed by a `ThreadsafeDict`, `getindex` spawns a `Task`
+For `IndexableProperty` backed by a `ThreadsafeDict`, `memoize!` spawns a `Task`
 for the computation. The `fetch` callback receives `(rv, status)` where `rv` is
 the `Task` (still running) or the computed result (done), and `status` is the
 substatus object (from `__substatus__`) or `nothing`.
 
 Pass `force=true` to unconditionally recompute: clears both the in-memory cache
-entry and the on-disk cache file so `getindex` always spawns a fresh Task.
+entry and the on-disk cache file so `memoize!` always spawns a fresh Task.
 
 # Example
 ```julia
@@ -477,21 +497,21 @@ function fetchindex(fetch, ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsaf
         path = get_cache_path(ip.o, name(ip), indices...; kwargs...)
         isfile(path) && rm(path)
     end
-    rv = getindex(ip, indices...; fetch=identity, retry_failed, kwargs...)
+    rv = memoize!(ip, indices...; fetch=identity, retry_failed, kwargs...)
     status = getstatus(ip, indices...; kwargs...)
     fetch(rv, status)
 end
 # Fallback for non-ThreadsafeDict IPs (1-arg callback, no status)
-fetchindex(fetch, args...; kwargs...) = getindex(args...; fetch, kwargs...)
+fetchindex(fetch, ip::IndexableProperty, indices...; kwargs...) = memoize!(ip, indices...; fetch, kwargs...)
 
 """
     fetchindex!(callback, ip, indices...; fetch=Base.fetch, kwargs...)
 
 In-place variant of [`fetchindex`](@ref). When `callback` is `nothing`, falls
-through to a plain `getindex(ip, indices...; fetch, kwargs...)` — useful for
+through to a plain `memoize!(ip, indices...; fetch, kwargs...)` — useful for
 sites that opt out of the two-phase fetch dance without changing call shape.
 """
-fetchindex!(::Nothing, ip, indices...; fetch=Base.fetch, kwargs...) = getindex(ip, indices...; fetch, kwargs...)
+fetchindex!(::Nothing, ip, indices...; fetch=Base.fetch, kwargs...) = memoize!(ip, indices...; fetch, kwargs...)
 maybepop!(c::AbstractDict, key) = haskey(c, key) && pop!(c, key)
 maybepop!(c::AbstractThreadsafeDict, key) = begin
     lock(c.lock) do
@@ -987,7 +1007,7 @@ else
     # substatus closure so the spawn wrapper attaches a Treebars node to
     # the parent's __status__ for the duration of the compute. Skip
     # dunder names (`__status__`, `__appdata__`, …) and IPs (which get
-    # their own substatus via `Base.getindex(::IndexableProperty, …)`).
+    # their own substatus via `memoize!(::IndexableProperty, …)`).
     substatus_f = if isempty(indices) && isempty(kwargs) &&
                      name != :__substatus__ && name != :__status__ &&
                      !(startswith(string(name), "__") && endswith(string(name), "__")) &&
@@ -1111,7 +1131,7 @@ for indexed properties).
 @dynamicstruct struct App
     @cached result(key) = expensive(key)
     summary(key) = if @is_cached result(key)
-        "cached: \$(@memo result(key))"
+        "cached: \$(@memo! result(key))"
     else
         "not yet computed"
     end
@@ -1198,60 +1218,63 @@ macro persist(x)
 end
 
 """
-    maybegetindex(f, args...; kwargs...)
+    maybememoize!(f, args...; kwargs...)
 
-Dispatch helper used by `@memo`. The default just calls `f(args...; kwargs...)`,
+Dispatch helper used by `@memo!`. The default just calls `f(args...; kwargs...)`,
 so non-IP callees (functions, types, callable structs) behave like normal
-calls. The specialization for `IndexableProperty` routes through `getindex`,
-hitting the in-memory cache.
+calls. The specialization for `IndexableProperty` routes through
+[`memoize!`](@ref), hitting the in-memory cache.
 """
-maybegetindex(f, args...; kwargs...) = f(args...; kwargs...)
-maybegetindex(p::IndexableProperty, args...; kwargs...) = getindex(p, args...; kwargs...)
+maybememoize!(f, args...; kwargs...) = f(args...; kwargs...)
+maybememoize!(p::IndexableProperty, args...; kwargs...) = memoize!(p, args...; kwargs...)
 
 """
-    @memo expr
+    @memo! expr
 
-Rewrite every call inside `expr` as `maybegetindex(callee, args…)`. At
-runtime `maybegetindex` dispatches: `IndexableProperty` callees go through
-`getindex` (cached); everything else just calls normally.
+Rewrite every call inside `expr` as `maybememoize!(callee, args…)`. At
+runtime `maybememoize!` dispatches: `IndexableProperty` callees go through
+[`memoize!`](@ref) (cached); everything else just calls normally.
 
-`@memo` is the preferred way to ask for cached access at a call site — the
-marker makes the caching visible to the reader. It is what an indexed-property
-call site should use whenever the result should be memoized.
+`@memo!` is the preferred in-body way to ask for cached access at a call
+site — the marker makes the caching visible to the reader. It is what an
+indexed-property call site should use whenever the result should be memoized.
+For one-shot cached calls outside a `@dynamicstruct` body, call `memoize!`
+directly.
 
 Inside a `@dynamicstruct`, an indexable property `prop(i) = ...` can be
 invoked two different ways:
 
 - `o.prop(i)` — recompute on every call, no caching.
-- `@memo o.prop(i)` — look up in the in-memory cache, compute (and cache) on miss.
+- `@memo! o.prop(i)` — look up in the in-memory cache, compute (and cache) on miss.
 
 ```julia
-@memo o.prop(i)                          # cached access
-@memo o.prop(i; k=v)                     # kwargs participate in the cache key
+@memo! o.prop(i)                          # cached access
+@memo! o.prop(i; k=v)                     # kwargs participate in the cache key
 
 # Chained IP calls all get memoized; intermediate non-IP calls (e.g.
 # top-level helpers) just call normally:
-@memo qt.loaded(dataset; data_version).filtered(; src).eda.counts
-@memo sort(x.prop(i))
+@memo! qt.loaded(dataset; data_version).filtered(; src).eda.counts
+@memo! sort(x.prop(i))
 ```
 
-Outside a `@dynamicstruct` body, `@memo` is also exposed as a process-wide
-function memoizer (`@memo expensive(x) = …`) — that form is a separate, older
-overload kept for compatibility with simple memoize-a-function use cases.
+The bang on `@memo!` / `memoize!` / `maybememoize!` reflects that each
+mutates the per-key in-memory cache. There is no bracket access on
+`IndexableProperty` — `ip[args...]` and `ip[; kw...]` are unsupported
+(the latter never parsed in the first place); use the function forms.
 """
-macro memo(x)
+macro memo!(x)
     esc(_memo_rewrite(x))
 end
 
-# Recursively rewrite every call site to `maybegetindex(...)`. Plain property
+# Recursively rewrite every call site to `maybememoize!(...)`. Plain property
 # accesses (`.foo`, `.bar.baz`) are left untouched — only `:call` heads are
-# transformed. `maybegetindex`'s dispatch decides at runtime whether to
+# transformed. `maybememoize!`'s dispatch decides at runtime whether to
 # memoize (IP) or just call (everything else).
 _memo_rewrite(x) = x
 function _memo_rewrite(x::Expr)
     if Meta.isexpr(x, :call) && length(x.args) >= 1
         rewritten = Any[_memo_rewrite(a) for a in x.args]
-        return fixcall(Expr(:call, GlobalRef(@__MODULE__, :maybegetindex), rewritten...))
+        return fixcall(Expr(:call, GlobalRef(@__MODULE__, :maybememoize!), rewritten...))
     end
     Expr(x.head, Any[_memo_rewrite(a) for a in x.args]...)
 end
@@ -1542,6 +1565,54 @@ _is_forwarded(::Any) = false
 const _AUTO_DUNDERS = Set([:__parent__, :__prefix__, :__req__, :__route__])
 
 # --- Per-property checks ---------------------------------------------------
+
+# Collect every `(callee_name::Symbol, ref_expr)` pair in `e` where `ref_expr`
+# is `:ref` head (i.e. `a[b...]`) and the callee resolves to a sibling
+# property reference. After `walk_rhs`, in-body sibling references appear as
+# either `__self__.<name>` (the common rewrite) or the bare `<name>` (when
+# inside a non-shadowed scope; rare since walk_rhs rewrites those too).
+# Returns the list of (callee_name, original_ref_callee_expr) hits.
+_bracket_ip_callee(::Any) = nothing
+function _bracket_ip_callee(e::Symbol)
+    # bare sibling name in a `[...]`; resolved by caller against prop_names
+    e
+end
+function _bracket_ip_callee(e::Expr)
+    if e.head === :. && length(e.args) == 2 &&
+            e.args[1] === :__self__ && e.args[2] isa QuoteNode &&
+            e.args[2].value isa Symbol
+        return e.args[2].value::Symbol
+    end
+    nothing
+end
+
+_scan_bracket_ip!(_, _, _) = nothing
+function _scan_bracket_ip!(hits::Vector{Symbol}, e::Expr, prop_names)
+    if Meta.isexpr(e, :ref) && length(e.args) >= 1
+        callee = _bracket_ip_callee(e.args[1])
+        callee isa Symbol && callee in prop_names && push!(hits, callee)
+    end
+    for a in e.args
+        _scan_bracket_ip!(hits, a, prop_names)
+    end
+end
+
+function _check_bracket_ip_access!(msgs, type, name::Symbol, info, prop_names, indexed_names)
+    info.rhs === nothing && return
+    info.rhs isa Expr || return
+    hits = Symbol[]
+    _scan_bracket_ip!(hits, info.rhs, prop_names)
+    isempty(hits) && return
+    seen = Set{Symbol}()
+    for callee in hits
+        callee in indexed_names || continue
+        callee in seen && continue
+        push!(seen, callee)
+        short = "`o.$callee[...]`: use `@memo! o.$callee(...)` or `memoize!(o.$callee, ...)` — bracket access on IndexableProperty is no longer supported"
+        long  = "Property `$type.$name` reads `$callee[...]` (bracket access on an `IndexableProperty`). The `ip[args...]` overload has been removed: `ip[; kwargs...]` was never valid Julia syntax (the parser rejects `[; …]`), and Niko hit the gap often enough that the bracket form is gone entirely. Use one of the function forms uniformly: inside a `@dynamicstruct` body, wrap the call site in `@memo! o.$callee(args; kwargs...)`; outside (or when you want the explicit name), call `memoize!(o.$callee, args; kwargs...)` directly. Both go through the same per-key cache the bracket form used."
+        push!(msgs, LintMessage(type, name, :warn, short, long, info.lnn))
+    end
+end
 
 function _check_cryptic_arg_names!(msgs, type, name::Symbol, info)
     isempty(info.indices) && return
@@ -2062,6 +2133,7 @@ function analyze_structure(T::Type)
         props === nothing && continue
         oproperties = collect(props)
         prop_names  = Set(first(p) for p in props)
+        indexed_names = Set{Symbol}(n for (n, info) in oproperties if info.indexed)
         type_bound  = get(bound_groups, U, Dict{Tuple{Vararg{Symbol}},Vector{Symbol}}())
 
         # Per-property
@@ -2072,6 +2144,7 @@ function analyze_structure(T::Type)
             _check_trivial_cached_wrapper!(msgs, U, n, info)
             _check_hierarchical_placement!(msgs, types_in_tree, parent_map, U, n, info, wc_cache)
             _check_redundant_args!(msgs, call_index, parent_map, U, n, info)
+            _check_bracket_ip_access!(msgs, U, n, info, prop_names, indexed_names)
         end
 
         # Struct-level (skip forwarded entries from singleton/prefix views)
@@ -2673,6 +2746,17 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         prop_sym = Meta.isexpr(lhs, :call) ? lhs.args[1] : lhs
         prop_sym isa Symbol ||
             error("@struct: LHS must be `prop` or `prop(idx...)`, got $(lhs)")
+        # `@struct prop(args) = body` parses with body wrapped in `:block`,
+        # so the `:block` check above passes for the short-form misuse
+        # `@struct prop(args) = ExternalCtor(args)` (where the block holds a
+        # single bare call). `@struct` always requires an explicit
+        # `begin … end` declaring the child's properties — without this
+        # check, the downstream args-parsing loop crashes on the bare call
+        # with `union!(::Nothing, ::Set{Any})`.
+        rhs_stmts = [a for a in rhs.args if !(a isa LineNumberNode)]
+        if length(rhs_stmts) == 1 && !Meta.isexpr(rhs_stmts[1], (:(=), :macrocall, :struct, :tuple))
+            error("@struct $prop_sym: body must be an explicit `begin ... end` declaring the child's properties. Got a single bare expression `$(rhs_stmts[1])` — likely a short-form misuse like `@struct $lhs = ExternalCtor(...)`. Rewrite as `@struct $lhs = begin ... end` with the child's properties inline.")
+        end
         gen_child_name = Symbol(prop_sym, "_inline")
         rewritten = Expr(:(=), lhs, Expr(:struct, false, gen_child_name, rhs))
         body.args[i] = isnothing(doc_wrapper) ? rewritten :
@@ -3419,7 +3503,7 @@ e2.result  # loaded from disk (same n → same hash → same cache path)
 ```
 
 ```julia
-# Indexed properties. `obj.prop(args)` is fresh; `@memo obj.prop(args)` is cached.
+# Indexed properties. `obj.prop(args)` is fresh; `@memo! obj.prop(args)` is cached.
 # Properties reference each other by bare name (auto-rewritten to __self__.<name>).
 @dynamicstruct struct DataSet
     items = ["apple", "banana", "cherry"]
@@ -3429,7 +3513,7 @@ end
 
 ds = DataSet()
 ds.matches("an")        # ["banana"] — fresh each call
-@memo ds.matches("an")  # ["banana"] — cached in the per-property dict
+@memo! ds.matches("an")  # ["banana"] — cached in the per-property dict
 ds.top("a"; n=2)        # ["apple", "banana"] — kwargs supported
 ```
 
