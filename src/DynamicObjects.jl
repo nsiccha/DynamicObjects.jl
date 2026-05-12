@@ -36,6 +36,7 @@ module DynamicObjects
 export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo, @lru, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, ThreadsafeLRUDict, LRUDict
 
 import SHA, Serialization
+using Treebars
 
 struct DiskCacheLocks
     lock::ReentrantLock
@@ -70,24 +71,34 @@ compute_property(o, ::Val{:__cache_type__}) = typeof(getfield(o, :cache).cache)
 compute_property(o, ::Val{:__substatus__}, name, args...; kwargs...) =
     _default_substatus(o.__status__, o, name, args...; kwargs...)
 _default_substatus(status, o, name, args...; kwargs...) = nothing
+# `transient` is consumed here (default true → substatus auto-detaches on finalize);
+# it does not reach the property body. Pass transient=false to keep finished substatuses
+# pinned to the parent tree (e.g. for historical "N finished" pill display).
+_default_substatus(status::Treebars.ProgressNode, o, name, args...; transient=true, kwargs...) =
+    Treebars.initialize_progress!(status;
+        description=_property_description(o, Val(name), args...; kwargs...),
+        transient)
 
-# Substatus lifecycle hooks — overridden by TreebarsExt to forward to
+# Substatus lifecycle hooks — Treebars overrides forward to
 # `Treebars.finalize_progress!` / `Treebars.fail_progress!`. Default is no-op
-# so DO stays independent of Treebars. Called from ThreadsafeDict's spawn
-# wrapper around `f(s)` to give the substatus the `with_progress` init/run/
-# finalize symmetry it otherwise lacks.
+# so callers that don't pass a Treebars node stay independent of Treebars.
+# Called from ThreadsafeDict's spawn wrapper around `f(s)` to give the
+# substatus the `with_progress` init/run/finalize symmetry it otherwise lacks.
 _finalize_substatus!(s) = nothing
 _finalize_substatus!(::Nothing) = nothing
+_finalize_substatus!(s::Treebars.ProgressNode) = Treebars.finalize_progress!(s)
 _fail_substatus!(s, e) = nothing
 _fail_substatus!(::Nothing, e) = nothing
+_fail_substatus!(s::Treebars.ProgressNode, e) = Treebars.fail_progress!(s, e)
 
-# Disk-load reporting hook — TreebarsExt overrides to set the substatus
-# message to "from disk: <size>". Default no-op. Called from
-# `_computeproperty` just before `Serialization.deserialize` when the cache
-# is `:ready` so the user sees something flash up for big-file loads
-# instead of a silent stall.
+# Disk-load reporting hook — Treebars override sets the substatus message
+# to "from disk: <size>". Default no-op. Called from `_computeproperty` just
+# before `Serialization.deserialize` when the cache is `:ready` so the user
+# sees something flash up for big-file loads instead of a silent stall.
 _report_disk_load!(s, cache_path, size_bytes) = nothing
 _report_disk_load!(::Nothing, _, _) = nothing
+_report_disk_load!(s::Treebars.ProgressNode, cache_path, size_bytes) =
+    Treebars.update_progress!(s, "from disk: " * _format_size(size_bytes))
 
 # Format a byte count as "1.2 MB" / "850 KB" / "42 B" for human-readable
 # progress messages.
@@ -492,6 +503,11 @@ through to a plain `getindex(ip, indices...; fetch, kwargs...)` — useful for
 sites that opt out of the two-phase fetch dance without changing call shape.
 """
 fetchindex!(::Nothing, ip, indices...; fetch=Base.fetch, kwargs...) = getindex(ip, indices...; fetch, kwargs...)
+fetchindex!(status::Treebars.ProgressNode, ip, indices...; fetch=Base.fetch, kwargs...) =
+    fetchindex(ip, indices...; kwargs...) do rv, s
+        Treebars.add_child!(status, s)
+        fetch(rv)
+    end
 maybepop!(c::AbstractDict, key) = haskey(c, key) && pop!(c, key)
 maybepop!(c::AbstractThreadsafeDict, key) = begin
     lock(c.lock) do
