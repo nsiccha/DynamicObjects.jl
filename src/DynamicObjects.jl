@@ -3368,7 +3368,16 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                         Meta.isexpr(idx, :parameters) && any(a -> Meta.isexpr(a, :...), idx.args)
                     end
                     desc_extras = has_user_kw_splat ? () : (:(kwargs...),)
-                    _lnn, Expr(:(=), _call(:_property_description, desc_extras...), Expr(:block, _lnn, pdoc))
+                    # Walk the docstring expression so interpolated bare names
+                    # resolve through the same scope rules as the property's
+                    # body: sibling-property references (`$method`,
+                    # `$top_chains`, …) get rewritten to `__self__.<name>`,
+                    # while the property's own indices and kwargs stay as
+                    # plain locals (they're in the emitted method signature).
+                    # String literals with no interpolation are passed through
+                    # unchanged by `walk_rhs`.
+                    walked_doc = walk_rhs(pdoc; info.locals, properties=prop_names, lnn=info.lnn)
+                    _lnn, Expr(:(=), _call(:_property_description, desc_extras...), Expr(:block, _lnn, walked_doc))
                 else
                     nothing
                 end
