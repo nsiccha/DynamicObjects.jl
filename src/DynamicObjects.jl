@@ -934,8 +934,39 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
     vname = Val(name)
     isnothing(__status__) && name != :__status__ && (__status__ = getorcomputeproperty(o, :__status__))
     _status_kw = is_generated_property(o, name) ? (; __status__) : (;)
+    # Phase 6 auto-progress instrumentation. A property is "announced" iff
+    # `_property_description(o, Val(name), indices…)` returns non-nothing
+    # (docstring-bearing, set via `@dynamicstruct`'s `_property_description`
+    # emission). For announced properties we (a) pre-enumerate level-1
+    # announced dependencies as pending children of `__status__` (giving
+    # the user a preview of the per-property phases that WILL run), and
+    # (b) bracket the body in start_progress!/finalize_progress!/fail_progress!.
+    # The pre-enumeration is statically driven by the macro-time
+    # `_dependencies(typeof(o), Val(name))` set — Piece 1's linear-top-level
+    # check guarantees that set faithfully reflects the body's level-1
+    # dep-force sequence.
+    #
+    # `start_progress!` is idempotent (no-op when the node has already
+    # started — which it has, since the threadsafe spawn wrapper creates
+    # `__status__` via `_default_substatus`'s eager `initialize_progress!`).
+    # `finalize_progress!`/`fail_progress!` likewise overlap harmlessly
+    # with `_finalize_substatus!`/`_fail_substatus!` in the spawn wrapper
+    # (idempotent on `StateProgress`). For the non-threadsafe / fresh-IP
+    # call path there's no spawn wrapper, so these calls are the only
+    # lifecycle hook on `__status__`. `__status__ === nothing` and other
+    # non-`ProgressNode` carriers degrade to no-ops via the Treebars
+    # interface fallbacks at `interface.jl`.
+    _announced = _property_description(o, vname, indices...; kwargs...) !== nothing
+    if _announced && __status__ isa Treebars.ProgressNode
+        for dep in _dependencies(typeof(o), vname)
+            dep_desc = _property_description(o, Val(dep))
+            dep_desc === nothing && continue
+            Treebars.prepare_progress!(__status__; description=dep_desc, transient=true)
+        end
+        Treebars.start_progress!(__status__)
+    end
     try
-        if iscached(o, vname, indices...; kwargs...)
+        rv = if iscached(o, vname, indices...; kwargs...)
             cache_path = get_cache_path(o, name, indices...; kwargs...)
             mkpath(dirname(cache_path))
             __strict__ = getorcomputeproperty(o, :__strict__)
@@ -1006,7 +1037,20 @@ If multiple objects with the same hash are writing here concurrently, this may i
         else
             compute_property(o, vname, indices...; _status_kw..., kwargs...)
         end
+        # Auto-progress: mark the property's status node finished on
+        # success. Idempotent with the threadsafe spawn wrapper's later
+        # `_finalize_substatus!`; the sole-finaliser for non-threadsafe
+        # paths. No-op when `_announced` is false or `__status__` isn't a
+        # `Treebars.ProgressNode`.
+        _announced && __status__ isa Treebars.ProgressNode &&
+            Treebars.finalize_progress!(__status__)
+        rv
     catch e
+        # Auto-progress: surface the failure on the property's status node
+        # before wrapping into `PropertyComputationError`. Idempotent with
+        # the spawn wrapper's `_fail_substatus!`.
+        _announced && __status__ isa Treebars.ProgressNode &&
+            Treebars.fail_progress!(__status__, e)
         kw_tuple = isempty(kwargs) ? () : Tuple(pairs(kwargs))
         bt = catch_backtrace()
         throw(PropertyComputationError(
@@ -2373,10 +2417,13 @@ end
 _apply_property_macro!(state::_PropertyMacroState, ::Val{name}, arg) where {name} =
     (push!(state.macros, name); arg.args[end])
 
-# `@doc "str" <def>` — silently consume (don't push to macros) and capture
-# the docstring. `length(arg.args) >= 4` matches Julia's lowered shape
-# (`(:macrocall, :@doc, LNN, "str", <def>)`); shorter forms fall back to
-# the default behavior.
+# `@doc "str" <def>` — silently consume and capture the docstring; the
+# outer body-loop (~L3012) sets the `Symbol("@doc")` marker on `info.macros`
+# once `state.doc` is non-nothing, covering this path AND the bare-string
+# body-element path (`"docstring"\nname = …`) uniformly. `length(arg.args) >= 4`
+# matches Julia's lowered shape (`(:macrocall, :@doc, LNN, "str", <def>)`);
+# shorter forms fall back to the default behavior (treat as a generic
+# property macro).
 function _apply_property_macro!(state::_PropertyMacroState, ::Val{Symbol("@doc")}, arg)
     if length(arg.args) >= 4
         docexpr = arg.args[end-1]
@@ -3009,6 +3056,13 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         doc = macro_state.doc
         cache_version = macro_state.cache_version
         lru_size = macro_state.lru_size
+        # "Announced" marker: any property carrying a docstring (whether via
+        # `@doc` macrocall, a bare-string body element absorbed into
+        # `metadata.doc[]`, or a `Core.@doc "str" @struct …` wrapper) gets
+        # `Symbol("@doc")` pushed into its macros set. Phase 6 reads this
+        # to decide which properties get the linear-top-level body check
+        # and runtime auto-progress instrumentation.
+        isnothing(doc) || push!(macros, Symbol("@doc"))
         # Inline-method form: `f(__self__, ...) = body` (with optional `where`
         # clauses and qualified `Module.f` names). Bypasses property tooling —
         # no compute_property, no getproperty entry — but the body still gets
@@ -3177,6 +3231,54 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             walk_rhs(info.rhs; info.locals, properties=prop_names, lnn=info.lnn, deps)
         end
         oproperties[i] = name => merge(info, (; dependencies=deps))
+    end
+    # Phase 6: linear-top-level body constraint for ANNOUNCED properties.
+    # A property is "announced" iff it carries a docstring (i.e.
+    # `Symbol("@doc") in info.macros`, set ~L3012). Phase 6's auto-progress
+    # instrumentation pre-enumerates level-1 announced dependencies from the
+    # statically-discovered `info.dependencies` set; that enumeration is
+    # only meaningful when the body's top-level structure is a linear
+    # sequence of statements. Conditionals / loops / `let` / `try` at the
+    # TOP level break the static enumeration invariant — the body could
+    # take different dep-force paths at runtime — so we reject them at
+    # macro-expand time with an informative error pointing at the offending
+    # head. Interior conditionals (inside a helper expression, a lambda, or
+    # a non-top-level block) are fine.
+    for (name, info) in oproperties
+        Symbol("@doc") in info.macros || continue
+        isfixed(info) && continue
+        info.rhs isa Expr && info.rhs.head === :block || continue
+        for stmt in info.rhs.args
+            stmt isa LineNumberNode && continue
+            stmt isa Expr || continue
+            bad_head = if stmt.head === :if
+                "if"
+            elseif stmt.head === :elseif
+                "elseif"
+            elseif stmt.head === :for
+                "for"
+            elseif stmt.head === :while
+                "while"
+            elseif stmt.head === :try
+                "try"
+            elseif stmt.head === :let
+                "let"
+            elseif stmt.head === :block
+                "block"
+            else
+                nothing
+            end
+            isnothing(bad_head) && continue
+            loc = isnothing(info.lnn) ? "" : " (near $(info.lnn.file):$(info.lnn.line))"
+            throw(ArgumentError("""
+            announced property $(type).$(name) has a top-level `$(bad_head)`$loc —
+            docstring-bearing (announced) properties must be linear at the top level
+            so their dependencies are statically enumerable. Allowed top-level forms:
+            `local x` / `local x = expr` declarations, assignments to locals, sibling
+            forces / arbitrary expression statements, and a final return expression.
+            Lift the conditional into a helper property or a non-announced sibling.
+            """))
+        end
     end
     properties = collect(oproperties)
     property_docs = Dict(name => doc for (name, (doc, _)) in docs if !isnothing(doc))
