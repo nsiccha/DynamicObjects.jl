@@ -381,7 +381,7 @@ Cancel all running tasks on an `IndexableProperty`.
 """
 cancel_all!(ip::IndexableProperty) = begin
     lock(ip.cache.lock) do
-        for (key, task) in ip.cache.tasks
+        for (_, task) in ip.cache.tasks
             istaskdone(task) || Base.schedule(task, InterruptException(); error=true)
         end
         empty!(ip.cache.tasks)
@@ -863,10 +863,10 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
     # `__status__` via `_default_substatus`'s eager `initialize_progress!`).
     # `finalize_progress!`/`fail_progress!` likewise overlap harmlessly
     # with `_finalize_substatus!`/`_fail_substatus!` in the spawn wrapper
-    # (idempotent on `StateProgress`). For the non-threadsafe / fresh-IP
-    # call path there's no spawn wrapper, so these calls are the only
-    # lifecycle hook on `__status__`. `__status__ === nothing` and other
-    # non-`ProgressNode` carriers degrade to no-ops via the Treebars
+    # (idempotent on `StateProgress`). For the fresh-IP call path
+    # (`ip(args…)` without `memoize!`) there's no spawn wrapper, so these
+    # calls are the only lifecycle hook on `__status__`. `__status__ === nothing`
+    # and other non-`ProgressNode` carriers degrade to no-ops via the Treebars
     # interface fallbacks at `interface.jl`.
     if __status__ isa Treebars.ProgressNode
         _info = metafirst(typeof(o), name)
@@ -953,9 +953,9 @@ If multiple objects with the same hash are writing here concurrently, this may i
         end
         # Auto-progress: mark the property's status node finished on
         # success. Always-on (membership axis): every force runs the
-        # lifecycle bracket. Idempotent with the threadsafe spawn
-        # wrapper's later `_finalize_substatus!`; sole-finaliser for
-        # non-threadsafe paths. No-op when `__status__` isn't a
+        # lifecycle bracket. Idempotent with the spawn wrapper's later
+        # `_finalize_substatus!`; sole finaliser on the fresh-IP path
+        # (no spawn wrapper). No-op when `__status__` isn't a
         # `Treebars.ProgressNode` (Treebars `::Nothing` overloads).
         __status__ isa Treebars.ProgressNode &&
             Treebars.finalize_progress!(__status__)
@@ -3584,17 +3584,15 @@ ds.top("a"; n=2)        # ["apple", "banana"] — kwargs supported
 
 # Async progress with `__status__`
 
-With `cache_type=:parallel`, indexed properties spawn background `Task`s.
-Define `__status__` (root progress node) to automatically wire progress into
-spawned tasks. A default `__substatus__` is provided that creates child progress
-nodes when Treebars is loaded (via the TreebarsExt extension):
+Indexed properties spawn background `Task`s. Every instance has a persistent
+`__status__` (a `Treebars.ProgressNode`) materialised lazily on first read; a
+default `__substatus__` creates child progress nodes for each spawned task:
 
 ```julia
 @dynamicstruct struct MyApp
-    __status__ = initialize_progress!(:state; description="MyApp")
     results(key) = expensive_computation(__status__)  # __status__ is the substatus
 end
-app = MyApp(; cache_type=:parallel)
+app = MyApp()
 
 # Non-blocking access with progress:
 fetchindex(app.results, key) do rv, status
