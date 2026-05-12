@@ -1571,40 +1571,6 @@ else
     e
 end
 
-# Post-walk_rhs rewrite for ANNOUNCED property bodies only: rewrite
-# `__self__.<sibling>(args...; kwargs...)` call forms to `__self__.<sibling>[args...; kwargs...]`
-# bracket-access forms. The call form (`ip(args...)`) bypasses the cache and
-# `_computeproperty` — and therefore the Phase 6 auto-progress instrumentation
-# — every time a sibling property is forced from inside an announced body.
-# The bracket form goes through `Base.getindex(::IndexableProperty, ...)` →
-# cached path → `_computeproperty` → instrumentation fires. We only apply
-# this inside announced bodies (those that opted into the
-# pre-enumerated-deps / linear-body / auto-progress contract by carrying a
-# docstring); non-announced bodies retain fresh-call semantics.
-#
-# Kwargs preservation: `Expr(:call, callee, Expr(:parameters, kws...), args...)`
-# rewrites to `Expr(:ref, callee, Expr(:parameters, kws...), args...)`, which
-# parses as `callee[args...; kws...]` and lines up with the existing
-# `Base.getindex(ip, indices...; fetch, kwargs...)` signature.
-function _auto_memo_siblings(expr, properties)
-    expr isa Expr || return expr
-    if expr.head === :call &&
-       length(expr.args) >= 1 &&
-       expr.args[1] isa Expr &&
-       expr.args[1].head === :. &&
-       length(expr.args[1].args) == 2 &&
-       expr.args[1].args[1] === :__self__ &&
-       expr.args[1].args[2] isa QuoteNode &&
-       expr.args[1].args[2].value isa Symbol &&
-       expr.args[1].args[2].value in properties
-        # `__self__.name(args...; kws...)` → `__self__.name[args...; kws...]`.
-        # Recurse into the args (callee itself is a `:.` access, no further work).
-        return Expr(:ref, expr.args[1],
-            (_auto_memo_siblings(a, properties) for a in expr.args[2:end])...)
-    end
-    return Expr(expr.head, (_auto_memo_siblings(a, properties) for a in expr.args)...)
-end
-
 # --- Linter ----------------------------------------------------------------
 #
 # Lints are computed by `analyze_structure(T)` — a tree-walk over `meta(T)`
@@ -3463,16 +3429,6 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     nothing
                 end
                 walked_rhs = walk_rhs(info.rhs; info.locals, properties=prop_names, lnn=info.lnn)
-                # Auto-memo sibling forces inside announced bodies: rewrite
-                # `__self__.sibling(args...)` (a fresh, uncached call) into
-                # `__self__.sibling[args...]` (cached bracket access) so the
-                # Phase 6 auto-progress instrumentation in `_computeproperty`
-                # fires for the level-1 deps pre-enumerated above. Only
-                # announced bodies get this rewrite — non-announced bodies
-                # keep fresh-call semantics by default.
-                if Symbol("@doc") in info.macros
-                    walked_rhs = _auto_memo_siblings(walked_rhs, prop_names)
-                end
                 # Emit `_dependencies(::Type{T}, ::Val{:name}) = Set{Symbol}((…))`.
                 # The Set literal is built explicitly as an Expr so the macro
                 # output is a self-contained constructor call rather than a
