@@ -32,14 +32,14 @@ cache. Bare names like `x` and `y` on the RHS are auto-rewritten to
 - **Lazy properties.** Order-independent; any RHS may reference any other
   field or property by bare name.
 - **Indexed properties.** `prop(args...) = expr` declares a property that
-  takes arguments. `obj.prop(args...)` recomputes; `@memo obj.prop(args...)`
-  caches per `(args, kwargs)` tuple.
-- **Disk caching.** `@cached prop = …` persists results under a
-  hash-derived path. `@memo f(x) = …` does the same for free functions.
-- **Thread-safe async.** With `cache_type=:parallel` (the default), indexed
-  property access spawns a `Task`, deduplicates concurrent requests for the
-  same key, and integrates with [`fetchindex`](#async-access) for
-  non-blocking UI polling.
+  takes arguments. `obj.prop(args...)` recomputes (always — no caching);
+  `@memo! obj.prop(args...)` caches per `(args, kwargs)` tuple.
+- **Disk caching.** `@diskcached prop = …` persists results under a
+  hash-derived path.
+- **Thread-safe async.** With `cache_type=:parallel` (the default), cached
+  indexed-property access (via `@memo!` / [`memoize!`](@ref)) spawns a
+  `Task`, deduplicates concurrent requests for the same key, and integrates
+  with [`fetchindex`](#async-access) for non-blocking UI polling.
 
 ## Three orthogonal axes (read before writing DO code)
 
@@ -52,18 +52,18 @@ bugs and confused explanations:
    - `prop(args...; kwargs...) = expr` (LHS has a call) → **this is an IP**,
      with *or without* arguments, with *or without* kwargs.
      `prop() = …` is an IP. `prop(i) = …` is an IP. `prop(; k=1) = …` is an IP.
-2. **`cache_type`** decides what dict backs the IP's per-key memo.
-   `:parallel` → `ThreadsafeDict` that spawns a `Task` per key, dedupes
-   concurrent requests, and is the thing that makes polling via
-   [`fetchindex`](#async-access) possible. `:serial` → plain `Dict`.
-3. **`@cached`** adds **disk serialisation** on top. It is purely an I/O
+2. **`cache_type`** decides what dict backs the IP's per-key memo. The only
+   supported value is `:parallel` (the default), which uses `ThreadsafeDict`
+   — it spawns a `Task` per key, dedupes concurrent requests, and is the
+   thing that makes polling via [`fetchindex`](#async-access) possible.
+3. **`@diskcached`** adds **disk serialisation** on top. It is purely an I/O
    concern — it doesn't decide IP-ness, it doesn't create polling, it
-   doesn't spawn tasks. Any IP is pollable regardless of `@cached`; any
-   non-IP scalar property can be `@cached` without becoming pollable.
+   doesn't spawn tasks. Any IP is pollable regardless of `@diskcached`; any
+   non-IP scalar property can be `@diskcached` without becoming pollable.
 
 If you want a property to be pollable / cancellable / background-runnable,
-declare it with call syntax — that is what makes it an IP. `@cached` is
-orthogonal. You almost never need `@cached` just to "make something async".
+declare it with call syntax — that is what makes it an IP. `@diskcached` is
+orthogonal. You almost never need `@diskcached` just to "make something async".
 
 ## Defining properties
 
@@ -112,36 +112,46 @@ Use call syntax `prop(args...; kwargs...) = expr`:
 end
 
 a = App()
-a.filter(iseven)                  # [2, 4] — fresh each call, no caching
-@memo a.filter(iseven)            # [2, 4] — cached in the per-property dict
-a.render(1; tag="span")           # "<span>1</span>" — fresh
-@memo a.render(1; tag="b")        # "<b>1</b>"       — cached, kwargs included
+a.filter(iseven)                   # [2, 4] — fresh each call, no caching
+@memo! a.filter(iseven)            # [2, 4] — cached in the per-property dict
+a.render(1; tag="span")            # "<span>1</span>" — fresh
+@memo! a.render(1; tag="b")        # "<b>1</b>"       — cached, kwargs included
 ```
 
 Two access forms:
 
-| Access                    | Behavior                                                          |
-|---------------------------|-------------------------------------------------------------------|
-| `obj.prop(args...)`       | Recompute every call. No caching.                                 |
-| `@memo obj.prop(args...)` | Look up `(args, kwargs)` in the per-property dict (cached access). |
+| Access                     | Behavior                                                           |
+|----------------------------|--------------------------------------------------------------------|
+| `obj.prop(args...)`        | Recompute every call. **No caching, ever.**                        |
+| `@memo! obj.prop(args...)` | Look up `(args, kwargs)` in the per-property dict (cached access). |
 
-`@memo obj.prop(args...)` is the preferred way to get cached access at a
-call site — the `@memo` marker makes the caching visible to a reader. The
-underlying bracket form `obj.prop[args...]` still works (and is what
-`@memo` expands to), but prefer `@memo` in new code: the cache is doing
-something that a bare `[...]` doesn't make obvious.
+The IP wrapper's call operator `(ip::IndexableProperty)(args...; kwargs...)`
+goes straight to the body — there is **no implicit cache** on this path,
+not even at the same `(args, kwargs)` you just called with. Caching is
+strictly opt-in via [`@memo!`](@ref) / [`memoize!`](@ref). The bang in the
+names is intentional: each form mutates the per-key in-memory cache. The
+legacy bracket form `obj.prop[args...]` has been removed; use the function
+forms.
 
 !!! note "`obj.prop` (no call) returns the wrapper"
     Bare `obj.prop` on an indexed property does **not** invoke the body. It
     returns an `IndexableProperty` wrapper that you can pass around (to
     `fetchindex`, `cancel!`, `entries`, etc.). To actually compute, append
-    `(args...)` (fresh call) or `@memo` it (cached call):
+    `(args...)` (fresh call) or `@memo!` it (cached call):
     ```julia
-    a.filter            # IndexableProperty :filter (Dict(...))
-    a.filter(iseven)    # [2, 4]              — fresh
-    @memo a.filter(iseven)  # [2, 4]          — cached
+    a.filter            # IndexableProperty :filter (ThreadsafeDict(...))
+    a.filter(iseven)    # [2, 4]              — fresh, no caching
+    @memo! a.filter(iseven)  # [2, 4]         — cached
     fetchindex(a.filter, (iseven,)) do rv, status; … end  # non-blocking
     ```
+
+!!! warning "Chained calls — `@memo!` rewrites every call in the chain"
+    `@memo! qt.loaded().filtered(; src).fit(formula).sampled()` makes
+    every IP call cached. Without the `@memo!`, each call recomputes — and
+    in cascades of inline `@struct` children, that means every level rebuilds
+    a fresh child instance, with fresh caches one level deeper. The fix is
+    almost always "wrap the chain in `@memo!`", not "add caching to the
+    fresh-call path".
 
 Multiple methods participate in normal Julia dispatch:
 
@@ -150,20 +160,17 @@ greet(name::String) = "Hello, $(name)!"
 greet(n::Int)       = "Hello, person #$(n)!"
 ```
 
-!!! warning "Brackets and kwargs don't mix, in either direction"
-    - **Declaration:** always `prop(i; kw=default) = …`, never
-      `prop[i] = …` — the bracket form can't take kwargs and is
-      deprecated.
-    - **Access:** always `obj.prop(i; kw=v)` or `@memo obj.prop(i; kw=v)`,
-      never `obj.prop[i; kw=v]` — that's invalid Julia (`;` inside `[]`
-      means concatenation).
+!!! warning "Declaration form: always call syntax"
+    **Declaration:** always `prop(i; kw=default) = …`, never `prop[i] = …`
+    — the bracket declaration form is gone. **Access:** always
+    `obj.prop(i; kw=v)` (fresh) or `@memo! obj.prop(i; kw=v)` (cached).
 
 #### Zero-arg call vs plain property
 
 ```julia
-timestamp = time()                 # plain: cached once on first read
-now()     = time()                 # indexed: obj.now() is fresh
-@memo obj.now()                    # cached zero-arg access
+timestamp = time()                  # plain: cached once on first read
+now()     = time()                  # indexed: obj.now() is always fresh
+@memo! obj.now()                    # cached zero-arg access
 ```
 
 ### Multi-LHS destructuring
@@ -178,7 +185,7 @@ once into a hidden helper property; individual members extract from it.
     (; val, grad) = (; val=f(x), grad=df(x))       # named: by field
     (; x_val<=val, x_grad<=grad) = autodiff(x)     # per-field rename
     (; x_<=(val, grad)) = autodiff(x)              # prefix shorthand
-    @cached a, b = expensive()                     # macros apply to the group
+    @diskcached a, b = expensive()                 # macros apply to the group
 end
 ```
 
@@ -204,7 +211,7 @@ DynamicObjects.compute_property(__self__::Foo, ::Val{:b}; kwargs...) =
 ```
 
 `__self__` is also visible as a bare symbol — useful for explicit API calls
-that take the object: `@cache_path(__self__.result)`,
+that take the object: `@diskcache_path(__self__.result)`,
 `fetchindex(__self__.fits, key)`, etc.
 
 ### Scoping rules
@@ -231,7 +238,7 @@ explicitly:
 
 ```julia
 @dynamicstruct struct Counter
-    @cached count = 0
+    @diskcached count = 0
     increment = begin
         count = count + 1   # explicitly: rewrites to __self__.count = …
         count
@@ -254,23 +261,14 @@ end
 ### In-memory cache
 
 Every derived property's value is stored in an instance-level
-`PropertyCache` after first compute. The backing dict type is controlled by
-`cache_type`:
-
-| `cache_type`       | Backing dict       | Access semantics                                        |
-|--------------------|--------------------|---------------------------------------------------------|
-| `:parallel` (default) | `ThreadsafeDict` | Lock-protected; concurrent requests for the same key share one `Task`. |
-| `:serial`          | `Dict`             | Single-threaded; faster but unsafe under concurrency.   |
+`PropertyCache` after first compute. The backing dict for an
+`IndexableProperty`'s per-key memo is a `ThreadsafeDict` — lock-protected;
+concurrent requests for the same key share one `Task`. `cache_type`'s only
+supported value is `:parallel` (the default).
 
 ```julia
-obj = Foo(3; cache_type=:serial)
-```
-
-Pass a dict type directly to use a custom backend. The package-level default
-can also be set via the multi-arg macro form:
-
-```julia
-@dynamicstruct "doc" :serial struct Q
+obj = Foo(3)                          # cache_type=:parallel is the default
+@dynamicstruct "doc" :parallel struct Q
     n::Int
     data(id) = expensive(id)
 end
@@ -293,15 +291,15 @@ Inside a property body, `prop = value` rewrites to
 updates — and the explanation for the [shadowing error](#assignment-shadows-property-error)
 above.
 
-### Disk caching: `@cached`
+### Disk caching: `@diskcached`
 
-`@cached prop = expr` persists the value to disk under
-`joinpath(cache_base, hash, "<prop>.sjl")`:
+`@diskcached prop = expr` persists the value to disk under
+`joinpath(diskcache_base, hash, "<prop>.sjl")`:
 
 ```julia
 @dynamicstruct struct Experiment
     n::Int
-    @cached result = sum(rand(n))
+    @diskcached result = sum(rand(n))
 end
 
 e = Experiment(1_000_000)
@@ -309,27 +307,27 @@ e.result                       # computes, writes to "cache/<hash>/result.sjl"
 Experiment(1_000_000).result   # loads from disk on a fresh instance
 ```
 
-`@cached` works on indexed properties too — each `(args, kwargs)` tuple is
-keyed and persisted independently:
+`@diskcached` works on indexed properties too — each `(args, kwargs)`
+tuple is keyed and persisted independently:
 
 ```julia
-@cached fit(seed) = run_fit(seed)   # cache/<hash>/fit_<arg-hash>.sjl
+@diskcached fit(seed) = run_fit(seed)   # cache/<hash>/fit_<arg-hash>.sjl
 ```
 
 #### Where the file lives
 
-`cache_path` defaults to `joinpath(cache_base, hash)` where `cache_base`
-defaults to `"cache"` and `hash` is derived from `hash_fields`. By default
-`hash_fields` is the tuple of all fixed fields. Override either to relocate
-caches or to narrow the hash:
+`diskcache_path` defaults to `joinpath(diskcache_base, hash)` where
+`diskcache_base` defaults to `"cache"` and `hash` is derived from
+`hash_fields`. By default `hash_fields` is the tuple of all fixed fields.
+Override either to relocate caches or to narrow the hash:
 
 ```julia
 @dynamicstruct struct Foo
     a::Int
     b::Int
-    hash_fields = (a,)              # `b` is not part of the cache key
-    cache_base  = "/mnt/cache"
-    @cached result = a + b
+    hash_fields    = (a,)            # `b` is not part of the cache key
+    diskcache_base = "/mnt/cache"
+    @diskcached result = a + b
 end
 ```
 
@@ -337,14 +335,14 @@ Inside `hash_fields`, any `@dynamicstruct` value is replaced by its own
 stable `.hash` string before hashing — so nested DOs don't leak their full
 serialised representation into the parent hash.
 
-#### Versioning a cache: `@cached v"2"`
+#### Versioning a cache: `@diskcached v"2"`
 
 Bumping `v"…"` invalidates that property's disk file even when the inputs
 hash the same — useful when you change the property body and don't want
 stale `.sjl` files to load:
 
 ```julia
-@cached v"2" result = improved_algorithm(n)
+@diskcached v"2" result = improved_algorithm(n)
 ```
 
 The version mixes into the cache filename
@@ -352,80 +350,66 @@ The version mixes into the cache filename
 
 #### Disk-write locking: `__strict__`
 
-`__strict__ = true` (the default) makes `@cached` writes go through a per-path
-`ReentrantLock` so concurrent computations of the same key never race on the
-file. Set `__strict__ = false` if you've already coordinated externally and
-want to skip the lock.
+`__strict__ = true` (the default) makes `@diskcached` writes go through a
+per-path `ReentrantLock` so concurrent computations of the same key never
+race on the file. Set `__strict__ = false` if you've already coordinated
+externally and want to skip the lock.
 
 ### `@persist`: write the in-memory value to disk
 
-`@cached` reads from disk on first access and writes after computing. If you
-later mutate the in-memory value (`obj.result = …`), it stays in RAM until
-you flush it:
+`@diskcached` reads from disk on first access and writes after computing.
+If you later mutate the in-memory value (`obj.result = …`), it stays in
+RAM until you flush it:
 
 ```julia
 @persist obj.result             # plain
 @persist obj.data(url)          # indexed (call form — preferred)
 ```
 
-### `@lru N`: bound an indexed property's in-memory dict
+### `@memo!`: opt into the in-memory cache at a call site
+
+Inside a `@dynamicstruct` body or at the REPL, `@memo!` rewrites every
+call in its argument as `maybememoize!(callee, args…; kwargs…)`. At
+runtime, `IndexableProperty` callees go through [`memoize!`](@ref)
+(cached); everything else is called normally. This is the **only** way to
+get cached access — the bare call form on an IP wrapper is uncached.
 
 ```julia
-@dynamicstruct struct Models
-    @lru 100 sim(subject_id)         = simulate(subject_id)        # 100 most-recent kept
-    @cached @lru 50 fit(model, seed) = run_fit(model, seed)        # disk + LRU in RAM
-end
+@memo! obj.prop(i)                          # cached access
+@memo! obj.prop(i; k=v)                     # kwargs participate in the cache key
+
+# Every IP call in the chain gets memoized; non-IP calls just call normally:
+@memo! qt.loaded(dataset; data_version).filtered(; src).eda.counts
+@memo! sort(x.prop(i))
 ```
 
-`@lru` is orthogonal to `@cached`: it only bounds the in-memory dict, never
-the on-disk cache. On `:parallel` structs, eviction is task-aware — keys
-with an in-flight `Task` are never evicted, so awaiters never see their cache
-slot vanish. If every slot is pinned, the dict temporarily exceeds `maxsize`.
-
-`maxsize` must be a literal `Int`; only indexed properties may carry `@lru`.
-
-### `@memo`: two distinct meanings
-
-Outside `@dynamicstruct`:
-
-```julia
-@memo expensive(x, y) = heavy_computation(x, y)
-```
-
-Produces a process-wide memoised version of `expensive` — the usual
-[memoize-a-function](https://en.wikipedia.org/wiki/Memoization) pattern.
-
-Inside a `@dynamicstruct` body, `@memo` is a **call-site rewrite** that
-turns `obj.prop(args...; kwargs...)` into the cached access path. It is
-the preferred way to ask for cached access at a call site — the marker
-makes the caching visible to the reader. See
-[indexed properties](#indexed-properties).
+For one-shot cached calls *outside* a `@dynamicstruct` body, call
+[`memoize!`](@ref) directly — `@memo!` is purely sugar for the same
+runtime path.
 
 ### Inspecting and clearing caches
 
-| Macro / function                   | Returns                                             |
-|------------------------------------|-----------------------------------------------------|
-| `@cache_status obj.result`         | `:unstarted` / `:started` / `:ready`                |
-| `@is_cached obj.result`            | `true` if the disk cache file is `:ready`           |
-| `@cache_path obj.result`           | The on-disk path                                    |
-| `@clear_cache! obj.result`         | Drop in-memory + delete all on-disk files           |
-| `@clear_cache! obj.result(key)`    | Drop a single index                                 |
-| `clear_mem_caches!(obj)`           | Drop every in-memory entry on `obj`                 |
-| `clear_disk_caches!(obj)`          | Delete every `@cached` file under `obj.cache_path`  |
-| `clear_all_caches!(obj)`           | Both                                                |
+| Macro / function                       | Returns                                                |
+|----------------------------------------|--------------------------------------------------------|
+| `@diskcache_status obj.result`         | `:unstarted` / `:started` / `:ready`                   |
+| `@is_diskcached obj.result`            | `true` if the disk cache file is `:ready`              |
+| `@diskcache_path obj.result`           | The on-disk path                                       |
+| `@clear_diskcache! obj.result`         | Drop in-memory + delete all on-disk files              |
+| `@clear_diskcache! obj.result(key)`    | Drop a single index                                    |
+| `clear_mem_caches!(obj)`               | Drop every in-memory entry on `obj`                    |
+| `clear_disk_caches!(obj)`              | Delete every `@diskcached` file under `diskcache_path` |
+| `clear_all_caches!(obj)`               | Both                                                   |
 
-Indexed forms use call syntax too: `@is_cached obj.result(key)`,
-`@cache_path obj.fit(2; seed=42)`, `@clear_cache! obj.result(key)`. The
-inspection macros also accept the legacy bracket form, but prefer parens —
-it reads as "inspect this call".
+Indexed forms use call syntax too: `@is_diskcached obj.result(key)`,
+`@diskcache_path obj.fit(2; seed=42)`, `@clear_diskcache! obj.result(key)`.
 
 These macros also work *inside* a `@dynamicstruct` body — drop the
 object prefix:
 
 ```julia
 @dynamicstruct struct App
-    @cached result(key) = expensive(key)
-    summary(key) = @is_cached(result(key)) ? "done" : "pending"
+    @diskcached result(key) = expensive(key)
+    summary(key) = @is_diskcached(result(key)) ? "done" : "pending"
 end
 ```
 
@@ -450,9 +434,9 @@ property by bare name.
 end
 
 p = Parent(1.0)
-p.sub.z                                # 3.0
-p.weighted(3; bias=1).total            # fresh each call (default scale=2)
-p.weighted[3; bias=1, scale=5].total   # cached in `weighted`'s per-key dict
+p.sub.z                                       # 3.0
+p.weighted(3; bias=1).total                   # fresh each call (default scale=2)
+@memo! p.weighted(3; bias=1, scale=5).total   # cached in `weighted`'s per-key dict
 ```
 
 - **`@struct name = begin … end`** — singleton child, one instance per parent.
@@ -491,13 +475,13 @@ pathfinder(instance, init; rng=Xoshiro(42), maxiters=100) =
     initialize_mcmc(instance, init; rng, progress=__status__, maxiters)
 ```
 
-`@memo obj.pathfinder(m, init; maxiters=500)` shows
+`@memo! obj.pathfinder(m, init; maxiters=500)` shows
 `Pathfinder(maxiters=500)`, not the default. Works at any nesting depth.
 
 ## Async access
 
 With `cache_type=:parallel` (default), cached access on an indexed property
-(`@memo obj.prop(args...)`):
+(`@memo! obj.prop(args...)`):
 
 1. Locks the cache.
 2. If the value is present → returns it.
@@ -573,12 +557,12 @@ fetchindex!(app.__status__, app.fit, "k1")   # extension method
 
 Inside any property body, `__status__` is bound to the relevant node — the
 root for plain access, the per-key substatus for cached access on a
-`ThreadsafeDict` (i.e. `@memo obj.prop(key)`). Pass it to your inner code
+`ThreadsafeDict` (i.e. `@memo! obj.prop(key)`). Pass it to your inner code
 via the `progress=` kwarg of whatever long-running API you call.
 
 `__substatus__` only fires on the **cached** access path
-(`@memo obj.prop(key)` / equivalently `obj.prop[key]`). Fresh call syntax
-`obj.prop(key)` and scalar property access don't trigger it.
+(`@memo! obj.prop(key)`). Fresh call syntax `obj.prop(key)` and scalar
+property access don't trigger it.
 
 ## Construction and `remake`
 
@@ -624,7 +608,7 @@ Limits inherited from Julia + Revise:
 
 After hot-reloading, in-memory caches still hold values computed by the *old*
 methods. Call `clear_mem_caches!(obj)` to force recomputation against the
-new code without touching `@cached` files.
+new code without touching `@diskcached` files.
 
 ## Debugging
 
@@ -686,25 +670,25 @@ julia> entries(app.fit)
 For a single property:
 
 ```julia
-@cache_status obj.result        # :unstarted / :started / :ready
-@is_cached    obj.result        # true if disk cache is :ready
-@cache_path   obj.result        # absolute on-disk path
+@diskcache_status obj.result        # :unstarted / :started / :ready
+@is_diskcached    obj.result        # true if disk cache is :ready
+@diskcache_path   obj.result        # absolute on-disk path
 ```
 
 For an indexed property, append the key:
 
 ```julia
-@cache_status obj.fit("seed-1")
-@is_cached    obj.fit("seed-1")
-@cache_path   obj.fit("seed-1")
+@diskcache_status obj.fit("seed-1")
+@is_diskcached    obj.fit("seed-1")
+@diskcache_path   obj.fit("seed-1")
 ```
 
 Inside a `@dynamicstruct` body, drop the object prefix:
 
 ```julia
 @dynamicstruct struct App
-    @cached result(key) = expensive(key)
-    summary(key) = @is_cached(result(key)) ? "done" : "pending"
+    @diskcached result(key) = expensive(key)
+    summary(key) = @is_diskcached(result(key)) ? "done" : "pending"
 end
 ```
 
@@ -713,15 +697,15 @@ end
 When a fixed field is itself a `@dynamicstruct`, its `.hash` field is substituted into the parent's hash inputs (so nested DOs don't bloat the parent's serialised hash key). To check what a given object's hash and cache path will be:
 
 ```julia
-obj.hash         # the cache key
-obj.cache_path   # joinpath(obj.cache_base, obj.hash)
+obj.hash             # the cache key
+obj.diskcache_path   # joinpath(obj.diskcache_base, obj.hash)
 ```
 
-Override `hash_fields` to narrow the hash, or `cache_base` to relocate caches.
+Override `hash_fields` to narrow the hash, or `diskcache_base` to relocate caches.
 
 ### Force recomputation after Revise
 
-After `Revise` hot-reloads a property body, the in-memory cache still holds values produced by the *old* method. To recompute against the new code without touching `@cached` files on disk:
+After `Revise` hot-reloads a property body, the in-memory cache still holds values produced by the *old* method. To recompute against the new code without touching `@diskcached` files on disk:
 
 ```julia
 clear_mem_caches!(obj)        # wipe the in-memory PropertyCache
@@ -740,7 +724,7 @@ foreach(clear_mem_caches!, last.(cached_entries(parent.weighted)))     # cached 
 
 ### Pluggable key tracking: `KeyTracker`
 
-For `@cached` indexed properties, you sometimes want to enumerate *all*
+For `@diskcached` indexed properties, you sometimes want to enumerate *all*
 keys ever computed (e.g. to bound on-disk storage by deleting the
 least-recently used). The `KeyTracker` hook decides where that key set is
 persisted:
@@ -755,7 +739,7 @@ Override per-type / per-property:
 
 ```julia
 DynamicObjects.key_tracker(o::MyType, ::Val{name}) where {name} =
-    PerPodFileTracker(joinpath(o.cache_path, string(name) * "_keys"), pod_id)
+    PerPodFileTracker(joinpath(o.diskcache_path, string(name) * "_keys"), pod_id)
 ```
 
 `record!` and `load_keys` are the read/write API; recording is currently a
@@ -769,8 +753,6 @@ writes land — see the source for details).
 |-----------------------------------------------------------|-----------------------------------------------------------------------------------------------|
 | `PersistentSet(path)`                                     | Thread-safe `Set` that re-serialises on every `push!`/`pop!`.                                 |
 | `LazyPersistentDict(path[, empty]; seed!)`                | Threadsafe dict; backing file resolved lazily, loaded on first op (precompile-safe).          |
-| `LRUDict{K,V}(maxsize)`                                   | Plain LRU dict, used internally for `@lru` on `:serial` structs.                              |
-| `ThreadsafeLRUDict{K,V}(maxsize)`                         | Lock-protected LRU dict, used internally for `@lru` on `:parallel` structs (task-aware eviction). |
 
 These are exposed as exports; you can use them outside `@dynamicstruct`
 contexts wherever they're useful.

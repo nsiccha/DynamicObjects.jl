@@ -11,18 +11,29 @@ the [manual](index.md).
 
 ## In-struct property markers
 
-These are *not* real macros — they are pattern-matched by `@dynamicstruct`
-inside a struct body. Outside a struct body they're either no-ops, real
-macros (e.g. `@memo`), or undefined. Don't rely on them in arbitrary
-positions.
+These are pattern-matched by `@dynamicstruct` inside a struct body. Outside
+a struct body they're either no-ops, real macros, or undefined. Don't rely
+on them in arbitrary positions.
 
-| Marker                       | Effect                                                                                  |
-|------------------------------|-----------------------------------------------------------------------------------------|
-| `@cached prop = expr`        | Persist to disk under `cache_path`. Per-key for indexed properties.                     |
-| `@cached v"N" prop = expr`   | Versioned disk cache; bumping `N` invalidates files without changing inputs.            |
-| `@persist prop = expr`       | Write the in-memory value back to disk on demand (see [`@persist`](@ref)).              |
-| `@lru N prop(idx) = expr`    | Bound the per-property in-memory dict to `N` entries (LRU eviction).                    |
-| `@memo prop = expr`          | Inside a struct: rewrite call → bracket access. Outside: process-wide function memoize. |
+| Marker                          | Effect                                                                          |
+|---------------------------------|---------------------------------------------------------------------------------|
+| `@diskcached prop = expr`       | Persist to disk under the instance's `diskcache_path`. Per-key for indexed properties. |
+| `@diskcached v"N" prop = expr`  | Versioned disk cache; bumping `N` invalidates files without changing inputs.     |
+| `@persist prop = expr`          | Write the in-memory value back to disk on demand (see [`@persist`](@ref)).       |
+
+## Cached access (call-site)
+
+The in-memory cache on an [`IndexableProperty`](@ref) is **opt-in**: calling
+the IP wrapper as a function (`o.prop(args...)`) goes straight to the body
+on every call. To get cached access, route the call through
+[`memoize!`](@ref) — directly, or via the [`@memo!`](@ref) macro which
+rewrites every call site inside its argument.
+
+```@docs
+@memo!
+memoize!
+maybememoize!
+```
 
 ## Cache inspection
 
@@ -30,10 +41,10 @@ Real macros — usable inside *and* outside `@dynamicstruct` bodies. Inside
 a body, drop the object prefix and use the bare property name.
 
 ```@docs
-@cache_status
-@is_cached
-@cache_path
-@clear_cache!
+@diskcache_status
+@is_diskcached
+@diskcache_path
+@clear_diskcache!
 @persist
 ```
 
@@ -70,13 +81,11 @@ PropertyComputationError
 unwrap_error
 ```
 
-## Persistent / bounded collections
+## Persistent collections
 
 ```@docs
 PersistentSet
 LazyPersistentDict
-LRUDict
-ThreadsafeLRUDict
 ```
 
 ## Pluggable key tracking
