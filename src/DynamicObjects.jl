@@ -1338,19 +1338,19 @@ isfixed(info::NamedTuple) = isnothing(info.rhs)
 # inside the loop body. Tuple-Expr leaves go through `_push_if_symbol!`,
 # Symbol assignment LHS through `_walk_local_assign!`.
 _walk_local_arg!(arg::Symbol; locals, kwargs...) = (push!(locals, arg); arg)
-_walk_local_arg!(arg; locals, properties, lnn) = walk_rhs(arg; locals, properties, lnn)
-function _walk_local_arg!(arg::Expr; locals, properties, lnn)
+_walk_local_arg!(arg; locals, properties, lnn, deps) = walk_rhs(arg; locals, properties, lnn, deps)
+function _walk_local_arg!(arg::Expr; locals, properties, lnn, deps)
     if Meta.isexpr(arg, :(=))
-        return _walk_local_assign!(arg.args[1], arg, locals, properties, lnn)
+        return _walk_local_assign!(arg.args[1], arg, locals, properties, lnn, deps)
     elseif Meta.isexpr(arg, :tuple)
         foreach(s -> _push_if_symbol!(locals, s), arg.args)
         return arg
     end
-    walk_rhs(arg; locals, properties, lnn)
+    walk_rhs(arg; locals, properties, lnn, deps)
 end
-_walk_local_assign!(lhs::Symbol, arg, locals, properties, lnn) =
-    (push!(locals, lhs); Expr(:(=), lhs, walk_rhs(arg.args[2]; locals, properties, lnn)))
-_walk_local_assign!(_, arg, locals, properties, lnn) = walk_rhs(arg; locals, properties, lnn)
+_walk_local_assign!(lhs::Symbol, arg, locals, properties, lnn, deps) =
+    (push!(locals, lhs); Expr(:(=), lhs, walk_rhs(arg.args[2]; locals, properties, lnn, deps)))
+_walk_local_assign!(_, arg, locals, properties, lnn, deps) = walk_rhs(arg; locals, properties, lnn, deps)
 _push_if_symbol!(locals, s::Symbol) = (push!(locals, s); nothing)
 _push_if_symbol!(_, _) = nothing
 
@@ -1358,24 +1358,24 @@ _push_if_symbol!(_, _) = nothing
 # LineNumberNode arms record the LNN into a Ref so subsequent siblings
 # pick it up; everything else recurses with the most recent LNN. Avoids
 # the `if arg isa LineNumberNode` mutating-closure pattern.
-_walk_with_lnn_tracking!(arg::LineNumberNode, ref, locals, properties) = (ref[] = arg; arg)
-_walk_with_lnn_tracking!(arg, ref, locals, properties) =
-    walk_rhs(arg; locals, properties, lnn=ref[])
+_walk_with_lnn_tracking!(arg::LineNumberNode, ref, locals, properties, deps) = (ref[] = arg; arg)
+_walk_with_lnn_tracking!(arg, ref, locals, properties, deps) =
+    walk_rhs(arg; locals, properties, lnn=ref[], deps)
 
 walk_rhs(e; kwargs...) = e
-walk_rhs(e::Expr; locals, properties, lnn=nothing) = if e.head == :let
+walk_rhs(e::Expr; locals, properties, lnn=nothing, deps=Set{Symbol}()) = if e.head == :let
     # locals = properties[dependent].locals
     ls = Set{Symbol}()
     !Meta.isexpr(e.args[1], :block) && (e.args[1] = Expr(:block, e.args[1]))
     map!(e.args[1].args, e.args[1].args) do arg
         arg = _normalize_let_binding(arg)
         @assert Meta.isexpr(arg, :(=))
-        name, rhs = arg.args[1], walk_rhs(arg.args[2]; locals, properties, lnn)
+        name, rhs = arg.args[1], walk_rhs(arg.args[2]; locals, properties, lnn, deps)
         name in locals || push!(ls, name)
         push!(locals, name)
         Expr(:(=), name, rhs)
     end
-    e.args[2] = walk_rhs(e.args[2]; locals, properties, lnn)
+    e.args[2] = walk_rhs(e.args[2]; locals, properties, lnn, deps)
     for l in ls
         delete!(locals, l)
     end
@@ -1386,7 +1386,7 @@ elseif e.head == :(->)
     params = e.args[1]
     ls = extractnames(Meta.isexpr(params, :tuple) ? params.args : [params])
     new_locals = union(locals, ls)
-    Expr(e.head, e.args[1], walk_rhs(e.args[2]; locals=new_locals, properties, lnn))
+    Expr(e.head, e.args[1], walk_rhs(e.args[2]; locals=new_locals, properties, lnn, deps))
 elseif e.head == :for
     # for x in range; body; end — iterator var is local in body
     # Multi-iterator: for x in xs, y in ys → args[1] is a :block of :(=)
@@ -1394,9 +1394,9 @@ elseif e.head == :for
     iters = Meta.isexpr(iter_block, :block) ? iter_block.args : [iter_block]
     ls = mapreduce(it -> extractnames([it.args[1]]), union, iters)
     new_locals = union(locals, ls)
-    walked_iters = [Expr(:(=), it.args[1], walk_rhs(it.args[2]; locals=new_locals, properties, lnn)) for it in iters]
+    walked_iters = [Expr(:(=), it.args[1], walk_rhs(it.args[2]; locals=new_locals, properties, lnn, deps)) for it in iters]
     walked_iter_block = Meta.isexpr(iter_block, :block) ? Expr(:block, walked_iters...) : walked_iters[1]
-    walked_body = walk_rhs(e.args[2]; locals=new_locals, properties, lnn)
+    walked_body = walk_rhs(e.args[2]; locals=new_locals, properties, lnn, deps)
     Expr(:for, walked_iter_block, walked_body)
 elseif e.head == :generator
     # x for x in range — iterator var(s) are local in the body expression
@@ -1413,20 +1413,20 @@ elseif e.head == :generator
     end
     ls = isempty(all_eq) ? Set{Symbol}() : mapreduce(it -> extractnames([it.args[1]]), union, all_eq)
     new_locals = union(locals, ls)
-    walked_body = walk_rhs(e.args[1]; locals=new_locals, properties, lnn)
+    walked_body = walk_rhs(e.args[1]; locals=new_locals, properties, lnn, deps)
     walked_iters = map(raw_iters) do it
         if Meta.isexpr(it, :filter)
             # filter args: condition, then :(=) iterators
             walked_args = map(it.args) do a
                 if Meta.isexpr(a, :(=))
-                    Expr(:(=), a.args[1], walk_rhs(a.args[2]; locals, properties, lnn))
+                    Expr(:(=), a.args[1], walk_rhs(a.args[2]; locals, properties, lnn, deps))
                 else
-                    walk_rhs(a; locals=new_locals, properties, lnn)
+                    walk_rhs(a; locals=new_locals, properties, lnn, deps)
                 end
             end
             Expr(:filter, walked_args...)
         else
-            Expr(:(=), it.args[1], walk_rhs(it.args[2]; locals, properties, lnn))
+            Expr(:(=), it.args[1], walk_rhs(it.args[2]; locals, properties, lnn, deps))
         end
     end
     Expr(:generator, walked_body, walked_iters...)
@@ -1436,19 +1436,19 @@ elseif e.head == :function
     if Meta.isexpr(sig, :call)
         ls = extractnames(sig.args)  # includes func name + params
         new_locals = union(locals, ls)
-        Expr(:function, sig, walk_rhs(e.args[2]; locals=new_locals, properties, lnn))
+        Expr(:function, sig, walk_rhs(e.args[2]; locals=new_locals, properties, lnn, deps))
     else
-        Expr(:function, sig, walk_rhs(e.args[2]; locals, properties, lnn))
+        Expr(:function, sig, walk_rhs(e.args[2]; locals, properties, lnn, deps))
     end
 elseif e.head == :try
     # try; body; catch e; catch_body; [finally; finally_body;] end
     # args: [try_body, catch_var, catch_body, [finally_body]]
-    walked_try = walk_rhs(e.args[1]; locals, properties, lnn)
+    walked_try = walk_rhs(e.args[1]; locals, properties, lnn, deps)
     catch_var = e.args[2]  # Symbol or false
     catch_locals = catch_var === false ? locals : union(locals, Set([catch_var]))
-    walked_catch = walk_rhs(e.args[3]; locals=catch_locals, properties, lnn)
+    walked_catch = walk_rhs(e.args[3]; locals=catch_locals, properties, lnn, deps)
     if length(e.args) >= 4
-        walked_finally = walk_rhs(e.args[4]; locals, properties, lnn)
+        walked_finally = walk_rhs(e.args[4]; locals, properties, lnn, deps)
         Expr(:try, walked_try, catch_var, walked_catch, walked_finally)
     else
         Expr(:try, walked_try, catch_var, walked_catch)
@@ -1458,7 +1458,7 @@ elseif e.head in (:kw, :(=))
     if Meta.isexpr(e.args[1], :call)
         ls = extractnames(e.args[1].args)  # includes func name + params
         new_locals = union(locals, ls)
-        Expr(e.head, e.args[1], walk_rhs.(e.args[2:end]; locals=new_locals, properties, lnn)...)
+        Expr(e.head, e.args[1], walk_rhs.(e.args[2:end]; locals=new_locals, properties, lnn, deps)...)
     else
         # Warn if assigning to a property name inside a block — likely intended as local
         lhs = e.args[1]
@@ -1469,22 +1469,22 @@ elseif e.head in (:kw, :(=))
                 error("Assignment to `$s` in a property RHS shadows property `$s`$loc. This writes to the property cache, not a local variable. Declare it with `local $s` (or `local $s = ...`) or use `let $s = ...` to make it a local.")
             end
         end
-        walked_lhs = Meta.isexpr(lhs, (:ref, :.)) ? walk_rhs(lhs; locals, properties, lnn) : lhs
-        Expr(e.head, walked_lhs, walk_rhs.(e.args[2:end]; locals, properties, lnn)...)
+        walked_lhs = Meta.isexpr(lhs, (:ref, :.)) ? walk_rhs(lhs; locals, properties, lnn, deps) : lhs
+        Expr(e.head, walked_lhs, walk_rhs.(e.args[2:end]; locals, properties, lnn, deps)...)
     end
 elseif e.head == :local
     # `local x`, `local x, y, z`, or `local x = expr` — add names to the local
     # scope so subsequent assignments don't hit the property cache.
-    walked = map(arg -> _walk_local_arg!(arg; locals, properties, lnn), e.args)
+    walked = map(arg -> _walk_local_arg!(arg; locals, properties, lnn, deps), e.args)
     Expr(:local, walked...)
 elseif e.head == :tuple
     # Named tuple: (x=1, y=2) — :(=) children are field definitions, not assignments.
     # Walk only the values, not the keys.
     walked = map(e.args) do arg
         if Meta.isexpr(arg, :(=))
-            Expr(:(=), arg.args[1], walk_rhs(arg.args[2]; locals, properties, lnn))
+            Expr(:(=), arg.args[1], walk_rhs(arg.args[2]; locals, properties, lnn, deps))
         else
-            walk_rhs(arg; locals, properties, lnn)
+            walk_rhs(arg; locals, properties, lnn, deps)
         end
     end
     Expr(:tuple, walked...)
@@ -1494,10 +1494,11 @@ else
     # the Ref; the fallback walks the arg with the current LNN) instead
     # of branching on `isa` inside the loop body.
     ref_lnn = Ref{Any}(lnn)
-    walked = map(arg -> _walk_with_lnn_tracking!(arg, ref_lnn, locals, properties), e.args)
+    walked = map(arg -> _walk_with_lnn_tracking!(arg, ref_lnn, locals, properties, deps), e.args)
     Expr(e.head, walked...)
 end
-walk_rhs(e::Symbol; locals, properties, lnn=nothing) = if (e in properties) && !(e in locals)
+walk_rhs(e::Symbol; locals, properties, lnn=nothing, deps=Set{Symbol}()) = if (e in properties) && !(e in locals)
+    push!(deps, e)
     :(__self__.$e)
 else
     e
@@ -2215,6 +2216,19 @@ end
 is_generated_property(o, name) = false
 is_indexed_property(o, name) = false
 _disk_cache(o, name) = nothing
+"""    _dependencies(::Type{T}, ::Val{name}) -> Set{Symbol}
+
+Direct sibling-property dependencies of `T`'s `name` property, as discovered
+during `@dynamicstruct`'s `walk_rhs` pass. Equals the set of bare symbols in
+the property's RHS and kwarg-defaults that the macro rewrote to
+`__self__.<dep>` (i.e. references to other properties on `T`, not shadowed
+by `let` / lambda / loop / `local` scopes).
+
+Currently informational only — Phase 6 auto-progress will consume it. The
+default returns an empty Set so types defined before this method was
+emitted still resolve.
+"""
+_dependencies(::Type, ::Val) = Set{Symbol}()
 """    _nested_struct_type(::Type{T}, ::Val{name})
 
 Return the type of the nested struct exposed under property `name` on `T`,
@@ -3112,8 +3126,34 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     # names — e.g. a future `@get foo()` + `@include foo(x::String)` pair). It's
     # what `meta(T)` returns; macro-internal lookups that just need "is `x` a
     # property name?" use the `prop_names` set built from it.
-    properties = collect(oproperties)
     prop_names = Set{Symbol}(first.(oproperties))
+    # Per-property dependency discovery — walk each RHS (and kwarg defaults)
+    # with a Set{Symbol} accumulator that `walk_rhs` push!s into on every
+    # bare-sibling-name rewrite. The captured Set is folded into
+    # `info.dependencies` so callers (and the emitted `_dependencies(T,
+    # Val(:name))` method below) can read it without redoing the walk.
+    # NOTE: this is a discovery pass; the per-property emission block below
+    # re-walks each RHS to produce the rewritten `compute_property` body.
+    # Re-walking is safe because `walk_rhs`'s `:let` branch undoes its
+    # `locals` pushes (and `:local`/`_walk_local_arg!` pushes are idempotent
+    # under Set semantics), so the second walk sees an equivalent locals
+    # state. The emitted `_dependencies` method reads `info.dependencies`
+    # from this pre-walk, so the two stay in sync without threading the Set.
+    for (i, (name, info)) in enumerate(oproperties)
+        deps = Set{Symbol}()
+        if !isfixed(info)
+            for idx in info.indices
+                Meta.isexpr(idx, :parameters) || continue
+                for a in idx.args
+                    Meta.isexpr(a, :kw) || continue
+                    walk_rhs(a.args[2]; locals=info.locals, properties=prop_names, lnn=info.lnn, deps)
+                end
+            end
+            walk_rhs(info.rhs; info.locals, properties=prop_names, lnn=info.lnn, deps)
+        end
+        oproperties[i] = name => merge(info, (; dependencies=deps))
+    end
+    properties = collect(oproperties)
     property_docs = Dict(name => doc for (name, (doc, _)) in docs if !isnothing(doc))
 
     # Struct-level lint passes: repeated-prefix and shared-arg-signature.
@@ -3262,10 +3302,23 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     nothing
                 end
                 walked_rhs = walk_rhs(info.rhs; info.locals, properties=prop_names, lnn=info.lnn)
+                # Emit `_dependencies(::Type{T}, ::Val{:name}) = Set{Symbol}((…))`.
+                # The Set literal is built explicitly as an Expr so the macro
+                # output is a self-contained constructor call rather than a
+                # spliced-in `Set` instance (which wouldn't survive printing /
+                # serialization through `setlnn`). `info.dependencies` is
+                # populated by the pre-walk pass above (~L3116).
+                deps_expr = Expr(:call, Expr(:curly, GlobalRef(Base, :Set), :Symbol),
+                                 Expr(:tuple, (QuoteNode(d) for d in sort!(collect(info.dependencies)))...))
+                _deps_method = Expr(:call,
+                    Expr(:., DynamicObjects, QuoteNode(:_dependencies)),
+                    :(::Type{$type}), :(::Val{$(Meta.quot(name))}),
+                )
                 block = Expr(:block,
                     _lnn, Expr(:(=), _call(:compute_property, cp_kwargs...), Expr(:block, _lnn, walked_rhs)),
                     _lnn, Expr(:(=), _call(:iscached), Expr(:block, _lnn, iscached_val)),
                     _lnn, Expr(:(=), _call(:resumes), Expr(:block, _lnn, false)),
+                    _lnn, Expr(:(=), _deps_method, Expr(:block, _lnn, deps_expr)),
                 )
                 if !isnothing(info.cache_version)
                     # Don't use _call — cache_version is per-property, not per-index
