@@ -147,9 +147,14 @@ end
 # Bare-prop path: forwards `substatus` so the inner `ThreadsafeDict.get!`
 # creates a Treebars node + lifecycle just like it does for IPs. Closure
 # takes `s` (the substatus the spawn wrapper passes) so the body can
-# attach work to it.
+# attach work to it. PropertyCache caches only the one-shot per-name
+# IP-wrapper / first-compute result (no kwargs in the cache key);
+# kwargs-keyed caching is the IP wrapper's job (`memoize!`).
+# `getorcomputeproperty` routes around this layer when indices/kwargs are
+# present (see ~L1109), so this overload only needs to handle the
+# bare-name case.
 Base.get!(f::Function, c::PropertyCache, key; substatus=nothing, kwargs...) =
-    get!(s -> f(s), c.cache, key; substatus, kwargs...)
+    get!(s -> f(s), c.cache, key; substatus)
 Base.get!(f::Function, ::PropertyCache, key, indices...; kwargs...) = f(nothing)
 Base.setindex!(c::PropertyCache, args...) = setindex!(c.cache, args...)
 Base.show(io::IO, pc::PropertyCache) = print(io, "PropertyCache(", length(pc.cache), " properties)")
@@ -1109,6 +1114,16 @@ end
 getorcomputeproperty(o, name, indices...; __status__=nothing, kwargs...) = if hasfield(typeof(o), name)
     @assert length(indices) == length(kwargs) == 0
     getfield(o, name)
+elseif !isempty(indices) || !isempty(kwargs)
+    # Non-empty indices/kwargs path: bypass the PropertyCache layer entirely.
+    # PropertyCache keys only on `name` (it's meant to cache one-shot
+    # IP-wrapper construction per property — see the IP-wrapper return
+    # branch below). Forwarding `(indices, kwargs)` through `get!(::PropertyCache, …)`
+    # is unsound: the cache would collide across different (indices, kwargs)
+    # tuples, and the inner `Base.get!(::AbstractThreadsafeDict, …)` rejects
+    # arbitrary kwargs with MethodError. The IP-wrapper / `memoize!` machinery
+    # owns kwargs-keyed caching for indexed properties; we just hand off.
+    _computeproperty(o, name, indices...; __status__, kwargs...)
 else
     # `__status__` is a framework kwarg (parent substatus to attach to), NOT a
     # user/cache-key kwarg. It is extracted from the signature so it doesn't
@@ -1123,8 +1138,7 @@ else
     # the parent's __status__ for the duration of the compute. Skip
     # dunder names (`__status__`, `__appdata__`, …) and IPs (which get
     # their own substatus via `memoize!(::IndexableProperty, …)`).
-    substatus_f = if isempty(indices) && isempty(kwargs) &&
-                     name != :__substatus__ && name != :__status__ &&
+    substatus_f = if name != :__substatus__ && name != :__status__ &&
                      !(startswith(string(name), "__") && endswith(string(name), "__")) &&
                      is_generated_property(o, name) && !is_indexed_property(o, name)
         () -> begin
@@ -1139,19 +1153,17 @@ else
     else
         nothing
     end
-    get!(getfield(o, :cache), name, indices...; substatus=substatus_f, kwargs...) do s
+    get!(getfield(o, :cache), name; substatus=substatus_f) do s
         # When called with no indices on an indexed property (declared with
         # call/ref syntax, e.g. `x() = ...` or `x[i] = ...`), return an
         # IndexableProperty wrapper instead of calling compute_property.
-        if isempty(indices) && isempty(kwargs)
-            if is_indexed_property(o, name)
-                return IndexableProperty(name, o, subcache(getfield(o, :cache), typeof(o), Val(name)))
-            end
+        if is_indexed_property(o, name)
+            return IndexableProperty(name, o, subcache(getfield(o, :cache), typeof(o), Val(name)))
         end
         # `s` is the substatus the spawn wrapper passed (or `nothing` when
         # `substatus_f` was nothing). Pass it as `__status__` so the body
         # — and any IP/property accesses inside — attach to it.
-        _computeproperty(o, name, indices...; __status__=s, kwargs...)
+        _computeproperty(o, name; __status__=s)
     end
 end
 maybehash(x::Number) = x
