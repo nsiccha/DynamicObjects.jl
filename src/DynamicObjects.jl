@@ -980,8 +980,10 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
         if _info !== nothing && Symbol("@progress") in get(_info, :macros, Set{Symbol}())
             for dep in _dependencies(typeof(o), vname)
                 dep_desc = _property_description(o, Val(dep))
-                dep_desc === nothing && continue
-                Treebars.prepare_progress!(__status__; description=dep_desc, transient=true)
+                Treebars.prepare_progress!(__status__;
+                    description=something(dep_desc, string(dep)),
+                    transient=true,
+                    displayed=dep_desc !== nothing)
             end
         end
         Treebars.start_progress!(__status__)
