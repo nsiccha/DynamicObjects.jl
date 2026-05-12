@@ -2425,7 +2425,7 @@ function _resolve_type_description(::Type{T}, args, kwargs) where {T}
     label = strip(txt)
     isempty(label) && return nothing
     argstr = join(args, ",")
-    kwstr  = isempty(kwargs) ? "" : "; " * join(("$k=$v" for (k, v) in kwargs), ",")
+    kwstr  = isempty(kwargs) ? "" : "; " * join(("$k=$v" for (k, v) in pairs(kwargs)), ",")
     "$label($argstr$kwstr)"
 end
 is_generated_property(o, name) = false
