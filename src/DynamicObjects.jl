@@ -1106,10 +1106,18 @@ If multiple objects with the same hash are writing here concurrently, this may i
         ))
     end
 end
-getorcomputeproperty(o, name, indices...; kwargs...) = if hasfield(typeof(o), name)
+getorcomputeproperty(o, name, indices...; __status__=nothing, kwargs...) = if hasfield(typeof(o), name)
     @assert length(indices) == length(kwargs) == 0
     getfield(o, name)
 else
+    # `__status__` is a framework kwarg (parent substatus to attach to), NOT a
+    # user/cache-key kwarg. It is extracted from the signature so it doesn't
+    # pollute `kwargs` — otherwise it would (a) break the IP-wrapper fast path
+    # below (`isempty(kwargs)` would be false), and (b) get forwarded into
+    # `Base.get!(::AbstractThreadsafeDict, …)` whose signature rejects unknown
+    # kwargs (MethodError on `__status__`). Downstream `_computeproperty`
+    # re-derives the substatus root from `o.__status__` when needed, so we
+    # discard the incoming value here.
     # For plain (non-indexed) generated user-facing properties, build a
     # substatus closure so the spawn wrapper attaches a Treebars node to
     # the parent's __status__ for the duration of the compute. Skip
