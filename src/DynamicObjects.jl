@@ -76,7 +76,7 @@ _default_substatus(status, o, name, args...; kwargs...) = nothing
 # pinned to the parent tree (e.g. for historical "N finished" pill display).
 _default_substatus(status::Treebars.ProgressNode, o, name, args...; transient=true, kwargs...) =
     Treebars.initialize_progress!(status;
-        description=_property_description(o, Val(name), args...; kwargs...),
+        description=something(_property_description(o, Val(name), args...; kwargs...), string(name)),
         transient)
 
 # Substatus lifecycle hooks — Treebars overrides forward to
@@ -2161,11 +2161,15 @@ Return all infos for `name` in `meta(T)` in declaration order. Empty if absent.
 Use when duplicates are expected (e.g. coexisting route + indexed include).
 """
 metaall(T::Type, name::Symbol) = NamedTuple[info for (n, info) in meta(T) if n === name]
-"""    _property_description(o, ::Val{name}, args...; kwargs...)
+"""    _property_description(o, ::Val{name}, args...; kwargs...) -> Union{String,Nothing}
 
-Return a human-readable description for the property `name` with the given arguments.
-Override generated per-property when a docstring is present in @dynamicstruct.
-Default: "name(arg1,arg2,...; k1=v1,k2=v2)" — kwargs section is omitted when empty.
+Return a human-readable description for the property `name` with the given arguments,
+or `nothing` when none is registered. `@dynamicstruct` emits a per-property override
+for properties that carry a docstring; properties without a docstring fall through
+to this default (which returns `nothing`).
+
+Callers that need a guaranteed string (e.g. Treebars progress labels) should
+`something(_property_description(o, Val(name), args...; kwargs...), string(name))`.
 """
 _property_description(o, ::Val{name}, args...; kwargs...) where {name} = begin
     # Bubble: if `name` is a registered nested-struct property and the
@@ -2178,9 +2182,7 @@ _property_description(o, ::Val{name}, args...; kwargs...) where {name} = begin
         desc = _type_description(nested, args...; kwargs...)
         desc !== nothing && return desc
     end
-    argstr = join(args, ",")
-    kwstr = isempty(kwargs) ? "" : "; " * join(("$k=$v" for (k, v) in kwargs), ",")
-    "$name($argstr$kwstr)"
+    nothing
 end
 
 """    _type_description(::Type{T}, args...; kwargs...) -> Union{String,Nothing}
