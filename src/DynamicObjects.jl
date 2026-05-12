@@ -6,9 +6,9 @@ optionally disk-cached properties.
 
 # Exports
 - [`@dynamicstruct`](@ref): Define a struct with computed/cached properties.
-- [`@cache_status`](@ref): Get the disk-cache status of a property (`:unstarted`, `:started`, `:ready`).
-- [`@is_cached`](@ref): Check whether a property's disk cache is ready.
-- [`@cache_path`](@ref): Get the file path used for a property's disk cache.
+- [`@diskcache_status`](@ref): Get the disk-cache status of a property (`:unstarted`, `:started`, `:ready`).
+- [`@is_diskcached`](@ref): Check whether a property's disk cache is ready.
+- [`@diskcache_path`](@ref): Get the file path used for a property's disk cache.
 - [`@lru`](@ref): Bound an indexed property's in-memory cache via LRU eviction.
 - [`@memo!`](@ref): Wrap a call site so `IndexableProperty` callees are cached.
 - [`memoize!`](@ref): Explicit cached call into an `IndexableProperty`.
@@ -16,7 +16,7 @@ optionally disk-cached properties.
 - [`remake`](@ref): Create a new instance of a `@dynamicstruct` type with some fields changed.
 - [`fetchindex`](@ref): Non-blocking access to `ThreadsafeDict`-backed properties with `(rv, status)` callback.
 - [`getstatus`](@ref): Read the status object for an in-flight computation.
-- [`@clear_cache!`](@ref): Clear the disk and in-memory cache for a property.
+- [`@clear_diskcache!`](@ref): Clear the disk and in-memory cache for a property.
 - [`@persist`](@ref): Manually persist a property value to disk cache.
 - [`PropertyComputationError`](@ref): Exception wrapper for errors during property computation.
 - [`unwrap_error`](@ref): Dig through exception wrappers to find the root cause.
@@ -36,7 +36,7 @@ optionally disk-cached properties.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, memoize!, maybememoize!, @lru, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, ThreadsafeLRUDict, LRUDict
+export @dynamicstruct, @diskcache_status, @is_diskcached, @diskcache_path, @clear_diskcache!, @persist, @memo!, memoize!, maybememoize!, @lru, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, ThreadsafeLRUDict, LRUDict
 
 import SHA, Serialization
 using Treebars
@@ -55,8 +55,8 @@ persistent_hash(x) = begin
     Serialization.serialize(b, x)
     bytes2hex(SHA.sha1(take!(b)))
 end
-iscached(o, ::Val) = false
-cache_version(o, ::Val) = nothing
+isdiskcached(o, ::Val) = false
+diskcache_version(o, ::Val) = nothing
 compute_property(o, ::Val{:hash_fields}) = ntuple(Base.Fix1(getfield, o), fieldcount(typeof(o))-1)
 compute_property(o, ::Val{:hash}) = persistent_hash((typeof(o), _hash_replace(o.hash_fields)))
 # Shallow walker used only by the :hash compute. Leaves non-DO values
@@ -66,8 +66,8 @@ compute_property(o, ::Val{:hash}) = persistent_hash((typeof(o), _hash_replace(o.
 _hash_replace(x::Tuple) = map(_hash_replace, x)
 _hash_replace(x::NamedTuple) = map(_hash_replace, x)
 _hash_replace(x) = x
-compute_property(o, ::Val{:cache_base}) = "cache"
-compute_property(o, ::Val{:cache_path}) = joinpath(o.cache_base, o.hash)
+compute_property(o, ::Val{:diskcache_base}) = "cache"
+compute_property(o, ::Val{:diskcache_path}) = joinpath(o.diskcache_base, o.hash)
 # Persistent per-instance status node. The PropertyCache `get!` around the
 # fall-through stores the returned ProgressNode on first access, so every
 # subsequent `o.__status__` read returns the same object. Inline-child
@@ -125,9 +125,9 @@ _fail_substatus!(s::Treebars.ProgressNode, e) = Treebars.fail_progress!(s, e)
 # to "from disk: <size>". Default no-op. Called from `_computeproperty` just
 # before `Serialization.deserialize` when the cache is `:ready` so the user
 # sees something flash up for big-file loads instead of a silent stall.
-_report_disk_load!(s, cache_path, size_bytes) = nothing
+_report_disk_load!(s, diskcache_path, size_bytes) = nothing
 _report_disk_load!(::Nothing, _, _) = nothing
-_report_disk_load!(s::Treebars.ProgressNode, cache_path, size_bytes) =
+_report_disk_load!(s::Treebars.ProgressNode, diskcache_path, size_bytes) =
     Treebars.update_progress!(s, "from disk: " * _format_size(size_bytes))
 
 # Format a byte count as "1.2 MB" / "850 KB" / "42 B" for human-readable
@@ -544,7 +544,7 @@ function fetchindex(fetch, ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsaf
                     force=false, retry_failed=force, kwargs...)
     if force
         maybepop!(ip.cache, (indices, (;kwargs...)))
-        path = get_cache_path(ip.o, name(ip), indices...; kwargs...)
+        path = get_diskcache_path(ip.o, name(ip), indices...; kwargs...)
         isfile(path) && rm(path)
     end
     rv = memoize!(ip, indices...; fetch=identity, retry_failed, kwargs...)
@@ -794,7 +794,7 @@ end
     clear_mem_caches!(obj)
 
 Clear all in-memory memoized property values on a `@dynamicstruct` instance,
-leaving disk caches (`@cached` files) untouched. Every derived property —
+leaving disk caches (`@diskcached` files) untouched. Every derived property —
 including child DOs stored as values — will be recomputed on next access.
 
 This is useful after hot-reloading code via Revise: property values computed by
@@ -809,17 +809,17 @@ end
 """
     clear_disk_caches!(obj)
 
-Delete all on-disk cache files for `@cached` properties on a `@dynamicstruct`
+Delete all on-disk cache files for `@diskcached` properties on a `@dynamicstruct`
 instance. In-memory values are left intact (they'll be stale until
 `clear_mem_caches!` is also called, or until the process restarts).
 """
 function clear_disk_caches!(obj)
     m = meta(typeof(obj))
-    cp = obj.cache_path
+    cp = obj.diskcache_path
     isdir(cp) || return nothing
     for (name, info) in m
         isfixed(info) && continue
-        Symbol("@cached") in info.macros || continue
+        Symbol("@diskcached") in info.macros || continue
         prefix = string(name)
         for f in readdir(cp)
             if endswith(f, ".sjl") && (f == prefix * ".sjl" || startswith(f, prefix * "_"))
@@ -833,7 +833,7 @@ end
 """
     clear_all_caches!(obj)
 
-Clear all `@cached` properties on a `@dynamicstruct` instance — both in-memory
+Clear all `@diskcached` properties on a `@dynamicstruct` instance — both in-memory
 and on disk. Equivalent to `clear_mem_caches!` + `clear_disk_caches!`.
 """
 function clear_all_caches!(obj)
@@ -932,11 +932,11 @@ Override this method on your type to change the tracking strategy.
 ```julia
 # Example: use per-pod files for all indexed properties on MyType
 DynamicObjects.key_tracker(o::MyType, ::Val{name}) where {name} =
-    DynamicObjects.PerPodFileTracker(joinpath(o.cache_path, string(name) * "_keys"), pod_id)
+    DynamicObjects.PerPodFileTracker(joinpath(o.diskcache_path, string(name) * "_keys"), pod_id)
 ```
 """
 key_tracker(o, ::Val{name}) where {name} =
-    SharedFileTracker(joinpath(o.cache_path, string(name) * "_keys.sjl"))
+    SharedFileTracker(joinpath(o.diskcache_path, string(name) * "_keys.sjl"))
 
 # --- Accessed-keys tracking for IndexableProperty ---
 
@@ -1014,9 +1014,9 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
         Treebars.start_progress!(__status__)
     end
     try
-        rv = if iscached(o, vname, indices...; kwargs...)
-            cache_path = get_cache_path(o, name, indices...; kwargs...)
-            mkpath(dirname(cache_path))
+        rv = if isdiskcached(o, vname, indices...; kwargs...)
+            diskcache_path = get_diskcache_path(o, name, indices...; kwargs...)
+            mkpath(dirname(diskcache_path))
             __strict__ = getorcomputeproperty(o, :__strict__)
             _is_threadsafe = getorcomputeproperty(o, :__cache_type__) <: AbstractThreadsafeDict
             _cache_context = """Object type: $(nameof(typeof(o))) (objectid: $(objectid(o)), hash: $(hash(o)))
@@ -1024,60 +1024,60 @@ Cache dict: $(_is_threadsafe ? "ThreadsafeDict (parallel)" : "Dict (serial) — 
 If multiple objects with the same hash are writing here concurrently, this may indicate a concurrency issue or a hashing collision."""
             disk_locks = _disk_cache(o, vname)
             rv = if __strict__ && !isnothing(disk_locks)
-                path_lock = get_path_lock!(disk_locks, cache_path)
+                path_lock = get_path_lock!(disk_locks, diskcache_path)
                 if islocked(path_lock)
-                    @info "Waiting for disk cache lock on $cache_path\n$_cache_context"
+                    @info "Waiting for disk cache lock on $diskcache_path\n$_cache_context"
                 end
                 lock(path_lock) do
-                    cache_status = get_cache_status(cache_path)
-                    rv = if cache_status == :ready
-                        _report_disk_load!(__status__, cache_path, filesize(cache_path))
+                    diskcache_status = get_diskcache_status(diskcache_path)
+                    rv = if diskcache_status == :ready
+                        _report_disk_load!(__status__, diskcache_path, filesize(diskcache_path))
                         try
-                            Serialization.deserialize(cache_path)
+                            Serialization.deserialize(diskcache_path)
                         catch e
-                            @warn "Deserialization failed for $cache_path, recomputing.\n$_cache_context" exception=e
-                            rm(cache_path; force=true)
+                            @warn "Deserialization failed for $diskcache_path, recomputing.\n$_cache_context" exception=e
+                            rm(diskcache_path; force=true)
                             nothing
                         end
                     else
                         nothing
                     end
                     if isnothing(rv) || resumes(o, vname, indices...; kwargs...)
-                        @debug "Generating $cache_path...\n$_cache_context"
+                        @debug "Generating $diskcache_path...\n$_cache_context"
                         rv = compute_property(o, vname, indices...; _status_kw..., (name=>rv, )..., kwargs...)
-                        Serialization.serialize(cache_path, rv)
+                        Serialization.serialize(diskcache_path, rv)
                     end
                     rv
                 end
             else
                 # Non-strict or no disk locks: original flow
-                cache_status = get_cache_status(cache_path)
-                rv = if cache_status == :ready
-                    _report_disk_load!(__status__, cache_path, filesize(cache_path))
+                diskcache_status = get_diskcache_status(diskcache_path)
+                rv = if diskcache_status == :ready
+                    _report_disk_load!(__status__, diskcache_path, filesize(diskcache_path))
                     try
-                        Serialization.deserialize(cache_path)
+                        Serialization.deserialize(diskcache_path)
                     catch e
-                        @warn "Deserialization failed for $cache_path, recomputing.\n$_cache_context\nEnable __strict__=true for disk cache locking to prevent concurrent write issues." exception=e
-                        rm(cache_path; force=true)
-                        cache_status = :unstarted
-                        touch(cache_path)
+                        @warn "Deserialization failed for $diskcache_path, recomputing.\n$_cache_context\nEnable __strict__=true for disk cache locking to prevent concurrent write issues." exception=e
+                        rm(diskcache_path; force=true)
+                        diskcache_status = :unstarted
+                        touch(diskcache_path)
                         nothing
                     end
                 else
-                    if cache_status == :started
-                        @warn "Cache file $cache_path exists but has size 0.\nAssuming a previous run failed.\n$_cache_context\nEnable __strict__=true for disk cache locking to prevent concurrent write issues."
+                    if diskcache_status == :started
+                        @warn "Cache file $diskcache_path exists but has size 0.\nAssuming a previous run failed.\n$_cache_context\nEnable __strict__=true for disk cache locking to prevent concurrent write issues."
                     end
-                    touch(cache_path)
+                    touch(diskcache_path)
                     nothing
                 end
-                if cache_status != :ready || resumes(o, vname, indices...; kwargs...)
-                    @debug "Generating $cache_path...\n$_cache_context"
+                if diskcache_status != :ready || resumes(o, vname, indices...; kwargs...)
+                    @debug "Generating $diskcache_path...\n$_cache_context"
                     rv = compute_property(o, vname, indices...; _status_kw..., (name=>rv, )..., kwargs...)
-                    Serialization.serialize(cache_path, rv)
+                    Serialization.serialize(diskcache_path, rv)
                 end
                 rv
             end
-            # Record accessed key for indexed @cached properties
+            # Record accessed key for indexed @diskcached properties
             if !isempty(indices)
                 _record_accessed_key(o, name, indices, kwargs)
             end
@@ -1172,35 +1172,35 @@ maybehash(x) = persistent_hash(x)
 
 # Build a single path-segment identifier for a (name, args, kwargs) triple,
 # joining the parts with "_" via `maybehash`. Used in two places:
-#   1. As the file-name body of `get_cache_path` (with ".sjl" appended).
-#   2. As the per-level directory name in the inline-child cache_path
+#   1. As the file-name body of `get_diskcache_path` (with ".sjl" appended).
+#   2. As the per-level directory name in the inline-child diskcache_path
 #      auto-wiring, so the on-disk layout mirrors the DO hierarchy.
 # Kwargs are sorted by name so callers passing the same kwargs in different
 # syntactic order land in the same segment.
-cache_segment(name, args...; kwargs...) = begin
+diskcache_segment(name, args...; kwargs...) = begin
     parts = length(kwargs) == 0 ? (name, args...) : (name, args..., sort(collect(kwargs); by=first)...)
     join(map(maybehash, parts), "_")
 end
-get_cache_path(o, name, args...; kwargs...) = begin
-    seg = cache_segment(name, args...; kwargs...)
-    ver = cache_version(o, Val(name))
+get_diskcache_path(o, name, args...; kwargs...) = begin
+    seg = diskcache_segment(name, args...; kwargs...)
+    ver = diskcache_version(o, Val(name))
     !isnothing(ver) && (seg = seg * "_v" * string(ver))
-    joinpath(o.cache_path, seg * ".sjl")
+    joinpath(o.diskcache_path, seg * ".sjl")
 end
-get_cache_status(o, args...; kwargs...) = get_cache_status(get_cache_path(o, args...; kwargs...)) 
-get_cache_status(cache_path::AbstractString) = begin
-    !isfile(cache_path) && return :unstarted
-    filesize(cache_path) == 0 && return :started
+get_diskcache_status(o, args...; kwargs...) = get_diskcache_status(get_diskcache_path(o, args...; kwargs...))
+get_diskcache_status(diskcache_path::AbstractString) = begin
+    !isfile(diskcache_path) && return :unstarted
+    filesize(diskcache_path) == 0 && return :started
     return :ready
 end
-cache_f_expr(x; f) = begin
+diskcache_f_expr(x; f) = begin
     x, indices = if Meta.isexpr(x, (:ref, :call))
         x.args[1], x.args[2:end]
     else
         x, []
     end
     if Meta.isexpr(x, :$)
-        # Interpolated property name: @is_cached $prop[indices...]
+        # Interpolated property name: @is_diskcached $prop[indices...]
         name_expr = x.args[1]
         :($f(__self__, $name_expr, $(indices...))) |> fixcall
     else
@@ -1210,10 +1210,10 @@ cache_f_expr(x; f) = begin
     end
 end
 """
-    @cache_status o.prop
-    @cache_status o.prop(indices...)
+    @diskcache_status o.prop
+    @diskcache_status o.prop(indices...)
 
-Return the disk-cache status of a `@cached` property as a `Symbol`:
+Return the disk-cache status of a `@diskcached` property as a `Symbol`:
 - `:unstarted` — no cache file exists yet.
 - `:started`   — an empty placeholder file exists (previous run may have crashed).
 - `:ready`     — a complete cache file exists and can be deserialized.
@@ -1224,29 +1224,29 @@ for indexed properties).
 
 ```julia
 # Outside the struct:
-@cache_status e.result          # :unstarted (before first access)
+@diskcache_status e.result          # :unstarted (before first access)
 e.result
-@cache_status e.result          # :ready
-@cache_status e.ci(2)           # for indexed properties — call syntax
+@diskcache_status e.result          # :ready
+@diskcache_status e.ci(2)           # for indexed properties — call syntax
 
 # Inside the struct body:
 @dynamicstruct struct App
-    @cached result(key) = expensive(key)
-    status(key) = @cache_status result(key)   # :unstarted, :started, or :ready
+    @diskcached result(key) = expensive(key)
+    status(key) = @diskcache_status result(key)   # :unstarted, :started, or :ready
 end
 ```
 
-The legacy bracket form (`@cache_status o.prop[indices...]`) still works for
+The legacy bracket form (`@diskcache_status o.prop[indices...]`) still works for
 backward compatibility but is discouraged in new code — prefer call syntax,
 which mirrors the way the property is invoked.
 """
-macro cache_status(x)
-    cache_f_expr(x; f=get_cache_status) |> esc
+macro diskcache_status(x)
+    diskcache_f_expr(x; f=get_diskcache_status) |> esc
 end
 
 """
-    @is_cached o.prop
-    @is_cached o.prop(indices...)
+    @is_diskcached o.prop
+    @is_diskcached o.prop(indices...)
 
 Return `true` if the disk cache for `o.prop` (or `o.prop(indices...)`) is
 `:ready`, i.e. the cached value can be loaded from disk without recomputation.
@@ -1257,12 +1257,12 @@ for indexed properties).
 
 ```julia
 # Outside the struct:
-@is_cached e.result   # false before first access, true afterwards
+@is_diskcached e.result   # false before first access, true afterwards
 
 # Inside the struct body:
 @dynamicstruct struct App
-    @cached result(key) = expensive(key)
-    summary(key) = if @is_cached result(key)
+    @diskcached result(key) = expensive(key)
+    summary(key) = if @is_diskcached result(key)
         "cached: \$(@memo! result(key))"
     else
         "not yet computed"
@@ -1270,29 +1270,29 @@ for indexed properties).
 end
 ```
 
-The legacy bracket form (`@is_cached o.prop[indices...]`) still works for
+The legacy bracket form (`@is_diskcached o.prop[indices...]`) still works for
 backward compatibility but is discouraged in new code.
 """
-macro is_cached(x)
-    :($(cache_f_expr(x; f=get_cache_status)) == :ready) |> esc
+macro is_diskcached(x)
+    :($(diskcache_f_expr(x; f=get_diskcache_status)) == :ready) |> esc
 end
 
 """
-    @cache_path o.prop
-    @cache_path o.prop(indices...)
+    @diskcache_path o.prop
+    @diskcache_path o.prop(indices...)
 
 Return the file path where the disk-cached value of `o.prop` (or
 `o.prop(indices...)`) is (or would be) stored.
 
 ```julia
-@cache_path e.result          # e.g. "cache/<hash>/result.sjl"
-@cache_path e.ci(2)           # "cache/<hash>/ci_2.sjl"
+@diskcache_path e.result          # e.g. "cache/<hash>/result.sjl"
+@diskcache_path e.ci(2)           # "cache/<hash>/ci_2.sjl"
 ```
 
 The legacy bracket form is still accepted but discouraged.
 """
-macro cache_path(x)
-    cache_f_expr(x; f=get_cache_path) |> esc
+macro diskcache_path(x)
+    diskcache_f_expr(x; f=get_diskcache_path) |> esc
 end
 """
     @lru maxsize prop(idx...) = expr
@@ -1307,13 +1307,13 @@ time). Eviction is task-aware on `:parallel` structs: keys with an in-flight
 `Task` are never evicted — if every slot is pinned, the cache temporarily
 exceeds `maxsize` until something settles.
 
-`@lru` is orthogonal to `@cached`: both can apply to the same property — the
+`@lru` is orthogonal to `@diskcached`: both can apply to the same property — the
 disk cache is unaffected, only the in-memory dict is bounded.
 
 ```julia
 @dynamicstruct struct App
     @lru 100 sim(subject_id) = expensive(subject_id)
-    @cached @lru 50 fit(model, seed) = run_fit(model, seed)
+    @diskcached @lru 50 fit(model, seed) = run_fit(model, seed)
 end
 ```
 
@@ -1332,7 +1332,7 @@ end
 
 Write the in-memory value of `o.prop` (or the indexed entry `o.prop(indices...)`)
 back to its disk cache. Use after mutating a value in place when the property
-was declared with `@cached` and the on-disk copy is now stale relative to the
+was declared with `@diskcached` and the on-disk copy is now stale relative to the
 in-memory copy.
 
 The legacy bracket form (`@persist o.prop[indices...]`) still works but is
@@ -1413,7 +1413,7 @@ end
 
 persist(v, args...; kwargs...) = begin
     Serialization.serialize(
-        get_cache_path(args...; kwargs...),
+        get_diskcache_path(args...; kwargs...),
         v
     )
 end
@@ -1424,13 +1424,13 @@ _maybepop_indexed!(v::IndexableProperty, indices, kwargs) =
     (maybepop!(v.cache, (indices, (;kwargs...))); nothing)
 _maybepop_indexed!(args...) = nothing
 
-clear_cache!(o, name::Symbol, indices...; kwargs...) = begin
+clear_diskcache!(o, name::Symbol, indices...; kwargs...) = begin
     cache = getfield(o, :cache).cache
     if isempty(indices) && isempty(kwargs)
         # Clear in-memory (whole property, including IndexableProperty wrapper)
         delete!(cache, name)
         # Clear all disk cache files for this property
-        cp = o.cache_path
+        cp = o.diskcache_path
         if isdir(cp)
             prefix = string(name)
             for f in readdir(cp)
@@ -1443,30 +1443,30 @@ clear_cache!(o, name::Symbol, indices...; kwargs...) = begin
         # Clear specific indexed entry from in-memory cache
         haskey(cache, name) && _maybepop_indexed!(cache[name], indices, kwargs)
         # Clear specific disk cache file
-        path = get_cache_path(o, name, indices...; kwargs...)
+        path = get_diskcache_path(o, name, indices...; kwargs...)
         isfile(path) && rm(path)
     end
     nothing
 end
 """
-    @clear_cache! o.prop
-    @clear_cache! o.prop(indices...)
+    @clear_diskcache! o.prop
+    @clear_diskcache! o.prop(indices...)
 
-Clear the disk cache (and in-memory cache) for a `@cached` property.
+Clear the disk cache (and in-memory cache) for a `@diskcached` property.
 
 Without indices, clears **all** cached entries for the property (both the
 in-memory value and all `.sjl` files for that property on disk).
 With indices, clears only the specific entry.
 
 ```julia
-@clear_cache! e.result        # clear all cached entries for `result`
-@clear_cache! e.ci(3)         # clear only the (3,) entry
+@clear_diskcache! e.result        # clear all cached entries for `result`
+@clear_diskcache! e.ci(3)         # clear only the (3,) entry
 ```
 
 The legacy bracket form is still accepted but discouraged.
 """
-macro clear_cache!(x)
-    cache_f_expr(x; f=clear_cache!) |> esc
+macro clear_diskcache!(x)
+    diskcache_f_expr(x; f=clear_diskcache!) |> esc
 end
 
 isfixed(kv::Pair) = isfixed(kv[2])
@@ -1834,7 +1834,7 @@ function _check_no_self_access!(msgs, type, name::Symbol, info, prop_names,
 end
 
 function _check_trivial_cached_wrapper!(msgs, type, name::Symbol, info)
-    Symbol("@cached") in info.macros || return
+    Symbol("@diskcached") in info.macros || return
     rhs = info.rhs
     Meta.isexpr(rhs, :call) || return
     prop_arg_names = Symbol[]
@@ -1854,8 +1854,8 @@ function _check_trivial_cached_wrapper!(msgs, type, name::Symbol, info)
     end
     prop_arg_names == call_args || return
     callee = rhs.args[1]
-    short = "thin @cached wrapper around `$callee(…)`"
-    long  = "`@cached $type.$name(…)` is a thin wrapper around `$callee(…)` — body is one call passing the same args. Inline `$callee`'s body into the @cached property, or drop the wrapper and have callers `@cached`-call `$callee` directly. The current shape is doing both."
+    short = "thin @diskcached wrapper around `$callee(…)`"
+    long  = "`@diskcached $type.$name(…)` is a thin wrapper around `$callee(…)` — body is one call passing the same args. Inline `$callee`'s body into the @diskcached property, or drop the wrapper and have callers `@diskcached`-call `$callee` directly. The current shape is doing both."
     push!(msgs, LintMessage(type, name, :warn, short, long, info.lnn))
 end
 
@@ -2370,7 +2370,7 @@ function _siblings_in_bound(type_bonds, name::Symbol)
 end
 
 function compute_property end
-function iscached end
+function isdiskcached end
 function resumes end
 function meta end
 
@@ -2577,14 +2577,14 @@ _extract_member(extract_from, source) = :($extract_from[$source])
 _replace_lnn(::LineNumberNode, lnn) = lnn
 _replace_lnn(x, _) = x
 
-# Validate `@lru maxsize` / `@cached` Integer args at macro time without
+# Validate `@lru maxsize` / `@diskcached` Integer args at macro time without
 # inlining `isa(..., Integer) || error(...)`. Per-type method ⇒ Integer
 # passes silently; anything else hits the fallback that errors with the
 # offending value.
 _validate_lru_maxsize(::Integer) = nothing
 _validate_lru_maxsize(x) = error("@lru: maxsize must be a literal Integer, got: $x")
 
-# Property-macro accumulator: doc / cache_version / lru_size / macros are
+# Property-macro accumulator: doc / diskcache_version / lru_size / macros are
 # the four pieces of state the body-args parser threads through the
 # `while Meta.isexpr(arg, :macrocall)` peeling loop. Bundling them into a
 # small mutable struct lets per-macro logic live in dispatched methods of
@@ -2592,7 +2592,7 @@ _validate_lru_maxsize(x) = error("@lru: maxsize must be a literal Integer, got: 
 # branch arms inside the loop body.
 mutable struct _PropertyMacroState
     doc::Any
-    cache_version::Any
+    diskcache_version::Any
     lru_size::Any
     macros::Set{Symbol}
 end
@@ -2616,21 +2616,21 @@ function _apply_property_macro!(state::_PropertyMacroState, ::Val{Symbol("@doc")
     arg.args[end]
 end
 
-# `@cached <prop> = …` (length 3) or `@cached v"…" <prop> = …` (length 4
+# `@diskcached <prop> = …` (length 3) or `@diskcached v"…" <prop> = …` (length 4
 # with a version argument).
-function _apply_property_macro!(state::_PropertyMacroState, ::Val{Symbol("@cached")}, arg)
-    push!(state.macros, Symbol("@cached"))
-    length(arg.args) == 4 && (state.cache_version = _parse_cache_version(arg.args[3]))
+function _apply_property_macro!(state::_PropertyMacroState, ::Val{Symbol("@diskcached")}, arg)
+    push!(state.macros, Symbol("@diskcached"))
+    length(arg.args) == 4 && (state.diskcache_version = _parse_diskcache_version(arg.args[3]))
     arg.args[end]
 end
-_parse_cache_version(v::VersionNumber) = v
-function _parse_cache_version(ver_expr::Expr)
+_parse_diskcache_version(v::VersionNumber) = v
+function _parse_diskcache_version(ver_expr::Expr)
     Meta.isexpr(ver_expr, :macrocall) && ver_expr.args[1] == Symbol("@v_str") ||
-        error("@cached version argument must be a version string like v\"2\", got: $ver_expr")
+        error("@diskcached version argument must be a version string like v\"2\", got: $ver_expr")
     VersionNumber(ver_expr.args[end])
 end
-_parse_cache_version(x) =
-    error("@cached version argument must be a version string like v\"2\", got: $x")
+_parse_diskcache_version(x) =
+    error("@diskcached version argument must be a version string like v\"2\", got: $x")
 
 # `@lru N <prop> = …` — N must be a literal Integer (validated via
 # `_validate_lru_maxsize`'s fallback method).
@@ -2699,12 +2699,12 @@ function _emit_positional_element!(oproperties, docs, a::Expr, i, source_sym, ln
     inner_leaves = _collect_leaves(a)
     inner_name = Symbol("_tuple_", join(inner_leaves, "_"))
     inner_locals = Set{Symbol}(inner_leaves); push!(inner_locals, inner_name)
-    push!(oproperties, inner_name => (;lhs=inner_name, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=inner_locals, indices=tuple(), indexed=false, cache_version=nothing, lru_size=nothing, displayed=false))
+    push!(oproperties, inner_name => (;lhs=inner_name, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=inner_locals, indices=tuple(), indexed=false, diskcache_version=nothing, lru_size=nothing, displayed=false))
     push!(docs, (inner_name => (nothing, true)))
     _emit_positional_destructure!(oproperties, docs, a.args, inner_name, lnn)
 end
 function _push_positional_leaf!(oproperties, docs, leaf::Symbol, i, source_sym, lnn)
-    push!(oproperties, leaf => (;lhs=leaf, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([leaf]), indices=tuple(), indexed=false, cache_version=nothing, lru_size=nothing, displayed=false))
+    push!(oproperties, leaf => (;lhs=leaf, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([leaf]), indices=tuple(), indexed=false, diskcache_version=nothing, lru_size=nothing, displayed=false))
     push!(docs, (leaf => (nothing, true)))
 end
 # One element of a named-destructure LHS: either a bare Symbol leaf or a
@@ -3120,10 +3120,10 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         will_prepend_hash_fields && push!(prepend_names, :hash_fields)
         # Never forward DO-internal cache/identity properties from the parent
         # into the child — they have per-instance semantics (the child has its
-        # own hash/cache_path/cache_base) and forwarding them collides with the
-        # automatic machinery (e.g. with our hash_fields prepend, producing
-        # duplicate compute_property method definitions).
-        nonforwardable = Set{Symbol}([:hash_fields, :hash, :cache_path, :cache])
+        # own hash/diskcache_path/diskcache_base) and forwarding them collides
+        # with the automatic machinery (e.g. with our hash_fields prepend,
+        # producing duplicate compute_property method definitions).
+        nonforwardable = Set{Symbol}([:hash_fields, :hash, :diskcache_path, :cache])
         # Forward parent properties that (a) aren't overridden in the child,
         # (b) aren't __status__ (scoped separately), (c) aren't DO-internal
         # cache/identity names, and (d) aren't one of the names we're about
@@ -3152,23 +3152,23 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         if !isempty(forwarded)
             push!(prepend, :($(Expr(:tuple, Expr(:parameters, forwarded...))) = __parent__))
         end
-        # Auto-derive a hierarchical cache_path: extend the parent's path by a
-        # per-child directory whose name is the same flat segment that
-        # `get_cache_path` would use as the file-name body for this property.
-        # On disk this nests as "base/<parent_segment>/<child_segment>/…",
+        # Auto-derive a hierarchical diskcache_path: extend the parent's path by
+        # a per-child directory whose name is the same flat segment that
+        # `get_diskcache_path` would use as the file-name body for this
+        # property. On disk this nests as "base/<parent_segment>/<child_segment>/…",
         # ending at the leaf "<property>_<args>.sjl". Skipped when the child
-        # body explicitly declares cache_path — explicit wins.
-        if !(:cache_path in child_props)
+        # body explicitly declares diskcache_path — explicit wins.
+        if !(:diskcache_path in child_props)
             # Expr(:call) layout: (func, [parameters], positional...). The
             # parameters expression must come right after the function, not
             # after positional args, otherwise Julia's parser rejects it.
-            seg_call_args = Any[:(DynamicObjects.cache_segment)]
+            seg_call_args = Any[:(DynamicObjects.diskcache_segment)]
             !isempty(index_kwargs) && push!(seg_call_args,
                 Expr(:parameters, [Expr(:kw, kn, kn) for (kn, _) in index_kwargs]...))
             push!(seg_call_args, QuoteNode(prop_name))
             append!(seg_call_args, index_params)
             seg_call = Expr(:call, seg_call_args...)
-            push!(prepend, :(cache_path = joinpath(__parent__.cache_path, $seg_call)))
+            push!(prepend, :(diskcache_path = joinpath(__parent__.diskcache_path, $seg_call)))
         end
         child_body.args = vcat(prepend, child_body.args)
         push!(extracted_structs, child_struct)
@@ -3231,15 +3231,15 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         locals = nothing
         indices = tuple()
         indexed = false
-        cache_version = nothing
+        diskcache_version = nothing
         lru_size = nothing
-        # Peel `@doc` / `@cached` / `@lru` / unrecognised macros from `arg`
+        # Peel `@doc` / `@diskcached` / `@lru` / unrecognised macros from `arg`
         # via `_apply_property_macro!` dispatch (one method per macro
-        # shape). The state struct mutates `doc` / `cache_version` /
+        # shape). The state struct mutates `doc` / `diskcache_version` /
         # `lru_size` / `macros` in place — `macros` is the same Set the
         # outer loop uses, so we read it back implicitly; the other three
         # are scalars copied back after the loop.
-        macro_state = _PropertyMacroState(doc, cache_version, lru_size, macros)
+        macro_state = _PropertyMacroState(doc, diskcache_version, lru_size, macros)
         while Meta.isexpr(arg, :macrocall)
             # `_resolve_macro_name` collapses `GlobalRef(Core, :@doc)` (the
             # form Julia's docstring lowering surfaces) to bare `:@doc`.
@@ -3247,7 +3247,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             arg = _apply_property_macro!(macro_state, Val(mname), arg)
         end
         doc = macro_state.doc
-        cache_version = macro_state.cache_version
+        diskcache_version = macro_state.diskcache_version
         lru_size = macro_state.lru_size
         # Inline-method form: `f(__self__, ...) = body` (with optional `where`
         # clauses and qualified `Module.f` names). Bypasses property tooling —
@@ -3259,7 +3259,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             method_info = _detect_inline_method_lhs(arg.args[1])
             if !isnothing(method_info)
                 isempty(macros) ||
-                    error("Property-level macros (@cached, @lru, …) cannot be applied to inline methods in @dynamicstruct.")
+                    error("Property-level macros (@diskcached, @lru, …) cannot be applied to inline methods in @dynamicstruct.")
                 push!(inline_methods, (; method_info..., body=arg.args[2], lnn))
                 metadata.doc[] = nothing
                 continue
@@ -3285,7 +3285,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 all_leaves = _collect_leaves(arg)
                 group_name = Symbol("_tuple_", join(all_leaves, "_"))
                 group_locals = Set{Symbol}(all_leaves); push!(group_locals, group_name)
-                push!(oproperties, group_name => (;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, cache_version, lru_size=nothing, displayed=!isnothing(doc)))
+                push!(oproperties, group_name => (;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, diskcache_version, lru_size=nothing, displayed=!isnothing(doc)))
                 push!(docs, (group_name => (doc, true)))
                 _emit_positional_destructure!(oproperties, docs, raw_args, group_name, lnn)
                 metadata.doc[] = nothing
@@ -3319,14 +3319,14 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 group_name = Symbol("_tuple_", join(prop_names, "_"))
                 group_locals = Set{Symbol}(prop_names)
                 push!(group_locals, group_name)
-                push!(oproperties, group_name=>(;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, cache_version, lru_size=nothing, displayed=!isnothing(doc)))
+                push!(oproperties, group_name=>(;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, diskcache_version, lru_size=nothing, displayed=!isnothing(doc)))
                 push!(docs, (group_name=>(doc, true)))
                 group_name
             end
             metadata.doc[] = nothing
             for (prop_name, source) in members
                 extract_rhs = _extract_member(extract_from, source)
-                push!(oproperties, prop_name=>(;lhs=prop_name, macros=Set{Symbol}(), rhs=extract_rhs, lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([prop_name]), indices=tuple(), indexed=false, cache_version=nothing, lru_size=nothing, displayed=false))
+                push!(oproperties, prop_name=>(;lhs=prop_name, macros=Set{Symbol}(), rhs=extract_rhs, lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([prop_name]), indices=tuple(), indexed=false, diskcache_version=nothing, lru_size=nothing, displayed=false))
                 push!(docs, (prop_name=>(nothing, true)))
             end
             continue
@@ -3385,7 +3385,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         !isnothing(locals) && push!(locals, name)
         !isnothing(locals) && push!(locals, :__status__)
         @assert !isnothing(rhs) || length(macros) == 0
-        push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices, indexed, cache_version, lru_size, displayed=!isnothing(doc)))
+        push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices, indexed, diskcache_version, lru_size, displayed=!isnothing(doc)))
     end
     # `properties` holds the per-declaration list (preserves order AND duplicate
     # names — e.g. a future `@get foo()` + `@include foo(x::String)` pair). It's
@@ -3432,7 +3432,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
 
     generated_names = Tuple(name for (name, info) in oproperties if !isfixed(info))
     indexed_names = Tuple(name for (name, info) in oproperties if info.indexed)
-    cached_names = [(name, Symbol("_", type, "_", name, "_disk_cache")) for (name, info) in oproperties if !isfixed(info) && Symbol("@cached") in info.macros]
+    cached_names = [(name, Symbol("_", type, "_", name, "_disk_cache")) for (name, info) in oproperties if !isfixed(info) && Symbol("@diskcached") in info.macros]
     fixed_fields = [(name, info.lhs) for (name, info) in oproperties if isfixed(info)]
     fixed_names = [n for (n, _) in fixed_fields]
     fixed_lhs = [lhs for (_, lhs) in fixed_fields]
@@ -3555,7 +3555,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     :(__self__::$type), :(::Val{$(Meta.quot(name))}),
                     walked_indices..., Expr(:parameters, extras...),
                 ))
-                iscached_val = Symbol("@cached") in info.macros
+                iscached_val = Symbol("@diskcached") in info.macros
                 desc_expr = if haskey(property_docs, name)
                     pdoc = property_docs[name]
                     has_user_kw_splat = any(walked_indices) do idx
@@ -3609,17 +3609,17 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                                  Expr(:tuple, (QuoteNode(d) for d in sort!(collect(info.dependencies)))...))
                 block = Expr(:block,
                     _lnn, Expr(:(=), _call(:compute_property, cp_kwargs...), Expr(:block, _lnn, walked_rhs)),
-                    _lnn, Expr(:(=), _call(:iscached), Expr(:block, _lnn, iscached_val)),
+                    _lnn, Expr(:(=), _call(:isdiskcached), Expr(:block, _lnn, iscached_val)),
                     _lnn, Expr(:(=), _call(:resumes), Expr(:block, _lnn, false)),
                     _lnn, Expr(:(=), _call(:_dependencies), Expr(:block, _lnn, deps_expr)),
                 )
-                if !isnothing(info.cache_version)
-                    # Don't use _call — cache_version is per-property, not per-index
+                if !isnothing(info.diskcache_version)
+                    # Don't use _call — diskcache_version is per-property, not per-index
                     cv_method = Expr(:call,
-                        Expr(:., DynamicObjects, QuoteNode(:cache_version)),
+                        Expr(:., DynamicObjects, QuoteNode(:diskcache_version)),
                         :(__self__::$type), :(::Val{$(Meta.quot(name))}),
                     )
-                    cv_expr = (_lnn, Expr(:(=), cv_method, Expr(:block, _lnn, info.cache_version)))
+                    cv_expr = (_lnn, Expr(:(=), cv_method, Expr(:block, _lnn, info.diskcache_version)))
                     push!(block.args, cv_expr...)
                 end
                 if !isnothing(info.lru_size)
@@ -3712,12 +3712,12 @@ _parse_macro_opt(a) = error("@dynamicstruct: unsupported option `$a` — use a d
 
 """
     @dynamicstruct [docstring] [cache_type] struct Name
-        field                     # fixed field (constructor argument)
-        prop = expr               # lazily computed property
-        @cached prop = expr       # lazily computed + disk-cached property
-        prop(idx) = expr          # indexable property (fresh each call)
-        prop(args...; kw...) = expr  # indexable property (fresh each call)
-        @cached prop(idx) = expr  # indexable + disk-cached property (cached per index)
+        field                         # fixed field (constructor argument)
+        prop = expr                   # lazily computed property
+        @diskcached prop = expr       # lazily computed + disk-cached property
+        prop(idx) = expr              # indexable property (fresh each call)
+        prop(args...; kw...) = expr   # indexable property (fresh each call)
+        @diskcached prop(idx) = expr  # indexable + disk-cached property (cached per index)
     end
 
 Define a struct whose *fixed fields* are set at construction time and whose
@@ -3733,9 +3733,9 @@ does not matter — cycles will result in a stack overflow at runtime.
 - `:parallel` (default) — `ThreadsafeDict`, safe to access from multiple tasks
   simultaneously; duplicate work is avoided by sharing in-flight `Task`s.
 
-Properties marked `@cached` are additionally persisted to disk under
-`__self__.cache_path` (which itself defaults to
-`joinpath(__self__.cache_base, __self__.hash)`).
+Properties marked `@diskcached` are additionally persisted to disk under
+`__self__.diskcache_path` (which itself defaults to
+`joinpath(__self__.diskcache_base, __self__.hash)`).
 
 Keyword arguments passed to the constructor pre-populate the cache, so they act
 as overrides for any computed property.
@@ -3758,11 +3758,11 @@ p.theta  # atan(4, 3)
 
 ```julia
 # Disk-cached expensive computation.
-# cache_path defaults to joinpath("cache", hash(n)), so two Experiment(n)
+# diskcache_path defaults to joinpath("cache", hash(n)), so two Experiment(n)
 # instances with the same n share the same cache directory.
 @dynamicstruct struct Experiment
     n::Int
-    @cached result = sum(rand(n))   # computed once, then loaded from disk
+    @diskcached result = sum(rand(n))   # computed once, then loaded from disk
 end
 
 e = Experiment(1_000_000)
@@ -3948,7 +3948,8 @@ _print_struct_skip(::Type{T}, name::Symbol) where {T} = begin
     is_dunder ||
         startswith(s, "_tuple_") ||
         name === :hash_fields ||
-        name === :cache_path ||
+        name === :diskcache_path ||
+        name === :diskcache_base ||
         name === :hash ||
         name === :cache
 end
@@ -4464,7 +4465,7 @@ function _prop_nodes(route_tag::String, cached::Bool, name::Symbol,
                      indices, dep, color_map)
     out = Any[]
     isempty(route_tag) || push!(out, _tok(route_tag; bold=true, italic=true))
-    cached && push!(out, _tok("@cached "; bold=true, italic=true))
+    cached && push!(out, _tok("@diskcached "; bold=true, italic=true))
     push!(out, _tok(string(name)))
     append!(out, _signature_nodes(indices, color_map))
     append!(out, _dep_nodes(dep, color_map))
@@ -4543,7 +4544,7 @@ function _build_section(T::Type, header;
                     break
                 end
             end
-            cached = Symbol("@cached") in info.macros
+            cached = Symbol("@diskcached") in info.macros
             dep = info.indexed ?
                 _print_struct_worst_case(types_in_tree, parent_map, T, name, info) :
                 nothing
@@ -4820,7 +4821,7 @@ dependson set from `meta(T)`. Returns:
   - `rhs_string::String` — the lnn-stripped expression as a string, or
     `"(no rhs — forwarded/typed property)"` if `info.rhs === nothing`.
   - `signature::String` — `"name"` or `"name(arg, …)"`.
-  - `macros::String` — `"@cached "` etc. (trailing space if non-empty).
+  - `macros::String` — `"@diskcached "` etc. (trailing space if non-empty).
   - `dependson::Vector{Symbol}` — sorted dependency names.
 
 Pure data extraction. Renderers turn this into HTML / markdown /
