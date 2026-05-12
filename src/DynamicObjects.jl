@@ -35,7 +35,7 @@ optionally disk-cached properties.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @diskcache_status, @is_diskcached, @diskcache_path, @clear_diskcache!, @persist, @memo!, memoize!, maybememoize!, maybeprogress!, noprogress, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!
+export @dynamicstruct, @diskcache_status, @is_diskcached, @diskcache_path, @clear_diskcache!, @persist, @memo!, @dynamic_progress, memoize!, maybememoize!, maybeprogress!, noprogress, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!
 
 import SHA, Serialization
 using Treebars
@@ -1328,24 +1328,65 @@ maybeprogress!(progress, ip::IndexableProperty{name}, indices...; kwargs...) whe
     end
 end
 
-# Recursively rewrite every call site to `maybeprogress!(__progress__, …)`.
+# Recursively rewrite every call site to `maybeprogress!($progress_var, …)`.
 # Mirrors `_memo_rewrite`'s shape; orthogonal but stackable.
 #
-# Stacking with `@memo!`: `@dynamicstruct` calls `_progress_rewrite` first,
-# so `@memo! foo(x)` is still a `:macrocall` at this point — we just recurse
-# into it like any other Expr. The inner `foo(x)` becomes
+# `progress_var` is the in-scope identifier the call sites should reference
+# — typically `:__progress__`. Inside a Tb `@progress label body` block
+# (or anything that rebinds the identifier), `__progress__` gets the
+# per-block node, so the same emitted code transparently follows the
+# nesting.
+#
+# Stacking with `@memo!`: `@dynamic_progress`'s macro expansion runs before
+# `@memo!`'s (outside→in), so `@memo! foo(x)` is still a `:macrocall` here —
+# we just recurse into it like any other Expr. The inner `foo(x)` becomes
 # `maybeprogress!(__progress__, foo, x)`. When `@memo!` expands later, its
 # own `_memo_rewrite` sees that `:call` and turns it into
 # `maybememoize!(maybeprogress!, __progress__, foo, x)`. The
 # `maybememoize!(::typeof(maybeprogress!), …)` dispatch arms (above) then
 # do the right thing at runtime.
-_progress_rewrite(x) = x
-function _progress_rewrite(x::Expr)
+_progress_rewrite(progress_var::Symbol, x) = x
+function _progress_rewrite(progress_var::Symbol, x::Expr)
     if Meta.isexpr(x, :call) && length(x.args) >= 1
-        rewritten = Any[_progress_rewrite(a) for a in x.args]
-        return fixcall(Expr(:call, GlobalRef(@__MODULE__, :maybeprogress!), :__progress__, rewritten...))
+        rewritten = Any[_progress_rewrite(progress_var, a) for a in x.args]
+        return fixcall(Expr(:call, GlobalRef(@__MODULE__, :maybeprogress!), progress_var, rewritten...))
     end
-    Expr(x.head, Any[_progress_rewrite(a) for a in x.args]...)
+    Expr(x.head, Any[_progress_rewrite(progress_var, a) for a in x.args]...)
+end
+
+"""
+    @dynamic_progress progress_var body
+
+Rewrite every `:call` inside `body` as
+`maybeprogress!(progress_var, callee, args…)`, then wrap the rewritten
+body in `Treebars.@progress progress_var body` so `progress_var` is bound
+inside (and nested Tb `@progress` blocks rebind it per block).
+
+This is the macro form the property-level `@dynamic_progress` annotation
+expands to:
+
+    @dynamic_progress prop() = body
+    # in `@dynamicstruct` is sugar for
+    prop() = @dynamic_progress __status__ body
+
+It's also usable standalone:
+
+    @dynamic_progress my_status begin
+        a = foo(x)           # → maybeprogress!(my_status, foo, x)
+        b = @memo! bar(y)    # cached + progress (see `maybememoize!` arms)
+        a + b
+    end
+"""
+macro dynamic_progress(progress_var, body)
+    progress_var isa Symbol ||
+        error("@dynamic_progress: progress var must be a Symbol, got $(progress_var)")
+    rewritten = _progress_rewrite(progress_var, body)
+    out = Expr(:macrocall,
+        GlobalRef(Treebars, Symbol("@progress")),
+        __source__,
+        progress_var,
+        rewritten)
+    esc(out)
 end
 
 persist(v, args...; kwargs...) = begin
@@ -3491,26 +3532,26 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     nothing
                 end
                 walked_rhs = walk_rhs(info.rhs; info.locals, properties=prop_names, lnn=info.lnn)
-                # `@dynamic_progress`: rewrite every call site in the body to
-                # `maybeprogress!(__progress__, callee, args…)` so each call
-                # opens a substatus rooted at the current progress context.
-                # Runs BEFORE the Tb `@progress` wrap so the emitted `__progress__`
-                # symbols get substituted to `__status__` (or per-block ctx
-                # inside a nested `Treebars.@progress "label" …`) at Tb-expand
-                # time.
+                # `@dynamic_progress`-marked: emit the 2-arg form
+                # `@dynamic_progress __status__ <body>`. The macro (defined
+                # above) handles both the call-site rewrite AND the Tb
+                # `@progress __status__ <body>` wrap that binds `__progress__`
+                # inside the body. Same outside→in macro expansion order as
+                # before — `@memo!` calls inside still expand after, so the
+                # `maybememoize!(maybeprogress!, …)` stacking dispatch arms
+                # pick them up.
                 if Symbol("@dynamic_progress") in info.macros
-                    walked_rhs = _progress_rewrite(walked_rhs)
-                end
-                # Wrap the body in `Treebars.@progress __status__ <body>` when
-                # either (a) the property carries `@dynamic_progress` (so the
-                # `maybeprogress!(__progress__, …)` calls emitted above resolve
-                # to `__status__` at top level) or (b) the body uses any of the
-                # Tb in-body `@progress` forms (phase markers, for-loop wraps,
-                # sub-blocks, single-stmt wraps). Tb's `@progress` macro handles
-                # all six forms; we leave the inner macrocalls alone (walk_rhs
-                # only rewrote `__self__` references) and let Tb expand them at
-                # the outer scope.
-                if Symbol("@dynamic_progress") in info.macros || _contains_progress_macrocall(info.rhs)
+                    walked_rhs = Expr(:macrocall,
+                        GlobalRef(@__MODULE__, Symbol("@dynamic_progress")),
+                        something(info.lnn, LineNumberNode(0, :unknown)),
+                        :__status__,
+                        walked_rhs)
+                elseif _contains_progress_macrocall(info.rhs)
+                    # Body uses Tb in-body `@progress` forms (phase markers,
+                    # for-loop wraps, sub-blocks, single-stmt wraps) without
+                    # being `@dynamic_progress`-marked. Wrap in Tb's
+                    # `@progress __status__ <body>` so `__progress__` is bound
+                    # for the inner Tb macros to rebind from.
                     walked_rhs = Expr(:macrocall,
                         GlobalRef(Treebars, Symbol("@progress")),
                         something(info.lnn, LineNumberNode(0, :unknown)),
