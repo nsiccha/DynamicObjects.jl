@@ -1389,6 +1389,30 @@ macro dynamic_progress(progress_var, body)
     esc(out)
 end
 
+# Body-wrap dispatcher: each property macro that wants to transform the
+# walked RHS at `@dynamicstruct` codegen time registers a method here.
+# Default = identity. The codegen loop folds over `info.macros`; iteration
+# order is `Set{Symbol}` order (implementation-defined). In practice each
+# property carries at most one body-wrap annotation so order is moot — see
+# `_PropertyMacroState` for the rationale.
+#
+# This is the dispatch-based replacement for the prior
+# `if Symbol("@…") in info.macros … end` if-tree. Adding a new property
+# annotation now means: one peeling method on `_apply_property_macro!`
+# (parse-time) plus one method on `_apply_body_wrap!` (codegen-time) —
+# no edit to the central if-tree.
+_apply_body_wrap!(::Val{name}, walked_rhs, info) where {name} = walked_rhs
+
+# `@dynamic_progress`: emit the 2-arg `@dynamic_progress __status__ <body>`
+# macrocall — the macro itself drives the call-site rewrite and the Tb
+# `@progress __status__ <body>` wrap.
+_apply_body_wrap!(::Val{Symbol("@dynamic_progress")}, walked_rhs, info) =
+    Expr(:macrocall,
+        GlobalRef(@__MODULE__, Symbol("@dynamic_progress")),
+        something(info.lnn, LineNumberNode(0, :unknown)),
+        :__status__,
+        walked_rhs)
+
 persist(v, args...; kwargs...) = begin
     Serialization.serialize(
         get_diskcache_path(args...; kwargs...),
@@ -2564,13 +2588,22 @@ _replace_lnn(x, _) = x
 mutable struct _PropertyMacroState
     doc::Any
     diskcache_version::Any
+    # Set-typed: the body-wrap dispatcher's iteration order is
+    # implementation-defined for a single property, but in practice each
+    # property carries at most one body-wrap annotation, so order is moot.
+    # If two body-wrap annotations ever need to compose deterministically,
+    # extend the state with a separate ordered vector and iterate that.
     macros::Set{Symbol}
 end
 
 # Default: register the macro name in `state.macros` and unwrap to the
-# inner expression so the loop continues peeling.
-_apply_property_macro!(state::_PropertyMacroState, ::Val{name}, arg) where {name} =
-    (push!(state.macros, name); arg.args[end])
+# inner expression so the loop continues peeling. Idempotent push — outer
+# macro peeling never visits the same annotation twice on a single property,
+# but the guard makes the invariant explicit.
+function _apply_property_macro!(state::_PropertyMacroState, ::Val{name}, arg) where {name}
+    name in state.macros || push!(state.macros, name)
+    arg.args[end]
+end
 
 # `@doc "str" <def>` — silently consume (don't push to macros) and capture
 # the docstring. `length(arg.args) >= 4` matches Julia's lowered shape
@@ -2589,7 +2622,7 @@ end
 # `@diskcached <prop> = …` (length 3) or `@diskcached v"…" <prop> = …` (length 4
 # with a version argument).
 function _apply_property_macro!(state::_PropertyMacroState, ::Val{Symbol("@diskcached")}, arg)
-    push!(state.macros, Symbol("@diskcached"))
+    Symbol("@diskcached") in state.macros || push!(state.macros, Symbol("@diskcached"))
     length(arg.args) == 4 && (state.diskcache_version = _parse_diskcache_version(arg.args[3]))
     arg.args[end]
 end
@@ -3532,26 +3565,23 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     nothing
                 end
                 walked_rhs = walk_rhs(info.rhs; info.locals, properties=prop_names, lnn=info.lnn)
-                # `@dynamic_progress`-marked: emit the 2-arg form
-                # `@dynamic_progress __status__ <body>`. The macro (defined
-                # above) handles both the call-site rewrite AND the Tb
-                # `@progress __status__ <body>` wrap that binds `__progress__`
-                # inside the body. Same outside→in macro expansion order as
-                # before — `@memo!` calls inside still expand after, so the
-                # `maybememoize!(maybeprogress!, …)` stacking dispatch arms
-                # pick them up.
-                if Symbol("@dynamic_progress") in info.macros
-                    walked_rhs = Expr(:macrocall,
-                        GlobalRef(@__MODULE__, Symbol("@dynamic_progress")),
-                        something(info.lnn, LineNumberNode(0, :unknown)),
-                        :__status__,
-                        walked_rhs)
-                elseif _contains_progress_macrocall(info.rhs)
-                    # Body uses Tb in-body `@progress` forms (phase markers,
-                    # for-loop wraps, sub-blocks, single-stmt wraps) without
-                    # being `@dynamic_progress`-marked. Wrap in Tb's
-                    # `@progress __status__ <body>` so `__progress__` is bound
-                    # for the inner Tb macros to rebind from.
+                # Body-wrap dispatcher. Each property macro that wants to
+                # transform the walked RHS at codegen time registers a method
+                # of `_apply_body_wrap!(::Val{name}, walked_rhs, info)`; the
+                # default arm is identity. We fold over `info.macros`
+                # (`Set{Symbol}` — iteration order is implementation-defined;
+                # see `_PropertyMacroState` for why that's fine in practice).
+                for _mname in info.macros
+                    walked_rhs = _apply_body_wrap!(Val(_mname), walked_rhs, info)
+                end
+                # Implicit Tb wrap: body uses Tb in-body `@progress` forms
+                # (phase markers, for-loop wraps, sub-blocks, single-stmt
+                # wraps) without being `@dynamic_progress`-marked. Wrap in
+                # `Treebars.@progress __status__ <body>` so `__progress__` is
+                # bound for the inner Tb macros to rebind from. Skipped when
+                # `@dynamic_progress` is marked — the dispatched body-wrap
+                # already does the Tb wrap.
+                if !(Symbol("@dynamic_progress") in info.macros) && _contains_progress_macrocall(info.rhs)
                     walked_rhs = Expr(:macrocall,
                         GlobalRef(Treebars, Symbol("@progress")),
                         something(info.lnn, LineNumberNode(0, :unknown)),
