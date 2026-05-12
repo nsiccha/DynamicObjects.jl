@@ -236,7 +236,16 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
         nothing
     end
     get!(cache, (indices, (;kwargs...)); fetch, substatus=substatus_f, retry_failed) do s
-        getorcomputeproperty(o, name, indices...; __status__=s, kwargs...)
+        # Call `_computeproperty` directly, NOT `getorcomputeproperty`:
+        # the latter, when `indices` and `kwargs` are both empty AND
+        # `is_indexed_property(o, name)` (we're already inside the IP wrapper,
+        # so this is always true), short-circuits to return the IP wrapper
+        # itself (see `getorcomputeproperty`'s IP-wrapper branch ~L1156).
+        # That would cache the IP wrapper at `((), (;))` instead of running
+        # the body — `@memo! o.foo()` on a 0-arg IP would never actually
+        # compute anything. `_computeproperty` skips the wrapper short-circuit
+        # and goes straight to the body.
+        _computeproperty(o, name, indices...; __status__=s, kwargs...)
     end
 end
 # `substatus()` is invoked OUTSIDE the cache lock. Calling it under the
