@@ -36,7 +36,7 @@ optionally disk-cached properties.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, memoize!, maybememoize!, @lru, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, ThreadsafeLRUDict, LRUDict
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, memoize!, maybememoize!, maybeprogress!, noprogress, @lru, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, ThreadsafeLRUDict, LRUDict
 
 import SHA, Serialization
 
@@ -1227,6 +1227,9 @@ calls. The specialization for `IndexableProperty` routes through
 """
 maybememoize!(f, args...; kwargs...) = f(args...; kwargs...)
 maybememoize!(p::IndexableProperty, args...; kwargs...) = memoize!(p, args...; kwargs...)
+# `maybememoize!(::typeof(maybeprogress!), …)` stacking arms live below
+# `maybeprogress!`'s definition — they reference `typeof(maybeprogress!)`,
+# which has to exist at parse time.
 
 """
     @memo! expr
@@ -1277,6 +1280,101 @@ function _memo_rewrite(x::Expr)
         return fixcall(Expr(:call, GlobalRef(@__MODULE__, :maybememoize!), rewritten...))
     end
     Expr(x.head, Any[_memo_rewrite(a) for a in x.args]...)
+end
+
+"""
+    noprogress(f, args...; kwargs...)
+
+Opt out of dynamic progress wrapping at a specific call site. Inside an IP
+body annotated with `@dynamic_progress`, every call is rewritten to
+`maybeprogress!(__progress__, callee, args…)`. Writing `noprogress(f, args…)`
+makes the rewriter emit `maybeprogress!(__progress__, noprogress, f, args…)`,
+which dispatches to a method that just runs `f(args…)` without any progress
+attachment.
+
+Note the argument shape: `noprogress(f, args…)` (comma-separated callee and
+its args), not `noprogress(f(args…))` — the latter would still wrap `f(args…)`
+under the body-wide rewrite before `noprogress` ever sees it.
+
+Outside a `@dynamic_progress` body, `noprogress(f, args…)` is just `f(args…)`.
+"""
+noprogress(f, args...; kwargs...) = f(args...; kwargs...)
+
+"""
+    maybeprogress!(progress, callee, args…; kwargs...)
+
+Runtime dispatch arm for `@dynamic_progress`-rewritten call sites. The
+rewriter wraps every call as `maybeprogress!(__progress__, callee, args…)`,
+where `__progress__` resolves to the current Treebars progress context (the
+enclosing IP's `__status__` at top level; a nested `@progress` block re-binds
+it to that block's node). Dispatch on `callee`:
+
+- `callee::IndexableProperty` — open a per-call substatus rooted at
+  `progress`, run the IP body inside it (no caching).
+- `callee::typeof(noprogress)` — opt-out, calls through (`noprogress(f, args…)`).
+- anything else — plain `callee(args…; kwargs…)`.
+
+The caching stack — `@memo! foo(x)` inside a `@dynamic_progress` body —
+lands at `maybememoize!(maybeprogress!, progress, callee, args…)` after
+natural macro expansion order, and is handled by the corresponding
+`maybememoize!` dispatch arms (see above).
+
+`progress === nothing` is fine throughout — the `_default_substatus` /
+`fetchindex!` paths have explicit `::Nothing` fallbacks.
+"""
+maybeprogress!(progress, f, args...; kwargs...) = f(args...; kwargs...)
+
+maybeprogress!(progress, ::typeof(noprogress), f, args...; kwargs...) =
+    f(args...; kwargs...)
+
+# `@memo!` expands outside `@dynamic_progress`'s `_progress_rewrite`, so a
+# `@memo! foo(x)` inside a `@dynamic_progress` body lands at runtime as
+# `maybememoize!(maybeprogress!, __progress__, callee, args…)` — i.e. with
+# `maybeprogress!` swallowed as the first positional arg. These dispatch arms
+# undo that nesting: an IP callee goes through `fetchindex!` (cached + progress);
+# a plain callee runs without caching but still under the progress context.
+maybememoize!(::typeof(maybeprogress!), progress, f::IndexableProperty, args...; kwargs...) =
+    fetchindex!(progress, f, args...; kwargs...)
+maybememoize!(::typeof(maybeprogress!), progress, f, args...; kwargs...) =
+    maybeprogress!(progress, f, args...; kwargs...)
+
+maybeprogress!(progress, ip::IndexableProperty{name}, indices...; kwargs...) where {name} = begin
+    o = ip.o
+    _info = metafirst(typeof(o), name)
+    _displayed = _info === nothing ? true : get(_info, :displayed, true)
+    # Per-call substatus, parented under `progress` (instead of the default
+    # `o.__status__`). When `progress === nothing` this returns `nothing` and
+    # everything downstream falls back to the standard `o.__status__` flow
+    # inside `_computeproperty`.
+    s = _default_substatus(progress, o, name, indices...; displayed=_displayed, kwargs...)
+    try
+        rv = _computeproperty(o, name, indices...; __status__=s, kwargs...)
+        _finalize_substatus!(s)
+        rv
+    catch e
+        _fail_substatus!(s, e)
+        rethrow()
+    end
+end
+
+# Recursively rewrite every call site to `maybeprogress!(__progress__, …)`.
+# Mirrors `_memo_rewrite`'s shape; orthogonal but stackable.
+#
+# Stacking with `@memo!`: `@dynamicstruct` calls `_progress_rewrite` first,
+# so `@memo! foo(x)` is still a `:macrocall` at this point — we just recurse
+# into it like any other Expr. The inner `foo(x)` becomes
+# `maybeprogress!(__progress__, foo, x)`. When `@memo!` expands later, its
+# own `_memo_rewrite` sees that `:call` and turns it into
+# `maybememoize!(maybeprogress!, __progress__, foo, x)`. The
+# `maybememoize!(::typeof(maybeprogress!), …)` dispatch arms (above) then
+# do the right thing at runtime.
+_progress_rewrite(x) = x
+function _progress_rewrite(x::Expr)
+    if Meta.isexpr(x, :call) && length(x.args) >= 1
+        rewritten = Any[_progress_rewrite(a) for a in x.args]
+        return fixcall(Expr(:call, GlobalRef(@__MODULE__, :maybeprogress!), :__progress__, rewritten...))
+    end
+    Expr(x.head, Any[_progress_rewrite(a) for a in x.args]...)
 end
 
 persist(v, args...; kwargs...) = begin
@@ -3339,6 +3437,21 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     nothing
                 end
                 walked_rhs = walk_rhs(info.rhs; info.locals, properties=prop_names, lnn=info.lnn)
+                # `@dynamic_progress`: rewrite every call site in the body to
+                # `maybeprogress!(__progress__, callee, args…)` so each call
+                # opens a substatus rooted at the current progress context.
+                # Then wrap the body in `Treebars.@progress __status__ <body>`
+                # so the emitted `__progress__` placeholder gets substituted
+                # to `__status__` (or per-block ctx inside a nested
+                # `Treebars.@progress "label" …`) at Tb-expand time.
+                if Symbol("@dynamic_progress") in info.macros
+                    walked_rhs = _progress_rewrite(walked_rhs)
+                    walked_rhs = Expr(:macrocall,
+                        GlobalRef(Treebars, Symbol("@progress")),
+                        something(info.lnn, LineNumberNode(0, :unknown)),
+                        :__status__,
+                        walked_rhs)
+                end
                 block = Expr(:block,
                     _lnn, Expr(:(=), _call(:compute_property, cp_kwargs...), Expr(:block, _lnn, walked_rhs)),
                     _lnn, Expr(:(=), _call(:iscached), Expr(:block, _lnn, iscached_val)),
