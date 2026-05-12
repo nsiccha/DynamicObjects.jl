@@ -960,7 +960,7 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
     #    re-read it.
     # 3. **Pre-enumeration**: gated by the `@progress` property-level marker.
     #    When `Symbol("@progress") in info.macros`, before the body runs we
-    #    drive `_dependencies(typeof(o), Val(name))` (statically discovered by
+    #    drive `_dependencies(typeof(o), Val(name), indices...)` (statically discovered by
     #    `walk_rhs`) to register pending placeholder children of `__status__`.
     #    Pending children whose deps the body never forces remain pending;
     #    Treebars' transient cleanup on `finalize_progress!` handles them.
@@ -978,7 +978,7 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
     if __status__ isa Treebars.ProgressNode
         _info = metafirst(typeof(o), name)
         if _info !== nothing && Symbol("@progress") in get(_info, :macros, Set{Symbol}())
-            for dep in _dependencies(typeof(o), vname)
+            for dep in _dependencies(typeof(o), vname, indices...)
                 dep_desc = _property_description(o, Val(dep))
                 Treebars.prepare_progress!(__status__;
                     description=something(dep_desc, string(dep)),
@@ -2356,8 +2356,14 @@ Consumed by `_computeproperty`'s auto-progress instrumentation to
 pre-enumerate level-1 announced dependencies as pending children of
 `__status__`. The default returns an empty Set so types defined before
 this method was emitted still resolve.
+
+The signature mirrors `compute_property`'s — `(::Type{T}, ::Val{name},
+walked_indices...)` — so different indexing signatures of the same
+property name produce distinct method definitions instead of silently
+overwriting each other (which errors during precompilation). The default
+fallback absorbs any extra args/kwargs to remain a catch-all.
 """
-_dependencies(::Type, ::Val) = Set{Symbol}()
+_dependencies(::Type, ::Val, args...; kwargs...) = Set{Symbol}()
 """    _nested_struct_type(::Type{T}, ::Val{name})
 
 Return the type of the nested struct exposed under property `name` on `T`,
@@ -3440,23 +3446,28 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     nothing
                 end
                 walked_rhs = walk_rhs(info.rhs; info.locals, properties=prop_names, lnn=info.lnn)
-                # Emit `_dependencies(::Type{T}, ::Val{:name}) = Set{Symbol}((…))`.
+                # Emit `_dependencies(::Type{T}, ::Val{:name}, walked_indices...) = Set{Symbol}((…))`.
                 # The Set literal is built explicitly as an Expr so the macro
                 # output is a self-contained constructor call rather than a
                 # spliced-in `Set` instance (which wouldn't survive printing /
                 # serialization through `setlnn`). `info.dependencies` is
                 # populated by the pre-walk pass above (~L3116).
+                #
+                # The signature mirrors `compute_property`'s — built via the
+                # same `_call` helper so it includes `walked_indices...`. This
+                # is what makes the method definition distinct across overloads
+                # of the same property name (e.g. an `@include`-forwarded
+                # duplicate vs the host definition): different `walked_indices`
+                # tuples produce distinct method signatures, so the two methods
+                # coexist instead of silently overwriting each other (which
+                # errors during precompilation).
                 deps_expr = Expr(:call, Expr(:curly, GlobalRef(Base, :Set), :Symbol),
                                  Expr(:tuple, (QuoteNode(d) for d in sort!(collect(info.dependencies)))...))
-                _deps_method = Expr(:call,
-                    Expr(:., DynamicObjects, QuoteNode(:_dependencies)),
-                    :(::Type{$type}), :(::Val{$(Meta.quot(name))}),
-                )
                 block = Expr(:block,
                     _lnn, Expr(:(=), _call(:compute_property, cp_kwargs...), Expr(:block, _lnn, walked_rhs)),
                     _lnn, Expr(:(=), _call(:iscached), Expr(:block, _lnn, iscached_val)),
                     _lnn, Expr(:(=), _call(:resumes), Expr(:block, _lnn, false)),
-                    _lnn, Expr(:(=), _deps_method, Expr(:block, _lnn, deps_expr)),
+                    _lnn, Expr(:(=), _call(:_dependencies), Expr(:block, _lnn, deps_expr)),
                 )
                 if !isnothing(info.cache_version)
                     # Don't use _call — cache_version is per-property, not per-index
