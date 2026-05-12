@@ -65,7 +65,30 @@ _hash_replace(x::NamedTuple) = map(_hash_replace, x)
 _hash_replace(x) = x
 compute_property(o, ::Val{:cache_base}) = "cache"
 compute_property(o, ::Val{:cache_path}) = joinpath(o.cache_base, o.hash)
-compute_property(o, ::Val{:__status__}) = nothing
+# Persistent per-instance status node. The PropertyCache `get!` around the
+# fall-through stores the returned ProgressNode on first access, so every
+# subsequent `o.__status__` read returns the same object. Inline-child
+# constructors pre-populate `__status__` in the cache (so this fall-through
+# only fires for instances that don't have one wired explicitly). Parent
+# resolution: if a `__parent__` entry is present in the cache (i.e. the
+# instance was constructed as a child), parent under `__parent__.__status__`;
+# otherwise build a root node. Label uses `_type_description(typeof(o))` if
+# non-nothing, else the bare type name.
+function compute_property(o, ::Val{:__status__})
+    T = typeof(o)
+    label = something(_type_description(T), string(nameof(T)))
+    parent_status = if haskey(getfield(o, :cache).cache, :__parent__)
+        parent = o.__parent__
+        parent === nothing ? nothing : parent.__status__
+    else
+        nothing
+    end
+    Treebars.ProgressNode(
+        Treebars.StateProgress(; description=label),
+        (; propagates=false);
+        parent=parent_status,
+    )
+end
 compute_property(o, ::Val{:__strict__}) = true
 compute_property(o, ::Val{:__cache_type__}) = typeof(getfield(o, :cache).cache)
 compute_property(o, ::Val{:__substatus__}, name, args...; kwargs...) =
