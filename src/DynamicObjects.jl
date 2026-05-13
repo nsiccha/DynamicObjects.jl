@@ -2542,18 +2542,6 @@ end
 _resolve_macro_name(m::GlobalRef) = m.name
 _resolve_macro_name(m) = m
 
-# True iff `e` (or any sub-expression) is an `@progress` macrocall.
-# Used at property-body emission to decide whether to wrap the body in
-# `Treebars.@progress __status__ <body>` so the in-body `@progress` forms
-# (phase markers, for-loop wraps, sub-blocks, single-stmt wraps) get
-# lowered by Treebars at the property's outer scope.
-_contains_progress_macrocall(::Any) = false
-function _contains_progress_macrocall(e::Expr)
-    e.head === :macrocall && length(e.args) >= 1 &&
-        _resolve_macro_name(e.args[1]) === Symbol("@progress") && return true
-    any(_contains_progress_macrocall, e.args)
-end
-
 # Property names introduced by an `arg`'s LHS — bare symbols, typed
 # fields, and tuple destructures. Inline structs and other shapes
 # contribute none. Used to assemble `parent_props` in `dynamicstruct`.
@@ -3573,20 +3561,6 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 # see `_PropertyMacroState` for why that's fine in practice).
                 for _mname in info.macros
                     walked_rhs = _apply_body_wrap!(Val(_mname), walked_rhs, info)
-                end
-                # Implicit Tb wrap: body uses Tb in-body `@progress` forms
-                # (phase markers, for-loop wraps, sub-blocks, single-stmt
-                # wraps) without being `@dynamic_progress`-marked. Wrap in
-                # `Treebars.@progress __status__ <body>` so `__progress__` is
-                # bound for the inner Tb macros to rebind from. Skipped when
-                # `@dynamic_progress` is marked — the dispatched body-wrap
-                # already does the Tb wrap.
-                if !(Symbol("@dynamic_progress") in info.macros) && _contains_progress_macrocall(info.rhs)
-                    walked_rhs = Expr(:macrocall,
-                        GlobalRef(Treebars, Symbol("@progress")),
-                        something(info.lnn, LineNumberNode(0, :unknown)),
-                        :__status__,
-                        walked_rhs)
                 end
                 # Emit `_dependencies(::Type{T}, ::Val{:name}, walked_indices...) = Set{Symbol}((…))`.
                 # The Set literal is built explicitly as an Expr so the macro
