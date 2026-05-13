@@ -2521,13 +2521,24 @@ fixcall(x::Expr) = if Meta.isexpr(x, :call)
     # :parameters nodes (e.g. one from info.indices containing `kwargs...` and one from
     # cp_kwargs containing `name=val`). Julia requires splat kwargs to be final, so we
     # sort them to the end regardless of which :parameters node they originated from.
+    # Splats are deduped by the splatted name (`kwargs...` appearing twice
+    # collapses to once) — Julia rejects duplicate splats in a method
+    # signature, and at call sites splatting the same NamedTuple twice is a
+    # no-op, so dedupe is safe either way.
     pargs_fixed = []
     pargs_splat = []
+    seen_splats = Set{Any}()
     args = []
     for arg in fixcall.(x.args[2:end])
         if Meta.isexpr(arg, :parameters)
             for a in arg.args
-                Meta.isexpr(a, :(...)) ? push!(pargs_splat, a) : push!(pargs_fixed, a)
+                if Meta.isexpr(a, :(...))
+                    a.args[1] in seen_splats && continue
+                    push!(seen_splats, a.args[1])
+                    push!(pargs_splat, a)
+                else
+                    push!(pargs_fixed, a)
+                end
             end
         else
             push!(args, arg)
@@ -3568,17 +3579,14 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 # locals + prop_names so interpolated sibling-property refs in
                 # the docstring resolve through the same scope rules as the
                 # body (`$method` → `__self__.method`, `$top_chains` → … etc).
-                # If the user's signature already includes a `; kwargs...`
-                # splat, don't add a second one — Julia rejects duplicate
-                # kw-splats.
+                # `_property_description` is called as `(o, Val(name), args...;
+                # kwargs...)` so the override must accept `kwargs...`; we
+                # always append, and `fixcall` dedupes against a user-supplied
+                # `; kwargs...` in the index signature.
                 if !isnothing(info.doc)
-                    has_user_kw_splat = any(walked_indices) do idx
-                        Meta.isexpr(idx, :parameters) && any(a -> Meta.isexpr(a, :...), idx.args)
-                    end
-                    desc_extras = has_user_kw_splat ? () : (:(kwargs...),)
                     walked_doc = walk_rhs(info.doc; info.locals, properties=prop_names, lnn=info.lnn)
                     push!(block.args, _lnn,
-                        Expr(:(=), _call(:_property_description, desc_extras...),
+                        Expr(:(=), _call(:_property_description, :(kwargs...)),
                              Expr(:block, _lnn, walked_doc)))
                 end
                 block
