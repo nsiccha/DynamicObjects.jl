@@ -2584,35 +2584,30 @@ mutable struct _PropertyMacroState
     macros::Set{Symbol}
 end
 
-# Default: register the macro name in `state.macros` and unwrap to the
-# inner expression so the loop continues peeling. Idempotent push — outer
-# macro peeling never visits the same annotation twice on a single property,
-# but the guard makes the invariant explicit.
-function _apply_property_macro!(state::_PropertyMacroState, ::Val{name}, arg) where {name}
-    name in state.macros || push!(state.macros, name)
-    arg.args[end]
+# Default arm: register the macro name in `state.macros` and return the
+# inner expression so the driver loop continues peeling. `Set` semantics
+# make the push idempotent. Variadic `extras...` absorbs any positional
+# macro args (e.g. `@diskcached v"2" …`) the macro doesn't care to inspect.
+function _apply_property_macro!(state::_PropertyMacroState, ::Val{name}, inner, extras...) where {name}
+    push!(state.macros, name)
+    inner
 end
 
-# `@doc "str" <def>` — silently consume (don't push to macros) and capture
-# the docstring. `length(arg.args) >= 4` matches Julia's lowered shape
-# (`(:macrocall, :@doc, LNN, "str", <def>)`); shorter forms fall back to
-# the default behavior.
-function _apply_property_macro!(state::_PropertyMacroState, ::Val{Symbol("@doc")}, arg)
-    if length(arg.args) >= 4
-        docexpr = arg.args[end-1]
-        (docexpr isa AbstractString || Meta.isexpr(docexpr, :string)) && (state.doc = docexpr)
-        return arg.args[end]
-    end
+# `@doc "str" <def>` — capture the docstring as a side-effect on `state`.
+# The bare `@doc <def>` form falls through to the default arm. Both push.
+function _apply_property_macro!(state::_PropertyMacroState, ::Val{Symbol("@doc")}, inner, str)
     push!(state.macros, Symbol("@doc"))
-    arg.args[end]
+    (str isa AbstractString || Meta.isexpr(str, :string)) && (state.doc = str)
+    inner
 end
 
-# `@diskcached <prop> = …` (length 3) or `@diskcached v"…" <prop> = …` (length 4
-# with a version argument).
-function _apply_property_macro!(state::_PropertyMacroState, ::Val{Symbol("@diskcached")}, arg)
-    Symbol("@diskcached") in state.macros || push!(state.macros, Symbol("@diskcached"))
-    length(arg.args) == 4 && (state.diskcache_version = _parse_diskcache_version(arg.args[3]))
-    arg.args[end]
+# `@diskcached v"…" <prop> = …` captures the per-property cache version.
+# The bare `@diskcached <prop> = …` form falls through to the default arm
+# (it just needs `:@diskcached` registered in `state.macros`).
+function _apply_property_macro!(state::_PropertyMacroState, ::Val{Symbol("@diskcached")}, inner, version_expr)
+    push!(state.macros, Symbol("@diskcached"))
+    state.diskcache_version = _parse_diskcache_version(version_expr)
+    inner
 end
 _parse_diskcache_version(v::VersionNumber) = v
 function _parse_diskcache_version(ver_expr::Expr)
@@ -3211,18 +3206,23 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         indices = tuple()
         indexed = false
         diskcache_version = nothing
-        # Peel `@doc` / `@diskcached` / unrecognised macros from `arg`
-        # via `_apply_property_macro!` dispatch (one method per macro
-        # shape). The state struct mutates `doc` / `diskcache_version` /
-        # `macros` in place — `macros` is the same Set the outer loop
-        # uses, so we read it back implicitly; the other two are scalars
-        # copied back after the loop.
+        # Peel macros from `arg` via `_apply_property_macro!` dispatch.
+        # The driver does the structural peel — extracts the inner expr
+        # and any positional macro args — and hands `(state, ::Val{name},
+        # inner, extras...)` to the handler. Handlers mutate `state`
+        # (push to `macros`, set `doc` / `diskcache_version`) and return
+        # `inner` (or a transformed inner) for the next iteration. The
+        # default arm just registers the macro name and returns `inner`,
+        # so unknown property macros are recorded without bespoke code.
         macro_state = _PropertyMacroState(doc, diskcache_version, macros)
         while Meta.isexpr(arg, :macrocall)
+            # macrocall shape: (:macrocall, name_or_globalref, LNN, args...).
             # `_resolve_macro_name` collapses `GlobalRef(Core, :@doc)` (the
             # form Julia's docstring lowering surfaces) to bare `:@doc`.
             mname = _resolve_macro_name(arg.args[1])
-            arg = _apply_property_macro!(macro_state, Val(mname), arg)
+            extras = arg.args[3:end-1]
+            inner = arg.args[end]
+            arg = _apply_property_macro!(macro_state, Val(mname), inner, extras...)
         end
         doc = macro_state.doc
         diskcache_version = macro_state.diskcache_version
