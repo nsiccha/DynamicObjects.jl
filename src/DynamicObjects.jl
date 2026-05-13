@@ -2673,12 +2673,12 @@ function _emit_positional_element!(oproperties, docs, a::Expr, i, source_sym, ln
     inner_leaves = _collect_leaves(a)
     inner_name = Symbol("_tuple_", join(inner_leaves, "_"))
     inner_locals = Set{Symbol}(inner_leaves); push!(inner_locals, inner_name)
-    push!(oproperties, inner_name => (;lhs=inner_name, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=inner_locals, indices=tuple(), indexed=false, diskcache_version=nothing, displayed=false))
+    push!(oproperties, inner_name => (;lhs=inner_name, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=inner_locals, indices=tuple(), indexed=false, diskcache_version=nothing, displayed=false, doc=nothing))
     push!(docs, (inner_name => (nothing, true)))
     _emit_positional_destructure!(oproperties, docs, a.args, inner_name, lnn)
 end
 function _push_positional_leaf!(oproperties, docs, leaf::Symbol, i, source_sym, lnn)
-    push!(oproperties, leaf => (;lhs=leaf, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([leaf]), indices=tuple(), indexed=false, diskcache_version=nothing, displayed=false))
+    push!(oproperties, leaf => (;lhs=leaf, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([leaf]), indices=tuple(), indexed=false, diskcache_version=nothing, displayed=false, doc=nothing))
     push!(docs, (leaf => (nothing, true)))
 end
 # One element of a named-destructure LHS: either a bare Symbol leaf or a
@@ -3262,7 +3262,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 all_leaves = _collect_leaves(arg)
                 group_name = Symbol("_tuple_", join(all_leaves, "_"))
                 group_locals = Set{Symbol}(all_leaves); push!(group_locals, group_name)
-                push!(oproperties, group_name => (;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, diskcache_version, displayed=!isnothing(doc)))
+                push!(oproperties, group_name => (;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, diskcache_version, displayed=!isnothing(doc), doc))
                 push!(docs, (group_name => (doc, true)))
                 _emit_positional_destructure!(oproperties, docs, raw_args, group_name, lnn)
                 metadata.doc[] = nothing
@@ -3296,14 +3296,14 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 group_name = Symbol("_tuple_", join(prop_names, "_"))
                 group_locals = Set{Symbol}(prop_names)
                 push!(group_locals, group_name)
-                push!(oproperties, group_name=>(;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, diskcache_version, displayed=!isnothing(doc)))
+                push!(oproperties, group_name=>(;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, diskcache_version, displayed=!isnothing(doc), doc))
                 push!(docs, (group_name=>(doc, true)))
                 group_name
             end
             metadata.doc[] = nothing
             for (prop_name, source) in members
                 extract_rhs = _extract_member(extract_from, source)
-                push!(oproperties, prop_name=>(;lhs=prop_name, macros=Set{Symbol}(), rhs=extract_rhs, lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([prop_name]), indices=tuple(), indexed=false, diskcache_version=nothing, displayed=false))
+                push!(oproperties, prop_name=>(;lhs=prop_name, macros=Set{Symbol}(), rhs=extract_rhs, lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([prop_name]), indices=tuple(), indexed=false, diskcache_version=nothing, displayed=false, doc=nothing))
                 push!(docs, (prop_name=>(nothing, true)))
             end
             continue
@@ -3362,7 +3362,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         !isnothing(locals) && push!(locals, name)
         !isnothing(locals) && push!(locals, :__status__)
         @assert !isnothing(rhs) || length(macros) == 0
-        push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices, indexed, diskcache_version, displayed=!isnothing(doc)))
+        push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices, indexed, diskcache_version, displayed=!isnothing(doc), doc))
     end
     # `properties` holds the per-declaration list (preserves order AND duplicate
     # names — e.g. a future `@get foo()` + `@include foo(x::String)` pair). It's
@@ -3396,7 +3396,6 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         oproperties[i] = name => merge(info, (; dependencies=deps))
     end
     properties = collect(oproperties)
-    property_docs = Dict(name => doc for (name, (doc, _)) in docs if !isnothing(doc))
 
     # Struct-level lint passes: repeated-prefix and shared-arg-signature.
     # Lints have moved to `analyze_structure(T)` — run from `print_structure`,
@@ -3533,25 +3532,6 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     walked_indices..., Expr(:parameters, extras...),
                 ))
                 iscached_val = Symbol("@diskcached") in info.macros
-                desc_expr = if haskey(property_docs, name)
-                    pdoc = property_docs[name]
-                    has_user_kw_splat = any(walked_indices) do idx
-                        Meta.isexpr(idx, :parameters) && any(a -> Meta.isexpr(a, :...), idx.args)
-                    end
-                    desc_extras = has_user_kw_splat ? () : (:(kwargs...),)
-                    # Walk the docstring expression so interpolated bare names
-                    # resolve through the same scope rules as the property's
-                    # body: sibling-property references (`$method`,
-                    # `$top_chains`, …) get rewritten to `__self__.<name>`,
-                    # while the property's own indices and kwargs stay as
-                    # plain locals (they're in the emitted method signature).
-                    # String literals with no interpolation are passed through
-                    # unchanged by `walk_rhs`.
-                    walked_doc = walk_rhs(pdoc; info.locals, properties=prop_names, lnn=info.lnn)
-                    _lnn, Expr(:(=), _call(:_property_description, desc_extras...), Expr(:block, _lnn, walked_doc))
-                else
-                    nothing
-                end
                 walked_rhs = walk_rhs(info.rhs; info.locals, properties=prop_names, lnn=info.lnn)
                 # Body-wrap dispatcher. Each property macro that wants to
                 # transform the walked RHS at codegen time registers a method
@@ -3594,7 +3574,24 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     cv_expr = (_lnn, Expr(:(=), cv_method, Expr(:block, _lnn, info.diskcache_version)))
                     push!(block.args, cv_expr...)
                 end
-                !isnothing(desc_expr) && push!(block.args, desc_expr...)
+                # `@doc`-annotated properties emit a per-property
+                # `_property_description` override. Walked with the property's
+                # locals + prop_names so interpolated sibling-property refs in
+                # the docstring resolve through the same scope rules as the
+                # body (`$method` → `__self__.method`, `$top_chains` → … etc).
+                # If the user's signature already includes a `; kwargs...`
+                # splat, don't add a second one — Julia rejects duplicate
+                # kw-splats.
+                if !isnothing(info.doc)
+                    has_user_kw_splat = any(walked_indices) do idx
+                        Meta.isexpr(idx, :parameters) && any(a -> Meta.isexpr(a, :...), idx.args)
+                    end
+                    desc_extras = has_user_kw_splat ? () : (:(kwargs...),)
+                    walked_doc = walk_rhs(info.doc; info.locals, properties=prop_names, lnn=info.lnn)
+                    push!(block.args, _lnn,
+                        Expr(:(=), _call(:_property_description, desc_extras...),
+                             Expr(:block, _lnn, walked_doc)))
+                end
                 block
             end
             for (name, info) in oproperties if !isfixed(info)
