@@ -3531,6 +3531,12 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     :(__self__::$type), :(::Val{$(Meta.quot(name))}),
                     walked_indices..., Expr(:parameters, extras...),
                 ))
+                # Method-def shorthand: every per-property emit (compute_property,
+                # _dependencies, _property_description, …) is `Expr(:(=), _call(f,
+                # extras...), Expr(:block, _lnn, body))`. Funnel through one helper
+                # so a future signature change (e.g. extra dispatch slot) is a
+                # one-line edit.
+                _method(f, body, extras...) = Expr(:(=), _call(f, extras...), Expr(:block, _lnn, body))
                 iscached_val = Symbol("@diskcached") in info.macros
                 walked_rhs = walk_rhs(info.rhs; info.locals, properties=prop_names, lnn=info.lnn)
                 # Body-wrap dispatcher. Each property macro that wants to
@@ -3560,10 +3566,10 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 deps_expr = Expr(:call, Expr(:curly, GlobalRef(Base, :Set), :Symbol),
                                  Expr(:tuple, (QuoteNode(d) for d in sort!(collect(info.dependencies)))...))
                 block = Expr(:block,
-                    _lnn, Expr(:(=), _call(:compute_property, cp_kwargs...), Expr(:block, _lnn, walked_rhs)),
-                    _lnn, Expr(:(=), _call(:isdiskcached), Expr(:block, _lnn, iscached_val)),
-                    _lnn, Expr(:(=), _call(:resumes), Expr(:block, _lnn, false)),
-                    _lnn, Expr(:(=), _call(:_dependencies), Expr(:block, _lnn, deps_expr)),
+                    _lnn, _method(:compute_property, walked_rhs, cp_kwargs...),
+                    _lnn, _method(:isdiskcached, iscached_val),
+                    _lnn, _method(:resumes, false),
+                    _lnn, _method(:_dependencies, deps_expr),
                 )
                 if !isnothing(info.diskcache_version)
                     # Don't use _call — diskcache_version is per-property, not per-index
@@ -3585,9 +3591,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 # `; kwargs...` in the index signature.
                 if !isnothing(info.doc)
                     walked_doc = walk_rhs(info.doc; info.locals, properties=prop_names, lnn=info.lnn)
-                    push!(block.args, _lnn,
-                        Expr(:(=), _call(:_property_description, :(kwargs...)),
-                             Expr(:block, _lnn, walked_doc)))
+                    push!(block.args, _lnn, _method(:_property_description, walked_doc, :(kwargs...)))
                 end
                 block
             end
