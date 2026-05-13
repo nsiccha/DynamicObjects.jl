@@ -1829,9 +1829,9 @@ function _check_no_self_access!(msgs, type, name::Symbol, info, prop_names,
         depsstr = join(string.(bound), ", ")
         short = "stateless — body uses no sibling state; shares deps `{$depsstr}` with $slist, fold the cluster into one inline child keyed on `($depsstr)` rather than each on its own args"
     else
-        short = "stateless — body uses no sibling state; fold to `@struct $name($argstr) = begin … end` if args own an identity, or accept as helper"
+        short = "stateless — body uses no sibling state; fold to `@include $name($argstr) = begin … end` if args own an identity, or accept as helper"
     end
-    long  = "Property `$type.$name(…)` calls functions but reads no sibling state. This property does not belong on `$type`. Lift it to an inline-child DO that owns the underlying object/key and exposes the derivations as bare properties. (A) Args key on a 'thing' the struct isn't modelling yet → introduce `@struct entry(k) = begin …end`. (B) Args all come from one existing object → lift `$name` to be a property OF that object."
+    long  = "Property `$type.$name(…)` calls functions but reads no sibling state. This property does not belong on `$type`. Lift it to an inline-child DO that owns the underlying object/key and exposes the derivations as bare properties. (A) Args key on a 'thing' the struct isn't modelling yet → introduce `@include entry(k) = begin …end`. (B) Args all come from one existing object → lift `$name` to be a property OF that object."
     push!(msgs, LintMessage(type, name, :warn, short, long, info.lnn))
 end
 
@@ -1900,12 +1900,12 @@ function _check_repeated_prefix!(msgs, type, oproperties)
         length(group) >= 2 || continue
         members = join(map(g -> "`$g`", group), ", ")
         if Symbol(prefix) in name_set
-            short = "$(length(group)) `$(prefix)_*` siblings ($members) + bare `$prefix` — fold into it (`@struct`/`@include` body)"
-            long  = "`$type` has $(length(group)) properties named `$(prefix)_*` ($(join(group, ", "))) AND a bare `$prefix` property. Move the `$(prefix)_*` members INTO `$prefix` as bare suffixes (`$type.$prefix.<suffix>`). Use `@struct $prefix = begin …end` for data, `@include $prefix = begin …end` for routes."
+            short = "$(length(group)) `$(prefix)_*` siblings ($members) + bare `$prefix` — fold into it (`@include $prefix` body)"
+            long  = "`$type` has $(length(group)) properties named `$(prefix)_*` ($(join(group, ", "))) AND a bare `$prefix` property. Move the `$(prefix)_*` members INTO `$prefix` as bare suffixes (`$type.$prefix.<suffix>`). Use `@include $prefix = begin …end`."
             push!(msgs, LintMessage(type, nothing, :error, short, long, nothing))
         else
-            short = "$(length(group)) `$(prefix)_*` siblings ($members) — group as `@struct $prefix` (or `@include $prefix` if routes)"
-            long  = "`$type` has $(length(group)) properties sharing `$(prefix)_*` prefix: $(join(group, ", ")). Group inside `@struct $prefix = begin …end` (data) or `@include $prefix = begin …end` (routes) so the shared-prefix names become bare members of the child."
+            short = "$(length(group)) `$(prefix)_*` siblings ($members) — group as `@include $prefix`"
+            long  = "`$type` has $(length(group)) properties sharing `$(prefix)_*` prefix: $(join(group, ", ")). Group inside `@include $prefix = begin …end` so the shared-prefix names become bare members of the child."
             push!(msgs, LintMessage(type, nothing, :warn, short, long, nothing))
         end
     end
@@ -1951,12 +1951,12 @@ function _check_shared_arg_signature!(msgs, type, oproperties, types_in_tree, pa
             ("$(length(group)) IPs share `($argstr)` ($members) — args derived from $upstr; refactor to key on those upstream identities instead of threading `($argstr)` through",
              :warn)
         else
-            ("$(length(group)) IPs share `($argstr)` ($members) — `($argstr)` look like proper keys; fold to `@struct shared($argstr)`",
+            ("$(length(group)) IPs share `($argstr)` ($members) — `($argstr)` look like proper keys; fold to `@include shared($argstr)`",
              :warn)
         end
         long = derived ?
-            "`$type` has $(length(group)) indexed properties sharing the `($argstr)` signature: $(join(group, ", ")). Their worst-case bound includes $upstr, meaning every call site computes `($argstr)` from those upstream identities. Folding into `@struct shared($argstr)` just shifts the redundancy. Refactor the IPs to key on the upstream identities ($upstr) directly so callers don't have to thread the derived values through." :
-            "`$type` has $(length(group)) indexed properties sharing the `($argstr)` signature: $(join(group, ", ")). Worst-case bound is empty — callers pass `($argstr)` without additional scope contributions, so they're independent identities. `@struct shared($argstr) = begin …end` is the right fold; the IP bodies become bare members."
+            "`$type` has $(length(group)) indexed properties sharing the `($argstr)` signature: $(join(group, ", ")). Their worst-case bound includes $upstr, meaning every call site computes `($argstr)` from those upstream identities. Folding into `@include shared($argstr)` just shifts the redundancy. Refactor the IPs to key on the upstream identities ($upstr) directly so callers don't have to thread the derived values through." :
+            "`$type` has $(length(group)) indexed properties sharing the `($argstr)` signature: $(join(group, ", ")). Worst-case bound is empty — callers pass `($argstr)` without additional scope contributions, so they're independent identities. `@include shared($argstr) = begin …end` is the right fold; the IP bodies become bare members."
         push!(msgs, LintMessage(type, nothing, severity, short, long, nothing))
         by_prefix = Dict{String, Vector{Symbol}}()
         for n in group
@@ -1969,11 +1969,11 @@ function _check_shared_arg_signature!(msgs, type, oproperties, types_in_tree, pa
             length(sub) >= 2 || continue
             sub_members = join(map(g -> "`$g`", sub), ", ")
             short_e = derived ?
-                "$(length(sub)) IPs share `($argstr)` AND `$(prefix)_*` ($sub_members) — args derived from $upstr; refactor to key on those upstream identities, possibly via `@struct $prefix($(join(upnames, ", "))) = begin … end`" :
-                "$(length(sub)) IPs share `($argstr)` AND `$(prefix)_*` ($sub_members) — `($argstr)` look like proper keys; fold to `@struct $prefix($argstr)`"
+                "$(length(sub)) IPs share `($argstr)` AND `$(prefix)_*` ($sub_members) — args derived from $upstr; refactor to key on those upstream identities, possibly via `@include $prefix($(join(upnames, ", "))) = begin … end`" :
+                "$(length(sub)) IPs share `($argstr)` AND `$(prefix)_*` ($sub_members) — `($argstr)` look like proper keys; fold to `@include $prefix($argstr)`"
             long_e  = derived ?
                 "`$type` has $(length(sub)) indexed properties that share BOTH the `($argstr)` signature AND the `$(prefix)_*` prefix: $(join(sub, ", ")). Args derive from $upstr; refactor to key on those upstream identities and let the suffixes become bare members of the resulting child." :
-                "`$type` has $(length(sub)) indexed properties that share BOTH the `($argstr)` signature AND the `$(prefix)_*` prefix: $(join(sub, ", ")). Fold them into `@struct $prefix($argstr) = begin …end` and let the suffixes become bare members."
+                "`$type` has $(length(sub)) indexed properties that share BOTH the `($argstr)` signature AND the `$(prefix)_*` prefix: $(join(sub, ", ")). Fold them into `@include $prefix($argstr) = begin …end` and let the suffixes become bare members."
             push!(msgs, LintMessage(type, nothing, :error, short_e, long_e, nothing))
         end
     end
@@ -2278,7 +2278,7 @@ function _check_identical_bound_siblings!(msgs, bound_groups, types_in_tree, par
             for member in group
                 others = filter(!=(member), group)
                 olist = join(map(o -> "`$o`", others), ", ")
-                short = "same deps as $olist — fold all $(length(group)) into `@struct shared($argstr) = begin … end`, callers `.shared($argstr).<member>`"
+                short = "same deps as $olist — fold all $(length(group)) into `@include shared($argstr) = begin … end`, callers `.shared($argstr).<member>`"
                 long  = "`$T.$member(…)` has the same upstream deps `{$argstr}` as $olist. They share an identity that isn't currently modelled; fold them into one inline child keyed on `($argstr)` and expose the per-member derivations as bare properties of it."
                 # `metafirst` is fine here: this lint groups properties by
                 # bound, and even with future duplicate-name declarations the
@@ -2409,9 +2409,9 @@ Callers that need a guaranteed string (e.g. Treebars progress labels) should
 _property_description(o, ::Val{name}, args...; kwargs...) where {name} = begin
     # Bubble: if `name` is a registered nested-struct property and the
     # nested type carries a user docstring, use that as the description.
-    # Inline `@struct child = begin "doc" … end` declarations emit their
-    # own per-prop `_property_description` override which wins; bare
-    # @include externals and typed properties fall through to here.
+    # Inline `@include child = begin "doc" … end` declarations emit their
+    # own per-prop `_property_description` override which wins; reference-form
+    # `@include` externals and typed properties fall through to here.
     nested = _walk_nested_type(typeof(o), name)
     if nested !== nothing
         desc = _type_description(nested, args...; kwargs...)
@@ -2477,8 +2477,9 @@ _dependencies(::Type, ::Val, args...; kwargs...) = Set{Symbol}()
 
 Return the type of the nested struct exposed under property `name` on `T`,
 or `nothing` if `name` is not backed by a nested struct. Methods are emitted
-by `@dynamicstruct` for every inline `@struct` child, and by `@htmx` for
-each `@include` external. Used both by `print_structure` and by
+by `@dynamicstruct` for every inline `@include … = begin … end` child, and
+by `@htmx` for each call-form `@include … = SomeT(...)` external. Used both
+by `print_structure` and by
 HTMXObjects' route-walking machinery.
 """
 _nested_struct_type(::Type, ::Val) = nothing
@@ -2780,14 +2781,29 @@ function _inject_include_kwargs!(call_expr, prop_name)
 end
 
 function _process_include_externals!(body)
-    # Returned: (prop_name, type_expr) for each `@include`'d external. Used
-    # to emit `_analysis_nested_type` so `analyze_structure` walks the
-    # included type's tree even when the enclosing struct is
-    # `@dynamicstruct` (and therefore HTMXObjects' route walker — which
-    # would otherwise emit `_nested_struct_type` — never runs). For `@htmx`
-    # structs HTMXObjects also emits `_nested_struct_type`, which
-    # `_walk_nested_type` queries first; the duplicate `_analysis_nested_type`
-    # entry is redundant but harmless.
+    # `@include` is the unified child-property macro. It accepts two RHS
+    # shapes:
+    #
+    #   `@include name = SomeT(args...)`           — reference an existing
+    #                                                 type (recorded in
+    #                                                 `externals` so the
+    #                                                 analyzer walks it).
+    #   `@include name = begin … end`              — define an anonymous
+    #                                                 inline child struct
+    #                                                 (the block desugars
+    #                                                 to `name = struct
+    #                                                 <gen> body end`,
+    #                                                 picked up by the
+    #                                                 inline-struct Form
+    #                                                 1a/1b path below).
+    #
+    # Both LHS shapes — bare `name` and indexed `name(idx::T, …)` — are
+    # supported.
+    #
+    # `externals` returns (prop_name, type_expr) pairs for the call-form
+    # branch only; the begin-block branch's wiring is handled downstream
+    # by the inline-struct path (`_nested_struct_type` + the analyzer's
+    # fallback through `_walk_nested_type`).
     externals = Pair{Symbol, Any}[]
     for (i, arg) in enumerate(body.args)
         arg isa Expr || continue
@@ -2799,30 +2815,49 @@ function _process_include_externals!(body)
         end
         Meta.isexpr(expr, :macrocall) && expr.args[1] == Symbol("@include") || continue
         inner = expr.args[end]
-        Meta.isexpr(inner, :(=)) || continue
+        Meta.isexpr(inner, :(=)) ||
+            error("@include: expected `name = SomeT(...)` or `name = begin ... end`, got $(inner)")
         lhs = inner.args[1]
         rhs = inner.args[2]
-        Meta.isexpr(rhs, :call) || continue
-        # LHS is a bare prop name `prop` for the classic non-indexed form, or a
-        # call expression `prop(args…)` for the indexed-include form
-        # (`@include foo(x, y) = External(x, y)`). Either way, the LHS expression
-        # is preserved verbatim in the rewritten assignment so DO sees the
-        # property as either bare or indexed accordingly.
-        prop_name = if lhs isa Symbol
-            lhs
-        elseif Meta.isexpr(lhs, :call) && lhs.args[1] isa Symbol
-            lhs.args[1]
+        rewritten = if Meta.isexpr(rhs, :block)
+            # Define-inline path. The begin-block desugars to a `:struct`
+            # assignment; the inline-struct Form 1a/1b loop later in
+            # `dynamicstruct(...)` picks it up and produces the child's
+            # `@dynamicstruct` definition + parent property wiring.
+            prop_sym = Meta.isexpr(lhs, :call) ? lhs.args[1] : lhs
+            prop_sym isa Symbol ||
+                error("@include $lhs: LHS must be `name` or `name(idx...)`, got $(lhs)")
+            rhs_stmts = [a for a in rhs.args if !(a isa LineNumberNode)]
+            if length(rhs_stmts) == 1 && !Meta.isexpr(rhs_stmts[1], (:(=), :macrocall, :struct, :tuple))
+                error("@include $prop_sym = begin ... end: body must declare the child's properties. " *
+                      "Got a single bare expression `$(rhs_stmts[1])` — to reference an existing type, " *
+                      "use call form `@include $lhs = ExternalCtor(...)` instead.")
+            end
+            gen_child_name = Symbol(prop_sym, "_inline")
+            Expr(:(=), lhs, Expr(:struct, false, gen_child_name, rhs))
+        elseif Meta.isexpr(rhs, :call)
+            # Reference-existing path. LHS may be bare `name` (non-indexed)
+            # or `name(idx::T, …)` (indexed include); preserved verbatim
+            # in the rewritten assignment.
+            prop_name = if lhs isa Symbol
+                lhs
+            elseif Meta.isexpr(lhs, :call) && lhs.args[1] isa Symbol
+                lhs.args[1]
+            else
+                error("@include: LHS must be `name` or `name(idx...)`, got $(lhs)")
+            end
+            type_expr = rhs.args[1]
+            push!(externals, prop_name => type_expr)
+            _inject_include_kwargs!(rhs, prop_name)
+            Expr(:(=), lhs, rhs)
         else
-            continue
+            error("@include $lhs: RHS must be `SomeT(...)` (reference existing) or " *
+                  "`begin ... end` (define inline), got $(rhs)")
         end
-        type_expr = rhs.args[1]
-        push!(externals, prop_name => type_expr)
-        _inject_include_kwargs!(rhs, prop_name)
-        assignment = :($lhs = $rhs)
         if isnothing(parent_expr)
-            body.args[i] = assignment
+            body.args[i] = rewritten
         else
-            parent_expr.args[end] = assignment
+            parent_expr.args[end] = rewritten
         end
     end
     externals
@@ -2900,54 +2935,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     Meta.isexpr(type, :(<:)) && (type = type.args[1])
     Meta.isexpr(type, :(curly)) && (type = type.args[1])
     @assert body.head == :block
-    # --- Rewrite `@struct prop[(idx...)] = begin body end` into the equivalent
-    # `prop[(idx...)] = struct <auto-named> body end` so the Form 1 path picks
-    # it up. `@struct` is not a real macro — it's a marker handled here.
-    # Also peels a `Core.@doc "str" @struct …` wrapper so docstrings on
-    # `@struct` properties survive the rewrite (Julia's parser auto-wraps
-    # `"str"\n<def>` inside any `:struct` body, including @dynamicstruct's).
-    for (i, arg) in enumerate(body.args)
-        arg isa Expr || continue
-        # Peel a `Core.@doc "str" <inner>` wrapper if present.
-        doc_wrapper = nothing
-        macro_arg = arg
-        if Meta.isexpr(macro_arg, :macrocall)
-            mname = macro_arg.args[1]
-            mname = _resolve_macro_name(mname)
-            if mname === Symbol("@doc") && length(macro_arg.args) >= 4
-                doc_wrapper = macro_arg
-                macro_arg = macro_arg.args[end]
-            end
-        end
-        Meta.isexpr(macro_arg, :macrocall) || continue
-        macro_arg.args[1] == Symbol("@struct") || continue
-        inner = macro_arg.args[end]
-        Meta.isexpr(inner, :(=)) ||
-            error("@struct: expected `prop = begin ... end` or `prop(idx...) = begin ... end`, got $(macro_arg)")
-        lhs = inner.args[1]
-        rhs = inner.args[2]
-        Meta.isexpr(rhs, :block) ||
-            error("@struct: RHS must be a `begin ... end` block, got $(rhs)")
-        prop_sym = Meta.isexpr(lhs, :call) ? lhs.args[1] : lhs
-        prop_sym isa Symbol ||
-            error("@struct: LHS must be `prop` or `prop(idx...)`, got $(lhs)")
-        # `@struct prop(args) = body` parses with body wrapped in `:block`,
-        # so the `:block` check above passes for the short-form misuse
-        # `@struct prop(args) = ExternalCtor(args)` (where the block holds a
-        # single bare call). `@struct` always requires an explicit
-        # `begin … end` declaring the child's properties — without this
-        # check, the downstream args-parsing loop crashes on the bare call
-        # with `union!(::Nothing, ::Set{Any})`.
-        rhs_stmts = [a for a in rhs.args if !(a isa LineNumberNode)]
-        if length(rhs_stmts) == 1 && !Meta.isexpr(rhs_stmts[1], (:(=), :macrocall, :struct, :tuple))
-            error("@struct $prop_sym: body must be an explicit `begin ... end` declaring the child's properties. Got a single bare expression `$(rhs_stmts[1])` — likely a short-form misuse like `@struct $lhs = ExternalCtor(...)`. Rewrite as `@struct $lhs = begin ... end` with the child's properties inline.")
-        end
-        gen_child_name = Symbol(prop_sym, "_inline")
-        rewritten = Expr(:(=), lhs, Expr(:struct, false, gen_child_name, rhs))
-        body.args[i] = isnothing(doc_wrapper) ? rewritten :
-            Expr(:macrocall, doc_wrapper.args[1:end-1]..., rewritten)
-    end
-    # --- Process @include external structs ---
+    # --- Process @include (unified: both `name = SomeT()` and `name = begin … end`) ---
     # Returned (prop, type) pairs feed `_analysis_nested_type` so the
     # analyzer walks @include'd externals even when the enclosing struct
     # is `@dynamicstruct` (no HTMXObjects route walker = no
@@ -2977,8 +2965,9 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     end
     extracted_structs = Expr[]
     # Parallel record of (parent-property-name => generated-child-type-name) for
-    # each inline `@struct` child, used to emit `_nested_struct_type` methods so
-    # `print_structure` can walk the inline-child tree.
+    # each inline `@include … = begin … end` child, used to emit
+    # `_nested_struct_type` methods so `print_structure` can walk the
+    # inline-child tree.
     inline_child_pairs = Pair{Symbol,Any}[]
     # Typed computed properties (`prop::T = rhs`) register T only with
     # `_analysis_nested_type` (not `_nested_struct_type`), so the analyzer's
@@ -2990,8 +2979,8 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     for (i, arg) in enumerate(body.args)
         arg isa Expr || continue
         # Peel a `Core.@doc "str" <inner>` wrapper if present, so that
-        # `"docstring"\n@struct prop(args) = …` (which pass 1 has already
-        # rewritten to `Core.@doc "str" (prop(args) = struct gen … end)`)
+        # `"docstring"\n@include prop(args) = begin … end` (which pass 1 has
+        # already rewritten to `Core.@doc "str" (prop(args) = struct gen … end)`)
         # is recognised as Form 1a here. The wrapper is reattached to the
         # constructor assignment at the end so the third pass picks the
         # docstring up via its `@doc` unwrap and routes it into

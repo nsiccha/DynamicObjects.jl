@@ -148,7 +148,7 @@ forms.
 !!! warning "Chained calls — `@memo!` rewrites every call in the chain"
     `@memo! qt.loaded().filtered(; src).fit(formula).sampled()` makes
     every IP call cached. Without the `@memo!`, each call recomputes — and
-    in cascades of inline `@struct` children, that means every level rebuilds
+    in cascades of inline `@include` children, that means every level rebuilds
     a fresh child instance, with fresh caches one level deeper. The fix is
     almost always "wrap the chain in `@memo!`", not "add caching to the
     fresh-call path".
@@ -424,11 +424,11 @@ property by bare name.
     x::Float64
     y = x + 1
 
-    @struct sub = begin
+    @include sub = begin
         z = x + y                          # x, y forwarded from parent
     end
 
-    @struct weighted(id; scale=2, bias) = begin
+    @include weighted(id; scale=2, bias) = begin
         total = x * id * scale + bias      # id, scale, bias become child properties
     end
 end
@@ -439,15 +439,15 @@ p.weighted(3; bias=1).total                   # fresh each call (default scale=2
 @memo! p.weighted(3; bias=1, scale=5).total   # cached in `weighted`'s per-key dict
 ```
 
-- **`@struct name = begin … end`** — singleton child, one instance per parent.
-- **`@struct name(args...; kw...) = begin … end`** — one cached child per
+- **`@include name = begin … end`** — singleton child, one instance per parent.
+- **`@include name(args...; kw...) = begin … end`** — one cached child per
   `(args, kwargs)` tuple. Args/kwargs become child properties and are
   prepended to the child's auto-`hash_fields`, so distinct call values
   produce distinct cache directories. Required kwargs (no default) are
   enforced at the parent's call site.
 
 Older forms `name = struct Name … end`, bare `struct Name … end`, and
-`name(idx) = struct Name … end` still work; `@struct` is just a marker
+`name(idx) = struct Name … end` still work; `@include` is just a marker
 that auto-generates the child name. In every form:
 
 - The parent's properties (including those introduced by destructuring)

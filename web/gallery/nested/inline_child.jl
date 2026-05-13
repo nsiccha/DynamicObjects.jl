@@ -1,22 +1,22 @@
-# title: Inline child struct via @struct
+# title: Inline child struct via @include
 # description: Children get __parent__ auto-wired; parent props forward by bare name.
 # tags: nested, struct, parent
 
-# `@struct sub = begin … end` declares an inline singleton child DO. The
+# `@include sub = begin … end` declares an inline singleton child DO. The
 # child gets a `__parent__` field auto-wired and may reference any parent
 # property by bare name — DO's macro rewrites those to `__parent__.x` etc.
-# Compare with the indexed form `@struct weighted(id; scale=2)` which gives
+# Compare with the indexed form `@include weighted(id; scale=2)` which gives
 # a per-(id, scale) cached child.
 @dynamicstruct struct ParentDemo
     x::Float64
     y = x + 1
 
-    @struct sub = begin
+    @include sub = begin
         z = x + y           # x, y forwarded from parent
         label = "sub of x=$x"
     end
 
-    @struct weighted(id; scale=2) = begin
+    @include weighted(id; scale=2) = begin
         total = x * id * scale
     end
 end
