@@ -1387,35 +1387,37 @@ end
     @dynamic_progress progress_var body
 
 Rewrite every `:call` inside `body` as
-`maybeprogress!(progress_var, callee, args…)`, then wrap the rewritten
-body in `Treebars.@progress progress_var body` so `progress_var` is bound
-inside (and nested Tb `@progress` blocks rebind it per block).
+`maybeprogress!(progress_var, callee, args…)`. Returns the rewritten body
+unchanged otherwise. **The caller is responsible for binding
+`progress_var`** — e.g. via `Treebars.@progress progress_var body` — and
+for keeping DO free of a hard `Treebars` dependency.
 
-This is the macro form the property-level `@dynamic_progress` annotation
-expands to:
+`maybeprogress!` dispatches on `progress_var`'s runtime type: a
+`Treebars.ProgressNode` (when the caller has wrapped in `Tb.@progress`)
+opens per-call substatuses; `noprogress` opts out; anything else
+collapses to a plain `f(args…)`. The macro itself doesn't care which.
 
-    @dynamic_progress prop() = body
-    # in `@dynamicstruct` is sugar for
+In `@dynamicstruct`, a property marker `@dynamic_progress` lowers to
+
     prop() = @dynamic_progress __status__ body
 
-It's also usable standalone:
+where `__status__` is the IP caller's bound progress context (or
+`nothing`).
 
-    @dynamic_progress my_status begin
-        a = foo(x)           # → maybeprogress!(my_status, foo, x)
-        b = @memo! bar(y)    # cached + progress (see `maybememoize!` arms)
-        a + b
+Standalone:
+
+    Treebars.@progress my_status begin
+        @dynamic_progress my_status begin
+            a = foo(x)           # → maybeprogress!(my_status, foo, x)
+            b = @memo! bar(y)    # cached + progress (see `maybememoize!`)
+            a + b
+        end
     end
 """
 macro dynamic_progress(progress_var, body)
     progress_var isa Symbol ||
         error("@dynamic_progress: progress var must be a Symbol, got $(progress_var)")
-    rewritten = _progress_rewrite(progress_var, body)
-    out = Expr(:macrocall,
-        GlobalRef(Treebars, Symbol("@progress")),
-        __source__,
-        progress_var,
-        rewritten)
-    esc(out)
+    esc(_progress_rewrite(progress_var, body))
 end
 
 persist(v, args...; kwargs...) = begin
