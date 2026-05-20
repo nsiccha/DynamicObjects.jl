@@ -1059,16 +1059,50 @@ maybehash(x::Number) = x
 maybehash(x::Symbol) = x
 maybehash(x) = persistent_hash(x)
 
+# POSIX per-path-component byte limit. A single file or directory name longer
+# than this fails with ENAMETOOLONG on `mkpath`/`open`, no matter how short
+# the total path is.
+const NAME_MAX = 255
+# Cap for `cache_segment` output. Kept below `NAME_MAX` so the suffixes that
+# `get_cache_path` appends afterwards (`_v<version>` and `.sjl`) still leave
+# the final filename within the per-component limit.
+const _CACHE_SEGMENT_MAX = NAME_MAX - 55
+
+# Truncate `s` to at most `maxbytes` UTF-8 code units, never splitting a char.
+_truncate_codeunits(s::AbstractString, maxbytes::Integer) = begin
+    n = 0
+    io = IOBuffer()
+    for c in s
+        w = ncodeunits(c)
+        n + w > maxbytes && break
+        n += w
+        print(io, c)
+    end
+    String(take!(io))
+end
+
+# Keep a path segment within `_CACHE_SEGMENT_MAX`. Short segments pass through
+# unchanged so the on-disk layout stays human-readable; an overlong one (e.g. a
+# fat IndexableProperty key over many args) is replaced by a readable prefix
+# plus a SHA1 digest of the *full* segment — bounded, navigable, collision-free.
+_bound_segment(seg::AbstractString) = begin
+    ncodeunits(seg) <= _CACHE_SEGMENT_MAX && return String(seg)
+    digest = persistent_hash(seg)
+    head = _truncate_codeunits(seg, _CACHE_SEGMENT_MAX - ncodeunits(digest) - 1)
+    head * "_" * digest
+end
+
 # Build a single path-segment identifier for a (name, args, kwargs) triple,
 # joining the parts with "_" via `maybehash`. Used in two places:
 #   1. As the file-name body of `get_cache_path` (with ".sjl" appended).
 #   2. As the per-level directory name in the inline-child cache_path
 #      auto-wiring, so the on-disk layout mirrors the DO hierarchy.
 # Kwargs are sorted by name so callers passing the same kwargs in different
-# syntactic order land in the same segment.
+# syntactic order land in the same segment. The joined result is passed through
+# `_bound_segment` so a fat key cannot blow past the filesystem's NAME_MAX.
 cache_segment(name, args...; kwargs...) = begin
     parts = length(kwargs) == 0 ? (name, args...) : (name, args..., sort(collect(kwargs); by=first)...)
-    join(map(maybehash, parts), "_")
+    _bound_segment(join(map(maybehash, parts), "_"))
 end
 get_cache_path(o, name, args...; kwargs...) = begin
     seg = cache_segment(name, args...; kwargs...)
