@@ -617,9 +617,17 @@ end
 
 # If the deserialized payload's concrete type matches `d.data`'s, swap the
 # whole container in (cheaper, preserves identity semantics). Otherwise merge
-# entries into the existing one.
-_ingest_loaded!(d::LazyPersistentDict{D}, loaded::D) where {D} = (d.data = loaded)
-_ingest_loaded!(d::LazyPersistentDict, loaded) = merge!(d.data, loaded)
+# entries into the existing one. Kept as a single method with a runtime type
+# check: a two-method `(LazyPersistentDict{D}, ::D)` / `(LazyPersistentDict,
+# ::Any)` pair is ambiguous when the payload type equals `D` — Julia's
+# specificity rule cannot rank a diagonal `where` against a fully generic slot.
+function _ingest_loaded!(d::LazyPersistentDict, loaded)
+    if loaded isa typeof(d.data)
+        d.data = loaded
+    else
+        merge!(d.data, loaded)
+    end
+end
 
 function _ensure_loaded!(d::LazyPersistentDict)
     @lock d.lock begin
