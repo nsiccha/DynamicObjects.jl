@@ -949,10 +949,22 @@ If multiple objects with the same hash are writing here concurrently, this may i
             disk_locks = _disk_cache(o, vname)
             rv = if __strict__ && !isnothing(disk_locks)
                 path_lock = get_path_lock!(disk_locks, cache_path)
-                if islocked(path_lock)
-                    @info "Waiting for disk cache lock on $cache_path\n$_cache_context"
+                # Concurrent access to the same cache file is upstream user
+                # error: N copies of the same logical object are racing the
+                # same disk file instead of sharing one memoized result.
+                # `trylock` atomically rejects the second-caller race (where
+                # the prior `islocked` + `lock(...) do` pair was racy) and
+                # the error names the type to point the user at the missing
+                # `@memo` construction site.
+                if !trylock(path_lock)
+                    error("""Concurrent access to disk cache $cache_path — \
+                          this almost always means the construction site for \
+                          $(nameof(typeof(o))) needs an `@memo!` so the same \
+                          logical object is not being computed in N copies \
+                          racing the same cache file.
+$_cache_context""")
                 end
-                lock(path_lock) do
+                try
                     cache_status = get_cache_status(cache_path)
                     rv = if cache_status == :ready
                         _report_disk_load!(__status__, cache_path, filesize(cache_path))
@@ -972,6 +984,8 @@ If multiple objects with the same hash are writing here concurrently, this may i
                         Serialization.serialize(cache_path, rv)
                     end
                     rv
+                finally
+                    unlock(path_lock)
                 end
             else
                 # Non-strict or no disk locks: original flow
