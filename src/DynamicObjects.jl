@@ -199,6 +199,64 @@ LRU layer only needs eviction-order signal, not accuracy. Pathological inputs
 (deep Vega-Lite spec Dicts, nested Stan draw matrices) stop walking at
 `depth` and contribute their nominal type-shell size instead of a full walk.
 """
+# --- Push-up bookkeeping (D6 sync-on-store; eviction trigger lands next commit) ---
+
+# Resolve and cache the parent PropertyCache via the owning DO's __parent__.
+# Called from the cache write path (post-`get!` closure) which runs OUTSIDE
+# the cache lock — see Base.get!(::AbstractThreadsafeDict, ...) below at the
+# spawn task body — so triggering `__parent__` resolution here can recurse
+# into the cache machinery without deadlocking on a held lock.
+function _parent_pc(pc::PropertyCache)
+    cached = pc.parent_pc[]
+    if cached isa WeakRef
+        val = cached.value
+        val isa PropertyCache && return val
+        # Parent was GC'd; treat as no parent. Don't re-resolve — the owner
+        # would also be GC'd or in trouble.
+        return nothing
+    end
+    # Not yet resolved (cached === nothing). Walk via owner.__parent__.
+    owner_ref = pc.owner_ref[]
+    owner_ref isa WeakRef || (pc.parent_pc[] = WeakRef(nothing); return nothing)
+    owner = owner_ref.value
+    owner === nothing && (pc.parent_pc[] = WeakRef(nothing); return nothing)
+    parent_obj = hasproperty(owner, :__parent__) ? owner.__parent__ : nothing
+    # A root DO's __parent__ self-references — detect and treat as no parent.
+    if parent_obj === nothing || parent_obj === owner
+        pc.parent_pc[] = WeakRef(nothing)
+        return nothing
+    end
+    parent_pc = getfield(parent_obj, :cache)
+    parent_pc isa PropertyCache || (pc.parent_pc[] = WeakRef(nothing); return nothing)
+    pc.parent_pc[] = WeakRef(parent_pc)
+    parent_pc
+end
+
+# Walk __parent__ chain bumping each PropertyCache's local `bytes` by delta.
+# O(tree-depth) per call.
+function _push_delta_up!(pc::PropertyCache, delta::Int)
+    parent_pc = _parent_pc(pc)
+    while parent_pc !== nothing
+        Threads.atomic_add!(parent_pc.bytes, delta)
+        parent_pc = _parent_pc(parent_pc)
+    end
+    nothing
+end
+
+# Called on cache miss (after the body returns `v`), inside the user-callback
+# closure that runs OUTSIDE the cache lock per Base.get!(::AbstractThreadsafeDict)
+# spawn pattern. Records size, pin status, and propagates the byte delta up
+# the __parent__ chain. Eviction is gated to budget-holders in step 4.
+function _record_pc_store!(pc::PropertyCache, name::Symbol, args_key, v)
+    key = (name, args_key)
+    sz = _summarysize_capped(v)
+    pc.sizes[key] = sz
+    is_pinnable_value(v) && push!(pc.pinned, key)
+    Threads.atomic_add!(pc.bytes, sz)
+    _push_delta_up!(pc, sz)
+    nothing
+end
+
 function _summarysize_capped(v, depth::Int=8, visited::Base.IdSet=Base.IdSet())
     v in visited && return 0
     !isbits(v) && push!(visited, v)
@@ -244,7 +302,11 @@ end
 # present (see ~L1109), so this overload only needs to handle the
 # bare-name case.
 Base.get!(f::Function, c::PropertyCache, key; substatus=nothing, kwargs...) =
-    get!(s -> f(s), c.cache, key; substatus)
+    get!(c.cache, key; substatus) do s
+        v = f(s)
+        _record_pc_store!(c, key, (), v)
+        v
+    end
 Base.get!(f::Function, ::PropertyCache, key, indices...; kwargs...) = f(nothing)
 Base.setindex!(c::PropertyCache, args...) = setindex!(c.cache, args...)
 Base.show(io::IO, pc::PropertyCache) = print(io, "PropertyCache(",
@@ -376,10 +438,15 @@ For two-phase access (returning a `Task` while computing) on
 call-site in `maybememoize!(callee, args...; kwargs...)` so cached IPs and
 plain functions can share the same syntax.
 """
-memoize!(ip::IndexableProperty, args...; fetch=Base.fetch, kwargs...) =
-    get!(ip.cache, (args, (;kwargs...))) do
-        ip(args...; kwargs...)
+memoize!(ip::IndexableProperty{name}, args...; fetch=Base.fetch, kwargs...) where {name} = begin
+    args_key = (args, (;kwargs...))
+    get!(ip.cache, args_key) do
+        v = ip(args...; kwargs...)
+        owner_pc = getfield(ip.o, :cache)
+        owner_pc isa PropertyCache && _record_pc_store!(owner_pc, name, args_key, v)
+        v
     end
+end
 """
     AbstractThreadsafeDict{K,V}
 
@@ -470,7 +537,8 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
     else
         nothing
     end
-    get!(cache, (indices, (;kwargs...)); fetch, substatus=substatus_f, retry_failed) do s
+    args_key = (indices, (;kwargs...))
+    get!(cache, args_key; fetch, substatus=substatus_f, retry_failed) do s
         # Call `_computeproperty` directly, NOT `getorcomputeproperty`:
         # the latter, when `indices` and `kwargs` are both empty AND
         # `is_indexed_property(o, name)` (we're already inside the IP wrapper,
@@ -480,7 +548,14 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
         # the body — `@memo! o.foo()` on a 0-arg IP would never actually
         # compute anything. `_computeproperty` skips the wrapper short-circuit
         # and goes straight to the body.
-        _computeproperty(o, name, indices...; __status__=s, kwargs...)
+        v = _computeproperty(o, name, indices...; __status__=s, kwargs...)
+        # Push-up bookkeeping: record IP slot's size+pin status on the OWNING
+        # PropertyCache (not the per-IP subcache `cache`). One sizes/pinned
+        # dict per DO tracks both bare-prop AND IP entries, keyed by
+        # `(prop_name, args_key)`.
+        owner_pc = getfield(o, :cache)
+        owner_pc isa PropertyCache && _record_pc_store!(owner_pc, name, args_key, v)
+        v
     end
 end
 # `substatus()` is invoked OUTSIDE the cache lock. Calling it under the
