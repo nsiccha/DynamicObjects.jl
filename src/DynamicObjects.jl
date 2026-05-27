@@ -124,7 +124,14 @@ The remaining fields back the LRU/eviction layer:
 - `last_evicted` — single-slot history on the budget-holder; `Tuple{Symbol,Any}`
   of the most recent evicted entry, or `nothing`. Used by `last_evicted(obj)`.
 """
-struct PropertyCache{D<:AbstractDict{Symbol,Any}}
+# MUTABLE. PropertyCache holds the WeakRef targets for parent_pc + descendants[]
+# — those WeakRefs are only meaningful if Julia preserves identity across
+# `getfield(do_inst, :cache)`. An immutable struct gets boxed on each WeakRef
+# call, and the box is unreachable from any strong reference, so GC reclaims
+# it and the WeakRef becomes dead while the field reference remains live.
+# (Confirmed by minimal Julia repro on 2026-05-27.) Mutability gives the
+# struct a stable heap identity that WeakRefs can latch onto.
+mutable struct PropertyCache{D<:AbstractDict{Symbol,Any}}
     cache::D
     sizes::Dict{Tuple{Symbol,Any}, Int}
     pinned::Set{Tuple{Symbol,Any}}
