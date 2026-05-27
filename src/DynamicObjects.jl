@@ -328,10 +328,15 @@ function _record_pc_store!(pc::PropertyCache, name::Symbol, args_key, v)
     end
     key = (name, args_key)
     sz = _summarysize_capped(v)
-    pc.sizes[key] = sz
-    is_pinnable_value(v) && push!(pc.pinned, key)
+    pinnable = is_pinnable_value(v)
     Threads.atomic_add!(pc.bytes, sz)
+    # Single critical section for pc.sizes / pc.pinned / pc.lru_order — all
+    # three are plain Base containers that MUST NOT be mutated concurrently
+    # (Base.Dict rehash-during-insert under threads is a textbook SIGABRT
+    # vector). Same `lru_lock` serves all three; cheap, simple.
     lock(pc.lru_lock) do
+        pc.sizes[key] = sz
+        pinnable && push!(pc.pinned, key)
         # If already in order (shouldn't normally happen on store, but defensive
         # in case of overwrite via setindex!), bump to MRU; else append.
         idx = findfirst(==(key), pc.lru_order)
@@ -388,7 +393,18 @@ end
 # decreases too).
 function _evict_entry!(pc::PropertyCache, key::Tuple{Symbol,Any})
     name, args_key = key
-    sz = get(pc.sizes, key, 0)
+    # Race-safe claim: pop sizes + pinned + lru_order in one critical
+    # section. A second concurrent evictor for the same key gets sz==0
+    # from pop! and bails — without this, both would atomic_sub by the
+    # same sz, drifting pc.bytes negative.
+    sz = lock(pc.lru_lock) do
+        s = pop!(pc.sizes, key, 0)
+        delete!(pc.pinned, key)
+        idx = findfirst(==(key), pc.lru_order)
+        idx !== nothing && deleteat!(pc.lru_order, idx)
+        s
+    end
+    sz > 0 || return  # already evicted by another caller
     if args_key === ()
         # Bare-prop slot. Use the cache's pop! (delegates through
         # AbstractThreadsafeDict if applicable, with task cleanup).
@@ -398,7 +414,6 @@ function _evict_entry!(pc::PropertyCache, key::Tuple{Symbol,Any})
         # not pc.cache. Reach it via the owning DO's IP wrapper.
         owner_ref = pc.owner_ref[]
         if owner_ref isa WeakRef && owner_ref.value !== nothing
-            owner = owner_ref.value
             # Read the IP wrapper from pc.cache[name] (cached IP wrapper).
             if haskey(pc.cache, name)
                 ip = pc.cache[name]
@@ -406,13 +421,7 @@ function _evict_entry!(pc::PropertyCache, key::Tuple{Symbol,Any})
             end
         end
     end
-    pop!(pc.sizes, key, 0)
-    delete!(pc.pinned, key)
     Threads.atomic_sub!(pc.bytes, sz)
-    lock(pc.lru_lock) do
-        idx = findfirst(==(key), pc.lru_order)
-        idx !== nothing && deleteat!(pc.lru_order, idx)
-    end
     # Push -sz up to all ancestor budget-holders
     parent_pc = _parent_pc(pc)
     while parent_pc !== nothing
