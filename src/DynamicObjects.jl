@@ -299,25 +299,14 @@ function _push_delta_up!(originating_pc::PropertyCache, delta::Int)
     first_holder
 end
 
-# Move `key` to MRU position in `pc.lru_order`. Called on cache hits.
-function _touch_lru_pc!(pc::PropertyCache, key::Tuple{Symbol,Any})
-    lock(pc.lru_lock) do
-        idx = findfirst(==(key), pc.lru_order)
-        if idx !== nothing
-            idx == length(pc.lru_order) && return
-            deleteat!(pc.lru_order, idx)
-        end
-        push!(pc.lru_order, key)
-    end
-    nothing
-end
-
-# Hit recorder — called when a `get!` resolves to an existing entry (no
-# user callback fired). Updates LRU access order so eviction picks oldest-
-# accessed first, not oldest-stored.
+# Hit recorder — intentionally a no-op. Tracking per-hit access order
+# would require an O(N) findfirst+move on `pc.lru_order` per cache hit,
+# which dominates on hot PCs with many entries. Instead we accept that
+# `lru_order` records INSERTION order, not access order: eviction picks
+# oldest-inserted within a tier. Approximate LRU is fine for best-effort
+# eviction; the per-hit cost is gone.
 function _record_pc_hit!(pc::PropertyCache, name::Symbol, args_key)
-    _any_budget_in_chain(pc) || return
-    _touch_lru_pc!(pc, (name, args_key))
+    return nothing
 end
 
 # Called on cache miss (after the body returns `v`), inside the user-callback
@@ -549,10 +538,12 @@ function _summarysize_capped(v, depth::Int=8, visited::Base.IdSet=Base.IdSet())
         # store walked every element). Approximate size is fine for LRU.
         n = sizeof(v)
     elseif v isa AbstractDict
-        for (k, val) in v
-            n += _summarysize_capped(k, depth - 1, visited)
-            n += _summarysize_capped(val, depth - 1, visited)
-        end
+        # Bulk charge: hashmap struct + a rough per-entry constant covering
+        # slot+key+value pointer storage. Iterating entries one-by-one for
+        # an N-entry Dict is O(N) on the cache-store hot path — same shape
+        # as the array element-walk fix above. Approximate, monotonic in
+        # length(v), fine for LRU.
+        n = sizeof(v) + length(v) * 24
     elseif v isa Tuple || v isa NamedTuple
         for elt in v
             n += _summarysize_capped(elt, depth - 1, visited)
