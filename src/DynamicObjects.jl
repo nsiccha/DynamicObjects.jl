@@ -448,6 +448,17 @@ _skip_summarysize(v) = v isa Type || v isa Function || v isa Module ||
     v isa Task || v isa Core.MethodTable || v isa Method ||
     v isa Core.CodeInstance || v isa Core.MethodInstance
 
+# Subtree-root boundary: a nested DynamicObject (anything with a
+# `__cache__::PropertyCache` field) is already tracked by its own PC
+# via push-up bookkeeping, an IndexableProperty's entries are charged
+# at memoize-store time, and a PropertyCache is itself the tracker.
+# Descending into them is both double-counting AND O(tree) per store
+# because IPs hold back-references to their owner DO — without this
+# boundary, every store walks the whole tree (terminating only via
+# the depth/visited cap, but pathologically slow).
+_is_subtree_root(v) = v isa PropertyCache || v isa IndexableProperty ||
+    hasfield(typeof(v), :__cache__)
+
 function _summarysize_capped(v, depth::Int=8, visited::Base.IdSet=Base.IdSet())
     _skip_summarysize(v) && return 0
     v in visited && return 0
@@ -458,6 +469,7 @@ function _summarysize_capped(v, depth::Int=8, visited::Base.IdSet=Base.IdSet())
         return ncodeunits(string(v))
     end
     n = _safe_typesize(typeof(v))
+    _is_subtree_root(v) && return n
     depth <= 0 && return n
     if v isa AbstractArray && !isbitstype(eltype(v))
         for i in eachindex(v)
