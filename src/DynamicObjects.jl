@@ -440,20 +440,29 @@ end
 
 _safe_typesize(::Type{T}) where {T} = isbitstype(T) ? sizeof(T) : 0
 
+# Skip Julia-internal "infrastructure" objects whose memory is shared
+# globally and not user-controllable; descending into them also risks
+# UndefRefError / runaway recursion via Type<->MethodTable<->Vector{Any}
+# back-edges.
+_skip_summarysize(v) = v isa Type || v isa Function || v isa Module ||
+    v isa Task || v isa Core.MethodTable || v isa Method ||
+    v isa Core.CodeInstance || v isa Core.MethodInstance
+
 function _summarysize_capped(v, depth::Int=8, visited::Base.IdSet=Base.IdSet())
+    _skip_summarysize(v) && return 0
     v in visited && return 0
     !isbits(v) && push!(visited, v)
     if v isa String
         return sizeof(v)
     elseif v isa Symbol
-        # Symbols are interned; charge textual size as proxy.
         return ncodeunits(string(v))
     end
     n = _safe_typesize(typeof(v))
     depth <= 0 && return n
     if v isa AbstractArray && !isbitstype(eltype(v))
-        for elt in v
-            n += _summarysize_capped(elt, depth - 1, visited)
+        for i in eachindex(v)
+            isassigned(v, i) || continue
+            n += _summarysize_capped(@inbounds(v[i]), depth - 1, visited)
         end
     elseif v isa AbstractArray
         # isbits eltype — array is contiguous; one bulk charge.
