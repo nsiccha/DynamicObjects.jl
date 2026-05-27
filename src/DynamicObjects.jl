@@ -410,10 +410,16 @@ end
 # spawns a fresh task on the next access).
 function _entry_in_flight(pc::PropertyCache, key::Tuple{Symbol,Any})
     name, args_key = key
-    if args_key === () && pc.cache isa AbstractThreadsafeDict
+    pc.cache isa AbstractThreadsafeDict || return false
+    if args_key === ()
         return lock(pc.cache.lock) do; haskey(pc.cache.tasks, name); end
     end
-    false
+    # IP slot — look up the IP wrapper in pc.cache (its own lock), then
+    # peek at the IP's subcache.tasks under that subcache's lock.
+    ip = get(pc.cache, name, nothing)
+    ip isa IndexableProperty || return false
+    ip.cache isa AbstractThreadsafeDict || return false
+    lock(ip.cache.lock) do; haskey(ip.cache.tasks, args_key); end
 end
 
 # Single eviction step: pop the entry, update sizes/bytes/lru_order, push
