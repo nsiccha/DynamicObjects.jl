@@ -314,6 +314,18 @@ end
 # over budget.
 function _record_pc_store!(pc::PropertyCache, name::Symbol, args_key, v)
     _any_budget_in_chain(pc) || return
+    # If v is a DO (has a PropertyCache) that wasn't constructed with an
+    # explicit __parent__ kwarg, wire its parent_pc to us now — this is the
+    # moment we know v's parent. Without this, IPs that return a DO via a
+    # plain constructor call (no @include lowering) end up with a child PC
+    # that has no parent link, so push-up from the child can't reach the
+    # budget-holder. Only fills `nothing` slots; explicit __parent__ still wins.
+    if hasfield(typeof(v), :cache)
+        v_cache = getfield(v, :cache)
+        if v_cache isa PropertyCache && v_cache.parent_pc[] === nothing
+            v_cache.parent_pc[] = WeakRef(pc)
+        end
+    end
     key = (name, args_key)
     sz = _summarysize_capped(v)
     pc.sizes[key] = sz
