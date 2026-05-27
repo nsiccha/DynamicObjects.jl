@@ -9,7 +9,6 @@ optionally disk-cached properties.
 - [`@cache_status`](@ref): Get the disk-cache status of a property (`:unstarted`, `:started`, `:ready`).
 - [`@is_cached`](@ref): Check whether a property's disk cache is ready.
 - [`@cache_path`](@ref): Get the file path used for a property's disk cache.
-- [`@lru`](@ref): Bound an indexed property's in-memory cache via LRU eviction.
 - [`@memo!`](@ref): Wrap a call site so `IndexableProperty` callees are cached.
 - [`memoize!`](@ref): Explicit cached call into an `IndexableProperty`.
 - [`maybememoize!`](@ref): Dispatch helper behind `@memo!`; cached on IPs, plain call otherwise.
@@ -36,7 +35,7 @@ optionally disk-cached properties.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @dynamic_progress, memoize!, maybememoize!, maybeprogress!, noprogress, @lru, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, ThreadsafeLRUDict, LRUDict
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @dynamic_progress, memoize!, maybememoize!, maybeprogress!, noprogress, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, set_cache_budget!, cache_budget, cache_bytes, cache_entries, subtree_bytes, subtree_budget, last_evicted, is_pinnable_value
 
 import SHA, Serialization
 
@@ -101,9 +100,377 @@ function _format_size(n::Integer)
     string(round(n / 1024^3, digits=1), " GB")
 end
 
+"""
+    PropertyCache{D}(cache, sizes, pinned, bytes, budget, parent_pc, owner_ref, last_evicted)
+
+Per-DO-instance memoization cache for `@dynamicstruct` properties. `cache::D` is
+the underlying `Dict` (`:serial`) or `ThreadsafeDict` (`:parallel`) holding the
+memoized values for non-indexed properties.
+
+The remaining fields back the LRU/eviction layer:
+- `sizes` — bytes recorded at store for each `(name, args_key)` entry; written
+  once at store via `_summarysize_capped`, never re-measured on hit.
+- `pinned` — entries that the eviction loop must skip (auto-pinned via
+  `is_pinnable_value` at store; never evicted).
+- `bytes` — atomic running subtotal of `sizes` for THIS cache only (no
+  recursion). Subtree totals are tracked at the budget-holder via push-up.
+- `budget` — `0` = not a budget-holder, push deltas up to parent; `>0` = this
+  PropertyCache is the budget-holder for its subtree.
+- `parent_pc` — lazily resolved `WeakRef` to the parent DO's PropertyCache, used
+  for push-up traversal.
+- `owner_ref` — `WeakRef` to the owning DO instance, set right after `new(...)`
+  in the `@dynamicstruct` constructor via `_link_owner!`. Lets the eviction
+  walker find `__parent__` without plumbing the DO through every `get!`.
+- `last_evicted` — single-slot history on the budget-holder; `Tuple{Symbol,Any}`
+  of the most recent evicted entry, or `nothing`. Used by `last_evicted(obj)`.
+"""
 struct PropertyCache{D<:AbstractDict{Symbol,Any}}
     cache::D
-    PropertyCache(D, c::NamedTuple) = new{D{Symbol,Any}}(D{Symbol,Any}(pairs(c)))
+    sizes::Dict{Tuple{Symbol,Any}, Int}
+    pinned::Set{Tuple{Symbol,Any}}
+    bytes::Threads.Atomic{Int}
+    budget::Threads.Atomic{Int}
+    parent_pc::Base.RefValue{Any}    # Union{Nothing, WeakRef} — lazily resolved
+    owner_ref::Base.RefValue{Any}    # Union{Nothing, WeakRef} — set via _link_owner!
+    last_evicted::Base.RefValue{Any} # Union{Nothing, Tuple{Symbol,Any}}
+    lru_order::Vector{Tuple{Symbol,Any}}  # access-order (MRU-last); local to this PC
+    descendants::Vector{WeakRef}     # populated on budget-holders only; descendant PCs in this subtree
+    lru_lock::ReentrantLock          # protects lru_order / descendants mutation
+    PropertyCache(D, c::NamedTuple) = new{D{Symbol,Any}}(
+        D{Symbol,Any}(pairs(c)),
+        Dict{Tuple{Symbol,Any},Int}(),
+        Set{Tuple{Symbol,Any}}(),
+        Threads.Atomic{Int}(0),
+        Threads.Atomic{Int}(0),
+        Ref{Any}(nothing),
+        Ref{Any}(nothing),
+        Ref{Any}(nothing),
+        Tuple{Symbol,Any}[],
+        WeakRef[],
+        ReentrantLock(),
+    )
+end
+
+# Owner-link injection. Called by `@dynamicstruct` lowering right after
+# `new(...)` constructs the instance so the eviction walker can find
+# `__parent__` from any PropertyCache without plumbing the owning DO through
+# every `get!`. Safe to call repeatedly (idempotent after first set).
+_link_owner!(pc::PropertyCache, owner) = (pc.owner_ref[] === nothing && (pc.owner_ref[] = WeakRef(owner)); nothing)
+_link_owner!(_, _) = nothing  # tolerate non-PropertyCache (e.g. unit tests / fixed-only structs)
+
+# --- Native-handle detection (D1 resolution: shallow direct-field check) ---
+
+_is_handle_field_type(::Type{<:Ptr}) = true
+_is_handle_field_type(::Type{<:IO}) = true
+_is_handle_field_type(::Type{<:Base.RefValue}) = true
+_is_handle_field_type(::Type{<:Threads.AbstractLock}) = true
+_is_handle_field_type(::Type) = false
+
+"""
+    is_pinnable_value(::Type{T}) -> Bool
+    is_pinnable_value(v) -> Bool
+
+Whether values of type `T` (or value `v`) should be auto-pinned in the cache —
+i.e. never evicted by the LRU layer. The default implementation does a shallow
+direct-field check: returns `true` iff any of `fieldtypes(T)` is `Ptr`, `IO`,
+`Base.RefValue`, `Threads.AbstractLock`, or a subtype thereof.
+
+Pure-data types like `Array`, `Dict`, `DataFrame`, `String`, `Vector{Any}` are
+NOT pinned by default (no direct pointer field) and remain eviction
+candidates. Wrapper types whose direct fields are pure data but which
+transitively hold a native resource should add a one-line override:
+
+```julia
+DynamicObjects.is_pinnable_value(::Type{<:MyBridgeHandle}) = true
+```
+"""
+is_pinnable_value(::Type{T}) where {T} = any(_is_handle_field_type, fieldtypes(T))
+is_pinnable_value(v) = is_pinnable_value(typeof(v))
+
+# --- Size measurement (D5 resolution: bounded recursion-depth walker) ---
+
+"""
+    _summarysize_capped(v, depth=8) -> Int
+
+Approximate byte size of `v` with a bounded recursion depth. Walks the
+common container shapes (`AbstractArray` of non-isbits elements,
+`AbstractDict`, `Tuple`, generic struct fields) up to `depth` levels and
+falls back to `sizeof(typeof(v))` for the unwalked remainder.
+
+Measured once at store and stored in `PropertyCache.sizes`; never re-measured
+on hit. This is intentionally an approximation — exact byte accounting under
+`Base.summarysize` is non-trivial to bound (no depth knob exposed) and the
+LRU layer only needs eviction-order signal, not accuracy. Pathological inputs
+(deep Vega-Lite spec Dicts, nested Stan draw matrices) stop walking at
+`depth` and contribute their nominal type-shell size instead of a full walk.
+"""
+# --- Push-up bookkeeping (D6 sync-on-store; eviction trigger lands next commit) ---
+
+# Resolve and cache the parent PropertyCache via the owning DO's __parent__.
+# Called from the cache write path (post-`get!` closure) which runs OUTSIDE
+# the cache lock — see Base.get!(::AbstractThreadsafeDict, ...) below at the
+# spawn task body — so triggering `__parent__` resolution here can recurse
+# into the cache machinery without deadlocking on a held lock.
+function _parent_pc(pc::PropertyCache)
+    cached = pc.parent_pc[]
+    if cached isa WeakRef
+        val = cached.value
+        val isa PropertyCache && return val
+        # Parent was GC'd; treat as no parent. Don't re-resolve — the owner
+        # would also be GC'd or in trouble.
+        return nothing
+    end
+    # Not yet resolved (cached === nothing). Walk via owner.__parent__.
+    owner_ref = pc.owner_ref[]
+    owner_ref isa WeakRef || (pc.parent_pc[] = WeakRef(nothing); return nothing)
+    owner = owner_ref.value
+    owner === nothing && (pc.parent_pc[] = WeakRef(nothing); return nothing)
+    parent_obj = hasproperty(owner, :__parent__) ? owner.__parent__ : nothing
+    # A root DO's __parent__ self-references — detect and treat as no parent.
+    if parent_obj === nothing || parent_obj === owner
+        pc.parent_pc[] = WeakRef(nothing)
+        return nothing
+    end
+    parent_pc = getfield(parent_obj, :cache)
+    parent_pc isa PropertyCache || (pc.parent_pc[] = WeakRef(nothing); return nothing)
+    pc.parent_pc[] = WeakRef(parent_pc)
+    parent_pc
+end
+
+# Walk __parent__ chain bumping each PropertyCache's local `bytes` by delta.
+# Registers `originating_pc` as a descendant at every budget-holder encountered
+# (so push-down eviction can enumerate the subtree). O(tree-depth) per call.
+# Returns the nearest budget-holder (if any) so the caller can fire eviction.
+function _push_delta_up!(originating_pc::PropertyCache, delta::Int)
+    first_holder = nothing
+    parent_pc = _parent_pc(originating_pc)
+    while parent_pc !== nothing
+        Threads.atomic_add!(parent_pc.bytes, delta)
+        if parent_pc.budget[] > 0
+            _register_descendant!(parent_pc, originating_pc)
+            first_holder === nothing && (first_holder = parent_pc)
+        end
+        parent_pc = _parent_pc(parent_pc)
+    end
+    first_holder
+end
+
+# Add `descendant_pc` to `holder`'s descendants list if not already present.
+# WeakRef-based so dead descendants drop out naturally on GC; the eviction
+# walker skips dead refs.
+function _register_descendant!(holder::PropertyCache, descendant_pc::PropertyCache)
+    lock(holder.lru_lock) do
+        for wref in holder.descendants
+            wref.value === descendant_pc && return
+        end
+        push!(holder.descendants, WeakRef(descendant_pc))
+    end
+    nothing
+end
+
+# Move `key` to MRU position in `pc.lru_order`. Called on cache hits.
+function _touch_lru_pc!(pc::PropertyCache, key::Tuple{Symbol,Any})
+    lock(pc.lru_lock) do
+        idx = findfirst(==(key), pc.lru_order)
+        if idx !== nothing
+            idx == length(pc.lru_order) && return
+            deleteat!(pc.lru_order, idx)
+        end
+        push!(pc.lru_order, key)
+    end
+    nothing
+end
+
+# Hit recorder — called when a `get!` resolves to an existing entry (no
+# user callback fired). Updates LRU access order so eviction picks oldest-
+# accessed first, not oldest-stored.
+function _record_pc_hit!(pc::PropertyCache, name::Symbol, args_key)
+    _touch_lru_pc!(pc, (name, args_key))
+end
+
+# Called on cache miss (after the body returns `v`), inside the user-callback
+# closure that runs OUTSIDE the cache lock per Base.get!(::AbstractThreadsafeDict)
+# spawn pattern. Records size, pin status, LRU order, propagates the byte
+# delta up the __parent__ chain, and fires eviction if a budget-holder is
+# over budget.
+function _record_pc_store!(pc::PropertyCache, name::Symbol, args_key, v)
+    key = (name, args_key)
+    sz = _summarysize_capped(v)
+    pc.sizes[key] = sz
+    is_pinnable_value(v) && push!(pc.pinned, key)
+    Threads.atomic_add!(pc.bytes, sz)
+    lock(pc.lru_lock) do
+        # If already in order (shouldn't normally happen on store, but defensive
+        # in case of overwrite via setindex!), bump to MRU; else append.
+        idx = findfirst(==(key), pc.lru_order)
+        idx !== nothing && deleteat!(pc.lru_order, idx)
+        push!(pc.lru_order, key)
+    end
+    # If `pc` is itself a budget-holder, also record self as descendant
+    # (we never push-up to ourselves). Otherwise push-up registers us at
+    # ancestor budget-holders.
+    pc.budget[] > 0 && _register_descendant!(pc, pc)
+    holder = _push_delta_up!(pc, sz)
+    # Fire eviction if we are or are below a budget-holder. Self is checked
+    # too — if pc is a budget-holder, the push-up didn't go anywhere but pc
+    # itself may be over budget.
+    if pc.budget[] > 0
+        _maybe_evict!(pc)
+    elseif holder !== nothing
+        _maybe_evict!(holder)
+    end
+    nothing
+end
+
+# --- Push-down eviction (D6 sync-on-store + D3 cost-aware bias) ---
+
+# Determine whether a `(name, args_key)` slot on PropertyCache `pc` corresponds
+# to a `@cached` property. Looks up `meta(typeof(owner))` for the property's
+# info bag and checks `info.macros`.
+function _is_cached_slot(pc::PropertyCache, name::Symbol)
+    owner_ref = pc.owner_ref[]
+    owner_ref isa WeakRef || return false
+    owner = owner_ref.value
+    owner === nothing && return false
+    info = metafirst(typeof(owner), name)
+    info === nothing && return false
+    Symbol("@cached") in info.macros
+end
+
+# Check whether `(name, args_key)` is currently the target of an in-flight
+# Task somewhere. For bare-prop slots, that's `pc.cache.tasks[name]`. For IP
+# slots, we'd need to dig into the IP's subcache — left for v2 (the bare-prop
+# tasks check covers the common case; an IP in-flight task evict-and-recompute
+# would mean wasted work but not corruption, since the cache machinery
+# spawns a fresh task on the next access).
+function _entry_in_flight(pc::PropertyCache, key::Tuple{Symbol,Any})
+    name, args_key = key
+    if args_key === () && pc.cache isa AbstractThreadsafeDict
+        return lock(pc.cache.lock) do; haskey(pc.cache.tasks, name); end
+    end
+    false
+end
+
+# Single eviction step: pop the entry, update sizes/bytes/lru_order, push
+# the negative delta up the parent chain (so the budget-holder's `bytes`
+# decreases too).
+function _evict_entry!(pc::PropertyCache, key::Tuple{Symbol,Any})
+    name, args_key = key
+    sz = get(pc.sizes, key, 0)
+    if args_key === ()
+        # Bare-prop slot. Use the cache's pop! (delegates through
+        # AbstractThreadsafeDict if applicable, with task cleanup).
+        haskey(pc.cache, name) && pop!(pc.cache, name)
+    else
+        # IP slot. The actual storage is on the IP's per-property subcache,
+        # not pc.cache. Reach it via the owning DO's IP wrapper.
+        owner_ref = pc.owner_ref[]
+        if owner_ref isa WeakRef && owner_ref.value !== nothing
+            owner = owner_ref.value
+            # Read the IP wrapper from pc.cache[name] (cached IP wrapper).
+            if haskey(pc.cache, name)
+                ip = pc.cache[name]
+                ip isa IndexableProperty && haskey(ip.cache, args_key) && pop!(ip.cache, args_key)
+            end
+        end
+    end
+    pop!(pc.sizes, key, 0)
+    delete!(pc.pinned, key)
+    Threads.atomic_sub!(pc.bytes, sz)
+    lock(pc.lru_lock) do
+        idx = findfirst(==(key), pc.lru_order)
+        idx !== nothing && deleteat!(pc.lru_order, idx)
+    end
+    # Push -sz up to all ancestor budget-holders
+    parent_pc = _parent_pc(pc)
+    while parent_pc !== nothing
+        Threads.atomic_sub!(parent_pc.bytes, sz)
+        parent_pc = _parent_pc(parent_pc)
+    end
+    nothing
+end
+
+# Gather every (pc, key, is_cached, position) tuple eligible for eviction
+# from holder's subtree, skipping pinned and in-flight entries.
+function _gather_eviction_candidates(holder::PropertyCache)
+    out = Vector{Tuple{PropertyCache, Tuple{Symbol,Any}, Bool, Int}}()
+    visited = Set{PropertyCache}()
+    # Walk holder + descendants
+    pcs = lock(holder.lru_lock) do
+        # Take a snapshot of descendants under the lock; live refs only.
+        live = PropertyCache[holder]
+        for wref in holder.descendants
+            pc = wref.value
+            pc isa PropertyCache && pc !== holder && push!(live, pc)
+        end
+        live
+    end
+    for pc in pcs
+        pc in visited && continue
+        push!(visited, pc)
+        lock(pc.lru_lock) do
+            for (i, key) in enumerate(pc.lru_order)
+                key in pc.pinned && continue
+                _entry_in_flight(pc, key) && continue
+                push!(out, (pc, key, _is_cached_slot(pc, key[1]), i))
+            end
+        end
+    end
+    out
+end
+
+# Main eviction loop. Called when a store crosses the budget threshold on
+# `holder`. Runs synchronously inside the user-callback closure of the
+# triggering store — outside any cache lock — so the lock-hold profile is
+# unchanged from today's `_on_store!` semantics.
+function _maybe_evict!(holder::PropertyCache)
+    holder.budget[] <= 0 && return  # not a budget-holder
+    holder.bytes[] <= holder.budget[] && return  # under budget
+    candidates = _gather_eviction_candidates(holder)
+    # Sort: @cached slots first (cheap re-deserialize wins), then by LRU
+    # position (oldest-accessed first within each tier).
+    sort!(candidates, by = c -> (c[3] ? 0 : 1, c[4]))
+    for (pc, key, _, _) in candidates
+        holder.bytes[] <= holder.budget[] && break
+        _evict_entry!(pc, key)
+        holder.last_evicted[] = key
+    end
+    nothing
+end
+
+function _summarysize_capped(v, depth::Int=8, visited::Base.IdSet=Base.IdSet())
+    v in visited && return 0
+    !isbits(v) && push!(visited, v)
+    n = sizeof(typeof(v))
+    depth <= 0 && return n
+    if v isa String
+        n = sizeof(v)
+    elseif v isa Symbol
+        # Symbols are interned; charge their textual size as proxy.
+        n = sizeof(String(v)) + sizeof(typeof(v))
+    elseif v isa AbstractArray && !isbitstype(eltype(v))
+        for elt in v
+            n += _summarysize_capped(elt, depth - 1, visited)
+        end
+    elseif v isa AbstractArray
+        # isbits eltype — array is contiguous; one bulk charge.
+        n = sizeof(v)
+    elseif v isa AbstractDict
+        for (k, val) in v
+            n += _summarysize_capped(k, depth - 1, visited)
+            n += _summarysize_capped(val, depth - 1, visited)
+        end
+    elseif v isa Tuple || v isa NamedTuple
+        for elt in v
+            n += _summarysize_capped(elt, depth - 1, visited)
+        end
+    elseif !isbits(v)
+        for i in 1:nfields(v)
+            isdefined(v, i) || continue
+            n += _summarysize_capped(getfield(v, i), depth - 1, visited)
+        end
+    end
+    n
 end
 
 # Bare-prop path: forwards `substatus` so the inner `ThreadsafeDict.get!`
@@ -115,11 +482,124 @@ end
 # `getorcomputeproperty` routes around this layer when indices/kwargs are
 # present (see ~L1109), so this overload only needs to handle the
 # bare-name case.
-Base.get!(f::Function, c::PropertyCache, key; substatus=nothing, kwargs...) =
-    get!(s -> f(s), c.cache, key; substatus)
+Base.get!(f::Function, c::PropertyCache, key; substatus=nothing, kwargs...) = begin
+    # Hit-vs-miss detection: race-prone but LRU ordering is approximate —
+    # a wrong move-to-back has no correctness impact, just suboptimal
+    # eviction order. The store path is correct regardless.
+    was_hit = haskey(c.cache, key)
+    rv = get!(c.cache, key; substatus) do s
+        v = f(s)
+        _record_pc_store!(c, key, (), v)
+        v
+    end
+    was_hit && _record_pc_hit!(c, key, ())
+    rv
+end
 Base.get!(f::Function, ::PropertyCache, key, indices...; kwargs...) = f(nothing)
 Base.setindex!(c::PropertyCache, args...) = setindex!(c.cache, args...)
-Base.show(io::IO, pc::PropertyCache) = print(io, "PropertyCache(", length(pc.cache), " properties)")
+Base.show(io::IO, pc::PropertyCache) = print(io, "PropertyCache(",
+    length(pc.cache), " properties, ", _format_size(pc.bytes[]),
+    pc.budget[] > 0 ? string(" / budget ", _format_size(pc.budget[])) : "",
+    ")")
+
+# --- LRU/eviction API ---
+
+"""
+    set_cache_budget!(obj, n_bytes::Integer)
+
+Mark `obj` (a `@dynamicstruct` instance) as the cache budget-holder for its
+subtree, with a budget of `n_bytes` bytes. All `@dynamicstruct` instances
+hanging off `obj` via `__parent__` push their cache-byte deltas up to `obj` on
+store; when the subtotal exceeds the budget, eviction runs to drain it back
+under the limit. A budget of `0` disables eviction at this node (delegates up
+to the next ancestor with a budget set, if any).
+
+There is no opt-in marker on the type — any DO instance can become a
+budget-holder by calling this function. Push-up walks via `__parent__` stop
+at the nearest ancestor with `budget > 0`. If no ancestor in the chain has a
+budget set, push-up terminates without effect; the cache behaves identically
+to today (no eviction, no overhead beyond a single atomic add per store).
+
+Typical usage in app init:
+```julia
+const APPDATA = AppData()
+set_cache_budget!(APPDATA, parse(Int, get(ENV, "JULIA_HEAP_SIZE", "0")) ÷ 2)
+```
+"""
+set_cache_budget!(obj, n_bytes::Integer) = (getfield(obj, :cache).budget[] = Int(n_bytes); nothing)
+
+"""
+    cache_budget(obj) -> Int
+
+The cache budget set on `obj`'s PropertyCache (the value passed to
+`set_cache_budget!`). Returns `0` if `obj` is not a budget-holder. Does NOT
+walk `__parent__` — see [`subtree_budget`](@ref) for the recursive variant.
+"""
+cache_budget(obj) = getfield(obj, :cache).budget[]
+
+"""
+    cache_bytes(obj) -> Int
+
+LOCAL byte subtotal of `obj`'s PropertyCache — sum of `summarysize` over the
+entries memoized directly on this instance. Does NOT walk `__parent__`. For
+the budget-holder's subtree total, see [`subtree_bytes`](@ref). For a
+budget-holder these return the same value (the push-up sum lands here).
+"""
+cache_bytes(obj) = getfield(obj, :cache).bytes[]
+
+"""
+    cache_entries(obj) -> Int
+
+Number of memoized entries currently held on `obj`'s PropertyCache (this
+instance only, no recursion).
+"""
+cache_entries(obj) = length(getfield(obj, :cache).cache)
+
+"""
+    subtree_bytes(obj) -> Int
+
+Total bytes in the budget-holder's subtree containing `obj`. Walks `__parent__`
+upward to the nearest ancestor with `budget > 0` and returns its `bytes[]`. If
+no ancestor in the chain has a budget set, falls back to `cache_bytes(obj)`.
+"""
+subtree_bytes(obj) = let holder = _find_budget_holder_obj(obj)
+    holder === nothing ? cache_bytes(obj) : cache_bytes(holder)
+end
+
+"""
+    subtree_budget(obj) -> Int
+
+Budget of the nearest ancestor budget-holder (including `obj` itself), or `0`
+if no budget is set anywhere in the chain.
+"""
+subtree_budget(obj) = let holder = _find_budget_holder_obj(obj)
+    holder === nothing ? 0 : cache_budget(holder)
+end
+
+"""
+    last_evicted(obj) -> Union{Nothing, Tuple{Symbol, Any}}
+
+`(name, args_key)` of the most recent entry evicted from the budget-holder's
+subtree containing `obj`, or `nothing` if no eviction has happened yet (or no
+budget-holder in the chain). Single-slot history; the previous value is
+overwritten on each new eviction.
+"""
+last_evicted(obj) = let holder = _find_budget_holder_obj(obj)
+    holder === nothing ? nothing : getfield(holder, :cache).last_evicted[]
+end
+
+# Walks `__parent__` from `obj` upward, returning the nearest DO whose
+# PropertyCache has `budget > 0`, or `nothing` if no budget-holder in the chain.
+# Used by `subtree_*` and `last_evicted` getters; not exported.
+function _find_budget_holder_obj(obj)
+    cur = obj
+    while cur !== nothing
+        pc = getfield(cur, :cache)
+        pc isa PropertyCache && pc.budget[] > 0 && return cur
+        cur = hasproperty(cur, :__parent__) ? cur.__parent__ : nothing
+    end
+    nothing
+end
 struct IndexableProperty{N,O,D<:AbstractDict}
     o::O
     cache::D
@@ -146,15 +626,26 @@ For two-phase access (returning a `Task` while computing) on
 call-site in `maybememoize!(callee, args...; kwargs...)` so cached IPs and
 plain functions can share the same syntax.
 """
-memoize!(ip::IndexableProperty, args...; fetch=Base.fetch, kwargs...) =
-    get!(ip.cache, (args, (;kwargs...))) do
-        ip(args...; kwargs...)
+memoize!(ip::IndexableProperty{name}, args...; fetch=Base.fetch, kwargs...) where {name} = begin
+    args_key = (args, (;kwargs...))
+    was_hit = haskey(ip.cache, args_key)
+    rv = get!(ip.cache, args_key) do
+        v = ip(args...; kwargs...)
+        owner_pc = getfield(ip.o, :cache)
+        owner_pc isa PropertyCache && _record_pc_store!(owner_pc, name, args_key, v)
+        v
     end
+    if was_hit
+        owner_pc = getfield(ip.o, :cache)
+        owner_pc isa PropertyCache && _record_pc_hit!(owner_pc, name, args_key)
+    end
+    rv
+end
 """
     AbstractThreadsafeDict{K,V}
 
 Supertype for the lock-protected, task-spawning dicts that back `:parallel`
-indexed properties. Concrete subtypes (`ThreadsafeDict`, `ThreadsafeLRUDict`)
+indexed properties. The concrete subtype `ThreadsafeDict`
 share the `(lock, cache, tasks, status)` shape so that `getstatus`/`cancel!`/
 `fetchindex`/`entries` and the `IndexableProperty` task-spawning `getindex`
 dispatch generically.
@@ -170,46 +661,6 @@ struct ThreadsafeDict{K,V} <: AbstractThreadsafeDict{K,V}
     ThreadsafeDict() = new{Any,Any}(ReentrantLock(), Dict{Any,Any}(), Dict{Any,Task}(), Dict{Any,Any}())
 end
 
-"""
-    ThreadsafeLRUDict{K,V}(maxsize)
-
-A `ThreadsafeDict` variant that bounds its cache to `maxsize` entries, evicting
-the least-recently-used keys on insert. Eviction skips keys that have an
-in-flight `Task` (i.e. a running computation), so callers awaiting a result
-never observe its cache slot vanish underneath them. If every slot is pinned
-by a running task, the dict is allowed to temporarily exceed `maxsize`.
-
-The `(lock, cache, tasks, status)` shape matches `ThreadsafeDict`, so all the
-generic dispatch on `<:AbstractThreadsafeDict` (`getstatus`, `cancel!`,
-`fetchindex`, `entries`, …) works unchanged.
-"""
-mutable struct ThreadsafeLRUDict{K,V} <: AbstractThreadsafeDict{K,V}
-    lock::ReentrantLock
-    cache::Dict{K,V}
-    tasks::Dict{K,Task}
-    status::Dict{K,Any}
-    order::Vector{K}        # MRU-last
-    maxsize::Int
-end
-ThreadsafeLRUDict{K,V}(maxsize::Integer) where {K,V} =
-    ThreadsafeLRUDict{K,V}(ReentrantLock(), Dict{K,V}(), Dict{K,Task}(), Dict{K,Any}(), K[], Int(maxsize))
-ThreadsafeLRUDict(maxsize::Integer) = ThreadsafeLRUDict{Any,Any}(maxsize)
-
-"""
-    LRUDict{K,V}(maxsize)
-
-Plain (non-thread-safe) `Dict` bounded to `maxsize` entries via least-recently-used
-eviction. Used as the per-property in-memory cache for `@lru`-marked properties on
-`:serial` `@dynamicstruct` instances.
-"""
-mutable struct LRUDict{K,V} <: AbstractDict{K,V}
-    cache::Dict{K,V}
-    order::Vector{K}        # MRU-last
-    maxsize::Int
-    LRUDict{K,V}(maxsize::Integer) where {K,V} = new{K,V}(Dict{K,V}(), K[], Int(maxsize))
-end
-LRUDict(maxsize::Integer) = LRUDict{Any,Any}(maxsize)
-
 const _cache_types = (;serial=Dict, parallel=ThreadsafeDict)
 resolve_cache_type(s::Symbol) = get(_cache_types, s, s)
 resolve_cache_type(T::Type) = T.name.wrapper
@@ -222,13 +673,9 @@ Base.length(c::AbstractThreadsafeDict) = lock(c.lock) do; length(c.cache); end
 Base.iterate(c::AbstractThreadsafeDict) = lock(c.lock) do; iterate(c.cache); end
 Base.iterate(c::AbstractThreadsafeDict, state) = lock(c.lock) do; iterate(c.cache, state); end
 Base.empty!(c::ThreadsafeDict) = (lock(c.lock) do; empty!(c.cache); empty!(c.tasks); empty!(c.status); end; c)
-Base.empty!(c::ThreadsafeLRUDict) = (lock(c.lock) do; empty!(c.cache); empty!(c.tasks); empty!(c.status); empty!(c.order); end; c)
 n_running(c::AbstractThreadsafeDict) = lock(c.lock) do; length(c.tasks); end
 Base.show(io::IO, c::ThreadsafeDict{K,V}) where {K,V} = lock(c.lock) do
     print(io, "ThreadsafeDict{", K, ",", V, "}(", length(c.cache), " cached, ", length(c.tasks), " running)")
-end
-Base.show(io::IO, c::ThreadsafeLRUDict{K,V}) where {K,V} = lock(c.lock) do
-    print(io, "ThreadsafeLRUDict{", K, ",", V, "}(", length(c.cache), "/", c.maxsize, " cached, ", length(c.tasks), " running)")
 end
 memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...; fetch=Base.fetch, retry_failed=true, kwargs...) where {name} = begin
     (;o, cache) = ip
@@ -240,7 +687,9 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
     else
         nothing
     end
-    get!(cache, (indices, (;kwargs...)); fetch, substatus=substatus_f, retry_failed) do s
+    args_key = (indices, (;kwargs...))
+    was_hit = lock(cache.lock) do; haskey(cache.cache, args_key); end
+    rv = get!(cache, args_key; fetch, substatus=substatus_f, retry_failed) do s
         # Call `_computeproperty` directly, NOT `getorcomputeproperty`:
         # the latter, when `indices` and `kwargs` are both empty AND
         # `is_indexed_property(o, name)` (we're already inside the IP wrapper,
@@ -250,8 +699,20 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
         # the body — `@memo! o.foo()` on a 0-arg IP would never actually
         # compute anything. `_computeproperty` skips the wrapper short-circuit
         # and goes straight to the body.
-        _computeproperty(o, name, indices...; __status__=s, kwargs...)
+        v = _computeproperty(o, name, indices...; __status__=s, kwargs...)
+        # Push-up bookkeeping: record IP slot's size+pin status on the OWNING
+        # PropertyCache (not the per-IP subcache `cache`). One sizes/pinned
+        # dict per DO tracks both bare-prop AND IP entries, keyed by
+        # `(prop_name, args_key)`.
+        owner_pc = getfield(o, :cache)
+        owner_pc isa PropertyCache && _record_pc_store!(owner_pc, name, args_key, v)
+        v
     end
+    if was_hit
+        owner_pc = getfield(o, :cache)
+        owner_pc isa PropertyCache && _record_pc_hit!(owner_pc, name, args_key)
+    end
+    rv
 end
 # `substatus()` is invoked OUTSIDE the cache lock. Calling it under the
 # lock is unsafe: substatus factories can recurse into other DO properties
@@ -331,36 +792,12 @@ end
 struct _Missing end
 const _missing_sentinel = _Missing()
 
-# Hooks into get! for LRU bookkeeping. No-ops on plain ThreadsafeDict;
-# ThreadsafeLRUDict implements ordering and eviction. Both run under c.lock.
+# Hooks into get! for cache bookkeeping. Now always no-ops at this layer;
+# the new per-PropertyCache LRU layer handles ordering and eviction (see
+# `_record_pc_store!` / `_record_pc_hit!` / `_maybe_evict!` above).
 _on_hit!(::AbstractThreadsafeDict, key) = nothing
 _on_store!(::AbstractThreadsafeDict, key) = nothing
-function _on_hit!(c::ThreadsafeLRUDict, key)
-    idx = findfirst(==(key), c.order)
-    isnothing(idx) && return
-    idx == length(c.order) && return
-    deleteat!(c.order, idx)
-    push!(c.order, key)
-end
-function _on_store!(c::ThreadsafeLRUDict, key)
-    push!(c.order, key)
-    # Evict from front, skipping pinned keys (those with running tasks).
-    # If every slot is pinned, leave the dict temporarily oversized.
-    while length(c.cache) > c.maxsize
-        evicted = false
-        for i in eachindex(c.order)
-            k = c.order[i]
-            if !haskey(c.tasks, k)
-                deleteat!(c.order, i)
-                haskey(c.cache, k) && pop!(c.cache, k)
-                haskey(c.status, k) && pop!(c.status, k)
-                evicted = true
-                break
-            end
-        end
-        evicted || break
-    end
-end
+_drop_order!(::AbstractThreadsafeDict, key) = nothing
 
 Base.pop!(c::AbstractThreadsafeDict, key) = begin
     lock(c.lock) do
@@ -376,51 +813,6 @@ Base.delete!(c::AbstractThreadsafeDict, key) = begin
         _drop_order!(c, key)
         delete!(c.cache, key)
     end
-    c
-end
-_drop_order!(::AbstractThreadsafeDict, key) = nothing
-function _drop_order!(c::ThreadsafeLRUDict, key)
-    idx = findfirst(==(key), c.order)
-    isnothing(idx) || deleteat!(c.order, idx)
-end
-
-# --- Synchronous LRUDict (for :serial @dynamicstruct + @lru) ---
-Base.length(c::LRUDict) = length(c.cache)
-Base.iterate(c::LRUDict, args...) = iterate(c.cache, args...)
-Base.haskey(c::LRUDict, key) = haskey(c.cache, key)
-Base.empty!(c::LRUDict) = (empty!(c.cache); empty!(c.order); c)
-Base.show(io::IO, c::LRUDict{K,V}) where {K,V} =
-    print(io, "LRUDict{", K, ",", V, "}(", length(c.cache), "/", c.maxsize, ")")
-function _touch_lru!(c::LRUDict, key)
-    idx = findfirst(==(key), c.order)
-    isnothing(idx) && return
-    idx == length(c.order) && return
-    deleteat!(c.order, idx)
-    push!(c.order, key)
-end
-function Base.get!(f::Function, c::LRUDict, key)
-    if haskey(c.cache, key)
-        _touch_lru!(c, key)
-        return c.cache[key]
-    end
-    v = f()
-    c.cache[key] = v
-    push!(c.order, key)
-    while length(c.cache) > c.maxsize
-        evicted = popfirst!(c.order)
-        delete!(c.cache, evicted)
-    end
-    v
-end
-function Base.pop!(c::LRUDict, key)
-    idx = findfirst(==(key), c.order)
-    isnothing(idx) || deleteat!(c.order, idx)
-    pop!(c.cache, key)
-end
-function Base.delete!(c::LRUDict, key)
-    idx = findfirst(==(key), c.order)
-    isnothing(idx) || deleteat!(c.order, idx)
-    delete!(c.cache, key)
     c
 end
 
@@ -536,11 +928,10 @@ maybepop!(c::AbstractThreadsafeDict, key) = begin
     end
 end
 
-# Per-property cache backing. Default falls through to the parent cache type;
-# `@dynamicstruct` emits 4-arg overrides for `@lru`-marked properties to swap
-# in an LRU-bounded dict. The 4-arg form is keyed on `(ParentType, Val{name})`
-# so an `@lru` directive on one struct doesn't leak to another struct that
-# happens to declare a property with the same Symbol.
+# Subcache factory for indexed-property dicts. Default routes by cache_type:
+# `:serial` → `Dict`, `:parallel` → `ThreadsafeDict`. The 4-arg form is keyed
+# on `(ParentType, Val{name})` for future per-property overrides; currently
+# unused.
 subcache(pc::PropertyCache, ::Type, ::Val) = subcache(pc)
 subcache(::PropertyCache{<:Dict}) = Dict()
 subcache(::PropertyCache{<:AbstractThreadsafeDict}) = ThreadsafeDict()
@@ -1239,38 +1630,6 @@ The legacy bracket form is still accepted but discouraged.
 macro cache_path(x)
     cache_f_expr(x; f=get_cache_path) |> esc
 end
-"""
-    @lru maxsize prop(idx...) = expr
-
-Mark an indexed property in a `@dynamicstruct` body so that its per-property
-in-memory cache is bounded to `maxsize` entries with least-recently-used
-eviction, instead of the unbounded `Dict`/`ThreadsafeDict` inherited from the
-struct's `cache_type`.
-
-`maxsize` must be a literal integer (so the bound is fixed at struct-definition
-time). Eviction is task-aware on `:parallel` structs: keys with an in-flight
-`Task` are never evicted — if every slot is pinned, the cache temporarily
-exceeds `maxsize` until something settles.
-
-`@lru` is orthogonal to `@cached`: both can apply to the same property — the
-disk cache is unaffected, only the in-memory dict is bounded.
-
-```julia
-@dynamicstruct struct App
-    @lru 100 sim(subject_id) = expensive(subject_id)
-    @cached @lru 50 fit(model, seed) = run_fit(model, seed)
-end
-```
-
-Outside a `@dynamicstruct` body the macro is a no-op pass-through on the
-property expression — the actual cache substitution is done via the
-`subcache` overrides emitted by `@dynamicstruct`.
-"""
-macro lru(maxsize, x)
-    _validate_lru_maxsize(maxsize)
-    esc(x)
-end
-
 """
     @persist o.prop
     @persist o.prop(indices...)
@@ -2584,15 +2943,8 @@ _extract_member(extract_from, source) = :($extract_from[$source])
 _replace_lnn(::LineNumberNode, lnn) = lnn
 _replace_lnn(x, _) = x
 
-# Validate `@lru maxsize` / `@cached` Integer args at macro time without
-# inlining `isa(..., Integer) || error(...)`. Per-type method ⇒ Integer
-# passes silently; anything else hits the fallback that errors with the
-# offending value.
-_validate_lru_maxsize(::Integer) = nothing
-_validate_lru_maxsize(x) = error("@lru: maxsize must be a literal Integer, got: $x")
-
-# Property-macro accumulator: doc / cache_version / lru_size / macros are
-# the four pieces of state the body-args parser threads through the
+# Property-macro accumulator: doc / cache_version / macros are the three
+# pieces of state the body-args parser threads through the
 # `while Meta.isexpr(arg, :macrocall)` peeling loop. Bundling them into a
 # small mutable struct lets per-macro logic live in dispatched methods of
 # `_apply_property_macro!` (one method per macro shape) instead of in
@@ -2600,7 +2952,6 @@ _validate_lru_maxsize(x) = error("@lru: maxsize must be a literal Integer, got: 
 mutable struct _PropertyMacroState
     doc::Any
     cache_version::Any
-    lru_size::Any
     macros::Set{Symbol}
 end
 
@@ -2638,18 +2989,6 @@ function _parse_cache_version(ver_expr::Expr)
 end
 _parse_cache_version(x) =
     error("@cached version argument must be a version string like v\"2\", got: $x")
-
-# `@lru N <prop> = …` — N must be a literal Integer (validated via
-# `_validate_lru_maxsize`'s fallback method).
-function _apply_property_macro!(state::_PropertyMacroState, ::Val{Symbol("@lru")}, arg)
-    push!(state.macros, Symbol("@lru"))
-    if length(arg.args) == 4
-        sz = arg.args[3]
-        _validate_lru_maxsize(sz)
-        state.lru_size = Int(sz)
-    end
-    arg.args[end]
-end
 
 # Body-args metadata absorber: LineNumberNode / String / `:string` Expr
 # args are not properties — they update the `lnn` / `doc` accumulators
@@ -2706,12 +3045,12 @@ function _emit_positional_element!(oproperties, docs, a::Expr, i, source_sym, ln
     inner_leaves = _collect_leaves(a)
     inner_name = Symbol("_tuple_", join(inner_leaves, "_"))
     inner_locals = Set{Symbol}(inner_leaves); push!(inner_locals, inner_name)
-    push!(oproperties, inner_name => (;lhs=inner_name, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=inner_locals, indices=tuple(), indexed=false, cache_version=nothing, lru_size=nothing))
+    push!(oproperties, inner_name => (;lhs=inner_name, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=inner_locals, indices=tuple(), indexed=false, cache_version=nothing))
     push!(docs, (inner_name => (nothing, true)))
     _emit_positional_destructure!(oproperties, docs, a.args, inner_name, lnn)
 end
 function _push_positional_leaf!(oproperties, docs, leaf::Symbol, i, source_sym, lnn)
-    push!(oproperties, leaf => (;lhs=leaf, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([leaf]), indices=tuple(), indexed=false, cache_version=nothing, lru_size=nothing))
+    push!(oproperties, leaf => (;lhs=leaf, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([leaf]), indices=tuple(), indexed=false, cache_version=nothing))
     push!(docs, (leaf => (nothing, true)))
 end
 # One element of a named-destructure LHS: either a bare Symbol leaf or a
@@ -3239,14 +3578,13 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         indices = tuple()
         indexed = false
         cache_version = nothing
-        lru_size = nothing
-        # Peel `@doc` / `@cached` / `@lru` / unrecognised macros from `arg`
-        # via `_apply_property_macro!` dispatch (one method per macro
-        # shape). The state struct mutates `doc` / `cache_version` /
-        # `lru_size` / `macros` in place — `macros` is the same Set the
-        # outer loop uses, so we read it back implicitly; the other three
-        # are scalars copied back after the loop.
-        macro_state = _PropertyMacroState(doc, cache_version, lru_size, macros)
+        # Peel `@doc` / `@cached` / unrecognised macros from `arg` via
+        # `_apply_property_macro!` dispatch (one method per macro shape).
+        # The state struct mutates `doc` / `cache_version` / `macros` in
+        # place — `macros` is the same Set the outer loop uses, so we read
+        # it back implicitly; the other two are scalars copied back after
+        # the loop.
+        macro_state = _PropertyMacroState(doc, cache_version, macros)
         while Meta.isexpr(arg, :macrocall)
             # `_resolve_macro_name` collapses `GlobalRef(Core, :@doc)` (the
             # form Julia's docstring lowering surfaces) to bare `:@doc`.
@@ -3255,7 +3593,6 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         end
         doc = macro_state.doc
         cache_version = macro_state.cache_version
-        lru_size = macro_state.lru_size
         # Inline-method form: `f(__self__, ...) = body` (with optional `where`
         # clauses and qualified `Module.f` names). Bypasses property tooling —
         # no compute_property, no getproperty entry — but the body still gets
@@ -3266,7 +3603,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             method_info = _detect_inline_method_lhs(arg.args[1])
             if !isnothing(method_info)
                 isempty(macros) ||
-                    error("Property-level macros (@cached, @lru, …) cannot be applied to inline methods in @dynamicstruct.")
+                    error("Property-level macros (@cached, …) cannot be applied to inline methods in @dynamicstruct.")
                 push!(inline_methods, (; method_info..., body=arg.args[2], lnn))
                 metadata.doc[] = nothing
                 continue
@@ -3292,7 +3629,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 all_leaves = _collect_leaves(arg)
                 group_name = Symbol("_tuple_", join(all_leaves, "_"))
                 group_locals = Set{Symbol}(all_leaves); push!(group_locals, group_name)
-                push!(oproperties, group_name => (;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, cache_version, lru_size=nothing))
+                push!(oproperties, group_name => (;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, cache_version))
                 push!(docs, (group_name => (doc, true)))
                 _emit_positional_destructure!(oproperties, docs, raw_args, group_name, lnn)
                 metadata.doc[] = nothing
@@ -3326,14 +3663,14 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 group_name = Symbol("_tuple_", join(prop_names, "_"))
                 group_locals = Set{Symbol}(prop_names)
                 push!(group_locals, group_name)
-                push!(oproperties, group_name=>(;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, cache_version, lru_size=nothing))
+                push!(oproperties, group_name=>(;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, cache_version))
                 push!(docs, (group_name=>(doc, true)))
                 group_name
             end
             metadata.doc[] = nothing
             for (prop_name, source) in members
                 extract_rhs = _extract_member(extract_from, source)
-                push!(oproperties, prop_name=>(;lhs=prop_name, macros=Set{Symbol}(), rhs=extract_rhs, lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([prop_name]), indices=tuple(), indexed=false, cache_version=nothing, lru_size=nothing))
+                push!(oproperties, prop_name=>(;lhs=prop_name, macros=Set{Symbol}(), rhs=extract_rhs, lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([prop_name]), indices=tuple(), indexed=false, cache_version=nothing))
                 push!(docs, (prop_name=>(nothing, true)))
             end
             continue
@@ -3392,7 +3729,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         !isnothing(locals) && push!(locals, name)
         !isnothing(locals) && push!(locals, :__status__)
         @assert !isnothing(rhs) || length(macros) == 0
-        push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices, indexed, cache_version, lru_size))
+        push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices, indexed, cache_version))
     end
     # `properties` holds the per-declaration list (preserves order AND duplicate
     # names — e.g. a future `@get foo()` + `@include foo(x::String)` pair). It's
@@ -3419,13 +3756,17 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     fixed_lhs = [lhs for (_, lhs) in fixed_fields]
     struct_expr = Expr(:struct, mut, head, Expr(:block,
         fixed_lhs..., :(cache::$PropertyCache),
-        :($type($(fixed_lhs...); cache_type=$(Meta.quot(cache_type)), kwargs...) = new(
-            $(fixed_names...),
-            $PropertyCache(
-                $(resolve_cache_type)(cache_type),
-                (;kwargs...)
+        :(function $type($(fixed_lhs...); cache_type=$(Meta.quot(cache_type)), kwargs...)
+            __inst__ = new(
+                $(fixed_names...),
+                $PropertyCache(
+                    $(resolve_cache_type)(cache_type),
+                    (;kwargs...)
+                )
             )
-        ))
+            $(_link_owner!)(getfield(__inst__, :cache), __inst__)
+            __inst__
+        end)
     ))
     result = Expr(:block)
     # Emit per-cached-property DiskCacheLocks
@@ -3585,22 +3926,6 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     )
                     cv_expr = (_lnn, Expr(:(=), cv_method, Expr(:block, _lnn, info.cache_version)))
                     push!(block.args, cv_expr...)
-                end
-                if !isnothing(info.lru_size)
-                    info.indexed || error("@lru on non-indexed property `$name`: only indexed properties have a per-property cache to bound. Drop the `@lru` or give the property index parameters: `$name(idx) = …`")
-                    sz = info.lru_size
-                    pc_ts = :($(Expr(:., DynamicObjects, QuoteNode(:PropertyCache))){<:$(Expr(:., DynamicObjects, QuoteNode(:AbstractThreadsafeDict)))})
-                    pc_pl = :($(Expr(:., DynamicObjects, QuoteNode(:PropertyCache))){<:Dict})
-                    sub_call_ts = Expr(:call, Expr(:., DynamicObjects, QuoteNode(:subcache)),
-                        :(::$pc_ts), :(::Type{$type}), :(::Val{$(Meta.quot(name))}))
-                    sub_call_pl = Expr(:call, Expr(:., DynamicObjects, QuoteNode(:subcache)),
-                        :(::$pc_pl), :(::Type{$type}), :(::Val{$(Meta.quot(name))}))
-                    sub_body_ts = Expr(:block, _lnn,
-                        Expr(:call, Expr(:curly, Expr(:., DynamicObjects, QuoteNode(:ThreadsafeLRUDict)), :Any, :Any), sz))
-                    sub_body_pl = Expr(:block, _lnn,
-                        Expr(:call, Expr(:curly, Expr(:., DynamicObjects, QuoteNode(:LRUDict)), :Any, :Any), sz))
-                    push!(block.args, _lnn, Expr(:(=), sub_call_ts, sub_body_ts))
-                    push!(block.args, _lnn, Expr(:(=), sub_call_pl, sub_body_pl))
                 end
                 !isnothing(desc_expr) && push!(block.args, desc_expr...)
                 block
