@@ -36,7 +36,7 @@ optionally disk-cached properties.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @dynamic_progress, memoize!, maybememoize!, maybeprogress!, noprogress, @lru, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, ThreadsafeLRUDict, LRUDict
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @dynamic_progress, memoize!, maybememoize!, maybeprogress!, noprogress, @lru, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, ThreadsafeLRUDict, LRUDict, set_cache_budget!, cache_budget, cache_bytes, cache_entries, subtree_bytes, subtree_budget, last_evicted
 
 import SHA, Serialization
 
@@ -101,10 +101,57 @@ function _format_size(n::Integer)
     string(round(n / 1024^3, digits=1), " GB")
 end
 
+"""
+    PropertyCache{D}(cache, sizes, pinned, bytes, budget, parent_pc, owner_ref, last_evicted)
+
+Per-DO-instance memoization cache for `@dynamicstruct` properties. `cache::D` is
+the underlying `Dict` (`:serial`) or `ThreadsafeDict` (`:parallel`) holding the
+memoized values for non-indexed properties.
+
+The remaining fields back the LRU/eviction layer:
+- `sizes` — bytes recorded at store for each `(name, args_key)` entry; written
+  once at store via `_summarysize_capped`, never re-measured on hit.
+- `pinned` — entries that the eviction loop must skip (auto-pinned via
+  `is_pinnable_value` at store; never evicted).
+- `bytes` — atomic running subtotal of `sizes` for THIS cache only (no
+  recursion). Subtree totals are tracked at the budget-holder via push-up.
+- `budget` — `0` = not a budget-holder, push deltas up to parent; `>0` = this
+  PropertyCache is the budget-holder for its subtree.
+- `parent_pc` — lazily resolved `WeakRef` to the parent DO's PropertyCache, used
+  for push-up traversal.
+- `owner_ref` — `WeakRef` to the owning DO instance, set right after `new(...)`
+  in the `@dynamicstruct` constructor via `_link_owner!`. Lets the eviction
+  walker find `__parent__` without plumbing the DO through every `get!`.
+- `last_evicted` — single-slot history on the budget-holder; `Tuple{Symbol,Any}`
+  of the most recent evicted entry, or `nothing`. Used by `last_evicted(obj)`.
+"""
 struct PropertyCache{D<:AbstractDict{Symbol,Any}}
     cache::D
-    PropertyCache(D, c::NamedTuple) = new{D{Symbol,Any}}(D{Symbol,Any}(pairs(c)))
+    sizes::Dict{Tuple{Symbol,Any}, Int}
+    pinned::Set{Tuple{Symbol,Any}}
+    bytes::Threads.Atomic{Int}
+    budget::Threads.Atomic{Int}
+    parent_pc::Base.RefValue{Any}    # Union{Nothing, WeakRef} — lazily resolved
+    owner_ref::Base.RefValue{Any}    # Union{Nothing, WeakRef} — set via _link_owner!
+    last_evicted::Base.RefValue{Any} # Union{Nothing, Tuple{Symbol,Any}}
+    PropertyCache(D, c::NamedTuple) = new{D{Symbol,Any}}(
+        D{Symbol,Any}(pairs(c)),
+        Dict{Tuple{Symbol,Any},Int}(),
+        Set{Tuple{Symbol,Any}}(),
+        Threads.Atomic{Int}(0),
+        Threads.Atomic{Int}(0),
+        Ref{Any}(nothing),
+        Ref{Any}(nothing),
+        Ref{Any}(nothing),
+    )
 end
+
+# Owner-link injection. Called by `@dynamicstruct` lowering right after
+# `new(...)` constructs the instance so the eviction walker can find
+# `__parent__` from any PropertyCache without plumbing the owning DO through
+# every `get!`. Safe to call repeatedly (idempotent after first set).
+_link_owner!(pc::PropertyCache, owner) = (pc.owner_ref[] === nothing && (pc.owner_ref[] = WeakRef(owner)); nothing)
+_link_owner!(_, _) = nothing  # tolerate non-PropertyCache (e.g. unit tests / fixed-only structs)
 
 # Bare-prop path: forwards `substatus` so the inner `ThreadsafeDict.get!`
 # creates a Treebars node + lifecycle just like it does for IPs. Closure
@@ -119,7 +166,109 @@ Base.get!(f::Function, c::PropertyCache, key; substatus=nothing, kwargs...) =
     get!(s -> f(s), c.cache, key; substatus)
 Base.get!(f::Function, ::PropertyCache, key, indices...; kwargs...) = f(nothing)
 Base.setindex!(c::PropertyCache, args...) = setindex!(c.cache, args...)
-Base.show(io::IO, pc::PropertyCache) = print(io, "PropertyCache(", length(pc.cache), " properties)")
+Base.show(io::IO, pc::PropertyCache) = print(io, "PropertyCache(",
+    length(pc.cache), " properties, ", _format_size(pc.bytes[]),
+    pc.budget[] > 0 ? string(" / budget ", _format_size(pc.budget[])) : "",
+    ")")
+
+# --- LRU/eviction API ---
+
+"""
+    set_cache_budget!(obj, n_bytes::Integer)
+
+Mark `obj` (a `@dynamicstruct` instance) as the cache budget-holder for its
+subtree, with a budget of `n_bytes` bytes. All `@dynamicstruct` instances
+hanging off `obj` via `__parent__` push their cache-byte deltas up to `obj` on
+store; when the subtotal exceeds the budget, eviction runs to drain it back
+under the limit. A budget of `0` disables eviction at this node (delegates up
+to the next ancestor with a budget set, if any).
+
+There is no opt-in marker on the type — any DO instance can become a
+budget-holder by calling this function. Push-up walks via `__parent__` stop
+at the nearest ancestor with `budget > 0`. If no ancestor in the chain has a
+budget set, push-up terminates without effect; the cache behaves identically
+to today (no eviction, no overhead beyond a single atomic add per store).
+
+Typical usage in app init:
+```julia
+const APPDATA = AppData()
+set_cache_budget!(APPDATA, parse(Int, get(ENV, "JULIA_HEAP_SIZE", "0")) ÷ 2)
+```
+"""
+set_cache_budget!(obj, n_bytes::Integer) = (getfield(obj, :cache).budget[] = Int(n_bytes); nothing)
+
+"""
+    cache_budget(obj) -> Int
+
+The cache budget set on `obj`'s PropertyCache (the value passed to
+`set_cache_budget!`). Returns `0` if `obj` is not a budget-holder. Does NOT
+walk `__parent__` — see [`subtree_budget`](@ref) for the recursive variant.
+"""
+cache_budget(obj) = getfield(obj, :cache).budget[]
+
+"""
+    cache_bytes(obj) -> Int
+
+LOCAL byte subtotal of `obj`'s PropertyCache — sum of `summarysize` over the
+entries memoized directly on this instance. Does NOT walk `__parent__`. For
+the budget-holder's subtree total, see [`subtree_bytes`](@ref). For a
+budget-holder these return the same value (the push-up sum lands here).
+"""
+cache_bytes(obj) = getfield(obj, :cache).bytes[]
+
+"""
+    cache_entries(obj) -> Int
+
+Number of memoized entries currently held on `obj`'s PropertyCache (this
+instance only, no recursion).
+"""
+cache_entries(obj) = length(getfield(obj, :cache).cache)
+
+"""
+    subtree_bytes(obj) -> Int
+
+Total bytes in the budget-holder's subtree containing `obj`. Walks `__parent__`
+upward to the nearest ancestor with `budget > 0` and returns its `bytes[]`. If
+no ancestor in the chain has a budget set, falls back to `cache_bytes(obj)`.
+"""
+subtree_bytes(obj) = let holder = _find_budget_holder_obj(obj)
+    holder === nothing ? cache_bytes(obj) : cache_bytes(holder)
+end
+
+"""
+    subtree_budget(obj) -> Int
+
+Budget of the nearest ancestor budget-holder (including `obj` itself), or `0`
+if no budget is set anywhere in the chain.
+"""
+subtree_budget(obj) = let holder = _find_budget_holder_obj(obj)
+    holder === nothing ? 0 : cache_budget(holder)
+end
+
+"""
+    last_evicted(obj) -> Union{Nothing, Tuple{Symbol, Any}}
+
+`(name, args_key)` of the most recent entry evicted from the budget-holder's
+subtree containing `obj`, or `nothing` if no eviction has happened yet (or no
+budget-holder in the chain). Single-slot history; the previous value is
+overwritten on each new eviction.
+"""
+last_evicted(obj) = let holder = _find_budget_holder_obj(obj)
+    holder === nothing ? nothing : getfield(holder, :cache).last_evicted[]
+end
+
+# Walks `__parent__` from `obj` upward, returning the nearest DO whose
+# PropertyCache has `budget > 0`, or `nothing` if no budget-holder in the chain.
+# Used by `subtree_*` and `last_evicted` getters; not exported.
+function _find_budget_holder_obj(obj)
+    cur = obj
+    while cur !== nothing
+        pc = getfield(cur, :cache)
+        pc isa PropertyCache && pc.budget[] > 0 && return cur
+        cur = hasproperty(cur, :__parent__) ? cur.__parent__ : nothing
+    end
+    nothing
+end
 struct IndexableProperty{N,O,D<:AbstractDict}
     o::O
     cache::D
@@ -3419,13 +3568,17 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     fixed_lhs = [lhs for (_, lhs) in fixed_fields]
     struct_expr = Expr(:struct, mut, head, Expr(:block,
         fixed_lhs..., :(cache::$PropertyCache),
-        :($type($(fixed_lhs...); cache_type=$(Meta.quot(cache_type)), kwargs...) = new(
-            $(fixed_names...),
-            $PropertyCache(
-                $(resolve_cache_type)(cache_type),
-                (;kwargs...)
+        :(function $type($(fixed_lhs...); cache_type=$(Meta.quot(cache_type)), kwargs...)
+            __inst__ = new(
+                $(fixed_names...),
+                $PropertyCache(
+                    $(resolve_cache_type)(cache_type),
+                    (;kwargs...)
+                )
             )
-        ))
+            $(_link_owner!)(getfield(__inst__, :cache), __inst__)
+            __inst__
+        end)
     ))
     result = Expr(:block)
     # Emit per-cached-property DiskCacheLocks
