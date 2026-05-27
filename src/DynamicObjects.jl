@@ -36,7 +36,7 @@ optionally disk-cached properties.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @dynamic_progress, memoize!, maybememoize!, maybeprogress!, noprogress, @lru, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, ThreadsafeLRUDict, LRUDict, set_cache_budget!, cache_budget, cache_bytes, cache_entries, subtree_bytes, subtree_budget, last_evicted
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @dynamic_progress, memoize!, maybememoize!, maybeprogress!, noprogress, @lru, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, ThreadsafeLRUDict, LRUDict, set_cache_budget!, cache_budget, cache_bytes, cache_entries, subtree_bytes, subtree_budget, last_evicted, is_pinnable_value
 
 import SHA, Serialization
 
@@ -152,6 +152,87 @@ end
 # every `get!`. Safe to call repeatedly (idempotent after first set).
 _link_owner!(pc::PropertyCache, owner) = (pc.owner_ref[] === nothing && (pc.owner_ref[] = WeakRef(owner)); nothing)
 _link_owner!(_, _) = nothing  # tolerate non-PropertyCache (e.g. unit tests / fixed-only structs)
+
+# --- Native-handle detection (D1 resolution: shallow direct-field check) ---
+
+_is_handle_field_type(::Type{<:Ptr}) = true
+_is_handle_field_type(::Type{<:IO}) = true
+_is_handle_field_type(::Type{<:Base.RefValue}) = true
+_is_handle_field_type(::Type{<:Threads.AbstractLock}) = true
+_is_handle_field_type(::Type) = false
+
+"""
+    is_pinnable_value(::Type{T}) -> Bool
+    is_pinnable_value(v) -> Bool
+
+Whether values of type `T` (or value `v`) should be auto-pinned in the cache —
+i.e. never evicted by the LRU layer. The default implementation does a shallow
+direct-field check: returns `true` iff any of `fieldtypes(T)` is `Ptr`, `IO`,
+`Base.RefValue`, `Threads.AbstractLock`, or a subtype thereof.
+
+Pure-data types like `Array`, `Dict`, `DataFrame`, `String`, `Vector{Any}` are
+NOT pinned by default (no direct pointer field) and remain eviction
+candidates. Wrapper types whose direct fields are pure data but which
+transitively hold a native resource should add a one-line override:
+
+```julia
+DynamicObjects.is_pinnable_value(::Type{<:MyBridgeHandle}) = true
+```
+"""
+is_pinnable_value(::Type{T}) where {T} = any(_is_handle_field_type, fieldtypes(T))
+is_pinnable_value(v) = is_pinnable_value(typeof(v))
+
+# --- Size measurement (D5 resolution: bounded recursion-depth walker) ---
+
+"""
+    _summarysize_capped(v, depth=8) -> Int
+
+Approximate byte size of `v` with a bounded recursion depth. Walks the
+common container shapes (`AbstractArray` of non-isbits elements,
+`AbstractDict`, `Tuple`, generic struct fields) up to `depth` levels and
+falls back to `sizeof(typeof(v))` for the unwalked remainder.
+
+Measured once at store and stored in `PropertyCache.sizes`; never re-measured
+on hit. This is intentionally an approximation — exact byte accounting under
+`Base.summarysize` is non-trivial to bound (no depth knob exposed) and the
+LRU layer only needs eviction-order signal, not accuracy. Pathological inputs
+(deep Vega-Lite spec Dicts, nested Stan draw matrices) stop walking at
+`depth` and contribute their nominal type-shell size instead of a full walk.
+"""
+function _summarysize_capped(v, depth::Int=8, visited::Base.IdSet=Base.IdSet())
+    v in visited && return 0
+    !isbits(v) && push!(visited, v)
+    n = sizeof(typeof(v))
+    depth <= 0 && return n
+    if v isa String
+        n = sizeof(v)
+    elseif v isa Symbol
+        # Symbols are interned; charge their textual size as proxy.
+        n = sizeof(String(v)) + sizeof(typeof(v))
+    elseif v isa AbstractArray && !isbitstype(eltype(v))
+        for elt in v
+            n += _summarysize_capped(elt, depth - 1, visited)
+        end
+    elseif v isa AbstractArray
+        # isbits eltype — array is contiguous; one bulk charge.
+        n = sizeof(v)
+    elseif v isa AbstractDict
+        for (k, val) in v
+            n += _summarysize_capped(k, depth - 1, visited)
+            n += _summarysize_capped(val, depth - 1, visited)
+        end
+    elseif v isa Tuple || v isa NamedTuple
+        for elt in v
+            n += _summarysize_capped(elt, depth - 1, visited)
+        end
+    elseif !isbits(v)
+        for i in 1:nfields(v)
+            isdefined(v, i) || continue
+            n += _summarysize_capped(getfield(v, i), depth - 1, visited)
+        end
+    end
+    n
+end
 
 # Bare-prop path: forwards `substatus` so the inner `ThreadsafeDict.get!`
 # creates a Treebars node + lifecycle just like it does for IPs. Closure
