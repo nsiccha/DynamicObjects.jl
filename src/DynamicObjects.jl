@@ -134,6 +134,9 @@ struct PropertyCache{D<:AbstractDict{Symbol,Any}}
     parent_pc::Base.RefValue{Any}    # Union{Nothing, WeakRef} — lazily resolved
     owner_ref::Base.RefValue{Any}    # Union{Nothing, WeakRef} — set via _link_owner!
     last_evicted::Base.RefValue{Any} # Union{Nothing, Tuple{Symbol,Any}}
+    lru_order::Vector{Tuple{Symbol,Any}}  # access-order (MRU-last); local to this PC
+    descendants::Vector{WeakRef}     # populated on budget-holders only; descendant PCs in this subtree
+    lru_lock::ReentrantLock          # protects lru_order / descendants mutation
     PropertyCache(D, c::NamedTuple) = new{D{Symbol,Any}}(
         D{Symbol,Any}(pairs(c)),
         Dict{Tuple{Symbol,Any},Int}(),
@@ -143,6 +146,9 @@ struct PropertyCache{D<:AbstractDict{Symbol,Any}}
         Ref{Any}(nothing),
         Ref{Any}(nothing),
         Ref{Any}(nothing),
+        Tuple{Symbol,Any}[],
+        WeakRef[],
+        ReentrantLock(),
     )
 end
 
@@ -233,27 +239,203 @@ function _parent_pc(pc::PropertyCache)
 end
 
 # Walk __parent__ chain bumping each PropertyCache's local `bytes` by delta.
-# O(tree-depth) per call.
-function _push_delta_up!(pc::PropertyCache, delta::Int)
-    parent_pc = _parent_pc(pc)
+# Registers `originating_pc` as a descendant at every budget-holder encountered
+# (so push-down eviction can enumerate the subtree). O(tree-depth) per call.
+# Returns the nearest budget-holder (if any) so the caller can fire eviction.
+function _push_delta_up!(originating_pc::PropertyCache, delta::Int)
+    first_holder = nothing
+    parent_pc = _parent_pc(originating_pc)
     while parent_pc !== nothing
         Threads.atomic_add!(parent_pc.bytes, delta)
+        if parent_pc.budget[] > 0
+            _register_descendant!(parent_pc, originating_pc)
+            first_holder === nothing && (first_holder = parent_pc)
+        end
         parent_pc = _parent_pc(parent_pc)
+    end
+    first_holder
+end
+
+# Add `descendant_pc` to `holder`'s descendants list if not already present.
+# WeakRef-based so dead descendants drop out naturally on GC; the eviction
+# walker skips dead refs.
+function _register_descendant!(holder::PropertyCache, descendant_pc::PropertyCache)
+    lock(holder.lru_lock) do
+        for wref in holder.descendants
+            wref.value === descendant_pc && return
+        end
+        push!(holder.descendants, WeakRef(descendant_pc))
     end
     nothing
 end
 
+# Move `key` to MRU position in `pc.lru_order`. Called on cache hits.
+function _touch_lru_pc!(pc::PropertyCache, key::Tuple{Symbol,Any})
+    lock(pc.lru_lock) do
+        idx = findfirst(==(key), pc.lru_order)
+        if idx !== nothing
+            idx == length(pc.lru_order) && return
+            deleteat!(pc.lru_order, idx)
+        end
+        push!(pc.lru_order, key)
+    end
+    nothing
+end
+
+# Hit recorder — called when a `get!` resolves to an existing entry (no
+# user callback fired). Updates LRU access order so eviction picks oldest-
+# accessed first, not oldest-stored.
+function _record_pc_hit!(pc::PropertyCache, name::Symbol, args_key)
+    _touch_lru_pc!(pc, (name, args_key))
+end
+
 # Called on cache miss (after the body returns `v`), inside the user-callback
 # closure that runs OUTSIDE the cache lock per Base.get!(::AbstractThreadsafeDict)
-# spawn pattern. Records size, pin status, and propagates the byte delta up
-# the __parent__ chain. Eviction is gated to budget-holders in step 4.
+# spawn pattern. Records size, pin status, LRU order, propagates the byte
+# delta up the __parent__ chain, and fires eviction if a budget-holder is
+# over budget.
 function _record_pc_store!(pc::PropertyCache, name::Symbol, args_key, v)
     key = (name, args_key)
     sz = _summarysize_capped(v)
     pc.sizes[key] = sz
     is_pinnable_value(v) && push!(pc.pinned, key)
     Threads.atomic_add!(pc.bytes, sz)
-    _push_delta_up!(pc, sz)
+    lock(pc.lru_lock) do
+        # If already in order (shouldn't normally happen on store, but defensive
+        # in case of overwrite via setindex!), bump to MRU; else append.
+        idx = findfirst(==(key), pc.lru_order)
+        idx !== nothing && deleteat!(pc.lru_order, idx)
+        push!(pc.lru_order, key)
+    end
+    # If `pc` is itself a budget-holder, also record self as descendant
+    # (we never push-up to ourselves). Otherwise push-up registers us at
+    # ancestor budget-holders.
+    pc.budget[] > 0 && _register_descendant!(pc, pc)
+    holder = _push_delta_up!(pc, sz)
+    # Fire eviction if we are or are below a budget-holder. Self is checked
+    # too — if pc is a budget-holder, the push-up didn't go anywhere but pc
+    # itself may be over budget.
+    if pc.budget[] > 0
+        _maybe_evict!(pc)
+    elseif holder !== nothing
+        _maybe_evict!(holder)
+    end
+    nothing
+end
+
+# --- Push-down eviction (D6 sync-on-store + D3 cost-aware bias) ---
+
+# Determine whether a `(name, args_key)` slot on PropertyCache `pc` corresponds
+# to a `@cached` property. Looks up `meta(typeof(owner))` for the property's
+# info bag and checks `info.macros`.
+function _is_cached_slot(pc::PropertyCache, name::Symbol)
+    owner_ref = pc.owner_ref[]
+    owner_ref isa WeakRef || return false
+    owner = owner_ref.value
+    owner === nothing && return false
+    info = metafirst(typeof(owner), name)
+    info === nothing && return false
+    Symbol("@cached") in info.macros
+end
+
+# Check whether `(name, args_key)` is currently the target of an in-flight
+# Task somewhere. For bare-prop slots, that's `pc.cache.tasks[name]`. For IP
+# slots, we'd need to dig into the IP's subcache — left for v2 (the bare-prop
+# tasks check covers the common case; an IP in-flight task evict-and-recompute
+# would mean wasted work but not corruption, since the cache machinery
+# spawns a fresh task on the next access).
+function _entry_in_flight(pc::PropertyCache, key::Tuple{Symbol,Any})
+    name, args_key = key
+    if args_key === () && pc.cache isa AbstractThreadsafeDict
+        return lock(pc.cache.lock) do; haskey(pc.cache.tasks, name); end
+    end
+    false
+end
+
+# Single eviction step: pop the entry, update sizes/bytes/lru_order, push
+# the negative delta up the parent chain (so the budget-holder's `bytes`
+# decreases too).
+function _evict_entry!(pc::PropertyCache, key::Tuple{Symbol,Any})
+    name, args_key = key
+    sz = get(pc.sizes, key, 0)
+    if args_key === ()
+        # Bare-prop slot. Use the cache's pop! (delegates through
+        # AbstractThreadsafeDict if applicable, with task cleanup).
+        haskey(pc.cache, name) && pop!(pc.cache, name)
+    else
+        # IP slot. The actual storage is on the IP's per-property subcache,
+        # not pc.cache. Reach it via the owning DO's IP wrapper.
+        owner_ref = pc.owner_ref[]
+        if owner_ref isa WeakRef && owner_ref.value !== nothing
+            owner = owner_ref.value
+            # Read the IP wrapper from pc.cache[name] (cached IP wrapper).
+            if haskey(pc.cache, name)
+                ip = pc.cache[name]
+                ip isa IndexableProperty && haskey(ip.cache, args_key) && pop!(ip.cache, args_key)
+            end
+        end
+    end
+    pop!(pc.sizes, key, 0)
+    delete!(pc.pinned, key)
+    Threads.atomic_sub!(pc.bytes, sz)
+    lock(pc.lru_lock) do
+        idx = findfirst(==(key), pc.lru_order)
+        idx !== nothing && deleteat!(pc.lru_order, idx)
+    end
+    # Push -sz up to all ancestor budget-holders
+    parent_pc = _parent_pc(pc)
+    while parent_pc !== nothing
+        Threads.atomic_sub!(parent_pc.bytes, sz)
+        parent_pc = _parent_pc(parent_pc)
+    end
+    nothing
+end
+
+# Gather every (pc, key, is_cached, position) tuple eligible for eviction
+# from holder's subtree, skipping pinned and in-flight entries.
+function _gather_eviction_candidates(holder::PropertyCache)
+    out = Vector{Tuple{PropertyCache, Tuple{Symbol,Any}, Bool, Int}}()
+    visited = Set{PropertyCache}()
+    # Walk holder + descendants
+    pcs = lock(holder.lru_lock) do
+        # Take a snapshot of descendants under the lock; live refs only.
+        live = PropertyCache[holder]
+        for wref in holder.descendants
+            pc = wref.value
+            pc isa PropertyCache && pc !== holder && push!(live, pc)
+        end
+        live
+    end
+    for pc in pcs
+        pc in visited && continue
+        push!(visited, pc)
+        lock(pc.lru_lock) do
+            for (i, key) in enumerate(pc.lru_order)
+                key in pc.pinned && continue
+                _entry_in_flight(pc, key) && continue
+                push!(out, (pc, key, _is_cached_slot(pc, key[1]), i))
+            end
+        end
+    end
+    out
+end
+
+# Main eviction loop. Called when a store crosses the budget threshold on
+# `holder`. Runs synchronously inside the user-callback closure of the
+# triggering store — outside any cache lock — so the lock-hold profile is
+# unchanged from today's `_on_store!` semantics.
+function _maybe_evict!(holder::PropertyCache)
+    holder.budget[] <= 0 && return  # not a budget-holder
+    holder.bytes[] <= holder.budget[] && return  # under budget
+    candidates = _gather_eviction_candidates(holder)
+    # Sort: @cached slots first (cheap re-deserialize wins), then by LRU
+    # position (oldest-accessed first within each tier).
+    sort!(candidates, by = c -> (c[3] ? 0 : 1, c[4]))
+    for (pc, key, _, _) in candidates
+        holder.bytes[] <= holder.budget[] && break
+        _evict_entry!(pc, key)
+        holder.last_evicted[] = key
+    end
     nothing
 end
 
@@ -301,12 +483,19 @@ end
 # `getorcomputeproperty` routes around this layer when indices/kwargs are
 # present (see ~L1109), so this overload only needs to handle the
 # bare-name case.
-Base.get!(f::Function, c::PropertyCache, key; substatus=nothing, kwargs...) =
-    get!(c.cache, key; substatus) do s
+Base.get!(f::Function, c::PropertyCache, key; substatus=nothing, kwargs...) = begin
+    # Hit-vs-miss detection: race-prone but LRU ordering is approximate —
+    # a wrong move-to-back has no correctness impact, just suboptimal
+    # eviction order. The store path is correct regardless.
+    was_hit = haskey(c.cache, key)
+    rv = get!(c.cache, key; substatus) do s
         v = f(s)
         _record_pc_store!(c, key, (), v)
         v
     end
+    was_hit && _record_pc_hit!(c, key, ())
+    rv
+end
 Base.get!(f::Function, ::PropertyCache, key, indices...; kwargs...) = f(nothing)
 Base.setindex!(c::PropertyCache, args...) = setindex!(c.cache, args...)
 Base.show(io::IO, pc::PropertyCache) = print(io, "PropertyCache(",
@@ -440,12 +629,18 @@ plain functions can share the same syntax.
 """
 memoize!(ip::IndexableProperty{name}, args...; fetch=Base.fetch, kwargs...) where {name} = begin
     args_key = (args, (;kwargs...))
-    get!(ip.cache, args_key) do
+    was_hit = haskey(ip.cache, args_key)
+    rv = get!(ip.cache, args_key) do
         v = ip(args...; kwargs...)
         owner_pc = getfield(ip.o, :cache)
         owner_pc isa PropertyCache && _record_pc_store!(owner_pc, name, args_key, v)
         v
     end
+    if was_hit
+        owner_pc = getfield(ip.o, :cache)
+        owner_pc isa PropertyCache && _record_pc_hit!(owner_pc, name, args_key)
+    end
+    rv
 end
 """
     AbstractThreadsafeDict{K,V}
@@ -538,7 +733,8 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
         nothing
     end
     args_key = (indices, (;kwargs...))
-    get!(cache, args_key; fetch, substatus=substatus_f, retry_failed) do s
+    was_hit = lock(cache.lock) do; haskey(cache.cache, args_key); end
+    rv = get!(cache, args_key; fetch, substatus=substatus_f, retry_failed) do s
         # Call `_computeproperty` directly, NOT `getorcomputeproperty`:
         # the latter, when `indices` and `kwargs` are both empty AND
         # `is_indexed_property(o, name)` (we're already inside the IP wrapper,
@@ -557,6 +753,11 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
         owner_pc isa PropertyCache && _record_pc_store!(owner_pc, name, args_key, v)
         v
     end
+    if was_hit
+        owner_pc = getfield(o, :cache)
+        owner_pc isa PropertyCache && _record_pc_hit!(owner_pc, name, args_key)
+    end
+    rv
 end
 # `substatus()` is invoked OUTSIDE the cache lock. Calling it under the
 # lock is unsafe: substatus factories can recurse into other DO properties
