@@ -438,17 +438,20 @@ function _maybe_evict!(holder::PropertyCache)
     nothing
 end
 
+_safe_typesize(::Type{T}) where {T} = isbitstype(T) ? sizeof(T) : 0
+
 function _summarysize_capped(v, depth::Int=8, visited::Base.IdSet=Base.IdSet())
     v in visited && return 0
     !isbits(v) && push!(visited, v)
-    n = sizeof(typeof(v))
-    depth <= 0 && return n
     if v isa String
-        n = sizeof(v)
+        return sizeof(v)
     elseif v isa Symbol
-        # Symbols are interned; charge their textual size as proxy.
-        n = sizeof(String(v)) + sizeof(typeof(v))
-    elseif v isa AbstractArray && !isbitstype(eltype(v))
+        # Symbols are interned; charge textual size as proxy.
+        return ncodeunits(string(v))
+    end
+    n = _safe_typesize(typeof(v))
+    depth <= 0 && return n
+    if v isa AbstractArray && !isbitstype(eltype(v))
         for elt in v
             n += _summarysize_capped(elt, depth - 1, visited)
         end
