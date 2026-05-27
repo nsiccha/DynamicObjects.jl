@@ -225,7 +225,11 @@ function _parent_pc(pc::PropertyCache)
     owner_ref isa WeakRef || (pc.parent_pc[] = WeakRef(nothing); return nothing)
     owner = owner_ref.value
     owner === nothing && (pc.parent_pc[] = WeakRef(nothing); return nothing)
-    parent_obj = hasproperty(owner, :__parent__) ? owner.__parent__ : nothing
+    # IMPORTANT: use getfield (struct slot) — `owner.__parent__` goes through
+    # getproperty → getorcomputeproperty → PropertyCache.get! → _record_pc_hit!
+    # → _any_budget_in_chain → _parent_pc, which is exactly this function.
+    # Stack-overflow guaranteed.
+    parent_obj = hasfield(typeof(owner), :__parent__) ? getfield(owner, :__parent__) : nothing
     # A root DO's __parent__ self-references — detect and treat as no parent.
     if parent_obj === nothing || parent_obj === owner
         pc.parent_pc[] = WeakRef(nothing)
