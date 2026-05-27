@@ -155,7 +155,23 @@ end
 # `new(...)` constructs the instance so the eviction walker can find
 # `__parent__` from any PropertyCache without plumbing the owning DO through
 # every `get!`. Safe to call repeatedly (idempotent after first set).
-_link_owner!(pc::PropertyCache, owner) = (pc.owner_ref[] === nothing && (pc.owner_ref[] = WeakRef(owner)); nothing)
+#
+# Also eagerly resolves `parent_pc`: `__parent__` is passed as a kwarg by the
+# child-constructor lowering (see ~L3574) and therefore lives as an entry in
+# `pc.cache` immediately after construction, NOT as a struct field. Resolving
+# it here avoids any later `owner.__parent__` / `getfield(owner, :__parent__)`
+# lookup at hit/store time — both are wrong (one recurses through the cache
+# machinery, the other misses because `__parent__` isn't a struct slot).
+function _link_owner!(pc::PropertyCache, owner)
+    pc.owner_ref[] === nothing || return nothing
+    pc.owner_ref[] = WeakRef(owner)
+    parent_obj = get(pc.cache, :__parent__, nothing)
+    if parent_obj !== nothing && parent_obj !== owner
+        parent_pc = getfield(parent_obj, :cache)
+        parent_pc isa PropertyCache && (pc.parent_pc[] = WeakRef(parent_pc))
+    end
+    nothing
+end
 _link_owner!(_, _) = nothing  # tolerate non-PropertyCache (e.g. unit tests / fixed-only structs)
 
 # --- Native-handle detection (D1 resolution: shallow direct-field check) ---
@@ -211,34 +227,16 @@ LRU layer only needs eviction-order signal, not accuracy. Pathological inputs
 # the cache lock — see Base.get!(::AbstractThreadsafeDict, ...) below at the
 # spawn task body — so triggering `__parent__` resolution here can recurse
 # into the cache machinery without deadlocking on a held lock.
+# Parent PropertyCache lookup. `parent_pc` is resolved eagerly by
+# `_link_owner!` from the `:__parent__` kwarg stored in `pc.cache` at
+# construction time, so this is just a cheap WeakRef read.
+# Returns `nothing` for roots, GC'd parents, or PCs whose owner wasn't
+# linked (e.g. fixed-only structs that never call `_link_owner!`).
 function _parent_pc(pc::PropertyCache)
     cached = pc.parent_pc[]
-    if cached isa WeakRef
-        val = cached.value
-        val isa PropertyCache && return val
-        # Parent was GC'd; treat as no parent. Don't re-resolve — the owner
-        # would also be GC'd or in trouble.
-        return nothing
-    end
-    # Not yet resolved (cached === nothing). Walk via owner.__parent__.
-    owner_ref = pc.owner_ref[]
-    owner_ref isa WeakRef || (pc.parent_pc[] = WeakRef(nothing); return nothing)
-    owner = owner_ref.value
-    owner === nothing && (pc.parent_pc[] = WeakRef(nothing); return nothing)
-    # IMPORTANT: use getfield (struct slot) — `owner.__parent__` goes through
-    # getproperty → getorcomputeproperty → PropertyCache.get! → _record_pc_hit!
-    # → _any_budget_in_chain → _parent_pc, which is exactly this function.
-    # Stack-overflow guaranteed.
-    parent_obj = hasfield(typeof(owner), :__parent__) ? getfield(owner, :__parent__) : nothing
-    # A root DO's __parent__ self-references — detect and treat as no parent.
-    if parent_obj === nothing || parent_obj === owner
-        pc.parent_pc[] = WeakRef(nothing)
-        return nothing
-    end
-    parent_pc = getfield(parent_obj, :cache)
-    parent_pc isa PropertyCache || (pc.parent_pc[] = WeakRef(nothing); return nothing)
-    pc.parent_pc[] = WeakRef(parent_pc)
-    parent_pc
+    cached isa WeakRef || return nothing
+    val = cached.value
+    val isa PropertyCache ? val : nothing
 end
 
 # Opt-in gate: bookkeeping (sizing, LRU ordering, push-up, descendant
