@@ -200,7 +200,35 @@ transitively hold a native resource should add a one-line override:
 DynamicObjects.is_pinnable_value(::Type{<:MyBridgeHandle}) = true
 ```
 """
-is_pinnable_value(::Type{T}) where {T} = any(_is_handle_field_type, fieldtypes(T))
+# Bounded type-level walk: true iff T (or any of its transitive field
+# types, the eltype of an array, or key/value type of a dict) is a
+# native-handle type. Depth cap (8) terminates pathological types and
+# any mutable cycles. Catches `Tuple{BridgeStanModel, X}` where the
+# direct field type isn't itself a Ptr/IO but contains one.
+function _type_has_handle(::Type{T}, depth::Int=8) where {T}
+    _is_handle_field_type(T) && return true
+    depth <= 0 && return false
+    isbitstype(T) && return false
+    # Abstract / Union / Any-typed slots: we can't see inside them at the
+    # type level. Treat as "no handle" so eviction stays effective; users
+    # whose Any-typed cache values transitively hold a native resource
+    # should add an override for their wrapper type.
+    isconcretetype(T) || return false
+    T <: Type && return false  # types-of-types aren't user data
+    if T <: AbstractArray
+        return _type_has_handle(eltype(T), depth - 1)
+    end
+    if T <: AbstractDict
+        return _type_has_handle(keytype(T), depth - 1) ||
+               _type_has_handle(valtype(T), depth - 1)
+    end
+    for ft in fieldtypes(T)
+        _type_has_handle(ft, depth - 1) && return true
+    end
+    false
+end
+
+is_pinnable_value(::Type{T}) where {T} = _type_has_handle(T)
 is_pinnable_value(v) = is_pinnable_value(typeof(v))
 
 # --- Size measurement (D5 resolution: bounded recursion-depth walker) ---
