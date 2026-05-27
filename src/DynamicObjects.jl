@@ -116,33 +116,29 @@ The remaining fields back the LRU/eviction layer:
   recursion). Subtree totals are tracked at the budget-holder via push-up.
 - `budget` — `0` = not a budget-holder, push deltas up to parent; `>0` = this
   PropertyCache is the budget-holder for its subtree.
-- `parent_pc` — lazily resolved `WeakRef` to the parent DO's PropertyCache, used
-  for push-up traversal.
-- `owner_ref` — `WeakRef` to the owning DO instance, set right after `new(...)`
+- `parent_pc` — strong ref to the parent DO's PropertyCache (or `nothing` for
+  roots), eagerly resolved at construction by `_link_owner!`. Used for push-up
+  byte-delta traversal.
+- `owner_ref` — strong ref to the owning DO instance, set right after `new(...)`
   in the `@dynamicstruct` constructor via `_link_owner!`. Lets the eviction
-  walker find `__parent__` without plumbing the DO through every `get!`.
+  walker find metadata about the owner (e.g. `@cached`-ness of a property)
+  without plumbing the DO through every `get!`. Forms a child_PC ↔ child_DO
+  cycle; Julia's tracing GC handles it when no external strong ref keeps
+  the cycle alive (i.e. when the parent's cache evicts the child).
 - `last_evicted` — single-slot history on the budget-holder; `Tuple{Symbol,Any}`
   of the most recent evicted entry, or `nothing`. Used by `last_evicted(obj)`.
 """
-# MUTABLE. PropertyCache holds the WeakRef targets for parent_pc + descendants[]
-# — those WeakRefs are only meaningful if Julia preserves identity across
-# `getfield(do_inst, :cache)`. An immutable struct gets boxed on each WeakRef
-# call, and the box is unreachable from any strong reference, so GC reclaims
-# it and the WeakRef becomes dead while the field reference remains live.
-# (Confirmed by minimal Julia repro on 2026-05-27.) Mutability gives the
-# struct a stable heap identity that WeakRefs can latch onto.
-mutable struct PropertyCache{D<:AbstractDict{Symbol,Any}}
+struct PropertyCache{D<:AbstractDict{Symbol,Any}}
     cache::D
     sizes::Dict{Tuple{Symbol,Any}, Int}
     pinned::Set{Tuple{Symbol,Any}}
     bytes::Threads.Atomic{Int}
     budget::Threads.Atomic{Int}
-    parent_pc::Base.RefValue{Any}    # Union{Nothing, WeakRef} — lazily resolved
-    owner_ref::Base.RefValue{Any}    # Union{Nothing, WeakRef} — set via _link_owner!
+    parent_pc::Base.RefValue{Any}    # Union{Nothing, PropertyCache} — strong ref to parent
+    owner_ref::Base.RefValue{Any}    # Union{Nothing, owning DO} — strong ref
     last_evicted::Base.RefValue{Any} # Union{Nothing, Tuple{Symbol,Any}}
     lru_order::Vector{Tuple{Symbol,Any}}  # access-order (MRU-last); local to this PC
-    descendants::Vector{WeakRef}     # populated on budget-holders only; descendant PCs in this subtree
-    lru_lock::ReentrantLock          # protects lru_order / descendants mutation
+    lru_lock::ReentrantLock          # protects lru_order mutation
     PropertyCache(D, c::NamedTuple) = new{D{Symbol,Any}}(
         D{Symbol,Any}(pairs(c)),
         Dict{Tuple{Symbol,Any},Int}(),
@@ -153,7 +149,6 @@ mutable struct PropertyCache{D<:AbstractDict{Symbol,Any}}
         Ref{Any}(nothing),
         Ref{Any}(nothing),
         Tuple{Symbol,Any}[],
-        WeakRef[],
         ReentrantLock(),
     )
 end
@@ -171,11 +166,11 @@ end
 # machinery, the other misses because `__parent__` isn't a struct slot).
 function _link_owner!(pc::PropertyCache, owner)
     pc.owner_ref[] === nothing || return nothing
-    pc.owner_ref[] = WeakRef(owner)
+    pc.owner_ref[] = owner  # strong ref — pc and owner share lifetime by design
     parent_obj = get(pc.cache, :__parent__, nothing)
     if parent_obj !== nothing && parent_obj !== owner
         parent_pc = getfield(parent_obj, :cache)
-        parent_pc isa PropertyCache && (pc.parent_pc[] = WeakRef(parent_pc))
+        parent_pc isa PropertyCache && (pc.parent_pc[] = parent_pc)  # strong ref
     end
     nothing
 end
@@ -264,14 +259,11 @@ LRU layer only needs eviction-order signal, not accuracy. Pathological inputs
 # into the cache machinery without deadlocking on a held lock.
 # Parent PropertyCache lookup. `parent_pc` is resolved eagerly by
 # `_link_owner!` from the `:__parent__` kwarg stored in `pc.cache` at
-# construction time, so this is just a cheap WeakRef read.
-# Returns `nothing` for roots, GC'd parents, or PCs whose owner wasn't
-# linked (e.g. fixed-only structs that never call `_link_owner!`).
+# construction time. Strong ref — parents and children share lifetime
+# by design (parent's cache holds the child, the child can't outlive it).
 function _parent_pc(pc::PropertyCache)
-    cached = pc.parent_pc[]
-    cached isa WeakRef || return nothing
-    val = cached.value
-    val isa PropertyCache ? val : nothing
+    p = pc.parent_pc[]
+    p isa PropertyCache ? p : nothing
 end
 
 # Opt-in gate: bookkeeping (sizing, LRU ordering, push-up, descendant
@@ -291,34 +283,20 @@ function _any_budget_in_chain(pc::PropertyCache)
 end
 
 # Walk __parent__ chain bumping each PropertyCache's local `bytes` by delta.
-# Registers `originating_pc` as a descendant at every budget-holder encountered
-# (so push-down eviction can enumerate the subtree). O(tree-depth) per call.
 # Returns the nearest budget-holder (if any) so the caller can fire eviction.
+# No descendant bookkeeping needed — eviction walks the cache tree directly
+# via the existing strong refs that the cache structure already maintains.
 function _push_delta_up!(originating_pc::PropertyCache, delta::Int)
     first_holder = nothing
     parent_pc = _parent_pc(originating_pc)
     while parent_pc !== nothing
         Threads.atomic_add!(parent_pc.bytes, delta)
-        if parent_pc.budget[] > 0
-            _register_descendant!(parent_pc, originating_pc)
-            first_holder === nothing && (first_holder = parent_pc)
+        if parent_pc.budget[] > 0 && first_holder === nothing
+            first_holder = parent_pc
         end
         parent_pc = _parent_pc(parent_pc)
     end
     first_holder
-end
-
-# Add `descendant_pc` to `holder`'s descendants list if not already present.
-# WeakRef-based so dead descendants drop out naturally on GC; the eviction
-# walker skips dead refs.
-function _register_descendant!(holder::PropertyCache, descendant_pc::PropertyCache)
-    lock(holder.lru_lock) do
-        for wref in holder.descendants
-            wref.value === descendant_pc && return
-        end
-        push!(holder.descendants, WeakRef(descendant_pc))
-    end
-    nothing
 end
 
 # Move `key` to MRU position in `pc.lru_order`. Called on cache hits.
@@ -358,7 +336,7 @@ function _record_pc_store!(pc::PropertyCache, name::Symbol, args_key, v)
     if hasfield(typeof(v), :cache)
         v_cache = getfield(v, :cache)
         if v_cache isa PropertyCache && v_cache.parent_pc[] === nothing
-            v_cache.parent_pc[] = WeakRef(pc)
+            v_cache.parent_pc[] = pc  # strong ref
         end
     end
     key = (name, args_key)
@@ -378,10 +356,6 @@ function _record_pc_store!(pc::PropertyCache, name::Symbol, args_key, v)
         idx !== nothing && deleteat!(pc.lru_order, idx)
         push!(pc.lru_order, key)
     end
-    # If `pc` is itself a budget-holder, also record self as descendant
-    # (we never push-up to ourselves). Otherwise push-up registers us at
-    # ancestor budget-holders.
-    pc.budget[] > 0 && _register_descendant!(pc, pc)
     holder = _push_delta_up!(pc, sz)
     # Fire eviction if we are or are below a budget-holder. Self is checked
     # too — if pc is a budget-holder, the push-up didn't go anywhere but pc
@@ -400,9 +374,7 @@ end
 # to a `@cached` property. Looks up `meta(typeof(owner))` for the property's
 # info bag and checks `info.macros`.
 function _is_cached_slot(pc::PropertyCache, name::Symbol)
-    owner_ref = pc.owner_ref[]
-    owner_ref isa WeakRef || return false
-    owner = owner_ref.value
+    owner = pc.owner_ref[]
     owner === nothing && return false
     info = metafirst(typeof(owner), name)
     info === nothing && return false
@@ -452,14 +424,10 @@ function _evict_entry!(pc::PropertyCache, key::Tuple{Symbol,Any})
         haskey(pc.cache, name) && pop!(pc.cache, name)
     else
         # IP slot. The actual storage is on the IP's per-property subcache,
-        # not pc.cache. Reach it via the owning DO's IP wrapper.
-        owner_ref = pc.owner_ref[]
-        if owner_ref isa WeakRef && owner_ref.value !== nothing
-            # Read the IP wrapper from pc.cache[name] (cached IP wrapper).
-            if haskey(pc.cache, name)
-                ip = pc.cache[name]
-                ip isa IndexableProperty && haskey(ip.cache, args_key) && pop!(ip.cache, args_key)
-            end
+        # not pc.cache. Reach it via the cached IP wrapper.
+        if haskey(pc.cache, name)
+            ip = pc.cache[name]
+            ip isa IndexableProperty && haskey(ip.cache, args_key) && pop!(ip.cache, args_key)
         end
     end
     Threads.atomic_sub!(pc.bytes, sz)
@@ -472,24 +440,18 @@ function _evict_entry!(pc::PropertyCache, key::Tuple{Symbol,Any})
     nothing
 end
 
-# Gather every (pc, key, is_cached, position) tuple eligible for eviction
-# from holder's subtree, skipping pinned and in-flight entries.
+# Walk the live cache subtree rooted at `holder` and collect every
+# (pc, key, is_cached, position) tuple eligible for eviction. The tree
+# is enumerated via the strong refs the cache itself maintains: each
+# value in `pc.cache` that is a DO (has a `:cache::PropertyCache` field)
+# contributes its own PC. No separate descendants registry — when a child
+# DO is evicted from its parent's cache, it falls out of this walk
+# automatically.
 function _gather_eviction_candidates(holder::PropertyCache)
     out = Vector{Tuple{PropertyCache, Tuple{Symbol,Any}, Bool, Int}}()
     visited = Set{PropertyCache}()
-    # Walk holder + descendants
-    pcs = lock(holder.lru_lock) do
-        # Take a snapshot of descendants under the lock; live refs only.
-        live = PropertyCache[holder]
-        for wref in holder.descendants
-            pc = wref.value
-            pc isa PropertyCache && pc !== holder && push!(live, pc)
-        end
-        live
-    end
-    for pc in pcs
-        pc in visited && continue
-        push!(visited, pc)
+    _walk_subtree_pcs!(holder, visited)
+    for pc in visited
         lock(pc.lru_lock) do
             for (i, key) in enumerate(pc.lru_order)
                 key in pc.pinned && continue
@@ -499,6 +461,25 @@ function _gather_eviction_candidates(holder::PropertyCache)
         end
     end
     out
+end
+
+function _walk_subtree_pcs!(pc::PropertyCache, visited::Set{PropertyCache})
+    pc in visited && return
+    push!(visited, pc)
+    # Snapshot the cache values under whatever lock the inner dict provides,
+    # then recurse outside the lock to avoid lock-while-recursing surprises.
+    vals = if pc.cache isa AbstractThreadsafeDict
+        lock(pc.cache.lock) do; collect(values(pc.cache.cache)); end
+    else
+        collect(values(pc.cache))
+    end
+    for v in vals
+        if hasfield(typeof(v), :cache)
+            child_pc = getfield(v, :cache)
+            child_pc isa PropertyCache && _walk_subtree_pcs!(child_pc, visited)
+        end
+    end
+    nothing
 end
 
 # Main eviction loop. Called when a store crosses the budget threshold on
