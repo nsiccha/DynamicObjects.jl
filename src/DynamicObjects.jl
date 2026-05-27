@@ -237,6 +237,22 @@ function _parent_pc(pc::PropertyCache)
     parent_pc
 end
 
+# Opt-in gate: bookkeeping (sizing, LRU ordering, push-up, descendant
+# registration) is entirely skipped unless some PC in the parent chain
+# has a budget set via `set_cache_budget!`. Without this, every cache
+# store would do O(tree-depth + value-size) work for no eviction benefit.
+# Stores that happen before `set_cache_budget!` is called won't count
+# toward the budget — acceptable: callers are expected to set the budget
+# early in startup, before significant cache traffic.
+function _any_budget_in_chain(pc::PropertyCache)
+    cur::Union{PropertyCache,Nothing} = pc
+    while cur !== nothing
+        cur.budget[] > 0 && return true
+        cur = _parent_pc(cur)
+    end
+    false
+end
+
 # Walk __parent__ chain bumping each PropertyCache's local `bytes` by delta.
 # Registers `originating_pc` as a descendant at every budget-holder encountered
 # (so push-down eviction can enumerate the subtree). O(tree-depth) per call.
@@ -285,6 +301,7 @@ end
 # user callback fired). Updates LRU access order so eviction picks oldest-
 # accessed first, not oldest-stored.
 function _record_pc_hit!(pc::PropertyCache, name::Symbol, args_key)
+    _any_budget_in_chain(pc) || return
     _touch_lru_pc!(pc, (name, args_key))
 end
 
@@ -294,6 +311,7 @@ end
 # delta up the __parent__ chain, and fires eviction if a budget-holder is
 # over budget.
 function _record_pc_store!(pc::PropertyCache, name::Symbol, args_key, v)
+    _any_budget_in_chain(pc) || return
     key = (name, args_key)
     sz = _summarysize_capped(v)
     pc.sizes[key] = sz
