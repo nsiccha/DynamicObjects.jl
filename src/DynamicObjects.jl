@@ -449,9 +449,13 @@ end
 # automatically.
 function _gather_eviction_candidates(holder::PropertyCache)
     out = Vector{Tuple{PropertyCache, Tuple{Symbol,Any}, Bool, Int}}()
-    visited = Set{PropertyCache}()
-    _walk_subtree_pcs!(holder, visited)
-    for pc in visited
+    # IdSet (identity-based) — Set{PropertyCache} would hash by field
+    # walking pc.cache / pc.sizes / pc.lru_order, O(cache-size) per
+    # check. IdSet is O(1) per op.
+    visited = Base.IdSet{Any}()
+    pcs = PropertyCache[]
+    _walk_subtree_pcs!(holder, visited, pcs)
+    for pc in pcs
         lock(pc.lru_lock) do
             for (i, key) in enumerate(pc.lru_order)
                 key in pc.pinned && continue
@@ -463,9 +467,10 @@ function _gather_eviction_candidates(holder::PropertyCache)
     out
 end
 
-function _walk_subtree_pcs!(pc::PropertyCache, visited::Set{PropertyCache})
+function _walk_subtree_pcs!(pc::PropertyCache, visited::Base.IdSet, pcs::Vector{PropertyCache})
     pc in visited && return
     push!(visited, pc)
+    push!(pcs, pc)
     # Snapshot the cache values under whatever lock the inner dict provides,
     # then recurse outside the lock to avoid lock-while-recursing surprises.
     vals = if pc.cache isa AbstractThreadsafeDict
@@ -476,7 +481,7 @@ function _walk_subtree_pcs!(pc::PropertyCache, visited::Set{PropertyCache})
     for v in vals
         if hasfield(typeof(v), :cache)
             child_pc = getfield(v, :cache)
-            child_pc isa PropertyCache && _walk_subtree_pcs!(child_pc, visited)
+            child_pc isa PropertyCache && _walk_subtree_pcs!(child_pc, visited, pcs)
         end
     end
     nothing
@@ -534,13 +539,14 @@ function _summarysize_capped(v, depth::Int=8, visited::Base.IdSet=Base.IdSet())
     n = _safe_typesize(typeof(v))
     _is_subtree_root(v) && return n
     depth <= 0 && return n
-    if v isa AbstractArray && !isbitstype(eltype(v))
-        for i in eachindex(v)
-            isassigned(v, i) || continue
-            n += _summarysize_capped(@inbounds(v[i]), depth - 1, visited)
-        end
-    elseif v isa AbstractArray
-        # isbits eltype — array is contiguous; one bulk charge.
+    if v isa AbstractArray
+        # Bulk charge: sizeof(v) gives the contiguous storage. For isbits
+        # eltype that's the full size; for non-isbits (Vector{String},
+        # Vector{Any}) it's the pointer array — a *lower bound*. We
+        # deliberately do NOT iterate non-isbits arrays: Bruno caches
+        # multi-million-row String / Vector{Float64} columns, and per-element
+        # recursion in a hot path made request handlers spin (each cache
+        # store walked every element). Approximate size is fine for LRU.
         n = sizeof(v)
     elseif v isa AbstractDict
         for (k, val) in v
