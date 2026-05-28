@@ -18,7 +18,20 @@ using DynamicObjects, Arrow, DataFrames
 DynamicObjects.save(::Val{:mmap}, path::AbstractString, df::DataFrame) =
     Arrow.write(path, df)
 
-DynamicObjects.load(::Val{:mmap}, path::AbstractString, ::Type{DataFrame}) =
+# `Arrow.Table` returns an empty 0-column table — it does NOT throw — when
+# handed a non-Arrow file (e.g. a stale Serialization `.sjl` left at the same
+# cache_path by a prior `@cached` version of this property). Without a guard,
+# DO's disk-cache load-failure catch (DynamicObjects.jl:1583-1591) never fires
+# and the empty table is served as a valid cache hit. Validate the Arrow file
+# magic (b"ARROW1") and throw on mismatch — mirroring the raw mmap path's
+# `_mmap_read_header` DOMM check — so the stale file is rm'd and recomputed.
+function DynamicObjects.load(::Val{:mmap}, path::AbstractString, ::Type{DataFrame})
+    open(path, "r") do io
+        magic = ntuple(_ -> eof(io) ? 0x00 : read(io, UInt8), 6)
+        magic == (0x41, 0x52, 0x52, 0x4f, 0x57, 0x31) ||  # b"ARROW1"
+            error("@mmap DataFrame: $path is not an Arrow file (bad magic $magic, expected b\"ARROW1\") — likely a stale cache in a different format; throwing so DynamicObjects recomputes.")
+    end
     DataFrame(Arrow.Table(path); copycols=false)
+end
 
 end
