@@ -1459,13 +1459,22 @@ No-op strategy: never records or loads keys. Use when tracking is unwanted.
 """
 struct NoKeyTracker <: KeyTracker end
 
-# TODO: use DiskCacheLocks to make _record_key_to_path concurrency-safe
+# Per-path lock registry serializing `_record_key_to_path`'s read-modify-write.
+# Without it, concurrent first-access to different keys of the same accessed-key
+# file (the shared `_keys.sjl` behind `SharedFileTracker`) interleaves
+# deserialize→push!→serialize and silently loses key-set updates. A non-const
+# module global (not a struct field — `SharedFileTracker`'s shape can't change
+# under Revise on 1.10) keyed by path: same file serializes, distinct files
+# don't contend beyond the brief registry lookup.
+_key_tracker_locks = DiskCacheLocks()
 function _record_key_to_path(path, key)
     mkpath(dirname(path))
-    existing = isfile(path) ? Serialization.deserialize(path) : Set()
-    key in existing && return
-    push!(existing, key)
-    Serialization.serialize(path, existing)
+    lock(get_path_lock!(_key_tracker_locks, path)) do
+        existing = isfile(path) ? Serialization.deserialize(path) : Set()
+        key in existing && return
+        push!(existing, key)
+        Serialization.serialize(path, existing)
+    end
     nothing
 end
 
