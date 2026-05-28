@@ -3208,11 +3208,27 @@ function _apply_property_macro!(state::_PropertyMacroState, ::Val{Symbol("@doc")
     arg.args[end]
 end
 
+# Capture an optional leading version tag (`@m v"N" <prop> = …` → length 4,
+# version at `arg.args[3]`). Shared by the disk-cache markers `@cached` and
+# `@mmap` so `v"N"` busts the cache identically for both formats.
+_capture_cache_version!(state::_PropertyMacroState, arg) =
+    length(arg.args) == 4 && (state.cache_version = _parse_cache_version(arg.args[3]))
+
 # `@cached <prop> = …` (length 3) or `@cached v"…" <prop> = …` (length 4
 # with a version argument).
 function _apply_property_macro!(state::_PropertyMacroState, ::Val{Symbol("@cached")}, arg)
     push!(state.macros, Symbol("@cached"))
-    length(arg.args) == 4 && (state.cache_version = _parse_cache_version(arg.args[3]))
+    _capture_cache_version!(state, arg)
+    arg.args[end]
+end
+
+# `@mmap <prop>::T = …` (length 3) or `@mmap v"…" <prop>::T = …` (length 4).
+# Mirrors `@cached`: `@mmap` owns a disk-cache path too, so a `v"N"` tag must
+# bump `cache_version` the same way (otherwise the version is silently dropped
+# by the generic handler — the disk path is shared, only the format differs).
+function _apply_property_macro!(state::_PropertyMacroState, ::Val{Symbol("@mmap")}, arg)
+    push!(state.macros, Symbol("@mmap"))
+    _capture_cache_version!(state, arg)
     arg.args[end]
 end
 _parse_cache_version(v::VersionNumber) = v
