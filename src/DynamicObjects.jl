@@ -28,14 +28,13 @@ optionally disk-cached properties.
 - [`LazyPersistentDict`](@ref): Thread-safe, lazily-loaded, disk-persisted `Dict`.
 - [`KeyTracker`](@ref): Abstract type for pluggable accessed-keys persistence strategies.
 - [`SharedFileTracker`](@ref): Default strategy — single shared `_keys.sjl` file.
-- [`PerPodFileTracker`](@ref): Per-pod strategy — one file per pod ID, merged on read.
 - [`NoKeyTracker`](@ref): No-op strategy — never records or loads keys.
 - [`key_tracker`](@ref): Override to set the tracking strategy per object type / property.
 - [`record!`](@ref): Record an accessed key via a `KeyTracker`.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @dynamic_progress, memoize!, maybememoize!, maybeprogress!, noprogress, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, set_cache_budget!, cache_budget, cache_bytes, cache_entries, subtree_bytes, subtree_budget, last_evicted, is_pinnable_value
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @dynamic_progress, memoize!, maybememoize!, maybeprogress!, noprogress, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, set_cache_budget!, cache_budget, cache_bytes, cache_entries, subtree_bytes, subtree_budget, last_evicted, is_pinnable_value
 
 import SHA, Serialization, Mmap
 
@@ -1454,18 +1453,6 @@ struct SharedFileTracker <: KeyTracker
 end
 
 """
-    PerPodFileTracker(base_path, pod_id)
-
-Per-pod strategy: each pod writes only to its own `_keys_{pod_id}.sjl` file.
-`load_keys` unions all matching files. Safe for NFS multi-pod setups — writes
-are never concurrent since each pod touches only its own file.
-"""
-struct PerPodFileTracker <: KeyTracker
-    base_path::String  # path WITHOUT extension, e.g. "cache/abc/cmdstan_keys"
-    pod_id::String
-end
-
-"""
     NoKeyTracker()
 
 No-op strategy: never records or loads keys. Use when tracking is unwanted.
@@ -1489,9 +1476,6 @@ Record that `key` was accessed, persisting according to the tracker's strategy.
 """
 record!(tracker::SharedFileTracker, key) = _record_key_to_path(tracker.path, key)
 record!(tracker::NoKeyTracker, key)      = nothing
-function record!(tracker::PerPodFileTracker, key)
-    _record_key_to_path(tracker.base_path * "_" * tracker.pod_id * ".sjl", key)
-end
 
 """
     load_keys(tracker::KeyTracker) -> Set
@@ -1501,17 +1485,6 @@ Load the full set of recorded keys according to the tracker's strategy.
 load_keys(tracker::SharedFileTracker) =
     isfile(tracker.path) ? Serialization.deserialize(tracker.path) : Set()
 load_keys(tracker::NoKeyTracker) = Set()
-function load_keys(tracker::PerPodFileTracker)
-    dir    = dirname(tracker.base_path)
-    prefix = basename(tracker.base_path) * "_"
-    isdir(dir) || return Set()
-    files = filter(
-        f -> startswith(basename(f), prefix) && endswith(f, ".sjl"),
-        readdir(dir; join=true)
-    )
-    isempty(files) && return Set()
-    mapreduce(Serialization.deserialize, union, files)
-end
 
 """
     key_tracker(o, ::Val{name}) -> KeyTracker
@@ -1520,9 +1493,9 @@ Return the `KeyTracker` to use for property `name` on object `o`.
 Override this method on your type to change the tracking strategy.
 
 ```julia
-# Example: use per-pod files for all indexed properties on MyType
+# Example: disable accessed-key tracking for all properties on MyType
 DynamicObjects.key_tracker(o::MyType, ::Val{name}) where {name} =
-    DynamicObjects.PerPodFileTracker(joinpath(o.cache_path, string(name) * "_keys"), pod_id)
+    DynamicObjects.NoKeyTracker()
 ```
 """
 key_tracker(o, ::Val{name}) where {name} =
