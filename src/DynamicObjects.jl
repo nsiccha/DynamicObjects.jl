@@ -37,7 +37,7 @@ optionally disk-cached properties.
 module DynamicObjects
 export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @dynamic_progress, memoize!, maybememoize!, maybeprogress!, noprogress, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, PerPodFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, set_cache_budget!, cache_budget, cache_bytes, cache_entries, subtree_bytes, subtree_budget, last_evicted, is_pinnable_value
 
-import SHA, Serialization
+import SHA, Serialization, Mmap
 
 struct DiskCacheLocks
     lock::ReentrantLock
@@ -53,6 +53,122 @@ persistent_hash(x) = begin
     Serialization.serialize(b, x)
     bytes2hex(SHA.sha1(take!(b)))
 end
+
+# --- Disk format extension point (D1) ---
+#
+# `save` / `load` are the format-agnostic disk-cache (de)serialization seam.
+# The `@dynamicstruct` disk-cache read/write path dispatches both on a `Val`
+# format token so it never hardcodes `Serialization`. The macro emits the
+# token per property via `_disk_format` (default `Val(:serial)`; `Val(:mmap)`
+# for `@mmap` properties). Public + overloadable by qualified name — register
+# a new format with `DynamicObjects.save(::Val{:myfmt}, …)` /
+# `DynamicObjects.load(::Val{:myfmt}, …)`. Not exported (the bare names `save`
+# / `load` collide with too many packages).
+#
+# `load`'s third argument is an eltype hint: a `Type` when the property carried
+# a `::T` annotation (type-stable fast path), or `nothing` for the
+# self-describing cold path.
+save(fmt::Val, path::AbstractString, x) = error("no `save` method for format $fmt")
+load(fmt::Val, path::AbstractString) = load(fmt, path, nothing)
+load(fmt::Val, path::AbstractString, ::Any) = error("no `load` method for format $fmt")
+
+save(::Val{:serial}, path::AbstractString, x) = Serialization.serialize(path, x)
+load(::Val{:serial}, path::AbstractString, ::Any) = Serialization.deserialize(path)
+
+# --- `Val{:mmap}` format (D2-v2, D3, layout) ---
+#
+# Single-file layout `[header][payload]`:
+#   magic   :: 4×UInt8  = b"DOMM"
+#   version :: UInt8    = _MMAP_VERSION
+#   tag     :: UInt8    = index into _MMAP_ELTYPE_TAGS
+#   ndims   :: UInt8
+#   dims    :: ndims × Int64
+#   payload :: raw column-major isbits bytes
+# `load` reads the header, then `Mmap.mmap`s the payload READONLY at the header
+# offset — Julia page-aligns the mapping internally, so any header size works.
+# The mapping is opened from a read-only stream, so the returned bare
+# `Array{T,N}` is backed by a PROT_READ region: mutations fault (D3). Because
+# the value is a bare `Array` with no inspectable handle field, the LRU layer
+# cannot detect the mmap backing from the value alone — the `@mmap` `meta`
+# marker is the reliable pin signal (D5).
+const _MMAP_MAGIC = (UInt8('D'), UInt8('O'), UInt8('M'), UInt8('M'))
+const _MMAP_VERSION = UInt8(1)
+# Stable integer tags (1-based index) for the isbits numeric eltypes the
+# self-describing (un-annotated) load path supports. Append-only — never
+# reorder, or existing files mis-decode. The annotated path uses the `::T`
+# eltype directly and only needs the registry to write a header tag.
+const _MMAP_ELTYPE_TAGS = (
+    Float64, Float32, Float16,
+    Int8, Int16, Int32, Int64, Int128,
+    UInt8, UInt16, UInt32, UInt64, UInt128,
+    Bool, ComplexF32, ComplexF64,
+)
+_mmap_tag_of(::Type{T}) where {T} = let i = findfirst(==(T), _MMAP_ELTYPE_TAGS)
+    i === nothing && error("@mmap: eltype $T is not in the supported isbits numeric registry $(_MMAP_ELTYPE_TAGS). Annotate with a registered eltype or register a custom `save`/`load` format.")
+    UInt8(i)
+end
+_mmap_eltype_of(tag::UInt8) = let i = Int(tag)
+    (1 <= i <= length(_MMAP_ELTYPE_TAGS)) || error("@mmap: unknown eltype tag $i in header (max $(length(_MMAP_ELTYPE_TAGS))). File written by a newer DynamicObjects?")
+    _MMAP_ELTYPE_TAGS[i]
+end
+
+function save(::Val{:mmap}, path::AbstractString, x::AbstractArray)
+    A = x isa Array ? x : Array(x)   # ensure dense column-major isbits payload
+    isbitstype(eltype(A)) || error("@mmap: array eltype $(eltype(A)) is not isbits; only isbits arrays can be memory-mapped.")
+    tag = _mmap_tag_of(eltype(A))
+    open(path, "w") do io
+        write(io, _MMAP_MAGIC...)
+        write(io, _MMAP_VERSION)
+        write(io, tag)
+        write(io, UInt8(ndims(A)))
+        for d in size(A); write(io, Int64(d)); end
+        write(io, A)
+    end
+    A
+end
+save(::Val{:mmap}, path::AbstractString, x) =
+    error("@mmap: property value is a $(typeof(x)); @mmap only supports `AbstractArray` of isbits numeric eltype.")
+
+# Read + validate the header; return (eltype_tag::UInt8, ndims::Int, dims::Vector{Int}, offset::Int).
+function _mmap_read_header(io::IO)
+    magic = ntuple(_ -> read(io, UInt8), 4)
+    magic == _MMAP_MAGIC || error("@mmap: bad magic $(magic) — not a DynamicObjects mmap file.")
+    ver = read(io, UInt8)
+    ver == _MMAP_VERSION || error("@mmap: unsupported file version $ver (this build writes v$(_MMAP_VERSION)).")
+    tag = read(io, UInt8)
+    nd = Int(read(io, UInt8))
+    dims = [Int(read(io, Int64)) for _ in 1:nd]
+    (tag, nd, dims, position(io))
+end
+
+# Annotated fast path: the property's `::T` array type is known → type-stable.
+function load(::Val{:mmap}, path::AbstractString, ::Type{A}) where {A<:AbstractArray}
+    ET = eltype(A); N = ndims(A)
+    io = open(path, "r")
+    tag, nd, dims, offset = _mmap_read_header(io)
+    nd == N || (close(io); error("@mmap: header ndims $nd ≠ annotated ndims $N for $path."))
+    _mmap_eltype_of(tag) === ET || (close(io); error("@mmap: header eltype $(_mmap_eltype_of(tag)) ≠ annotated eltype $ET for $path."))
+    arr = Mmap.mmap(io, Array{ET,N}, NTuple{N,Int}(dims), offset)
+    close(io)   # mapping survives the fd close
+    arr
+end
+
+# Self-describing cold path: no annotation → eltype + ndims come from the
+# header (type-unstable return, accepted per D2-v2).
+function load(::Val{:mmap}, path::AbstractString, ::Nothing)
+    io = open(path, "r")
+    tag, nd, dims, offset = _mmap_read_header(io)
+    ET = _mmap_eltype_of(tag)
+    arr = Mmap.mmap(io, Array{ET,nd}, NTuple{nd,Int}(dims), offset)
+    close(io)
+    arr
+end
+
+# Per-property disk-format / eltype-hint slots. `@dynamicstruct` emits an
+# override for each `@mmap` property; everything else uses these defaults.
+_disk_format(o, ::Val) = Val(:serial)
+_disk_eltype(o, ::Val) = nothing
+
 iscached(o, ::Val) = false
 cache_version(o, ::Val) = nothing
 compute_property(o, ::Val{:hash_fields}) = ntuple(Base.Fix1(getfield, o), fieldcount(typeof(o))-1)
@@ -329,8 +445,18 @@ function _record_pc_store!(pc::PropertyCache, name::Symbol, args_key, v)
         end
     end
     key = (name, args_key)
-    sz = _summarysize_capped(v)
-    pinnable = is_pinnable_value(v)
+    # `@mmap` slots (D5): pin + zero-bill. The value is a bare `Array{T,N}`
+    # backed by a read-only mmap region, so the runtime `is_pinnable_value`
+    # trait cannot detect the mapping from the value alone — the `meta(T)`
+    # `@mmap` marker is the reliable signal. Zero-billing keeps mmap arrays
+    # (already memory-resident on disk, paged on demand) off the cache budget.
+    if _is_mmap_slot(pc, name)
+        sz = 0
+        pinnable = true
+    else
+        sz = _summarysize_capped(v)
+        pinnable = is_pinnable_value(v)
+    end
     Threads.atomic_add!(pc.bytes, sz)
     # Single critical section for pc.sizes / pc.pinned / pc.lru_order — all
     # three are plain Base containers that MUST NOT be mutated concurrently
@@ -368,6 +494,17 @@ function _is_cached_slot(pc::PropertyCache, name::Symbol)
     info = metafirst(typeof(owner), name)
     info === nothing && return false
     Symbol("@cached") in info.macros
+end
+
+# Whether a slot corresponds to an `@mmap` property — the reliable pin signal
+# for read-only memory-mapped arrays (D5), since their runtime value is a bare
+# `Array` with no inspectable handle field.
+function _is_mmap_slot(pc::PropertyCache, name::Symbol)
+    owner = pc.owner_ref[]
+    owner === nothing && return false
+    info = metafirst(typeof(owner), name)
+    info === nothing && return false
+    Symbol("@mmap") in info.macros
 end
 
 # Check whether `(name, args_key)` is currently the target of an in-flight
@@ -1446,7 +1583,7 @@ $_cache_context""")
                     rv = if cache_status == :ready
                         _report_disk_load!(__status__, cache_path, filesize(cache_path))
                         try
-                            Serialization.deserialize(cache_path)
+                            load(_disk_format(o, vname), cache_path, _disk_eltype(o, vname))
                         catch e
                             @warn "Deserialization failed for $cache_path, recomputing.\n$_cache_context" exception=e
                             rm(cache_path; force=true)
@@ -1458,7 +1595,7 @@ $_cache_context""")
                     if isnothing(rv) || resumes(o, vname, indices...; kwargs...)
                         @debug "Generating $cache_path...\n$_cache_context"
                         rv = compute_property(o, vname, indices...; _status_kw..., (name=>rv, )..., kwargs...)
-                        Serialization.serialize(cache_path, rv)
+                        save(_disk_format(o, vname), cache_path, rv)
                     end
                     rv
                 finally
@@ -1470,7 +1607,7 @@ $_cache_context""")
                 rv = if cache_status == :ready
                     _report_disk_load!(__status__, cache_path, filesize(cache_path))
                     try
-                        Serialization.deserialize(cache_path)
+                        load(_disk_format(o, vname), cache_path, _disk_eltype(o, vname))
                     catch e
                         @warn "Deserialization failed for $cache_path, recomputing.\n$_cache_context\nEnable __strict__=true for disk cache locking to prevent concurrent write issues." exception=e
                         rm(cache_path; force=true)
@@ -1488,7 +1625,7 @@ $_cache_context""")
                 if cache_status != :ready || resumes(o, vname, indices...; kwargs...)
                     @debug "Generating $cache_path...\n$_cache_context"
                     rv = compute_property(o, vname, indices...; _status_kw..., (name=>rv, )..., kwargs...)
-                    Serialization.serialize(cache_path, rv)
+                    save(_disk_format(o, vname), cache_path, rv)
                 end
                 rv
             end
@@ -2345,6 +2482,16 @@ function _check_trivial_cached_wrapper!(msgs, type, name::Symbol, info)
     push!(msgs, LintMessage(type, name, :warn, short, long, info.lnn))
 end
 
+# D4: `@mmap` and `@cached` on the same property are mutually exclusive —
+# `@mmap` already implies disk persistence (with the mmap format), so stacking
+# `@cached` is contradictory (two formats fighting over one cache path).
+function _check_mmap_cached_conflict!(msgs, type, name::Symbol, info)
+    (Symbol("@mmap") in info.macros && Symbol("@cached") in info.macros) || return
+    short = "`@mmap` + `@cached` are mutually exclusive — drop `@cached`"
+    long  = "`$type.$name` carries both `@mmap` and `@cached`. `@mmap` already implies disk persistence using the memory-mapped format, so `@cached` is redundant and contradictory (both want to own the disk cache path with different formats). Keep `@mmap` alone for a memory-mapped read-only array, or `@cached` alone for the serialized format."
+    push!(msgs, LintMessage(type, name, :warn, short, long, info.lnn))
+end
+
 # --- Per-struct checks ----------------------------------------------------
 
 function _check_singleton_struct!(msgs, type, oproperties)
@@ -2805,6 +2952,7 @@ function analyze_structure(T::Type)
             _check_cryptic_arg_names!(msgs, U, n, info)
             _check_no_self_access!(msgs, U, n, info, prop_names, siblings, bound)
             _check_trivial_cached_wrapper!(msgs, U, n, info)
+            _check_mmap_cached_conflict!(msgs, U, n, info)
             _check_hierarchical_placement!(msgs, types_in_tree, parent_map, U, n, info, wc_cache)
             _check_redundant_args!(msgs, call_index, parent_map, U, n, info)
             _check_bracket_ip_access!(msgs, U, n, info, prop_names, indexed_names)
@@ -3653,6 +3801,10 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     docs = []
     oproperties = Pair[]
     inline_methods = Any[]
+    # `@mmap` properties: name => eltype-annotation-expr (or `nothing` when
+    # un-annotated). Drives the per-property `_disk_format`/`_disk_eltype`
+    # emission below.
+    mmap_eltypes = Dict{Symbol,Any}()
     for arg in body.args
         _absorb_body_metadata!(arg, metadata) && continue
         lnn = metadata.lnn[]
@@ -3777,6 +3929,20 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         else
             arg, nothing
         end
+        # `foo(i)::T = rhs` — the `::` annotation wraps the call, so the
+        # call/ref index strip above (which only fires on a bare `:ref`/`:call`
+        # arg) never ran. Strip the indices from `name` now, mark indexed, and
+        # reduce `arg` (→ the `lhs` field below) to the bare callee, matching
+        # how non-annotated indexed properties store their `lhs`. `ext_type`
+        # stays captured for `@mmap` load lowering.
+        if Meta.isexpr(name, (:ref, :call))
+            callee, post_indices... = name.args
+            indexed = true
+            !isnothing(locals) && union!(locals, extractnames(collect(post_indices)))
+            indices = (indices..., post_indices...)
+            arg = callee
+            name = callee
+        end
         if !(name isa Symbol)
             loc = isnothing(lnn) ? "" : " (near $(lnn.file):$(lnn.line))"
             hint = if Meta.isexpr(name, :parameters)
@@ -3810,6 +3976,11 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         if ext_type !== nothing && !isnothing(rhs) && !indexed
             push!(analysis_child_pairs, name => ext_type)
         end
+        # `@mmap` property: record its eltype annotation (or `nothing` when
+        # un-annotated) for the `_disk_format`/`_disk_eltype` emission below.
+        if Symbol("@mmap") in macros
+            mmap_eltypes[name] = ext_type
+        end
         push!(docs, (name=>(doc, !isnothing(rhs))))
         metadata.doc[] = nothing
         !isnothing(locals) && push!(locals, name)
@@ -3836,7 +4007,13 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
 
     generated_names = Tuple(name for (name, info) in oproperties if !isfixed(info))
     indexed_names = Tuple(name for (name, info) in oproperties if info.indexed)
-    cached_names = [(name, Symbol("_", type, "_", name, "_disk_cache")) for (name, info) in oproperties if !isfixed(info) && Symbol("@cached") in info.macros]
+    # DiskCacheLocks-bearing properties: `@cached` AND `@mmap` (both persist to
+    # disk and want the strict-mode per-path lock). `@mmap` implies disk
+    # persistence with the mmap format (D4).
+    cached_names = [(name, Symbol("_", type, "_", name, "_disk_cache")) for (name, info) in oproperties if !isfixed(info) && (Symbol("@cached") in info.macros || Symbol("@mmap") in info.macros)]
+    # `@mmap` properties → (name, eltype-annotation-expr-or-nothing) for the
+    # `_disk_format`/`_disk_eltype` per-property override emission.
+    mmap_names = sort!(collect(keys(mmap_eltypes)))
     fixed_fields = [(name, info.lhs) for (name, info) in oproperties if isfixed(info)]
     fixed_names = [n for (n, _) in fixed_fields]
     fixed_lhs = [lhs for (_, lhs) in fixed_fields]
@@ -3903,6 +4080,12 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 $DynamicObjects._disk_cache(::$type, ::Val{$(QuoteNode(name))}) = $varname
             ) for (name, varname) in cached_names]...)
             $([:(
+                $DynamicObjects._disk_format(::$type, ::Val{$(QuoteNode(name))}) = $(Val(:mmap))
+            ) for name in mmap_names]...)
+            $([:(
+                $DynamicObjects._disk_eltype(::$type, ::Val{$(QuoteNode(name))}) = $(something(mmap_eltypes[name], :nothing))
+            ) for name in mmap_names]...)
+            $([:(
                 $DynamicObjects._nested_struct_type(::Type{$type}, ::Val{$(QuoteNode(prop_name))}) = $gen_name
             ) for (prop_name, gen_name) in inline_child_pairs]...)
             $([:(
@@ -3963,7 +4146,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     :(__self__::$type), :(::Val{$(Meta.quot(name))}),
                     walked_indices..., Expr(:parameters, extras...),
                 ))
-                iscached_val = Symbol("@cached") in info.macros
+                iscached_val = Symbol("@cached") in info.macros || Symbol("@mmap") in info.macros
                 desc_expr = if haskey(property_docs, name)
                     pdoc = property_docs[name]
                     has_user_kw_splat = any(walked_indices) do idx
