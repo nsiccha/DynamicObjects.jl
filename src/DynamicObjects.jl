@@ -983,9 +983,18 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
             try
                 tmp = f(s)
                 lock(c.lock) do
-                    c.cache[key] = tmp
-                    pop!(c.tasks, key)
-                    _on_store!(c, key)
+                    # Only commit if we still own this key's registration.
+                    # An external `maybepop!` / `force` / `clear` (or a newer
+                    # task spawned after ours was retracted) may have removed
+                    # or replaced `c.tasks[key]` while we were in flight —
+                    # popping blindly `KeyError`s, and clobbering would
+                    # resurrect a cleared key or overwrite a fresher result.
+                    # The caller still receives `tmp` via `fetch(x)` below.
+                    if get(c.tasks, key, nothing) === task
+                        c.cache[key] = tmp
+                        pop!(c.tasks, key)
+                        _on_store!(c, key)
+                    end
                 end
                 _finalize_substatus!(s)
                 tmp
