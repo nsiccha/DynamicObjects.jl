@@ -74,6 +74,26 @@ load(fmt::Val, path::AbstractString, ::Any) = error("no `load` method for format
 save(::Val{:serial}, path::AbstractString, x) = Serialization.serialize(path, x)
 load(::Val{:serial}, path::AbstractString, ::Any) = Serialization.deserialize(path)
 
+# Every disk-cache write goes through `_atomic_save`: the format payload is
+# written to a unique sibling temp file, then `mv(...; force=true)` renames it
+# over `path`. `tempname(dirname(path))` is guaranteed same-filesystem, so the
+# `mv` is a `rename(2)` — atomic. Consequences: a reader (`get_cache_status` /
+# `load`) never observes a half-written file (it sees either the prior complete
+# file or the new one), a crash mid-`save` leaves the old cache intact instead
+# of a truncated one, and an in-flight READONLY `@mmap` mapping keeps the old
+# inode alive until unmapped (a plain in-place overwrite would corrupt it).
+function _atomic_save(fmt::Val, path::AbstractString, x)
+    tmp = tempname(dirname(path); cleanup=false)
+    try
+        r = save(fmt, tmp, x)
+        mv(tmp, path; force=true)
+        r
+    catch
+        rm(tmp; force=true)
+        rethrow()
+    end
+end
+
 # --- `Val{:mmap}` format (D2-v2, D3, layout) ---
 #
 # Single-file layout `[header][payload]`:
@@ -1586,7 +1606,7 @@ $_cache_context""")
                     if isnothing(rv) || resumes(o, vname, indices...; kwargs...)
                         @debug "Generating $cache_path...\n$_cache_context"
                         rv = compute_property(o, vname, indices...; _status_kw..., (name=>rv, )..., kwargs...)
-                        save(_disk_format(o, vname), cache_path, rv)
+                        _atomic_save(_disk_format(o, vname), cache_path, rv)
                     end
                     rv
                 finally
@@ -1616,7 +1636,7 @@ $_cache_context""")
                 if cache_status != :ready || resumes(o, vname, indices...; kwargs...)
                     @debug "Generating $cache_path...\n$_cache_context"
                     rv = compute_property(o, vname, indices...; _status_kw..., (name=>rv, )..., kwargs...)
-                    save(_disk_format(o, vname), cache_path, rv)
+                    _atomic_save(_disk_format(o, vname), cache_path, rv)
                 end
                 rv
             end
