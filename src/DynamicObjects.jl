@@ -3593,9 +3593,22 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         arg isa LineNumberNode && continue
         a = arg
         while Meta.isexpr(a, :macrocall); a = a.args[end]; end
-        # Skip inline structs (both forms)
-        Meta.isexpr(a, :struct) && continue
-        Meta.isexpr(a, :(=)) && Meta.isexpr(a.args[2], :struct) && continue
+        # Inline structs become regular parent properties after the
+        # extraction loop below (the `prop[(idx)]` forms → an
+        # IndexableProperty, the bare form → a plain property). Their
+        # parent-property names MUST be collected here so a sibling inline
+        # `@struct` can reference them by bare name — those names are
+        # forwarded into each child scope via `(; …) = __parent__` (Bruno
+        # qt/fit: `ppc_view`'s body calls `dense_view(…)`). The
+        # `prop = struct …` / `prop(idx) = struct …` forms carry the name
+        # on the LHS and fall through to the generic collector below; the
+        # bare `struct Name … end` form carries it as the struct name.
+        # (A child never forwards its OWN name — guarded at the `forwarded`
+        # comprehension below, not here.)
+        if Meta.isexpr(a, :struct)
+            _push_if_symbol!(parent_props, a.args[2])
+            continue
+        end
         lhs = if Meta.isexpr(a, :(=))
             a.args[1]
         else
@@ -3733,12 +3746,17 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         nonforwardable = Set{Symbol}([:hash_fields, :hash, :cache_path, :cache])
         # Forward parent properties that (a) aren't overridden in the child,
         # (b) aren't __status__ (scoped separately), (c) aren't DO-internal
-        # cache/identity names, and (d) aren't one of the names we're about
-        # to prepend ourselves.
+        # cache/identity names, (d) aren't one of the names we're about
+        # to prepend ourselves, and (e) aren't this child's OWN
+        # parent-property name. Inline-struct names are now in `parent_props`
+        # (so a sibling can forward them), but a child must never forward
+        # itself into its own scope — that would prepend a self-referential
+        # `name = __parent__.name` (the parent IP of this very child) and
+        # recurse.
         # Dedupe: a parent can declare the same property name multiple times
         # (indexed properties with multi-method dispatch on the index type).
         # We only want one forwarding extractor per name.
-        forwarded = unique!(Symbol[pp for pp in parent_props if !(pp in child_props) && pp != :__status__ && !(pp in nonforwardable) && !(pp in prepend_names)])
+        forwarded = unique!(Symbol[pp for pp in parent_props if pp != prop_name && !(pp in child_props) && pp != :__status__ && !(pp in nonforwardable) && !(pp in prepend_names)])
         prepend = Expr[]
         push!(prepend, :(__parent__ = nothing))
         for ip in index_params
