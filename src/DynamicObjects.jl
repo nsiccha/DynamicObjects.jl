@@ -3245,11 +3245,11 @@ end
 _parse_cache_version(v::VersionNumber) = v
 function _parse_cache_version(ver_expr::Expr)
     Meta.isexpr(ver_expr, :macrocall) && ver_expr.args[1] == Symbol("@v_str") ||
-        error("@cached version argument must be a version string like v\"2\", got: $ver_expr")
+        error("cache version argument must be a version string like v\"2\", got: $ver_expr")
     VersionNumber(ver_expr.args[end])
 end
 _parse_cache_version(x) =
-    error("@cached version argument must be a version string like v\"2\", got: $x")
+    error("cache version argument must be a version string like v\"2\", got: $x")
 
 # Body-args metadata absorber: LineNumberNode / String / `:string` Expr
 # args are not properties — they update the `lnn` / `doc` accumulators
