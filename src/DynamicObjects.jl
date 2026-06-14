@@ -3435,6 +3435,17 @@ function _process_include_externals!(body)
         Meta.isexpr(inner, :(=)) || continue
         lhs = inner.args[1]
         rhs = inner.args[2]
+        # `@include name = begin … end` (inline sub-router) is an HTMXObjects
+        # construct: under `@htmx`, `_convert_include_to_struct!` replaces the
+        # block form with a `prop = struct …` inline child BEFORE `dynamicstruct`
+        # runs, so a block-RHS `@include` reaching here means a plain
+        # `@dynamicstruct` (no routes to mount). Silently degrading it to a
+        # block-RHS property is a footgun — `o.name.subfield` then fails at
+        # runtime (decision 2026-06-15T00-08-54-324-u2us9y). Error with the
+        # route-less fix: `@struct`, which DO already lowers to an inline child.
+        if Meta.isexpr(rhs, :block)
+            error("`@include $lhs = begin … end` (inline sub-router) is only supported under `@htmx`. A plain `@dynamicstruct` has no routes to mount — use `@struct $lhs = begin … end` for a route-less inline sub-struct.")
+        end
         Meta.isexpr(rhs, :call) || continue
         # LHS is a bare prop name `prop` for the classic non-indexed form, or a
         # call expression `prop(args…)` for the indexed-include form
