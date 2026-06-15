@@ -5459,8 +5459,118 @@ function property_source_info(T::Type, prop::Symbol)
     (; rhs_string, signature, macros, dependson)
 end
 
+"""    property_signature(T::Type, prop::Symbol)
+        -> Union{Nothing, @NamedTuple{positional::Vector{NamedTuple}, kwargs::Vector{NamedTuple}}}
+
+Structured call signature for property `prop` on `T`, parsed from
+`info.indices` (the indexed-property argument list the macro captured from the
+LHS call). The structured counterpart to `property_source_info`'s stringy
+`signature`.
+
+Returns:
+
+- `nothing` if `meta(T)` is undefined or `prop` isn't a property of `T`;
+- otherwise `(; positional, kwargs)`, where every entry is a NamedTuple
+  `(; name, type, required, default)`:
+    - `name::Union{Symbol,Nothing}` — the argument name (`nothing` for an
+      anonymous `::T` positional).
+    - `type::Union{Type,Nothing}` — the annotation resolved against
+      `parentmodule(T)` via `Core.eval`, or `nothing` when un-annotated OR
+      unresolvable (e.g. a free static-parameter type-var like the `V` in
+      `Verb{V}`). Consumers map `nothing` to their permissive default
+      (HTMXObjects → `String`).
+    - `required::Bool` — `true` unless the arg carries a default or is a vararg.
+    - `default` — the default-value *expression* when `required === false`;
+      `nothing` (and meaningless) when `required === true`. A literal `nothing`
+      default is told apart from "no default" only by `required === false`.
+
+A non-indexed property (no call signature) yields empty `positional` and
+`kwargs`. A vararg (`x...`) is unwrapped to its inner name/type with
+`required=false`; the splat is not otherwise marked.
+
+Layering — intentionally verb-agnostic: this returns *every* positional arg,
+including any framework-injected leading arg (e.g. HTMXObjects' injected
+`__verb__::Verb{V}`). Filtering such args is the consumer's job.
+`@param`-derived properties are not indexed properties and carry no
+`info.indices`; their parsed shape lives in `info.rhs` and is the consumer's
+concern.
+
+Pure data extraction. See also `property_source_info`.
+"""
+function property_signature(T::Type, prop::Symbol)
+    props = try meta(T) catch; nothing end
+    props === nothing && return nothing
+    # `metafirst` matches `property_source_info`: first declaration wins if
+    # duplicate names coexist (e.g. a route + an indexed include).
+    info = metafirst(T, prop)
+    info === nothing && return nothing
+    mod = parentmodule(T)
+    positional = NamedTuple[]
+    kwargs = NamedTuple[]
+    for idx in info.indices
+        if Meta.isexpr(idx, :parameters)
+            # Everything after the `;` — keyword args (and any `; kw...` slurp).
+            for kw in idx.args
+                push!(kwargs, _parse_signature_arg(kw, mod))
+            end
+        else
+            push!(positional, _parse_signature_arg(idx, mod))
+        end
+    end
+    (; positional, kwargs)
+end
+
+# Parse one argument node from `info.indices` into `(; name, type, required,
+# default)`. Handles every call-LHS arg shape the macro can capture:
+#   x          x::T          required, untyped / typed
+#   x=d        x::T=d        optional positional / defaulted kwarg
+#   x...       x::T...       vararg — required=false, splat unwrapped
+#   ::T                      anonymous positional — name=nothing
+# Shared by positional args and the members of an `Expr(:parameters,…)` kwargs
+# node; the positional-vs-keyword distinction is the caller's (by where the
+# node sits), so this peels uniformly.
+function _parse_signature_arg(node, mod)
+    required = true
+    default = nothing
+    if Meta.isexpr(node, :kw)            # `x = d` / `x::T = d`
+        required = false
+        default = node.args[2]
+        node = node.args[1]
+    end
+    if Meta.isexpr(node, :...)           # `x...` — 0+ args, so not required
+        required = false
+        node = node.args[1]
+    end
+    typeexpr = nothing
+    nm = node
+    if Meta.isexpr(node, :(::))
+        if length(node.args) == 2        # `name::T`
+            nm, typeexpr = node.args
+        else                             # `::T` — anonymous arg
+            nm, typeexpr = nothing, node.args[1]
+        end
+    end
+    (; name = nm isa Symbol ? nm : nothing,
+       type = _resolve_arg_type(typeexpr, mod),
+       required, default)
+end
+
+# Resolve a type-annotation expression against the struct's defining module.
+# `nothing` for un-annotated args, for results that aren't a `Type`, and for
+# any expression that fails to evaluate (e.g. a free static-parameter type-var
+# such as the `V` in `Verb{V}`). Never throws.
+function _resolve_arg_type(expr, mod)
+    expr === nothing && return nothing
+    try
+        t = Core.eval(mod, expr)
+        t isa Type ? t : nothing
+    catch
+        nothing
+    end
+end
+
 export print_structure, structure
-export tree_children_map, lint_index, lookup_type, callers_by_name, property_source_info, LintMessage
+export tree_children_map, lint_index, lookup_type, callers_by_name, property_source_info, property_signature, LintMessage
 export metafirst, metaall
 
 end
