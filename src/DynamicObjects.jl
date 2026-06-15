@@ -5459,30 +5459,39 @@ function property_source_info(T::Type, prop::Symbol)
     (; rhs_string, signature, macros, dependson)
 end
 
-"""    property_signature(T::Type, prop::Symbol)
-        -> Union{Nothing, @NamedTuple{positional::Vector{NamedTuple}, kwargs::Vector{NamedTuple}}}
+"""    property_signature(T::Type, prop::Symbol) -> Union{Nothing, NamedTuple}
+        property_signature(info::NamedTuple, mod::Module) -> NamedTuple
 
-Structured call signature for property `prop` on `T`, parsed from
-`info.indices` (the indexed-property argument list the macro captured from the
-LHS call). The structured counterpart to `property_source_info`'s stringy
-`signature`.
+Structured call signature for an indexed property, parsed from `info.indices`
+(the argument list the macro captured from the LHS call). The structured
+counterpart to `property_source_info`'s stringy `signature`.
 
-Returns:
+Two entry points:
 
-- `nothing` if `meta(T)` is undefined or `prop` isn't a property of `T`;
-- otherwise `(; positional, kwargs)`, where every entry is a NamedTuple
-  `(; name, type, required, default)`:
-    - `name::Union{Symbol,Nothing}` — the argument name (`nothing` for an
-      anonymous `::T` positional).
-    - `type::Union{Type,Nothing}` — the annotation resolved against
-      `parentmodule(T)` via `Core.eval`, or `nothing` when un-annotated OR
-      unresolvable (e.g. a free static-parameter type-var like the `V` in
-      `Verb{V}`). Consumers map `nothing` to their permissive default
-      (HTMXObjects → `String`).
-    - `required::Bool` — `true` unless the arg carries a default or is a vararg.
-    - `default` — the default-value *expression* when `required === false`;
-      `nothing` (and meaningless) when `required === true`. A literal `nothing`
-      default is told apart from "no default" only by `required === false`.
+- `property_signature(T, prop)` — look `prop` up in `meta(T)` (first
+  declaration, via `metafirst`) and parse it against `parentmodule(T)`. Returns
+  `nothing` if `meta(T)` is undefined or `prop` isn't a property of `T`.
+- `property_signature(info, mod)` — parse an *already-selected* `meta` info
+  against module `mod`, without re-looking it up. Use this when the caller
+  holds a specific declaration. The key case is **multi-verb / duplicate-name
+  routes**: several declarations can share one property name (e.g. a `@get` and
+  a `@post` on `user`), so `meta(T)` carries duplicates and `metafirst` would
+  collapse them to the first. Walk `metaall(T, prop)` and call this per
+  declaration. Always returns a (possibly empty) `(; positional, kwargs)`.
+
+Both yield `(; positional, kwargs)`, where every entry is a NamedTuple
+`(; name, type, required, default)`:
+
+- `name::Union{Symbol,Nothing}` — the argument name (`nothing` for an anonymous
+  `::T` positional).
+- `type::Union{Type,Nothing}` — the annotation resolved against `mod` via
+  `Core.eval`, or `nothing` when un-annotated OR unresolvable (e.g. a free
+  static-parameter type-var like the `V` in `Verb{V}`). Consumers map `nothing`
+  to their permissive default (HTMXObjects → `String`).
+- `required::Bool` — `true` unless the arg carries a default or is a vararg.
+- `default` — the default-value *expression* when `required === false`;
+  `nothing` (and meaningless) when `required === true`. A literal `nothing`
+  default is told apart from "no default" only by `required === false`.
 
 A non-indexed property (no call signature) yields empty `positional` and
 `kwargs`. A vararg (`x...`) is unwrapped to its inner name/type with
@@ -5490,21 +5499,25 @@ A non-indexed property (no call signature) yields empty `positional` and
 
 Layering — intentionally verb-agnostic: this returns *every* positional arg,
 including any framework-injected leading arg (e.g. HTMXObjects' injected
-`__verb__::Verb{V}`). Filtering such args is the consumer's job.
-`@param`-derived properties are not indexed properties and carry no
-`info.indices`; their parsed shape lives in `info.rhs` and is the consumer's
-concern.
+`__verb__::Verb{V}`). Filtering such args — and selecting *which* declaration a
+verb maps to — is the consumer's job. `@param`-derived properties are not
+indexed properties and carry no `info.indices`; their parsed shape lives in
+`info.rhs` and is the consumer's concern.
 
 Pure data extraction. See also `property_source_info`.
 """
 function property_signature(T::Type, prop::Symbol)
     props = try meta(T) catch; nothing end
     props === nothing && return nothing
-    # `metafirst` matches `property_source_info`: first declaration wins if
-    # duplicate names coexist (e.g. a route + an indexed include).
+    # First declaration wins. Multi-verb / duplicate-name callers that must
+    # disambiguate should walk `metaall(T, prop)` and call the `(info, mod)`
+    # method per declaration instead.
     info = metafirst(T, prop)
     info === nothing && return nothing
-    mod = parentmodule(T)
+    property_signature(info, parentmodule(T))
+end
+
+function property_signature(info::NamedTuple, mod::Module)
     positional = NamedTuple[]
     kwargs = NamedTuple[]
     for idx in info.indices
