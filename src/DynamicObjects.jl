@@ -1182,6 +1182,9 @@ For `Dict`-backed caches (serial), falls through to `getproperty` (synchronous,
 no status). The two-phase dance only applies to `ThreadsafeDict`-backed caches.
 """
 fetchproperty(fetch, o, name::Symbol) = begin
+    if !(hasfield(typeof(o), :cache) && getfield(o, :cache) isa PropertyCache)
+        return fetch(getproperty(o, name), nothing)
+    end
     pc = getfield(o, :cache)
     c = pc.cache
     if !(c isa AbstractThreadsafeDict) || is_indexed_property(o, name)
