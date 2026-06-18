@@ -34,7 +34,7 @@ optionally disk-cached properties.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @dynamic_progress, memoize!, maybememoize!, maybeprogress!, noprogress, remake, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, set_cache_budget!, cache_budget, cache_bytes, cache_entries, subtree_bytes, subtree_budget, last_evicted, is_pinnable_value
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, set_cache_budget!, cache_budget, cache_bytes, cache_entries, subtree_bytes, subtree_budget, last_evicted, is_pinnable_value
 
 import SHA, Serialization, Mmap
 
@@ -1184,7 +1184,7 @@ no status). The two-phase dance only applies to `ThreadsafeDict`-backed caches.
 fetchproperty(fetch, o, name::Symbol) = begin
     pc = getfield(o, :cache)
     c = pc.cache
-    if !(c isa AbstractThreadsafeDict)
+    if !(c isa AbstractThreadsafeDict) || is_indexed_property(o, name)
         return fetch(getproperty(o, name), nothing)
     end
     substatus_f = _bare_substatus_f(o, name)
@@ -1984,6 +1984,72 @@ function _memo_rewrite(x::Expr)
         return fixcall(Expr(:call, GlobalRef(@__MODULE__, :maybememoize!), rewritten...))
     end
     Expr(x.head, Any[_memo_rewrite(a) for a in x.args]...)
+end
+
+"""
+    maybefetchindex!(progress, f, args...; kwargs...)
+
+Dispatch helper used by `@fetch!` for call sites. The default just calls
+`f(args...; kwargs...)`; the specialization for `IndexableProperty` routes
+through [`fetchindex!`](@ref) (memoized + progress-tree attachment).
+"""
+maybefetchindex!(progress, f, args...; kwargs...) = f(args...; kwargs...)
+maybefetchindex!(progress, p::IndexableProperty, args...; kwargs...) = fetchindex!(progress, p, args...; kwargs...)
+
+"""
+    maybefetchproperty!(progress, o, name::Symbol)
+
+Dispatch helper used by `@fetch!` for property accesses. For `@dynamicstruct`
+instances, routes through [`fetchproperty!`](@ref) (cached + progress-tree
+attachment). For indexed properties (IPs) and non-DO objects, falls through
+to `getproperty(o, name)`.
+"""
+maybefetchproperty!(progress, o, name::Symbol) =
+    hasfield(typeof(o), :cache) && getfield(o, :cache) isa PropertyCache ?
+        fetchproperty!(progress, o, name) :
+        getproperty(o, name)
+
+"""
+    @fetch! expr
+    @fetch! progress expr
+
+Like [`@memo!`](@ref) but also attaches progress. Rewrites every call site
+to `maybefetchindex!(progress, callee, args…)` and every property access
+to `maybefetchproperty!(progress, obj, :name)`.
+
+The one-argument form defaults `progress` to `__progress__` — the variable
+bound by `Treebars.@progress` blocks and `@dynamic_progress`.
+
+```julia
+@fetch! begin
+    data = loaded(dataset; data_version)   # IP → fetchindex!
+    result = data.dense_chains             # bare prop → fetchproperty!
+end
+
+@fetch! custom_progress begin
+    data = loaded(dataset; data_version)
+end
+```
+"""
+macro fetch!(x)
+    esc(_fetch_rewrite(:__progress__, x))
+end
+macro fetch!(progress_var, x)
+    esc(_fetch_rewrite(progress_var, x))
+end
+
+_fetch_rewrite(pv::Symbol, x) = x
+function _fetch_rewrite(pv::Symbol, x::Expr)
+    if Meta.isexpr(x, :call) && length(x.args) >= 1
+        rewritten = Any[_fetch_rewrite(pv, a) for a in x.args]
+        return fixcall(Expr(:call, GlobalRef(@__MODULE__, :maybefetchindex!), pv, rewritten...))
+    end
+    if Meta.isexpr(x, :.) && length(x.args) == 2 && x.args[2] isa QuoteNode
+        obj = _fetch_rewrite(pv, x.args[1])
+        name = x.args[2].value
+        return Expr(:call, GlobalRef(@__MODULE__, :maybefetchproperty!), pv, obj, QuoteNode(name))
+    end
+    Expr(x.head, Any[_fetch_rewrite(pv, a) for a in x.args]...)
 end
 
 """
