@@ -111,7 +111,8 @@ end
 # cannot detect the mmap backing from the value alone — the `@mmap` `meta`
 # marker is the reliable pin signal (D5).
 const _MMAP_MAGIC = (UInt8('D'), UInt8('O'), UInt8('M'), UInt8('M'))
-const _MMAP_VERSION = UInt8(1)
+const _MMAP_VERSION = UInt8(2)
+const _MMAP_ALIGN = 16
 # Stable integer tags (1-based index) for the isbits numeric eltypes the
 # self-describing (un-annotated) load path supports. Append-only — never
 # reorder, or existing files mis-decode. The annotated path uses the `::T`
@@ -141,6 +142,8 @@ function save(::Val{:mmap}, path::AbstractString, x::AbstractArray)
         write(io, tag)
         write(io, UInt8(ndims(A)))
         for d in size(A); write(io, Int64(d)); end
+        pad = mod(-position(io), _MMAP_ALIGN)
+        write(io, zeros(UInt8, pad))
         write(io, A)
     end
     A
@@ -153,11 +156,12 @@ function _mmap_read_header(io::IO)
     magic = ntuple(_ -> read(io, UInt8), 4)
     magic == _MMAP_MAGIC || error("@mmap: bad magic $(magic) — not a DynamicObjects mmap file.")
     ver = read(io, UInt8)
-    ver == _MMAP_VERSION || error("@mmap: unsupported file version $ver (this build writes v$(_MMAP_VERSION)).")
+    ver == _MMAP_VERSION || error("@mmap: file version $ver ≠ current v$(_MMAP_VERSION) — delete the cached file and re-run.")
     tag = read(io, UInt8)
     nd = Int(read(io, UInt8))
     dims = [Int(read(io, Int64)) for _ in 1:nd]
-    (tag, nd, dims, position(io))
+    offset = position(io) + mod(-position(io), _MMAP_ALIGN)
+    (tag, nd, dims, offset)
 end
 
 # Annotated fast path: the property's `::T` array type is known → type-stable.
@@ -1635,6 +1639,7 @@ $_cache_context""")
                         try
                             load(_disk_format(o, vname), cache_path, _disk_eltype(o, vname))
                         catch e
+                            # isa(e, ArgumentError) && rethrow()
                             @warn "Deserialization failed for $cache_path, recomputing.\n$_cache_context" exception=e
                             rm(cache_path; force=true)
                             nothing
