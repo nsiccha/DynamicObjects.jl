@@ -30,4 +30,10 @@ DynamicObjects.fetchindex!(status::Treebars.ProgressNode, ip, indices...; fetch=
         fetch(rv)
     end
 
+DynamicObjects.fetchproperty!(status::Treebars.ProgressNode, o, name::Symbol) =
+    DynamicObjects.fetchproperty(o, name) do rv, s
+        !isnothing(s) && Treebars.add_child!(status, s)
+        Base.fetch(rv)
+    end
+
 end

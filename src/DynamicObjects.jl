@@ -34,7 +34,7 @@ optionally disk-cached properties.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @dynamic_progress, memoize!, maybememoize!, maybeprogress!, noprogress, remake, fetchindex, fetchindex!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, set_cache_budget!, cache_budget, cache_bytes, cache_entries, subtree_bytes, subtree_budget, last_evicted, is_pinnable_value
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @dynamic_progress, memoize!, maybememoize!, maybeprogress!, noprogress, remake, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, set_cache_budget!, cache_budget, cache_bytes, cache_entries, subtree_bytes, subtree_budget, last_evicted, is_pinnable_value
 
 import SHA, Serialization, Mmap
 
@@ -1169,6 +1169,42 @@ through to a plain `memoize!(ip, indices...; fetch, kwargs...)` — useful for
 sites that opt out of the two-phase fetch dance without changing call shape.
 """
 fetchindex!(::Nothing, ip, indices...; fetch=Base.fetch, kwargs...) = memoize!(ip, indices...; fetch, kwargs...)
+
+"""
+    fetchproperty(fetch, o, name::Symbol)
+
+Like [`fetchindex`](@ref) but for bare (non-indexed) properties. Triggers
+computation via the `PropertyCache` and calls `fetch(rv, status)` where `rv`
+is the `Task` (still running) or the computed result, and `status` is the
+substatus object or `nothing`.
+
+For `Dict`-backed caches (serial), falls through to `getproperty` (synchronous,
+no status). The two-phase dance only applies to `ThreadsafeDict`-backed caches.
+"""
+fetchproperty(fetch, o, name::Symbol) = begin
+    pc = getfield(o, :cache)
+    c = pc.cache
+    if !(c isa AbstractThreadsafeDict)
+        return fetch(getproperty(o, name), nothing)
+    end
+    substatus_f = _bare_substatus_f(o, name)
+    rv = get!(c, name; substatus=substatus_f, fetch=identity) do s
+        v = _computeproperty(o, name; __status__=s)
+        _record_pc_store!(pc, name, (), v)
+        v
+    end
+    s = lock(c.lock) do; get(c.status, name, nothing); end
+    fetch(rv, s)
+end
+
+"""
+    fetchproperty!(callback, o, name::Symbol)
+
+In-place variant of [`fetchproperty`](@ref). When `callback` is `nothing`,
+falls through to `getproperty(o, name)`.
+"""
+fetchproperty!(::Nothing, o, name::Symbol) = getproperty(o, name)
+
 maybepop!(c::AbstractDict, key) = haskey(c, key) && pop!(c, key)
 maybepop!(c::AbstractThreadsafeDict, key) = begin
     lock(c.lock) do
@@ -1674,21 +1710,7 @@ elseif !isempty(indices) || !isempty(kwargs)
     # owns kwargs-keyed caching for indexed properties; we just hand off.
     _computeproperty(o, name, indices...; __status__, kwargs...)
 else
-    # For plain (non-indexed) generated user-facing properties, build a
-    # substatus closure so the spawn wrapper attaches a Treebars node to
-    # the parent's __status__ for the duration of the compute. Skip
-    # dunder names (`__status__`, `__appdata__`, …) and IPs (which get
-    # their own substatus via `memoize!(::IndexableProperty, …)`).
-    substatus_f = if name != :__substatus__ && name != :__status__ &&
-                     !(startswith(string(name), "__") && endswith(string(name), "__")) &&
-                     is_generated_property(o, name) && !is_indexed_property(o, name)
-        () -> begin
-            root = o.__status__
-            compute_property(o, Val(:__substatus__), name; __status__=root)
-        end
-    else
-        nothing
-    end
+    substatus_f = _bare_substatus_f(o, name)
     get!(getfield(o, :cache), name; substatus=substatus_f) do s
         # When called with no indices on an indexed property (declared with
         # call/ref syntax, e.g. `x() = ...` or `x[i] = ...`), return an
@@ -1702,6 +1724,18 @@ else
         _computeproperty(o, name; __status__=s)
     end
 end
+_bare_substatus_f(o, name) =
+    if name != :__substatus__ && name != :__status__ &&
+       !(startswith(string(name), "__") && endswith(string(name), "__")) &&
+       is_generated_property(o, name) && !is_indexed_property(o, name)
+        () -> begin
+            root = o.__status__
+            compute_property(o, Val(:__substatus__), name; __status__=root)
+        end
+    else
+        nothing
+    end
+
 maybehash(x::Number) = x
 maybehash(x::Symbol) = x
 maybehash(x) = persistent_hash(x)
