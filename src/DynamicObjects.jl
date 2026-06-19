@@ -2118,13 +2118,12 @@ maybememoize!(::typeof(maybeprogress!), progress, f, args...; kwargs...) =
 
 maybeprogress!(progress, ip::IndexableProperty{name}, indices...; kwargs...) where {name} = begin
     o = ip.o
-    _info = metafirst(typeof(o), name)
-    _displayed = _info === nothing ? true : get(_info, :displayed, true)
     # Per-call substatus, parented under `progress` (instead of the default
     # `o.__status__`). When `progress === nothing` this returns `nothing` and
     # everything downstream falls back to the standard `o.__status__` flow
-    # inside `_computeproperty`.
-    s = _default_substatus(progress, o, name, indices...; displayed=_displayed, kwargs...)
+    # inside `_computeproperty`. The label/inline decision lives in
+    # `_default_substatus` (gated on the property's docstring).
+    s = _default_substatus(progress, o, name, indices...; kwargs...)
     try
         rv = _computeproperty(o, name, indices...; __status__=s, kwargs...)
         _finalize_substatus!(s)
