@@ -2018,18 +2018,21 @@ maybefetchproperty!(progress, o, name::Symbol) =
         getproperty(o, name)
 
 """
-    @fetch! expr
     @fetch! progress expr
 
 Like [`@memo!`](@ref) but also attaches progress. Rewrites every call site
 to `maybefetchindex!(progress, callee, args…)` and every property access
 to `maybefetchproperty!(progress, obj, :name)`.
 
-The one-argument form defaults `progress` to `__progress__` — the variable
-bound by `Treebars.@progress` blocks and `@dynamic_progress`.
+`progress` is required — pass the progress/status variable explicitly
+(typically `__progress__`, the variable bound by `Treebars.@progress`
+blocks and `@dynamic_progress`). A one-argument form is intentionally not
+provided: under Julia's outside-in macro expansion, `@progress` renames
+`__progress__` before `@fetch!` expands, so a `@fetch!`-introduced
+`__progress__` would dangle into an `UndefVarError` at runtime.
 
 ```julia
-@fetch! begin
+@fetch! __progress__ begin
     data = loaded(dataset; data_version)   # IP → fetchindex!
     result = data.dense_chains             # bare prop → fetchproperty!
 end
@@ -2039,9 +2042,6 @@ end
 end
 ```
 """
-macro fetch!(x)
-    esc(_fetch_rewrite(:__progress__, x))
-end
 macro fetch!(progress_var, x)
     esc(_fetch_rewrite(progress_var, x))
 end
