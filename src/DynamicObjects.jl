@@ -4345,6 +4345,26 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                         :__status__,
                         walked_rhs)
                 end
+                # `@fetch!`-marked: emit `@fetch! __status__ <body>`. Sugar for a
+                # thin progress-reporting pass-through property — `@fetch!`
+                # rewrites every call in the body to
+                # `maybefetchindex!(__status__, …)` and every property access to
+                # `maybefetchproperty!(__status__, …)`, so a call down to an
+                # expensive sibling IP both memoizes AND mounts its progress
+                # subtree under the caller-bound `__status__`. Parallel to the
+                # `@dynamic_progress` branch above, but threads the memoizing
+                # `@fetch!` (cached + progress) rather than `maybeprogress!`
+                # (progress only) — the right default for wrappers over cached /
+                # `@mmap` work. `__status__` defaults to `nothing` (no caller
+                # progress / Tb absent), in which case `@fetch!` degrades to
+                # `memoize!` and Treebars stays a weakdep.
+                if Symbol("@fetch!") in info.macros
+                    walked_rhs = Expr(:macrocall,
+                        GlobalRef(@__MODULE__, Symbol("@fetch!")),
+                        something(info.lnn, LineNumberNode(0, :unknown)),
+                        :__status__,
+                        walked_rhs)
+                end
                 block = Expr(:block,
                     _lnn, Expr(:(=), _call(:compute_property, cp_kwargs...), Expr(:block, _lnn, walked_rhs)),
                     _lnn, Expr(:(=), _call(:iscached), Expr(:block, _lnn, iscached_val)),
