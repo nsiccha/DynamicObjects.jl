@@ -238,6 +238,21 @@ _kwargs_keys_path = Ref("")
     @cached result(key; mode="default") = "$key:$mode"
 end
 
+# Regression: `@fetch!` over a fetched IP call that carries kwargs. `walk_rhs`
+# rewrites the `; n_grid` shorthand to `; __self__.n_grid` (a `:.` shorthand —
+# valid Julia), so `_fetch_rewrite` must keep it valid keyword syntax rather
+# than turning it into a bare `maybefetchproperty!(…)` call (which 500'd with
+# `invalid keyword argument syntax`). Reported by
+# Bruno:qt:super.dense-progress:worker, 2026-06-23. A regression fails this
+# file at load time (the struct won't macroexpand).
+@dynamicstruct struct FetchKwargs
+    n_grid = 100
+    base = 5
+    from_schedule(a, b; n_grid=1) = a + b + n_grid           # IP with a kwarg
+    @fetch! shorthand() = from_schedule(base, base; n_grid)   # `; n_grid` (n_grid is a sibling property)
+    @fetch! explicit() = from_schedule(base, base; n_grid=7)  # `; n_grid=literal`
+end
+
 @dynamicstruct struct HashLeaf
     x::Int
     y::String
@@ -541,6 +556,20 @@ end
     end
     @test result2 == 84
     @test seen_task2[] == false
+end
+
+@testset "@fetch! kwargs" begin
+    o = FetchKwargs()
+    @test o.shorthand() == 110   # `; n_grid` shorthand threads the property (5+5+100)
+    @test o.explicit() == 17     # `; n_grid=7` explicit kwarg (5+5+7)
+    # Reporter's ask: `@fetch!(p, some_ip(x; kw=1))` => `maybefetchindex!(p, some_ip, x; kw=1)`.
+    rw = DynamicObjects._fetch_rewrite(:p, :(some_ip(x; kw=1)))
+    @test occursin("maybefetchindex!(p, some_ip, x; kw = 1)", string(rw))
+    # Dotted keyword shorthand `; o.n` must become a `:kw`, never a bare call.
+    rw2 = DynamicObjects._fetch_rewrite(:p, Expr(:call, :ip, Expr(:parameters, :(o.n))))
+    params = rw2.args[findfirst(a -> Meta.isexpr(a, :parameters), rw2.args)]
+    @test Meta.isexpr(params.args[1], :kw)
+    @test params.args[1].args[1] == :n
 end
 
 @testset "Persist with disk cache" begin

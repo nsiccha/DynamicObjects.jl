@@ -2052,12 +2052,39 @@ function _fetch_rewrite(pv::Symbol, x::Expr)
         rewritten = Any[_fetch_rewrite(pv, a) for a in x.args]
         return fixcall(Expr(:call, GlobalRef(@__MODULE__, :maybefetchindex!), pv, rewritten...))
     end
+    if Meta.isexpr(x, :parameters)
+        # Keyword block of a fetched call (or named tuple). A keyword position
+        # cannot hold a bare call, so each element must be rewritten while
+        # staying valid keyword syntax — see `_fetch_rewrite_kwarg`. Routing
+        # the whole `:parameters` node through the generic walker below would
+        # turn a dotted shorthand `; obj.field` into a bare
+        # `maybefetchproperty!(…)` call and emit `invalid keyword argument
+        # syntax`.
+        return Expr(:parameters, Any[_fetch_rewrite_kwarg(pv, a) for a in x.args]...)
+    end
     if Meta.isexpr(x, :.) && length(x.args) == 2 && x.args[2] isa QuoteNode
         obj = _fetch_rewrite(pv, x.args[1])
         name = x.args[2].value
         return Expr(:call, GlobalRef(@__MODULE__, :maybefetchproperty!), pv, obj, QuoteNode(name))
     end
     Expr(x.head, Any[_fetch_rewrite(pv, a) for a in x.args]...)
+end
+
+# Rewrite one element of a `:parameters` (keyword) block, keeping it valid
+# keyword syntax. The only element shape that needs special care is dotted
+# shorthand `; obj.field`: `walk_rhs` produces it from `; field` when `field`
+# is a sibling property, and the generic `_fetch_rewrite` would turn the `:.`
+# into a bare `maybefetchproperty!(…)` call — which Julia rejects in keyword
+# position. Wrap it back into an explicit `field = <rewritten obj.field>`.
+# Every other shape (`:kw` whose value is rewritten in place, bare-Symbol
+# shorthand `; k`, splat `; xs...`, nested `:call`) is already valid under the
+# generic recursion.
+_fetch_rewrite_kwarg(pv::Symbol, a) = _fetch_rewrite(pv, a)
+function _fetch_rewrite_kwarg(pv::Symbol, a::Expr)
+    if Meta.isexpr(a, :.) && length(a.args) == 2 && a.args[2] isa QuoteNode
+        return Expr(:kw, a.args[2].value, _fetch_rewrite(pv, a))
+    end
+    return _fetch_rewrite(pv, a)
 end
 
 """
