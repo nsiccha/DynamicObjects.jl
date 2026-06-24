@@ -2067,7 +2067,57 @@ function _fetch_rewrite(pv::Symbol, x::Expr)
         name = x.args[2].value
         return Expr(:call, GlobalRef(@__MODULE__, :maybefetchproperty!), pv, obj, QuoteNode(name))
     end
+    # Named-destructure assignment `(;a, b, c) = <source>` (incl. the
+    # trailing-comma `(;a, b, c,)` form — identical AST — and `::T`-typed
+    # names): rewrite each forwarded name to a `maybefetchproperty!` access so
+    # the forwarded properties thread progress + cache, exactly as an explicit
+    # `<source>.name` access already does. This is the shape DO's inline-child
+    # desugar emits as `(;forwarded...) = __parent__`; matching it here lets a
+    # `@fetch!` body thread through auto-forwarded parent properties. General
+    # over any source: for a non-DO source `maybefetchproperty!` degrades to
+    # `getproperty`, so the rewrite stays semantically identical to the plain
+    # destructure off-DO and only adds threading on a DO source. The source is
+    # bound once (no double-eval) and returned, so the block keeps the
+    # assignment's value (a destructure evaluates to its RHS). A `:block` does
+    # not introduce scope, so the destructured names leak to the enclosing
+    # scope exactly like the original destructure.
+    if Meta.isexpr(x, :(=)) && Meta.isexpr(x.args[1], :tuple) &&
+       length(x.args[1].args) == 1 && Meta.isexpr(x.args[1].args[1], :parameters)
+        binds = _fetch_destructure_binds(x.args[1].args[1])
+        if binds !== nothing
+            src = gensym(:fetch_src)
+            block = Expr(:block, :($src = $(_fetch_rewrite(pv, x.args[2]))))
+            for (lhs, nm) in binds
+                push!(block.args, :($lhs = $(Expr(:call,
+                    GlobalRef(@__MODULE__, :maybefetchproperty!), pv, src, QuoteNode(nm)))))
+            end
+            push!(block.args, src)
+            return block
+        end
+        # Unsupported element shape (kw-default `(;a=1)`, splat `(;xs...)`,
+        # nested) — fall through to the generic recursion, which passes the
+        # destructure through unchanged (today's no-threading behaviour).
+    end
     Expr(x.head, Any[_fetch_rewrite(pv, a) for a in x.args]...)
+end
+
+# Extract `(binding_lhs, name_symbol)` for each element of a `(;…)` destructure's
+# `:parameters` block. Each element must be a bare `Symbol` (`a`) or a `::T`-typed
+# name (`Expr(:(::), sym, T)`); for the typed case the binding keeps the `n::T`
+# lhs while the fetched name is the bare `n`. Any other shape (kw-default, splat,
+# nested) returns `nothing` so the caller bails to the generic passthrough.
+function _fetch_destructure_binds(params::Expr)
+    binds = Tuple{Any,Symbol}[]
+    for a in params.args
+        if a isa Symbol
+            push!(binds, (a, a))
+        elseif Meta.isexpr(a, :(::)) && length(a.args) == 2 && a.args[1] isa Symbol
+            push!(binds, (a, a.args[1]))
+        else
+            return nothing
+        end
+    end
+    return binds
 end
 
 # Rewrite one element of a `:parameters` (keyword) block, keeping it valid
@@ -3919,8 +3969,29 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         if will_prepend_hash_fields
             push!(prepend, :(hash_fields = $(Expr(:tuple, :__parent__, index_params..., kwarg_names...))))
         end
-        if !isempty(forwarded)
-            push!(prepend, :($(Expr(:tuple, Expr(:parameters, forwarded...))) = __parent__))
+        # Forward each parent prop as a `@fetch!`-marked property
+        # (`@fetch! nm = __parent__.nm`) rather than one
+        # `(; nm... ) = __parent__` destructure, so a bare reference to a
+        # progress-annotated parent prop threads progress instead of computing
+        # the parent IP with no substatus attached (the "Starting (spinner)"
+        # bug). The existing @fetch! property marker (731e012) wraps each body
+        # at emission as `@fetch! __status__ __parent__.nm` →
+        # `maybefetchproperty!(__status__, __parent__, :nm)`. This degrades to
+        # plain `getproperty(__parent__, nm)` — byte-identical to the old
+        # destructure — when `__status__ === nothing` (Treebars off / no
+        # progress), for serial caches, and for forwarded IPs (wrapper
+        # returned); it attaches a progress substatus only in the
+        # `:parallel`-non-indexed case, and only renders a node for documented
+        # props (undocumented → bare wrapper Treebars inlines). No Task ever
+        # leaks — `fetchproperty!`'s callback applies `Base.fetch`, blocking to
+        # the same value `getproperty` returns today. The destructure is
+        # already split per-member by the main `:tuple` lowering, so emitting
+        # per-member markers (vs one destructure) produces the SAME child
+        # properties, just `@fetch!`-marked. (decision `1vwuhqj`: user chose
+        # fix-directly; @fetch! call-site destructure recognition is the
+        # orthogonal sibling item (a), not used here.)
+        for nm in forwarded
+            push!(prepend, :(@fetch! $nm = __parent__.$nm))
         end
         # Auto-derive a hierarchical cache_path: extend the parent's path by a
         # per-child directory whose name is the same flat segment that
