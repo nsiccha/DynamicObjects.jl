@@ -3281,6 +3281,28 @@ function _resolve_type_description(::Type{T}, args, kwargs) where {T}
     kwstr  = isempty(kwargs) ? "" : "; " * join(("$k=$v" for (k, v) in pairs(kwargs)), ",")
     "$label($argstr$kwstr)"
 end
+"""    _is_property_documented(o, ::Val{name}, args...; kwargs...) -> Bool
+
+Whether the property `name`, called with `args...`, was declared with a docstring.
+Used by the Treebars extension's `_default_substatus` as the show-a-label-vs-inline
+gate (documented → labelled node; undocumented → bare wrapper the renderer inlines).
+
+`@dynamicstruct` emits a per-declaration method (`true` for documented, `false`
+for undocumented) alongside the matching `_property_description` override, so a
+property with multiple signatures resolves the right answer PER SIGNATURE via
+ordinary Julia dispatch.
+
+The **default** below is the safety net for structs expanded by an OLDER DO that
+carry no emitted overrides (Revise does not re-expand already-loaded consumers
+when this macro changes): it reproduces the historic name-keyed gate
+(`property_doc(metafirst(T, name))`) from the runtime `meta(T)` that every loaded
+struct already has — so on those structs nothing regresses, they keep first-sig
+behavior, and the per-signature fix rolls in as each is naturally re-expanded.
+Distinct from `property_doc(info)`, which reads a single meta entry — this
+dispatches on the actual call signature.
+"""
+_is_property_documented(o, ::Val{name}, args...; kwargs...) where {name} =
+    !isnothing(property_doc(metafirst(typeof(o), name)))
 is_generated_property(o, name) = false
 is_indexed_property(o, name) = false
 _disk_cache(o, name) = nothing
@@ -4261,7 +4283,6 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     # property name?" use the `prop_names` set built from it.
     properties = collect(oproperties)
     prop_names = Set{Symbol}(first.(oproperties))
-    property_docs = Dict(name => doc for (name, (doc, _)) in docs if !isnothing(doc))
 
     # Struct-level lint passes: repeated-prefix and shared-arg-signature.
     # Lints have moved to `analyze_structure(T)` — run from `print_structure`,
@@ -4414,12 +4435,33 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     walked_indices..., Expr(:parameters, extras...),
                 ))
                 iscached_val = Symbol("@cached") in info.macros || Symbol("@mmap") in info.macros
-                desc_expr = if haskey(property_docs, name)
-                    pdoc = property_docs[name]
-                    has_user_kw_splat = any(walked_indices) do idx
-                        Meta.isexpr(idx, :parameters) && any(a -> Meta.isexpr(a, :...), idx.args)
-                    end
-                    desc_extras = has_user_kw_splat ? () : (:(kwargs...),)
+                # Per-signature documentation flag + (when documented) the
+                # doc-derived label override.
+                #
+                # Gate on the PER-DECLARATION `info.doc`, never a name-keyed docs
+                # map (which would collapse duplicate names last-doc-wins): a
+                # property with multiple signatures has one `info` per signature,
+                # and each must reflect ITS OWN docstring. Both the
+                # `_is_property_documented` flag (the show-label-vs-inline gate
+                # the Treebars ext reads) and the `_property_description` override
+                # (the rendered label) are emitted per signature here, so Julia's
+                # own dispatch on `args...` selects the right one at call time —
+                # no parallel signature matcher.
+                #
+                # The flag is emitted for EVERY declaration — `true` when
+                # documented, `false` when not — so a re-expanded struct never
+                # falls through to the default `_is_property_documented` (the
+                # historic first-sig `metafirst` gate kept for not-yet-re-expanded
+                # structs): an undocumented signature of a multi-sig property must
+                # read `false`, not the first declaration's doc-presence.
+                has_user_kw_splat = any(walked_indices) do idx
+                    Meta.isexpr(idx, :parameters) && any(a -> Meta.isexpr(a, :...), idx.args)
+                end
+                doc_extras = has_user_kw_splat ? () : (:(kwargs...),)
+                isdoc_expr = (_lnn, Expr(:(=), _call(:_is_property_documented, doc_extras...),
+                                         Expr(:block, _lnn, !isnothing(info.doc))))
+                desc_expr = if !isnothing(info.doc)
+                    pdoc = info.doc
                     # Walk the docstring expression so interpolated bare names
                     # resolve through the same scope rules as the property's
                     # body: sibling-property references (`$method`,
@@ -4429,7 +4471,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     # String literals with no interpolation are passed through
                     # unchanged by `walk_rhs`.
                     walked_doc = walk_rhs(pdoc; info.locals, properties=prop_names, lnn=info.lnn)
-                    _lnn, Expr(:(=), _call(:_property_description, desc_extras...), Expr(:block, _lnn, walked_doc))
+                    (_lnn, Expr(:(=), _call(:_property_description, doc_extras...), Expr(:block, _lnn, walked_doc)))
                 else
                     nothing
                 end
@@ -4483,6 +4525,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     cv_expr = (_lnn, Expr(:(=), cv_method, Expr(:block, _lnn, info.cache_version)))
                     push!(block.args, cv_expr...)
                 end
+                push!(block.args, isdoc_expr...)
                 !isnothing(desc_expr) && push!(block.args, desc_expr...)
                 block
             end
