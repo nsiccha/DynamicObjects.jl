@@ -13,8 +13,14 @@ using DynamicObjects, Treebars
 # it does not reach the property body. Pass transient=false to keep finished substatuses
 # pinned to the parent tree (e.g. for historical "N finished" pill display).
 function DynamicObjects._default_substatus(status::Treebars.ProgressNode, o, name, args...; transient=true, kwargs...)
-    info = DynamicObjects.metafirst(typeof(o), name)
-    desc = (!isnothing(info) && !isnothing(DynamicObjects.property_doc(info))) ?
+    # Gate the label PER CALL SIGNATURE: `_is_property_documented` dispatches on
+    # `args...` (one `true` method emitted per documented declaration), so a
+    # property with multiple signatures resolves its OWN doc-presence here —
+    # unlike the old `property_doc(metafirst(T, name))`, which keyed on type+name
+    # only and always reflected the first declaration. The matching
+    # `_property_description` override is likewise per-signature, so the rendered
+    # label text is the right signature's docstring.
+    desc = DynamicObjects._is_property_documented(o, Val(name), args...; kwargs...) ?
         something(DynamicObjects._property_description(o, Val(name), args...; kwargs...), "") : ""
     Treebars.initialize_progress!(status; description=desc, transient)
 end

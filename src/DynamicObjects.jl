@@ -3281,6 +3281,18 @@ function _resolve_type_description(::Type{T}, args, kwargs) where {T}
     kwstr  = isempty(kwargs) ? "" : "; " * join(("$k=$v" for (k, v) in pairs(kwargs)), ",")
     "$label($argstr$kwstr)"
 end
+"""    _is_property_documented(o, ::Val{name}, args...; kwargs...) -> Bool
+
+Whether the property `name`, called with `args...`, was declared with a docstring.
+The default is `false`; `@dynamicstruct` emits a `true` method per DOCUMENTED
+declaration (alongside the matching `_property_description` override), so a
+property with multiple signatures resolves the right answer PER SIGNATURE via
+ordinary Julia dispatch. Used by the Treebars extension's `_default_substatus`
+as the show-a-label-vs-inline gate (documented → labelled node; undocumented →
+bare wrapper the renderer inlines). Distinct from `property_doc(info)`, which
+reads a single meta entry — this dispatches on the actual call signature.
+"""
+_is_property_documented(o, ::Val, args...; kwargs...) = false
 is_generated_property(o, name) = false
 is_indexed_property(o, name) = false
 _disk_cache(o, name) = nothing
@@ -4261,7 +4273,6 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     # property name?" use the `prop_names` set built from it.
     properties = collect(oproperties)
     prop_names = Set{Symbol}(first.(oproperties))
-    property_docs = Dict(name => doc for (name, (doc, _)) in docs if !isnothing(doc))
 
     # Struct-level lint passes: repeated-prefix and shared-arg-signature.
     # Lints have moved to `analyze_structure(T)` — run from `print_structure`,
@@ -4414,8 +4425,18 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     walked_indices..., Expr(:parameters, extras...),
                 ))
                 iscached_val = Symbol("@cached") in info.macros || Symbol("@mmap") in info.macros
-                desc_expr = if haskey(property_docs, name)
-                    pdoc = property_docs[name]
+                # Doc-derived label override + per-signature documentation flag.
+                # Gate on the PER-DECLARATION `info.doc`, never a name-keyed docs
+                # map (which would collapse duplicate names last-doc-wins): a
+                # property with multiple signatures has one `info` per signature,
+                # and each must reflect ITS OWN docstring. Both the
+                # `_property_description` override (the rendered label) and the
+                # `_is_property_documented` flag (the show-label-vs-inline gate
+                # the Treebars ext reads) are emitted per signature here, so
+                # Julia's own dispatch on `args...` selects the right one at call
+                # time — no parallel signature matcher.
+                desc_expr = if !isnothing(info.doc)
+                    pdoc = info.doc
                     has_user_kw_splat = any(walked_indices) do idx
                         Meta.isexpr(idx, :parameters) && any(a -> Meta.isexpr(a, :...), idx.args)
                     end
@@ -4429,7 +4450,8 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     # String literals with no interpolation are passed through
                     # unchanged by `walk_rhs`.
                     walked_doc = walk_rhs(pdoc; info.locals, properties=prop_names, lnn=info.lnn)
-                    _lnn, Expr(:(=), _call(:_property_description, desc_extras...), Expr(:block, _lnn, walked_doc))
+                    (_lnn, Expr(:(=), _call(:_property_description, desc_extras...), Expr(:block, _lnn, walked_doc)),
+                     _lnn, Expr(:(=), _call(:_is_property_documented, desc_extras...), Expr(:block, _lnn, true)))
                 else
                     nothing
                 end
