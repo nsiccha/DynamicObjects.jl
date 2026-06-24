@@ -48,63 +48,48 @@ DynamicObjects._report_disk_load!(s::Treebars.ProgressNode, cache_path, size_byt
 # `fetchindex`/`fetchproperty` follow the contract: the callback's `rv` is a
 # `Task` while the computation is in flight, and the cached VALUE once it is done.
 # So at callback entry `!(rv isa Task)` means the value was already in the
-# in-memory cache — a hit. How we present a hit depends on whether the cached
-# property is DOCUMENTED:
+# in-memory cache — a hit. On a DOCUMENTED in-memory hit we KEEP the original
+# node `s` and its ENTIRE sub-step subtree intact, and swap ONLY the subtree
+# ROOT's LABEL — appending " (cached)" in place — so it renders e.g.
+# "Compute subject data (cached) — done (13s)" (carrying `s`'s own frozen
+# ORIGINAL-compute duration) with all of `s`'s sub-steps rendering beneath it,
+# unchanged.
 #
-# - DOCUMENTED (`s.impl.description` non-empty, e.g. "Compute subject data"): a
-#   SINGLE finished node directly under `status` — no wrapper, no extra level —
-#   labelled "<original label> (cached)" and carrying `s`'s FROZEN original-compute
-#   duration, so it renders e.g. "Compute subject data (cached) — done (13s)".
-#   See `_cached_node!`.
-# - UNDOCUMENTED (`s.impl.description` empty): nothing extra — attach `s` directly
-#   (as the running path does); its empty description makes it a bare wrapper that
-#   the renderer inlines away (no info-free node, no extra level). (If a disk-load
-#   left a "from disk: …" message on `s`, it stays a meaningful message leaf — an
-#   accepted edge.)
+# In-place relabel (vs. a new born-finished root with the children re-homed) is
+# the correct mechanism here: `s` is SHARED per cache key (`getstatus` returns
+# the same node to every status tree / poll). Re-homing `s`'s children into a new
+# node would EMPTY `s.children`, so a second status tree hitting the same shared
+# `s` would build a CHILDLESS "(cached)" node — exactly the collapsed-subtree bug
+# this corrects. Relabeling `s` itself keeps the one shared subtree intact for all
+# trees, preserves children's (immutable) parent pointers, and mirrors
+# `_report_disk_load!` above, which already mutates the shared `s`'s display state
+# in place.
 #
-# While the computation is still running (`rv isa Task`), or there is no substatus
-# (`s === nothing`), we attach `s` directly — the live sub-tree, unchanged.
+# UNDOCUMENTED hit (`s.impl.description` empty): no relabel — `s` stays a bare
+# wrapper the renderer inlines away. Running (`rv isa Task`) and no-substatus
+# (`s === nothing`): no relabel. All four paths then attach `s` via `add_child!`
+# (idempotent on the `ThreadsafeSet`; no-op on `nothing`).
+const _CACHED_SUFFIX = " (cached)"
+
 function _attach_fetched!(status::Treebars.ProgressNode, rv, s)
     if !(rv isa Task) && !isnothing(s) && !isempty(s.impl.description)
-        _cached_node!(status, s)           # documented in-memory hit → "(cached)" node
-    else
-        Treebars.add_child!(status, s)     # undocumented hit (inlines) / running / no substatus
+        _mark_cached!(s)                   # documented in-memory hit → relabel root in place
     end
+    Treebars.add_child!(status, s)         # keep/attach the subtree root (no-op on `nothing`)
     nothing
 end
 
-# Get-or-create the single "<label> (cached)" node for documented cached node `s`
-# under `status`. Idempotent and leak-free with no module-level state: the node is
-# anchored to `s`'s IDENTITY via its `meta.cache_anchor`, so repeated hits / polls
-# of the same cached value (web routes poll the tree repeatedly; `getstatus`
-# returns the same shared `s` each time) reuse the existing node instead of piling
-# up duplicates. Identity — not the description — is the key on purpose: distinct
-# indexed keys can share a docstring-derived description, and they must NOT
-# collapse onto one node.
-#
-# The node is built born-finished: a fresh `StateProgress` whose `started_at` /
-# `finalized_at` are COPIED from `s.impl` (set before the `ProgressNode` is
-# published into `status.children`, so a concurrent render never sees a half-built
-# node) — this carries `s`'s frozen ORIGINAL-compute duration and reports as
-# finished, identical impl end-state to a `finalize_progress!`'d node (no children
-# to cascade, `propagates=false`, `transient=false`). `s` is removed from
-# `status`'s direct children (a prior running phase may have attached it) so the
-# hit shows ONLY this node, not also a bare `s`.
-function _cached_node!(status::Treebars.ProgressNode, s::Treebars.ProgressNode)
-    for c in status.children
-        get(c.meta, :cache_anchor, nothing) === s && return c
+# Append the "(cached)" suffix to `s`'s description exactly once. Idempotent under
+# repeat polls (web routes poll the tree repeatedly and re-fetch the same shared
+# `s`) via the `endswith` guard, and locked on `s.impl.lock` so concurrent first
+# hits cannot double-append. `s` is finished/frozen on a hit, so the visible
+# duration stays the frozen original-compute time.
+function _mark_cached!(s::Treebars.ProgressNode)
+    sp = s.impl
+    lock(sp.lock) do
+        endswith(sp.description, _CACHED_SUFFIX) || (sp.description *= _CACHED_SUFFIX)
     end
-    si = s.impl
-    impl = Treebars.StateProgress(; description=si.description * " (cached)")
-    impl.running = false
-    impl.started_at = si.started_at
-    impl.finalized_at = si.finalized_at
-    w = Treebars.ProgressNode(
-        impl, (; propagates=false, transient=false, displayed=true, cache_anchor=s);
-        parent=status,
-    )
-    Base.delete!(status.children, s)
-    w
+    nothing
 end
 
 DynamicObjects.fetchindex!(status::Treebars.ProgressNode, ip, indices...; fetch=Base.fetch, kwargs...) =
