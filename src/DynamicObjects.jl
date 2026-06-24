@@ -3969,8 +3969,29 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         if will_prepend_hash_fields
             push!(prepend, :(hash_fields = $(Expr(:tuple, :__parent__, index_params..., kwarg_names...))))
         end
-        if !isempty(forwarded)
-            push!(prepend, :($(Expr(:tuple, Expr(:parameters, forwarded...))) = __parent__))
+        # Forward each parent prop as a `@fetch!`-marked property
+        # (`@fetch! nm = __parent__.nm`) rather than one
+        # `(; nm... ) = __parent__` destructure, so a bare reference to a
+        # progress-annotated parent prop threads progress instead of computing
+        # the parent IP with no substatus attached (the "Starting (spinner)"
+        # bug). The existing @fetch! property marker (731e012) wraps each body
+        # at emission as `@fetch! __status__ __parent__.nm` →
+        # `maybefetchproperty!(__status__, __parent__, :nm)`. This degrades to
+        # plain `getproperty(__parent__, nm)` — byte-identical to the old
+        # destructure — when `__status__ === nothing` (Treebars off / no
+        # progress), for serial caches, and for forwarded IPs (wrapper
+        # returned); it attaches a progress substatus only in the
+        # `:parallel`-non-indexed case, and only renders a node for documented
+        # props (undocumented → bare wrapper Treebars inlines). No Task ever
+        # leaks — `fetchproperty!`'s callback applies `Base.fetch`, blocking to
+        # the same value `getproperty` returns today. The destructure is
+        # already split per-member by the main `:tuple` lowering, so emitting
+        # per-member markers (vs one destructure) produces the SAME child
+        # properties, just `@fetch!`-marked. (decision `1vwuhqj`: user chose
+        # fix-directly; @fetch! call-site destructure recognition is the
+        # orthogonal sibling item (a), not used here.)
+        for nm in forwarded
+            push!(prepend, :(@fetch! $nm = __parent__.$nm))
         end
         # Auto-derive a hierarchical cache_path: extend the parent's path by a
         # per-child directory whose name is the same flat segment that
