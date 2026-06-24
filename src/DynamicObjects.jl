@@ -906,7 +906,13 @@ struct ThreadsafeDict{K,V} <: AbstractThreadsafeDict{K,V}
 end
 
 const _cache_types = (;serial=Dict, parallel=ThreadsafeDict)
-resolve_cache_type(s::Symbol) = get(_cache_types, s, s)
+# `:serial` was removed (deprecated 2026-06; decision hw24wf) — error before the
+# `_cache_types` lookup. The const keeps `serial=Dict` (a const can't be redefined
+# under Julia-1.10 Revise); this method-level guard is what makes `:serial` fail.
+resolve_cache_type(s::Symbol) = begin
+    s === :serial && error("cache_type=:serial was removed (deprecated 2026-06); use cache_type=:parallel")
+    get(_cache_types, s, s)
+end
 resolve_cache_type(T::Type) = T.name.wrapper
 resolve_cache_type(T::UnionAll) = T
 
@@ -1612,7 +1618,7 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
             __strict__ = getorcomputeproperty(o, :__strict__)
             _is_threadsafe = getorcomputeproperty(o, :__cache_type__) <: AbstractThreadsafeDict
             _cache_context = """Object type: $(nameof(typeof(o))) (objectid: $(objectid(o)), hash: $(hash(o)))
-Cache dict: $(_is_threadsafe ? "ThreadsafeDict (parallel)" : "Dict (serial) — if concurrent access is intended, use cache_type=:parallel")
+Cache dict: $(_is_threadsafe ? "ThreadsafeDict (parallel)" : "non-threadsafe Dict — if concurrent access is intended, use cache_type=:parallel")
 If multiple objects with the same hash are writing here concurrently, this may indicate a concurrency issue or a hashing collision."""
             disk_locks = _disk_cache(o, vname)
             rv = if __strict__ && !isnothing(disk_locks)
@@ -4534,20 +4540,30 @@ function setlnn(lnn::Union{LineNumberNode,Nothing})
     end
 end
 
+# `cache_type=:serial` was removed (deprecated 2026-06; decision hw24wf). Reject it
+# at macro-parse so a struct definition fails at macroexpand, mirroring the runtime
+# `resolve_cache_type` guard. cache_type reaches `_parse_macro_opt` via TWO AST shapes
+# — a positional `:serial` (bare Symbol from the QuoteNode method) and `cache_type=:serial`
+# (a `QuoteNode(:serial)` from the `:(=)` branch) — so guard both. `_parse_macro_opt` is a
+# plain function the `@dynamicstruct` macro calls at expansion, so Revise hot-reloads it.
+_reject_serial_opt(v) = (v === :serial || v === QuoteNode(:serial)) &&
+    error("@dynamicstruct: cache_type=:serial was removed (deprecated 2026-06); use cache_type=:parallel")
+
 # Parse a single positional macro arg into a (kwarg-name => value) pair.
 # `name=value` Expr → `(name => value)`. String/`:string` → `(:docstring => …)`.
-# QuoteNode (`:parallel` / `:serial`) → `(:cache_type => sym)`. Anything else
+# QuoteNode (`:parallel`) → `(:cache_type => sym)`. Anything else
 # is rejected with a pointer to the recognised forms.
 _parse_macro_opt(a::AbstractString) = (:docstring => a)
-_parse_macro_opt(a::QuoteNode) = (:cache_type => a.value)
+_parse_macro_opt(a::QuoteNode) = (_reject_serial_opt(a.value); (:cache_type => a.value))
 _parse_macro_opt(a::Expr) = if a.head === :string
     (:docstring => a)
 elseif a.head === :(=) && a.args[1] isa Symbol
+    a.args[1] === :cache_type && _reject_serial_opt(a.args[2])
     (a.args[1] => a.args[2])
 else
-    error("@dynamicstruct: unsupported option `$a` — use a docstring, `:parallel`/`:serial`, or `name=value`.")
+    error("@dynamicstruct: unsupported option `$a` — use a docstring, `:parallel`, or `name=value`.")
 end
-_parse_macro_opt(a) = error("@dynamicstruct: unsupported option `$a` — use a docstring, `:parallel`/`:serial`, or `name=value`.")
+_parse_macro_opt(a) = error("@dynamicstruct: unsupported option `$a` — use a docstring, `:parallel`, or `name=value`.")
 
 """
     @dynamicstruct [docstring] [cache_type] struct Name
@@ -4568,9 +4584,10 @@ reference is automatically rewritten to `__self__.<name>`.  Order of definition
 does not matter — cycles will result in a stack overflow at runtime.
 
 `cache_type` controls the in-memory cache backend:
-- `:serial` — plain `Dict`, single-threaded safe.
 - `:parallel` (default) — `ThreadsafeDict`, safe to access from multiple tasks
   simultaneously; duplicate work is avoided by sharing in-flight `Task`s.
+
+`cache_type=:serial` was removed (deprecated 2026-06); use `:parallel` (the default).
 
 Properties marked `@cached` are additionally persisted to disk under
 `__self__.cache_path` (which itself defaults to
