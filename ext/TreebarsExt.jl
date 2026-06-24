@@ -33,47 +33,67 @@ DynamicObjects._fail_substatus!(s::Treebars.ProgressNode, e) = Treebars.fail_pro
 DynamicObjects._report_disk_load!(s::Treebars.ProgressNode, cache_path, size_bytes) =
     Treebars.update_progress!(s, "from disk: " * DynamicObjects._format_size(size_bytes))
 
-# In-memory cache hit rendering (decision 1it9aqq, option c).
+# In-memory cache hit rendering (decision 1it9aqq → reworked; supersedes the
+# generic "read from memory cache" wrapper).
 #
 # `fetchindex`/`fetchproperty` follow the contract: the callback's `rv` is a
 # `Task` while the computation is in flight, and the cached VALUE once it is done.
 # So at callback entry `!(rv isa Task)` means the value was already in the
-# in-memory cache — a hit. We present a hit as a labelled "read from memory cache"
-# node whose only child is the cached+finished substatus `s` (which carries its
-# own frozen original-compute duration). Both are finished, so Treebars hides them
-# by default but lets the user toggle them on to inspect the cache read: the
-# wrapper's own near-instant duration is the read time, `s`'s frozen duration is
-# the original compute time. Treebars owns all "— done (…)" formatting.
+# in-memory cache — a hit. How we present a hit depends on whether the cached
+# property is DOCUMENTED:
 #
-# While the computation is still running (`rv isa Task`) we attach `s` directly —
-# the live progress sub-tree, unchanged.
-const _CACHE_READ_LABEL = "read from memory cache"
-
+# - DOCUMENTED (`s.impl.description` non-empty, e.g. "Compute subject data"): a
+#   SINGLE finished node directly under `status` — no wrapper, no extra level —
+#   labelled "<original label> (cached)" and carrying `s`'s FROZEN original-compute
+#   duration, so it renders e.g. "Compute subject data (cached) — done (13s)".
+#   See `_cached_node!`.
+# - UNDOCUMENTED (`s.impl.description` empty): nothing extra — attach `s` directly
+#   (as the running path does); its empty description makes it a bare wrapper that
+#   the renderer inlines away (no info-free node, no extra level). (If a disk-load
+#   left a "from disk: …" message on `s`, it stays a meaningful message leaf — an
+#   accepted edge.)
+#
+# While the computation is still running (`rv isa Task`), or there is no substatus
+# (`s === nothing`), we attach `s` directly — the live sub-tree, unchanged.
 function _attach_fetched!(status::Treebars.ProgressNode, rv, s)
-    if !(rv isa Task) && !isnothing(s)
-        _cache_read_wrapper!(status, s)    # in-memory hit → wrap (idempotent)
+    if !(rv isa Task) && !isnothing(s) && !isempty(s.impl.description)
+        _cached_node!(status, s)           # documented in-memory hit → "(cached)" node
     else
-        Treebars.add_child!(status, s)     # running / no substatus (no-op on `nothing`)
+        Treebars.add_child!(status, s)     # undocumented hit (inlines) / running / no substatus
     end
     nothing
 end
 
-# Get-or-create the single "read from memory cache" wrapper for cached node `s`
-# under `status`. Idempotent and leak-free with no module-level state: reuse an
-# existing wrapper (matched by label + membership of `s`) so repeated hits / polls
-# of the same cached value never pile up duplicate wrappers. `s` is re-homed under
-# the wrapper (removed from `status`'s direct children, where a prior running phase
-# may have attached it) so it renders only as the wrapper's sole child, not also a
-# sibling. Non-transient so finalize freezes its duration without detaching it.
-function _cache_read_wrapper!(status::Treebars.ProgressNode, s::Treebars.ProgressNode)
+# Get-or-create the single "<label> (cached)" node for documented cached node `s`
+# under `status`. Idempotent and leak-free with no module-level state: the node is
+# anchored to `s`'s IDENTITY via its `meta.cache_anchor`, so repeated hits / polls
+# of the same cached value (web routes poll the tree repeatedly; `getstatus`
+# returns the same shared `s` each time) reuse the existing node instead of piling
+# up duplicates. Identity — not the description — is the key on purpose: distinct
+# indexed keys can share a docstring-derived description, and they must NOT
+# collapse onto one node.
+#
+# The node is built born-finished: a fresh `StateProgress` whose `started_at` /
+# `finalized_at` are COPIED from `s.impl` (set before the `ProgressNode` is
+# published into `status.children`, so a concurrent render never sees a half-built
+# node) — this carries `s`'s frozen ORIGINAL-compute duration and reports as
+# finished, identical impl end-state to a `finalize_progress!`'d node (no children
+# to cascade, `propagates=false`, `transient=false`). `s` is removed from
+# `status`'s direct children (a prior running phase may have attached it) so the
+# hit shows ONLY this node, not also a bare `s`.
+function _cached_node!(status::Treebars.ProgressNode, s::Treebars.ProgressNode)
     for c in status.children
-        if c.impl isa Treebars.StateProgress && c.impl.description == _CACHE_READ_LABEL && s in c.children
-            return c
-        end
+        get(c.meta, :cache_anchor, nothing) === s && return c
     end
-    w = Treebars.initialize_progress!(status; description=_CACHE_READ_LABEL, transient=false)
-    Treebars.add_child!(w, s)
-    Treebars.finalize_progress!(w)
+    si = s.impl
+    impl = Treebars.StateProgress(; description=si.description * " (cached)")
+    impl.running = false
+    impl.started_at = si.started_at
+    impl.finalized_at = si.finalized_at
+    w = Treebars.ProgressNode(
+        impl, (; propagates=false, transient=false, displayed=true, cache_anchor=s);
+        parent=status,
+    )
     Base.delete!(status.children, s)
     w
 end
