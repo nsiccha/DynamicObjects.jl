@@ -900,8 +900,14 @@ struct IndexableProperty{N,O,D<:AbstractDict}
 end
 name(::IndexableProperty{N}) where {N} = N
 Base.show(io::IO, ip::IndexableProperty{N}) where {N} = print(io, "IndexableProperty :", N, " (", ip.cache, ")")
+# The bare call form memoizes by default (the `4c71ccf` flip), UNLESS the
+# property carries the declaration-site `@fresh` marker — `_never_cache`
+# (default `false`, emitted `true` per `@fresh` prop) routes it to the uncached
+# `fresh` (= `_computeproperty`) instead. `name` is a type param and
+# `_never_cache` returns a constant `Bool`, so the branch constant-folds.
 (ip::IndexableProperty{name})(indices...; kwargs...) where {name} =
-    memoize!(ip, indices...; kwargs...)
+    _never_cache(ip.o, Val(name)) ? fresh(ip, indices...; kwargs...) :
+                                    memoize!(ip, indices...; kwargs...)
 """
     memoize!(ip::IndexableProperty, args...; kwargs...)
 
@@ -3544,6 +3550,17 @@ _is_property_documented(o, ::Val{name}, args...; kwargs...) where {name} =
 is_generated_property(o, name) = false
 is_indexed_property(o, name) = false
 _disk_cache(o, name) = nothing
+"""    _never_cache(o, ::Val{name})
+
+Per-type override: `true` when property `name` carries the declaration-site
+`@fresh` marker, meaning its `IndexableProperty` call form `o.name(args…)` must
+**never memoize** — it recomputes on every call (the declaration-site dual of
+the call-site `@fresh` / `fresh(ip, …)`). The default is `false`; the
+`@dynamicstruct` macro emits a `true` method per `@fresh`-marked property. The
+IP call form consults this and routes to `fresh` (the uncached `_computeproperty`)
+instead of `memoize!`. Method-level, so Revise-safe; constant-foldable so the
+call form's branch is free at runtime."""
+_never_cache(o, ::Val) = false
 """    _nested_struct_type(::Type{T}, ::Val{name})
 
 Return the type of the nested struct exposed under property `name` on `T`,
@@ -4636,6 +4653,19 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         end,
         [
             begin
+                # `@fresh` marker validation (macro-time). The marker declares a
+                # never-cache call form, so two combinations are contradictory and
+                # rejected here rather than silently emitting an inert/wrong method:
+                #   (a) on a bare scalar property — it memoizes via PropertyCache, a
+                #       different mechanism the IP-call-form `_never_cache` never
+                #       reaches; an unhelpful silent no-op without this guard.
+                #   (b) with @cached/@mmap — "never caches" vs "disk-caches" cannot
+                #       both hold; allowing it would serve a stale disk value under a
+                #       never-cache marker.
+                if Symbol("@fresh") in info.macros
+                    info.indexed || error("@fresh on property `$name`: the never-cache marker applies only to call-form / indexed properties (`@fresh $name() = …`). A bare scalar property `$name = …` memoizes via PropertyCache (a different mechanism) — use the call form, or drop @fresh.")
+                    (Symbol("@cached") in info.macros || Symbol("@mmap") in info.macros) && error("@fresh on property `$name`: cannot combine with @cached/@mmap. `@fresh` declares the property never caches; @cached/@mmap declare a disk cache — these are contradictory. Drop one.")
+                end
                 cp_kwargs = [Expr(:kw, name, length(info.indices) > 0 ? :(__self__.$name) : nothing)]
                 name != :__status__ && push!(cp_kwargs, Expr(:kw, :__status__, :nothing))
                 # Build method definitions with Expr directly (not :() syntax)
@@ -4785,6 +4815,18 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     )
                     cv_expr = (_lnn, Expr(:(=), cv_method, Expr(:block, _lnn, info.cache_version)))
                     push!(block.args, cv_expr...)
+                end
+                # `@fresh`-marked: emit `_never_cache(__self__::T, ::Val{name}) =
+                # true` so the IP call form routes to the uncached `fresh` instead
+                # of `memoize!`. Per-property (keyed by name only, no indices) —
+                # same direct-`Expr` shape as `cache_version`, not `_call`.
+                if Symbol("@fresh") in info.macros
+                    nc_method = Expr(:call,
+                        Expr(:., DynamicObjects, QuoteNode(:_never_cache)),
+                        :(__self__::$type), :(::Val{$(Meta.quot(name))}),
+                    )
+                    nc_expr = (_lnn, Expr(:(=), nc_method, Expr(:block, _lnn, true)))
+                    push!(block.args, nc_expr...)
                 end
                 push!(block.args, isdoc_expr...)
                 !isnothing(desc_expr) && push!(block.args, desc_expr...)
