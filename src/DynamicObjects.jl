@@ -9,9 +9,12 @@ optionally disk-cached properties.
 - [`@cache_status`](@ref): Get the disk-cache status of a property (`:unstarted`, `:started`, `:ready`).
 - [`@is_cached`](@ref): Check whether a property's disk cache is ready.
 - [`@cache_path`](@ref): Get the file path used for a property's disk cache.
-- [`@memo!`](@ref): Wrap a call site so `IndexableProperty` callees are cached.
+- [`@memo!`](@ref): Wrap a call site so `IndexableProperty` callees are cached (now the default; makes it explicit).
 - [`memoize!`](@ref): Explicit cached call into an `IndexableProperty`.
 - [`maybememoize!`](@ref): Dispatch helper behind `@memo!`; cached on IPs, plain call otherwise.
+- [`@fresh`](@ref): Wrap a call site so `IndexableProperty` callees are recomputed fresh (opt out of the default caching).
+- [`fresh`](@ref): Explicit uncached call into an `IndexableProperty`.
+- [`maybefresh`](@ref): Dispatch helper behind `@fresh`; uncached on IPs, plain call otherwise.
 - [`remake`](@ref): Create a new instance of a `@dynamicstruct` type with some fields changed.
 - [`fetchindex`](@ref): Non-blocking access to `ThreadsafeDict`-backed properties with `(rv, status)` callback.
 - [`getstatus`](@ref): Read the status object for an in-flight computation.
@@ -34,7 +37,7 @@ optionally disk-cached properties.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, set_cache_budget!, cache_budget, cache_bytes, cache_entries, subtree_bytes, subtree_budget, last_evicted, is_pinnable_value
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, set_cache_budget!, cache_budget, cache_bytes, cache_entries, subtree_bytes, subtree_budget, last_evicted, is_pinnable_value
 
 import SHA, Serialization, Mmap
 
@@ -851,18 +854,21 @@ struct IndexableProperty{N,O,D<:AbstractDict}
 end
 name(::IndexableProperty{N}) where {N} = N
 Base.show(io::IO, ip::IndexableProperty{N}) where {N} = print(io, "IndexableProperty :", N, " (", ip.cache, ")")
-((;o)::IndexableProperty{name})(indices...; kwargs...) where {name} =
-    _computeproperty(o, name, indices...; kwargs...)
+(ip::IndexableProperty{name})(indices...; kwargs...) where {name} =
+    memoize!(ip, indices...; kwargs...)
 """
     memoize!(ip::IndexableProperty, args...; kwargs...)
 
 Cached call into an `IndexableProperty`'s per-key dict. Returns the cached
-value if `(args, kwargs)` was seen before; otherwise calls `ip(args...; kwargs...)`,
-stores the result, and returns it. This is the explicit, exported function
-form of cached IP access — use it whenever you'd previously have written
-`ip[args...]`, *especially* in kwargs-only call sites (`memoize!(ip; k=v)`)
+value if `(args, kwargs)` was seen before; otherwise computes the value
+(via `_computeproperty`), stores the result, and returns it.
+
+The bare call form `o.prop(args...; kwargs...)` now routes through `memoize!`
+(caching by default), so `memoize!` is the explicit, exported equivalent of a
+bare indexed-property call — and the form to use whenever you'd previously have
+written `ip[args...]`, *especially* in kwargs-only call sites (`memoize!(ip; k=v)`)
 which the legacy bracket syntax couldn't express at all (`ip[; k=v]` doesn't
-parse as Julia).
+parse as Julia). For the uncached (fresh) call, use [`fresh`](@ref) / [`@fresh`](@ref).
 
 For two-phase access (returning a `Task` while computing) on
 `ThreadsafeDict`-backed IPs, see [`fetchindex`](@ref). Inside a
@@ -874,7 +880,14 @@ memoize!(ip::IndexableProperty{name}, args...; fetch=Base.fetch, kwargs...) wher
     args_key = (args, (;kwargs...))
     was_hit = haskey(ip.cache, args_key)
     rv = get!(ip.cache, args_key) do
-        v = ip(args...; kwargs...)
+        # Compute via `_computeproperty` directly, NOT the call form `ip(args...)`:
+        # the bare call form `o.prop(args)` now routes THROUGH `memoize!` (cached by
+        # default), so `ip(args...)` here would recurse into `memoize!` → stack
+        # overflow on first use. This mirrors the `ThreadsafeDict`-backed `memoize!`
+        # below, which already computes via `_computeproperty` (for the
+        # 0-arg-wrapper-trap reason documented there). After this, BOTH `memoize!`
+        # methods compute via `_computeproperty`, never via the call form.
+        v = _computeproperty(ip.o, name, args...; kwargs...)
         owner_pc = getfield(ip.o, :cache)
         owner_pc isa PropertyCache && _record_pc_store!(owner_pc, name, args_key, v)
         v
@@ -885,6 +898,20 @@ memoize!(ip::IndexableProperty{name}, args...; fetch=Base.fetch, kwargs...) wher
     end
     rv
 end
+"""
+    fresh(ip::IndexableProperty, args...; kwargs...)
+
+Uncached call into an `IndexableProperty`: computes the value fresh on every
+call, never reading or writing the per-key cache. This is the public, exported
+opt-out from the now-default memoized call form — the mirror of [`memoize!`](@ref).
+
+The bare call form `o.prop(args...; kwargs...)` caches by default; use
+`fresh(o.prop, args...; kwargs...)` (or the call-site macro [`@fresh`](@ref))
+when you specifically need to recompute and bypass the cache entirely (no read,
+no store).
+"""
+fresh(ip::IndexableProperty{name}, args...; kwargs...) where {name} =
+    _computeproperty(ip.o, name, args...; kwargs...)
 """
     AbstractThreadsafeDict{K,V}
 
@@ -1950,23 +1977,36 @@ maybememoize!(p::IndexableProperty, args...; kwargs...) = memoize!(p, args...; k
 # which has to exist at parse time.
 
 """
+    maybefresh(f, args...; kwargs...)
+
+Dispatch helper used by [`@fresh`](@ref). The default just calls
+`f(args...; kwargs...)`, so non-IP callees (functions, types, callable structs)
+behave like normal calls. The specialization for `IndexableProperty` routes
+through [`fresh`](@ref) — the uncached call — so the indexed property is
+recomputed and the cache is bypassed. The dual of [`maybememoize!`](@ref).
+"""
+maybefresh(f, args...; kwargs...) = f(args...; kwargs...)
+maybefresh(p::IndexableProperty, args...; kwargs...) = fresh(p, args...; kwargs...)
+
+"""
     @memo! expr
 
 Rewrite every call inside `expr` as `maybememoize!(callee, args…)`. At
 runtime `maybememoize!` dispatches: `IndexableProperty` callees go through
 [`memoize!`](@ref) (cached); everything else just calls normally.
 
-`@memo!` is the preferred in-body way to ask for cached access at a call
-site — the marker makes the caching visible to the reader. It is what an
-indexed-property call site should use whenever the result should be memoized.
-For one-shot cached calls outside a `@dynamicstruct` body, call `memoize!`
-directly.
+The bare call form `o.prop(i)` now caches by default, so `@memo!` is the
+explicit, reader-visible equivalent of a bare indexed-property call — and is
+still useful for making the caching intent obvious or for one-shot cached calls
+outside a `@dynamicstruct` body (where you can also call `memoize!` directly).
+To opt OUT and recompute fresh, use [`@fresh`](@ref) / [`fresh`](@ref).
 
 Inside a `@dynamicstruct`, an indexable property `prop(i) = ...` can be
-invoked two different ways:
+invoked these ways:
 
-- `o.prop(i)` — recompute on every call, no caching.
-- `@memo! o.prop(i)` — look up in the in-memory cache, compute (and cache) on miss.
+- `o.prop(i)` — caches by default (look up in the in-memory cache, compute and cache on miss).
+- `@memo! o.prop(i)` — identical to the bare call, but makes the caching explicit at the call site.
+- `@fresh o.prop(i)` — recompute on every call, bypassing the cache entirely.
 
 ```julia
 @memo! o.prop(i)                          # cached access
@@ -1984,20 +2024,44 @@ mutates the per-key in-memory cache. There is no bracket access on
 (the latter never parsed in the first place); use the function forms.
 """
 macro memo!(x)
-    esc(_memo_rewrite(x))
+    esc(_call_rewrite(x, :maybememoize!))
 end
 
-# Recursively rewrite every call site to `maybememoize!(...)`. Plain property
-# accesses (`.foo`, `.bar.baz`) are left untouched — only `:call` heads are
-# transformed. `maybememoize!`'s dispatch decides at runtime whether to
-# memoize (IP) or just call (everything else).
-_memo_rewrite(x) = x
-function _memo_rewrite(x::Expr)
+"""
+    @fresh expr
+
+Rewrite every call inside `expr` as `maybefresh(callee, args…)` — the dual of
+[`@memo!`](@ref). At runtime `maybefresh` dispatches: `IndexableProperty`
+callees go through [`fresh`](@ref) (uncached, recomputed); everything else just
+calls normally.
+
+`@fresh` is the call-site opt-out from the now-default memoized call form: the
+bare call `o.prop(i)` caches, and `@fresh o.prop(i)` recomputes fresh and
+bypasses the cache (no read, no store). For a one-shot fresh call outside a
+`@dynamicstruct` body, call [`fresh`](@ref) directly.
+
+```julia
+@fresh o.prop(i)                          # uncached access
+@fresh o.prop(i; k=v)                     # kwargs forwarded, not cached
+@fresh sort(x.prop(i))                    # the IP call is fresh; `sort` just calls
+```
+"""
+macro fresh(x)
+    esc(_call_rewrite(x, :maybefresh))
+end
+
+# Recursively rewrite every call site to `\$target(...)` (`maybememoize!` for
+# `@memo!`, `maybefresh` for `@fresh`). Plain property accesses (`.foo`,
+# `.bar.baz`) are left untouched — only `:call` heads are transformed. The
+# `target` helper's dispatch decides at runtime whether to act on an IP or just
+# call (everything else).
+_call_rewrite(x, target::Symbol) = x
+function _call_rewrite(x::Expr, target::Symbol)
     if Meta.isexpr(x, :call) && length(x.args) >= 1
-        rewritten = Any[_memo_rewrite(a) for a in x.args]
-        return fixcall(Expr(:call, GlobalRef(@__MODULE__, :maybememoize!), rewritten...))
+        rewritten = Any[_call_rewrite(a, target) for a in x.args]
+        return fixcall(Expr(:call, GlobalRef(@__MODULE__, target), rewritten...))
     end
-    Expr(x.head, Any[_memo_rewrite(a) for a in x.args]...)
+    Expr(x.head, Any[_call_rewrite(a, target) for a in x.args]...)
 end
 
 """
@@ -2218,7 +2282,7 @@ maybeprogress!(progress, ip::IndexableProperty{name}, indices...; kwargs...) whe
 end
 
 # Recursively rewrite every call site to `maybeprogress!($progress_var, …)`.
-# Mirrors `_memo_rewrite`'s shape; orthogonal but stackable.
+# Mirrors `_call_rewrite`'s shape; orthogonal but stackable.
 #
 # `progress_var` is the in-scope identifier the call sites should reference
 # — typically `:__progress__`. Inside a Tb `@progress label body` block
@@ -2230,7 +2294,7 @@ end
 # `@memo!`'s (outside→in), so `@memo! foo(x)` is still a `:macrocall` here —
 # we just recurse into it like any other Expr. The inner `foo(x)` becomes
 # `maybeprogress!(__progress__, foo, x)`. When `@memo!` expands later, its
-# own `_memo_rewrite` sees that `:call` and turns it into
+# own `_call_rewrite` sees that `:call` and turns it into
 # `maybememoize!(maybeprogress!, __progress__, foo, x)`. The
 # `maybememoize!(::typeof(maybeprogress!), …)` dispatch arms (above) then
 # do the right thing at runtime.
@@ -2609,8 +2673,8 @@ function _check_bracket_ip_access!(msgs, type, name::Symbol, info, prop_names, i
         callee in indexed_names || continue
         callee in seen && continue
         push!(seen, callee)
-        short = "`o.$callee[...]`: use `@memo! o.$callee(...)` or `memoize!(o.$callee, ...)` — bracket access on IndexableProperty is no longer supported"
-        long  = "Property `$type.$name` reads `$callee[...]` (bracket access on an `IndexableProperty`). The `ip[args...]` overload has been removed: `ip[; kwargs...]` was never valid Julia syntax (the parser rejects `[; …]`), and Niko hit the gap often enough that the bracket form is gone entirely. Use one of the function forms uniformly: inside a `@dynamicstruct` body, wrap the call site in `@memo! o.$callee(args; kwargs...)`; outside (or when you want the explicit name), call `memoize!(o.$callee, args; kwargs...)` directly. Both go through the same per-key cache the bracket form used."
+        short = "`o.$callee[...]`: use `o.$callee(...)` (now caches by default) — bracket access on IndexableProperty is no longer supported"
+        long  = "Property `$type.$name` reads `$callee[...]` (bracket access on an `IndexableProperty`). The `ip[args...]` overload has been removed: `ip[; kwargs...]` was never valid Julia syntax (the parser rejects `[; …]`), and Niko hit the gap often enough that the bracket form is gone entirely. Use the call form instead: `o.$callee(args; kwargs...)` now caches by default (keyed by args), exactly as the bracket form did — `@memo! o.$callee(...)` / `memoize!(o.$callee, ...)` are explicit equivalents. To recompute fresh and bypass the cache, use `@fresh o.$callee(...)` / `fresh(o.$callee, ...)`."
         push!(msgs, LintMessage(type, name, :warn, short, long, info.lnn))
     end
 end
@@ -4613,8 +4677,8 @@ _parse_macro_opt(a) = error("@dynamicstruct: unsupported option `$a` — use a d
         field                     # fixed field (constructor argument)
         prop = expr               # lazily computed property
         @cached prop = expr       # lazily computed + disk-cached property
-        prop(idx) = expr          # indexable property (fresh each call)
-        prop(args...; kw...) = expr  # indexable property (fresh each call)
+        prop(idx) = expr          # indexable property (cached per args; `@fresh` to bypass)
+        prop(args...; kw...) = expr  # indexable property (cached per args; `@fresh` to bypass)
         @cached prop(idx) = expr  # indexable + disk-cached property (cached per index)
     end
 
@@ -4671,17 +4735,18 @@ e2.result  # loaded from disk (same n → same hash → same cache path)
 ```
 
 ```julia
-# Indexed properties. `obj.prop(args)` is fresh; `@memo! obj.prop(args)` is cached.
+# Indexed properties. `obj.prop(args)` caches by default; `@fresh obj.prop(args)` recomputes.
 # Properties reference each other by bare name (auto-rewritten to __self__.<name>).
 @dynamicstruct struct DataSet
     items = ["apple", "banana", "cherry"]
-    matches(query)   = filter(x -> occursin(query, x), items)   # call: fresh each time
+    matches(query)   = filter(x -> occursin(query, x), items)   # call: cached per query
     top(query; n=1)  = first(matches(query), n)                 # call with kwargs
 end
 
 ds = DataSet()
-ds.matches("an")        # ["banana"] — fresh each call
-@memo! ds.matches("an")  # ["banana"] — cached in the per-property dict
+ds.matches("an")        # ["banana"] — cached in the per-property dict (keyed by args)
+@fresh ds.matches("an")  # ["banana"] — recomputed fresh, bypassing the cache
+fresh(ds.matches, "an")  # ["banana"] — explicit uncached call (outside a @dynamicstruct body)
 ds.top("a"; n=2)        # ["apple", "banana"] — kwargs supported
 ```
 
