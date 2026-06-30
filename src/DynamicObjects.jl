@@ -2321,6 +2321,66 @@ function _fetch_rewrite_kwarg(pv::Symbol, a::Expr)
     return _fetch_rewrite(pv, a)
 end
 
+# True iff `x` is a direct self-property / self-IP access `__self__.name` — the
+# shape `walk_rhs` rewrites a bare sibling reference into.
+_is_self_access(x) = Meta.isexpr(x, :.) && length(x.args) == 2 &&
+    x.args[1] === :__self__ && x.args[2] isa QuoteNode
+
+# `@progress` property-marker self-access rewrite (decision w0rn26 → A).
+#
+# A focused post-`walk_rhs` pass for the `@progress` body-wrap: rewrites ONLY the
+# self-property / self-IP accesses `walk_rhs` already resolved to `__self__.X`,
+# threading `__progress__` (the var the enclosing `Treebars.@progress __status__
+# begin…end` binds) so each self-access hangs its progress node under the ambient
+# phase. Foreign calls, locals, and accesses on other objects are left untouched —
+# this is "less exhaustive than @dynamic_progress": it follows only the
+# property-dependency tree, never wraps foreign work.
+#
+# Distinct from `_fetch_rewrite` (which wraps EVERY call/access): here a self-IP
+# call keeps its `__self__.X` callee LITERAL (not itself rewritten to
+# `maybefetchproperty!`), and only `__self__`-rooted accesses are touched. The
+# `__progress__` references are emitted LITERALLY in source, so Treebars'
+# outside-in `@progress` walker renames them — sidestepping the `fecc238`
+# dangling-`__progress__` footgun that killed the 1-arg `@fetch!`.
+_progress_self_rewrite(x) = x
+function _progress_self_rewrite(x::Expr)
+    # self-IP call `__self__.g(args…)` → `maybefetchindex!(__progress__, __self__.g, args…)`.
+    # Keep the `__self__.g` callee literal; recurse into the args.
+    if Meta.isexpr(x, :call) && length(x.args) >= 1 && _is_self_access(x.args[1])
+        rest = Any[_progress_self_rewrite(a) for a in x.args[2:end]]
+        return fixcall(Expr(:call, GlobalRef(@__MODULE__, :maybefetchindex!),
+            :__progress__, x.args[1], rest...))
+    end
+    # Keyword block: a self dotted-shorthand `; __self__.field` would become a bare
+    # `maybefetchproperty!(…)` call (invalid in keyword position), so route each
+    # element through the self-scoped kwarg handler. Mirrors `_fetch_rewrite`'s
+    # handling of the same edge, scoped to self-accesses.
+    if Meta.isexpr(x, :parameters)
+        return Expr(:parameters, Any[_progress_self_rewrite_kwarg(a) for a in x.args]...)
+    end
+    # bare self-property access `__self__.y` → `maybefetchproperty!(__progress__, __self__, :y)`.
+    if _is_self_access(x)
+        return Expr(:call, GlobalRef(@__MODULE__, :maybefetchproperty!),
+            :__progress__, :__self__, QuoteNode(x.args[2].value))
+    end
+    # Anything else: recurse, leaving foreign calls / locals untouched.
+    Expr(x.head, Any[_progress_self_rewrite(a) for a in x.args]...)
+end
+
+# One `:parameters` element, kept valid keyword syntax — parallels
+# `_fetch_rewrite_kwarg` but scoped to self-accesses. A dotted self-shorthand
+# `; __self__.field` (what `walk_rhs` produces from `; field` for a sibling
+# property) is wrapped back into `field = maybefetchproperty!(…)`; every other
+# shape (incl. a non-self dotted shorthand `; obj.field`, which stays valid under
+# the generic recursion) routes through `_progress_self_rewrite`.
+_progress_self_rewrite_kwarg(a) = _progress_self_rewrite(a)
+function _progress_self_rewrite_kwarg(a::Expr)
+    if _is_self_access(a)
+        return Expr(:kw, a.args[2].value, _progress_self_rewrite(a))
+    end
+    return _progress_self_rewrite(a)
+end
+
 """
     noprogress(f, args...; kwargs...)
 
@@ -4688,6 +4748,29 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                         something(info.lnn, LineNumberNode(0, :unknown)),
                         :__status__,
                         walked_rhs)
+                end
+                # `@progress`-marked (decision w0rn26 → A): wrap the body in
+                # `Treebars.@progress __status__ begin … end` and rewrite the body's
+                # self-property / self-IP accesses to thread `__progress__` (the var
+                # that block binds). The block roots a progress context at the
+                # property's `__status__` (the substatus a parent threaded in;
+                # `nothing` when none → the wrap is a transparent no-op and the
+                # `maybefetch*` calls degrade to `memoize!` / `getproperty`), so the
+                # property's self-accesses hang under the caller's ambient phase —
+                # ambient nesting, behaving like Tb's `@progress`. The self-access
+                # rewrite runs FIRST (on the walked body), so `__progress__` is
+                # literal in the source the `Treebars.@progress` walker then renames;
+                # the wrap is emitted as a qualified `Treebars.@progress` (DO does NOT
+                # export a `@progress` macro — `@progress` is only the parse-marker
+                # the generic `_apply_property_macro!` captures). Direct `maybefetch*`
+                # calls (NOT a nested `@fetch! __progress__ …`) avoid the `fecc238`
+                # outside-in dangling-`__progress__` footgun.
+                if Symbol("@progress") in info.macros
+                    walked_rhs = Expr(:macrocall,
+                        GlobalRef(Treebars, Symbol("@progress")),
+                        something(info.lnn, LineNumberNode(0, :unknown)),
+                        :__status__,
+                        Expr(:block, _progress_self_rewrite(walked_rhs)))
                 end
                 block = Expr(:block,
                     _lnn, Expr(:(=), _call(:compute_property, cp_kwargs...), Expr(:block, _lnn, walked_rhs)),
