@@ -39,7 +39,7 @@ optionally disk-cached properties.
 module DynamicObjects
 export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, set_cache_budget!, cache_budget, cache_bytes, cache_entries, subtree_bytes, subtree_budget, last_evicted, is_pinnable_value
 
-import SHA, Serialization, Mmap
+import SHA, Serialization, Mmap, Treebars
 
 struct DiskCacheLocks
     lock::ReentrantLock
@@ -215,23 +215,69 @@ compute_property(o, ::Val{:__substatus__}, name, args...; kwargs...) =
     _default_substatus(o.__status__, o, name, args...; kwargs...)
 _default_substatus(status, o, name, args...; kwargs...) = nothing
 
-# Substatus lifecycle hooks — overridden by TreebarsExt to forward to
-# `Treebars.finalize_progress!` / `Treebars.fail_progress!`. Default is no-op
-# so DO stays independent of Treebars. Called from ThreadsafeDict's spawn
-# wrapper around `f(s)` to give the substatus the `with_progress` init/run/
-# finalize symmetry it otherwise lacks.
+# Substatus lifecycle hooks — the generic methods are no-ops so DO stays
+# correct with progress disabled (`__status__===nothing`); the
+# `::Treebars.ProgressNode` specializations below forward to Treebars'
+# lifecycle. Called from ThreadsafeDict's spawn wrapper around `f(s)` to give
+# the substatus the `with_progress` init/run/finalize symmetry it otherwise
+# lacks.
 _finalize_substatus!(s) = nothing
 _finalize_substatus!(::Nothing) = nothing
 _fail_substatus!(s, e) = nothing
 _fail_substatus!(::Nothing, e) = nothing
 
-# Disk-load reporting hook — TreebarsExt overrides to set the substatus
-# message to "from disk: <size>". Default no-op. Called from
-# `_computeproperty` just before `Serialization.deserialize` when the cache
-# is `:ready` so the user sees something flash up for big-file loads
-# instead of a silent stall.
+# Disk-load reporting hook — the generic method is a no-op; the
+# `::Treebars.ProgressNode` specialization below sets the substatus message to
+# "from disk: <size>". Called from `_computeproperty` just before
+# `Serialization.deserialize` when the cache is `:ready` so the user sees
+# something flash up for big-file loads instead of a silent stall.
 _report_disk_load!(s, cache_path, size_bytes) = nothing
 _report_disk_load!(::Nothing, _, _) = nothing
+
+# ── Treebars-backed progress (folded from the former weak-dep TreebarsExt;
+# Treebars is now a hard dep, decision w0rn26 → A). These methods light up the
+# progress tree whenever a real `Treebars.ProgressNode` is threaded; with
+# `__status__===nothing` the generic no-op methods above run instead. ──
+
+# Description of a property's substatus node: the property's docstring — the
+# opt-in signal for "label this in the progress tree" — when present, else an
+# empty string, which makes the Treebars node a bare wrapper the renderer
+# inlines (children hoist up; no empty level). This is the `displayed =
+# !isnothing(doc)` rule: undocumented properties add no labelled noise to the
+# tree, documented ones do.
+#
+# `transient` is consumed here (default true → substatus auto-detaches on finalize);
+# it does not reach the property body. Pass transient=false to keep finished substatuses
+# pinned to the parent tree (e.g. for historical "N finished" pill display).
+function _default_substatus(status::Treebars.ProgressNode, o, name, args...; transient=true, kwargs...)
+    # Gate the label PER CALL SIGNATURE: `_is_property_documented` dispatches on
+    # `args...` (one method emitted per declaration — `true` if documented,
+    # `false` if not), so a property with multiple signatures resolves its OWN
+    # doc-presence here — unlike the old `property_doc(metafirst(T, name))`, which
+    # keyed on type+name only and always reflected the first declaration. The
+    # matching `_property_description` override is likewise per-signature, so the
+    # rendered label text is the right signature's docstring. (Structs expanded by
+    # an older DO carry no overrides and hit the `_is_property_documented` default,
+    # which reproduces that historic first-sig gate — no regression; the per-sig
+    # fix rolls in as each struct is re-expanded.)
+    desc = _is_property_documented(o, Val(name), args...; kwargs...) ?
+        something(_property_description(o, Val(name), args...; kwargs...), "") : ""
+    Treebars.initialize_progress!(status; description=desc, transient)
+end
+
+# Lifecycle hooks — give DO's ThreadsafeDict-spawned substatuses the with_progress
+# init/run/finalize symmetry. Success path calls finalize (which detaches transient
+# nodes from the tree); failure path calls fail (which leaves failed nodes pinned
+# so they stay visible until retry_failed clears them).
+_finalize_substatus!(s::Treebars.ProgressNode) = Treebars.finalize_progress!(s)
+_fail_substatus!(s::Treebars.ProgressNode, e) = Treebars.fail_progress!(s, e)
+
+# Disk-load reporting — set the substatus message to a human-readable
+# "from disk: <size>" so big-file loads show up in the tree instead of
+# stalling silently. Description stays as the property label; message
+# is the running annotation Treebars renders alongside.
+_report_disk_load!(s::Treebars.ProgressNode, cache_path, size_bytes) =
+    Treebars.update_progress!(s, "from disk: " * _format_size(size_bytes))
 
 # Format a byte count as "1.2 MB" / "850 KB" / "42 B" for human-readable
 # progress messages.
@@ -1251,6 +1297,74 @@ falls through to `getproperty(o, name)`.
 """
 fetchproperty!(::Nothing, o, name::Symbol) = getproperty(o, name)
 
+# ── Treebars-backed `fetch*!` (folded from the former weak-dep TreebarsExt;
+# Treebars is now a hard dep, decision w0rn26 → A). The `::Treebars.ProgressNode`
+# methods memoize AND mount the inner property's progress subtree under the
+# threaded node; `fetch*!(::Nothing, …)` above are the progress-disabled
+# degrade paths. ──
+
+# In-memory cache hit rendering (decision 1it9aqq → reworked; supersedes the
+# generic "read from memory cache" wrapper).
+#
+# `fetchindex`/`fetchproperty` follow the contract: the callback's `rv` is a
+# `Task` while the computation is in flight, and the cached VALUE once it is done.
+# So at callback entry `!(rv isa Task)` means the value was already in the
+# in-memory cache — a hit. On a DOCUMENTED in-memory hit we KEEP the original
+# node `s` and its ENTIRE sub-step subtree intact, and swap ONLY the subtree
+# ROOT's LABEL — appending " (cached)" in place — so it renders e.g.
+# "Compute subject data (cached) — done (13s)" (carrying `s`'s own frozen
+# ORIGINAL-compute duration) with all of `s`'s sub-steps rendering beneath it,
+# unchanged.
+#
+# In-place relabel (vs. a new born-finished root with the children re-homed) is
+# the correct mechanism here: `s` is SHARED per cache key (`getstatus` returns
+# the same node to every status tree / poll). Re-homing `s`'s children into a new
+# node would EMPTY `s.children`, so a second status tree hitting the same shared
+# `s` would build a CHILDLESS "(cached)" node — exactly the collapsed-subtree bug
+# this corrects. Relabeling `s` itself keeps the one shared subtree intact for all
+# trees, preserves children's (immutable) parent pointers, and mirrors
+# `_report_disk_load!` above, which already mutates the shared `s`'s display state
+# in place.
+#
+# UNDOCUMENTED hit (`s.impl.description` empty): no relabel — `s` stays a bare
+# wrapper the renderer inlines away. Running (`rv isa Task`) and no-substatus
+# (`s === nothing`): no relabel. All four paths then attach `s` via `add_child!`
+# (idempotent on the `ThreadsafeSet`; no-op on `nothing`).
+const _CACHED_SUFFIX = " (cached)"
+
+function _attach_fetched!(status::Treebars.ProgressNode, rv, s)
+    if !(rv isa Task) && !isnothing(s) && !isempty(s.impl.description)
+        _mark_cached!(s)                   # documented in-memory hit → relabel root in place
+    end
+    Treebars.add_child!(status, s)         # keep/attach the subtree root (no-op on `nothing`)
+    nothing
+end
+
+# Append the "(cached)" suffix to `s`'s description exactly once. Idempotent under
+# repeat polls (web routes poll the tree repeatedly and re-fetch the same shared
+# `s`) via the `endswith` guard, and locked on `s.impl.lock` so concurrent first
+# hits cannot double-append. `s` is finished/frozen on a hit, so the visible
+# duration stays the frozen original-compute time.
+function _mark_cached!(s::Treebars.ProgressNode)
+    sp = s.impl
+    lock(sp.lock) do
+        endswith(sp.description, _CACHED_SUFFIX) || (sp.description *= _CACHED_SUFFIX)
+    end
+    nothing
+end
+
+fetchindex!(status::Treebars.ProgressNode, ip, indices...; fetch=Base.fetch, kwargs...) =
+    fetchindex(ip, indices...; kwargs...) do rv, s
+        _attach_fetched!(status, rv, s)
+        fetch(rv)
+    end
+
+fetchproperty!(status::Treebars.ProgressNode, o, name::Symbol) =
+    fetchproperty(o, name) do rv, s
+        _attach_fetched!(status, rv, s)
+        Base.fetch(rv)
+    end
+
 maybepop!(c::AbstractDict, key) = haskey(c, key) && pop!(c, key)
 maybepop!(c::AbstractThreadsafeDict, key) = begin
     lock(c.lock) do
@@ -2211,6 +2325,66 @@ function _fetch_rewrite_kwarg(pv::Symbol, a::Expr)
         return Expr(:kw, a.args[2].value, _fetch_rewrite(pv, a))
     end
     return _fetch_rewrite(pv, a)
+end
+
+# True iff `x` is a direct self-property / self-IP access `__self__.name` — the
+# shape `walk_rhs` rewrites a bare sibling reference into.
+_is_self_access(x) = Meta.isexpr(x, :.) && length(x.args) == 2 &&
+    x.args[1] === :__self__ && x.args[2] isa QuoteNode
+
+# `@progress` property-marker self-access rewrite (decision w0rn26 → A).
+#
+# A focused post-`walk_rhs` pass for the `@progress` body-wrap: rewrites ONLY the
+# self-property / self-IP accesses `walk_rhs` already resolved to `__self__.X`,
+# threading `__progress__` (the var the enclosing `Treebars.@progress __status__
+# begin…end` binds) so each self-access hangs its progress node under the ambient
+# phase. Foreign calls, locals, and accesses on other objects are left untouched —
+# this is "less exhaustive than @dynamic_progress": it follows only the
+# property-dependency tree, never wraps foreign work.
+#
+# Distinct from `_fetch_rewrite` (which wraps EVERY call/access): here a self-IP
+# call keeps its `__self__.X` callee LITERAL (not itself rewritten to
+# `maybefetchproperty!`), and only `__self__`-rooted accesses are touched. The
+# `__progress__` references are emitted LITERALLY in source, so Treebars'
+# outside-in `@progress` walker renames them — sidestepping the `fecc238`
+# dangling-`__progress__` footgun that killed the 1-arg `@fetch!`.
+_progress_self_rewrite(x) = x
+function _progress_self_rewrite(x::Expr)
+    # self-IP call `__self__.g(args…)` → `maybefetchindex!(__progress__, __self__.g, args…)`.
+    # Keep the `__self__.g` callee literal; recurse into the args.
+    if Meta.isexpr(x, :call) && length(x.args) >= 1 && _is_self_access(x.args[1])
+        rest = Any[_progress_self_rewrite(a) for a in x.args[2:end]]
+        return fixcall(Expr(:call, GlobalRef(@__MODULE__, :maybefetchindex!),
+            :__progress__, x.args[1], rest...))
+    end
+    # Keyword block: a self dotted-shorthand `; __self__.field` would become a bare
+    # `maybefetchproperty!(…)` call (invalid in keyword position), so route each
+    # element through the self-scoped kwarg handler. Mirrors `_fetch_rewrite`'s
+    # handling of the same edge, scoped to self-accesses.
+    if Meta.isexpr(x, :parameters)
+        return Expr(:parameters, Any[_progress_self_rewrite_kwarg(a) for a in x.args]...)
+    end
+    # bare self-property access `__self__.y` → `maybefetchproperty!(__progress__, __self__, :y)`.
+    if _is_self_access(x)
+        return Expr(:call, GlobalRef(@__MODULE__, :maybefetchproperty!),
+            :__progress__, :__self__, QuoteNode(x.args[2].value))
+    end
+    # Anything else: recurse, leaving foreign calls / locals untouched.
+    Expr(x.head, Any[_progress_self_rewrite(a) for a in x.args]...)
+end
+
+# One `:parameters` element, kept valid keyword syntax — parallels
+# `_fetch_rewrite_kwarg` but scoped to self-accesses. A dotted self-shorthand
+# `; __self__.field` (what `walk_rhs` produces from `; field` for a sibling
+# property) is wrapped back into `field = maybefetchproperty!(…)`; every other
+# shape (incl. a non-self dotted shorthand `; obj.field`, which stays valid under
+# the generic recursion) routes through `_progress_self_rewrite`.
+_progress_self_rewrite_kwarg(a) = _progress_self_rewrite(a)
+function _progress_self_rewrite_kwarg(a::Expr)
+    if _is_self_access(a)
+        return Expr(:kw, a.args[2].value, _progress_self_rewrite(a))
+    end
+    return _progress_self_rewrite(a)
 end
 
 """
@@ -4605,6 +4779,29 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                         :__status__,
                         walked_rhs)
                 end
+                # `@progress`-marked (decision w0rn26 → A): wrap the body in
+                # `Treebars.@progress __status__ begin … end` and rewrite the body's
+                # self-property / self-IP accesses to thread `__progress__` (the var
+                # that block binds). The block roots a progress context at the
+                # property's `__status__` (the substatus a parent threaded in;
+                # `nothing` when none → the wrap is a transparent no-op and the
+                # `maybefetch*` calls degrade to `memoize!` / `getproperty`), so the
+                # property's self-accesses hang under the caller's ambient phase —
+                # ambient nesting, behaving like Tb's `@progress`. The self-access
+                # rewrite runs FIRST (on the walked body), so `__progress__` is
+                # literal in the source the `Treebars.@progress` walker then renames;
+                # the wrap is emitted as a qualified `Treebars.@progress` (DO does NOT
+                # export a `@progress` macro — `@progress` is only the parse-marker
+                # the generic `_apply_property_macro!` captures). Direct `maybefetch*`
+                # calls (NOT a nested `@fetch! __progress__ …`) avoid the `fecc238`
+                # outside-in dangling-`__progress__` footgun.
+                if Symbol("@progress") in info.macros
+                    walked_rhs = Expr(:macrocall,
+                        GlobalRef(Treebars, Symbol("@progress")),
+                        something(info.lnn, LineNumberNode(0, :unknown)),
+                        :__status__,
+                        Expr(:block, _progress_self_rewrite(walked_rhs)))
+                end
                 block = Expr(:block,
                     _lnn, Expr(:(=), _call(:compute_property, cp_kwargs...), Expr(:block, _lnn, walked_rhs)),
                     _lnn, Expr(:(=), _call(:iscached), Expr(:block, _lnn, iscached_val)),
@@ -4797,7 +4994,7 @@ ds.top("a"; n=2)        # ["apple", "banana"] — kwargs supported
 With `cache_type=:parallel`, indexed properties spawn background `Task`s.
 Define `__status__` (root progress node) to automatically wire progress into
 spawned tasks. A default `__substatus__` is provided that creates child progress
-nodes when Treebars is loaded (via the TreebarsExt extension):
+nodes (Treebars is a hard dependency):
 
 ```julia
 @dynamicstruct struct MyApp
