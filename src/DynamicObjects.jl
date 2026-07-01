@@ -4805,11 +4805,19 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 # calls (NOT a nested `@fetch! __progress__ …`) avoid the `fecc238`
                 # outside-in dangling-`__progress__` footgun.
                 if Symbol("@progress") in info.macros
+                    # Pass the rewritten body to Treebars.@progress. If it is already a
+                    # block, pass it DIRECTLY — wrapping a block inside another block
+                    # buries inline `@progress "phase"` markers one level deep, and Tb
+                    # requires a phase marker to be a DIRECT statement of the enclosing
+                    # @progress block (else: "phase marker must be a direct statement of
+                    # an enclosing @progress block"). Only a bare-expr body needs a fresh
+                    # block wrapper.
+                    _rewritten = _progress_self_rewrite(walked_rhs)
                     walked_rhs = Expr(:macrocall,
                         GlobalRef(Treebars, Symbol("@progress")),
                         something(info.lnn, LineNumberNode(0, :unknown)),
                         :__status__,
-                        Expr(:block, _progress_self_rewrite(walked_rhs)))
+                        Meta.isexpr(_rewritten, :block) ? _rewritten : Expr(:block, _rewritten))
                 end
                 block = Expr(:block,
                     _lnn, Expr(:(=), _call(:compute_property, cp_kwargs...), Expr(:block, _lnn, walked_rhs)),
