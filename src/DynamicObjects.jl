@@ -1777,11 +1777,16 @@ If multiple objects with the same hash are writing here concurrently, this may i
                 # it is also defeated when the memo key (call args) is finer-grained
                 # than the disk key (content hash) under an input-normalizing
                 # constructor. `trylock` atomically rejects the second-caller race
-                # (the prior `islocked` + `lock(...) do` pair was racy). Kept a hard,
-                # blocking error by design (decision 1hz5p6b) — it points at the
-                # interning gap; do NOT soften it to block-and-read.
+                # (the prior `islocked` + `lock(...) do` pair was racy). On a race we
+                # now WARN and block-and-read: this was a hard error under decision
+                # 1hz5p6b, but the user reversed that 2026-07-01 (no longer wanted as
+                # an error — still logged). After the warning we `lock(path_lock)`, so
+                # the try/finally below always runs holding the lock: the racing caller
+                # waits for the writer, then reads the now-ready cache (or recomputes if
+                # the writer failed to save). The warning still surfaces the interning
+                # gap (N content-equal instances not interned to one).
                 if !trylock(path_lock)
-                    error("""Concurrent access to disk cache $cache_path — \
+                    @warn("""Concurrent access to disk cache $cache_path — \
                           N distinct but content-equal instances of \
                           $(nameof(typeof(o))) are racing this cache file instead \
                           of being interned to one. In-memory memoization is \
@@ -1793,6 +1798,7 @@ If multiple objects with the same hash are writing here concurrently, this may i
                           two arg-sets collapse to one cache file but stay two \
                           un-shared instances.
 $_cache_context""")
+                    lock(path_lock)
                 end
                 try
                     cache_status = get_cache_status(cache_path)
