@@ -1770,19 +1770,28 @@ If multiple objects with the same hash are writing here concurrently, this may i
             disk_locks = _disk_cache(o, vname)
             rv = if __strict__ && !isnothing(disk_locks)
                 path_lock = get_path_lock!(disk_locks, cache_path)
-                # Concurrent access to the same cache file is upstream user
-                # error: N copies of the same logical object are racing the
-                # same disk file instead of sharing one memoized result.
-                # `trylock` atomically rejects the second-caller race (where
-                # the prior `islocked` + `lock(...) do` pair was racy) and
-                # the error names the type to point the user at the missing
-                # `@memo` construction site.
+                # Concurrent access to the same cache file means N distinct but
+                # content-equal instances of this type are racing the same disk
+                # file instead of being interned to one shared instance. In-memory
+                # memoization is per-instance and cannot dedup content-equal copies;
+                # it is also defeated when the memo key (call args) is finer-grained
+                # than the disk key (content hash) under an input-normalizing
+                # constructor. `trylock` atomically rejects the second-caller race
+                # (the prior `islocked` + `lock(...) do` pair was racy). Kept a hard,
+                # blocking error by design (decision 1hz5p6b) — it points at the
+                # interning gap; do NOT soften it to block-and-read.
                 if !trylock(path_lock)
                     error("""Concurrent access to disk cache $cache_path — \
-                          this almost always means the construction site for \
-                          $(nameof(typeof(o))) needs an `@memo!` so the same \
-                          logical object is not being computed in N copies \
-                          racing the same cache file.
+                          N distinct but content-equal instances of \
+                          $(nameof(typeof(o))) are racing this cache file instead \
+                          of being interned to one. In-memory memoization is \
+                          per-instance and cannot dedup content-equal copies; \
+                          intern the object at its construction site so the value \
+                          is computed once. A common subtle cause: the memo key \
+                          (call args) is finer-grained than the disk key (content \
+                          hash) because the constructor normalizes its inputs, so \
+                          two arg-sets collapse to one cache file but stay two \
+                          un-shared instances.
 $_cache_context""")
                 end
                 try
