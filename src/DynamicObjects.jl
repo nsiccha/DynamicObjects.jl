@@ -1819,6 +1819,9 @@ $_cache_context""")
                         @debug "Generating $cache_path...\n$_cache_context"
                         rv = compute_property(o, vname, indices...; _status_kw..., (name=>rv, )..., kwargs...)
                         _atomic_save(_disk_format(o, vname), cache_path, rv)
+                        if _disk_format(o, vname) == Val(:mmap)
+                            rv = load(Val(:mmap), cache_path, _disk_eltype(o, vname))
+                        end
                     end
                     rv
                 finally
@@ -1849,6 +1852,9 @@ $_cache_context""")
                     @debug "Generating $cache_path...\n$_cache_context"
                     rv = compute_property(o, vname, indices...; _status_kw..., (name=>rv, )..., kwargs...)
                     _atomic_save(_disk_format(o, vname), cache_path, rv)
+                    if _disk_format(o, vname) == Val(:mmap)
+                        rv = load(Val(:mmap), cache_path, _disk_eltype(o, vname))
+                    end
                 end
                 rv
             end
