@@ -34,4 +34,18 @@ function DynamicObjects.load(::Val{:mmap}, path::AbstractString, ::Type{DataFram
     DataFrame(Arrow.Table(path); copycols=false)
 end
 
+# Content-canonical hash key for a bare `DataFrame` in `hash_fields`. Without
+# this, the generic `_hash_replace(x) = x` fallthrough serializes the df
+# whole — including its `colindex` Dict, table/col metadata, and any
+# view/lazy column wrappers, all of which are process-varying structural
+# state, not content. Reducing to names + densified columns strips that
+# state while keeping logical content — the same collapse a `Matrix(df)`
+# workaround relies on, but keeps column names and doesn't `Any`-promote
+# heterogeneous columns. `collect` deliberately keeps `CategoricalValue`s
+# as-is (no CategoricalArrays dep here) — they hash stably through
+# Serialization. This is cross-process stability only; cross-version
+# stability is out of scope.
+DynamicObjects._hash_replace(df::AbstractDataFrame) =
+    (string.(names(df)), [collect(c) for c in eachcol(df)])
+
 end

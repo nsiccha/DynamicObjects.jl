@@ -1,4 +1,4 @@
-using TestModules, Random, DynamicObjects, Serialization
+using TestModules, Random, DynamicObjects, Serialization, Arrow, DataFrames
 import DynamicObjects: @persist, entries, cached_entries, clear_all_caches!, PersistentSet, accessed_keys, record_access!
 
 # --- Struct definitions (hoisted to module scope) ---
@@ -786,6 +786,29 @@ end
     getfield(leaves[1], :cache)[:junk] = :junk
     p_tup2 = HashParentTuple(leaves, 0)
     @test p_tup2.hash == h_tup
+end
+
+@testset "DataFrame hash canonicalization" begin
+    # Ext-provided _hash_replace(::AbstractDataFrame). Shape assertion
+    # doubles as a load guard: if the ext failed to load, _hash_replace(df)
+    # would hit the generic `_hash_replace(x) = x` fallthrough and return
+    # the df itself, failing this destructure loudly rather than passing
+    # vacuously.
+    df1 = DataFrame(a=[1, 2, 3], b=["x", "y", "z"])
+    df2 = DataFrame(a=[1, 2, 3], b=["x", "y", "z"])
+
+    names_rep, cols_rep = DynamicObjects._hash_replace(df1)
+    @test names_rep isa Vector{String}
+    @test names_rep == ["a", "b"]
+    @test cols_rep isa Vector
+    @test cols_rep == [[1, 2, 3], ["x", "y", "z"]]
+
+    h1 = DynamicObjects.persistent_hash(DynamicObjects._hash_replace(df1))
+    h2 = DynamicObjects.persistent_hash(DynamicObjects._hash_replace(df2))
+    @test h1 == h2  # stable across two independent constructions
+
+    h_copy = DynamicObjects.persistent_hash(DynamicObjects._hash_replace(df1[:, :]))
+    @test h1 == h_copy  # equal for df vs df[:, :]
 end
 
 @testset "Cache versioning" begin
