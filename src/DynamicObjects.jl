@@ -1878,6 +1878,21 @@ $_cache_context""")
         ))
     end
 end
+# Fast, closure-free cache peek for the bare-property hit path in
+# `getorcomputeproperty`. Returns the cached value, or `_missing_sentinel` on a
+# miss. Uses explicit lock/unlock (not `lock() do`) to keep the hot hit path
+# allocation-free; mirrors the fast-path read in `get!(::AbstractThreadsafeDict)`.
+_peek_hit(pc::PropertyCache, name::Symbol) = _peek_hit(getfield(pc, :cache), name)
+function _peek_hit(c::AbstractThreadsafeDict, name::Symbol)
+    lock(c.lock)
+    try
+        return get(c.cache, name, _missing_sentinel)
+    finally
+        unlock(c.lock)
+    end
+end
+_peek_hit(c::AbstractDict, name::Symbol) = get(c, name, _missing_sentinel)
+
 getorcomputeproperty(o, name, indices...; kwargs...) = if hasfield(typeof(o), name)
     @assert length(indices) == length(kwargs) == 0
     getfield(o, name)
@@ -1892,13 +1907,22 @@ elseif !isempty(indices) || !isempty(kwargs)
     # owns kwargs-keyed caching for indexed properties; we just hand off.
     _computeproperty(o, name, indices...; __status__, kwargs...)
 else
+    cache = getfield(o, :cache)
+    # Fast hit path: a cached bare property returns WITHOUT building the
+    # `substatus` factory or the `get!` do-block closure below — both allocate
+    # on every access and were the dominant warm-access cost. Hit bookkeeping is
+    # a no-op (`_on_hit!` / `_record_pc_hit!`), so returning the cached value
+    # directly is behaviourally identical to routing through `get!`. Only misses
+    # pay the closures.
+    hit = _peek_hit(cache, name)
+    hit === _missing_sentinel || return hit
     substatus_f = _bare_substatus_f(o, name)
-    get!(getfield(o, :cache), name; substatus=substatus_f) do s
+    get!(cache, name; substatus=substatus_f) do s
         # When called with no indices on an indexed property (declared with
         # call/ref syntax, e.g. `x() = ...` or `x[i] = ...`), return an
         # IndexableProperty wrapper instead of calling compute_property.
         if is_indexed_property(o, name)
-            return IndexableProperty(name, o, subcache(getfield(o, :cache), typeof(o), Val(name)))
+            return IndexableProperty(name, o, subcache(cache, typeof(o), Val(name)))
         end
         # `s` is the substatus the spawn wrapper passed (or `nothing` when
         # `substatus_f` was nothing). Pass it as `__status__` so the body
