@@ -353,18 +353,18 @@ end
     @test @cache_status(c.result) == :unstarted
     val2 = c.result
     @test @is_cached c.result
-    @test c.indexed[3] == 9
-    @test c.indexed[4] == 16
-    @test @is_cached c.indexed[3]
-    @test @is_cached c.indexed[4]
-    @clear_cache! c.indexed[3]
-    @test @cache_status(c.indexed[3]) == :unstarted
-    @test @is_cached c.indexed[4]
-    c.indexed[3]
-    @test @is_cached c.indexed[3]
+    @test c.indexed(3) == 9
+    @test c.indexed(4) == 16
+    @test @is_cached c.indexed(3)
+    @test @is_cached c.indexed(4)
+    @clear_cache! c.indexed(3)
+    @test @cache_status(c.indexed(3)) == :unstarted
+    @test @is_cached c.indexed(4)
+    c.indexed(3)
+    @test @is_cached c.indexed(3)
     @clear_cache! c.indexed
-    @test @cache_status(c.indexed[3]) == :unstarted
-    @test @cache_status(c.indexed[4]) == :unstarted
+    @test @cache_status(c.indexed(3)) == :unstarted
+    @test @cache_status(c.indexed(4)) == :unstarted
 end
 
 @testset "Constructor named parameters" begin
@@ -437,14 +437,14 @@ end
 @testset "Indexable properties" begin
     _idx_path[] = mktempdir()
     s = Idx()
-    @test s.i[5]        == 5
-    @test s.i[10]       == 10
-    @test @cache_status(s.ci[3]) == :unstarted
-    @test s.ci[3]       == 9
-    @test @cache_status(s.ci[3]) == :ready
-    @test @cache_status(s.ci3[1, 2, 3]) == :unstarted
-    @test s.ci3[1, 2, 3] == 321
-    @test @cache_status(s.ci3[1, 2, 3]) == :ready
+    @test s.i(5)        == 5
+    @test s.i(10)       == 10
+    @test @cache_status(s.ci(3)) == :unstarted
+    @test s.ci(3)       == 9
+    @test @cache_status(s.ci(3)) == :ready
+    @test @cache_status(s.ci3(1, 2, 3)) == :unstarted
+    @test s.ci3(1, 2, 3) == 321
+    @test @cache_status(s.ci3(1, 2, 3)) == :ready
     @test isa(s.ci3, DynamicObjects.IndexableProperty)
 end
 
@@ -452,21 +452,21 @@ end
     s = AllDefaults()
     @test isa(s.item, DynamicObjects.IndexableProperty)
     @test isa(s.multi, DynamicObjects.IndexableProperty)
-    @test s.item["hello"] == "got: hello"
-    @test s.multi[10, 20] == 30
-    @test s.item["default"] == "got: default"
-    @test s.multi[1, 2] == 3
+    @test s.item("hello") == "got: hello"
+    @test s.multi(10, 20) == 30
+    @test s.item("default") == "got: default"
+    @test s.multi(1, 2) == 3
 end
 
-@testset "Call vs bracket caching" begin
+@testset "Call caching" begin
     _call_vs_bracket_counter[] = 0
     s = CallVsBracket()
     _call_vs_bracket_counter[] = 0
-    @test s.counted[5] == 10
+    @test s.counted(5) == 10
     @test _call_vs_bracket_counter[] == 1
-    @test s.counted[5] == 10
+    @test s.counted(5) == 10
     @test _call_vs_bracket_counter[] == 1
-    @test s.counted[6] == 12
+    @test s.counted(6) == 12
     @test _call_vs_bracket_counter[] == 2
 end
 
@@ -477,7 +477,7 @@ end
     par = Par(; cache_type = :parallel)
     vals_par = asyncmap(_ -> par.slow, 1:6)
     @test length(unique(vals_par)) == 1
-    vals_idx = asyncmap(i -> par.slowi[i], 1:6)
+    vals_idx = asyncmap(i -> par.slowi(i), 1:6)
     @test length(unique(vals_idx)) == 6
 end
 
@@ -497,27 +497,27 @@ end
     @test serial_d1.d == 1
     serial_d1 = D1()
     @test serial_d1.d == 1
-    @test serial_d1.i[1] == 1
-    @test @cache_status(serial_d1.ci[2]) == :unstarted
-    @test serial_d1.ci[2] == 4
-    @test @cache_status(serial_d1.ci[2]) == :ready
-    @test @cache_status(serial_d1.ci3[1, 2, 3]) == :unstarted
-    @test serial_d1.ci3[1, 2, 3] == 321
+    @test serial_d1.i(1) == 1
+    @test @cache_status(serial_d1.ci(2)) == :unstarted
+    @test serial_d1.ci(2) == 4
+    @test @cache_status(serial_d1.ci(2)) == :ready
+    @test @cache_status(serial_d1.ci3(1, 2, 3)) == :unstarted
+    @test serial_d1.ci3(1, 2, 3) == 321
     @test isa(serial_d1.ci3, DynamicObjects.IndexableProperty)
-    @test @cache_status(serial_d1.ci3[1, 2, 3]) == :ready
+    @test @cache_status(serial_d1.ci3(1, 2, 3)) == :ready
     @test Threads.nthreads() == 1 || length(unique(asyncmap(i -> serial_d1.parallel_test, 1:10))) > 1
     parallel_d1 = D1(; cache_type = :parallel)
     @test length(unique(asyncmap(i -> parallel_d1.parallel_test, 1:10))) == 1
-    @test length(unique(asyncmap(i -> parallel_d1.parallel_testi[i], 1:10))) == 10
+    @test length(unique(asyncmap(i -> parallel_d1.parallel_testi(i), 1:10))) == 10
 end
 
 @testset "Property assignment in RHS" begin
     _assign_in_rhs_path[] = mktempdir()
     s = AssignInRhs(1)
     @test s.flag == false
-    s.toggle["go"]
+    s.toggle("go")
     @test s.flag == true
-    s.toggle["go2"]
+    s.toggle("go2")
     @test s.flag == false
 end
 
@@ -536,7 +536,7 @@ end
 
 @testset "fetchindex" begin
     app = AsyncApp(; cache_type=:parallel)
-    @test app.slow[3] == 6
+    @test app.slow(3) == 6
     seen_task = Ref(false)
     result = fetchindex(app.slow, 42) do rv, status
         if isa(rv, Task)
@@ -576,7 +576,7 @@ end
     _persistable_path[] = mktempdir()
     s = Persistable()
     @test s.counter == 0
-    s.increment["go"]
+    s.increment("go")
     @test s.counter == 1
     s2 = Persistable(; cache_path=_persistable_path[])
     @test s2.counter == 1
@@ -592,24 +592,28 @@ end
 
     # Serial: indexed property
     f2 = FailingProps()
-    err2 = (@test_throws DynamicObjects.PropertyComputationError f2.will_fail_indexed["abc"]).value
+    err2 = (@test_throws DynamicObjects.PropertyComputationError f2.will_fail_indexed("abc")).value
     @test err2.property == :will_fail_indexed
     @test err2.indices == ("abc",)
 
-    # Parallel: indexed property (TaskFailedException wrapped)
+    # Parallel: indexed property. The blocking bare call computes synchronously
+    # (fetch defaults to Base.fetch), so it surfaces the PropertyComputationError
+    # DIRECTLY — no TaskFailedException wrapper — converging with the serial path
+    # (commit 0e07742, synchronous compute on the blocking-default get! path).
+    # A TaskFailedException is only observable via non-blocking access
+    # (fetch=identity), which fetches the spawned task explicitly.
     pf = FailingProps(; cache_type=:parallel)
-    err3 = (@test_throws Base.TaskFailedException pf.will_fail_indexed["xyz"]).value
-    inner = err3.task.exception
-    @test inner isa DynamicObjects.PropertyComputationError
-    @test inner.property == :will_fail_indexed
-    @test DynamicObjects.unwrap_error(inner) isa ErrorException
+    err3 = (@test_throws DynamicObjects.PropertyComputationError pf.will_fail_indexed("xyz")).value
+    @test err3.property == :will_fail_indexed
+    @test err3.indices == ("xyz",)
+    @test DynamicObjects.unwrap_error(err3) isa ErrorException
 end
 
 @testset "entries / cached_entries" begin
     app = EntriesApp(; cache_type=:parallel)
     # Compute some values
-    @test app.slow[1] == 2
-    @test app.slow[2] == 4
+    @test app.slow(1) == 2
+    @test app.slow(2) == 4
     es = entries(app.slow)
     @test length(es) == 2
     @test all(e -> e.state == :done, es)
@@ -624,12 +628,12 @@ end
     _clearall_path[] = mktempdir()
     app = ClearAllApp()
     @test app.a == 42
-    @test app.b[3] == 6
+    @test app.b(3) == 6
     @test @is_cached app.a
-    @test @is_cached app.b[3]
+    @test @is_cached app.b(3)
     clear_all_caches!(app)
     @test @cache_status(app.a) == :unstarted
-    @test @cache_status(app.b[3]) == :unstarted
+    @test @cache_status(app.b(3)) == :unstarted
     # uncached property still works
     @test app.uncached == 99
 end
@@ -662,14 +666,14 @@ end
     ak = accessed_keys(app.result)
     @test isempty(ak)
     # Access some keys
-    @test app.result[3] == 9
-    @test app.result[5] == 25
+    @test app.result(3) == 9
+    @test app.result(5) == 25
     ak = accessed_keys(app.result)
     @test length(ak) == 2
     @test ((3,), (;)) in ak
     @test ((5,), (;)) in ak
     # Accessing same key again doesn't duplicate
-    @test app.result[3] == 9
+    @test app.result(3) == 9
     ak = accessed_keys(app.result)
     @test length(ak) == 2
     # New instance with same cache_path sees the same keys
@@ -693,8 +697,8 @@ end
 
 @testset "cached_entries on plain Dict" begin
     app = CallVsBracket()
-    app.counted[1]
-    app.counted[2]
+    app.counted(1)
+    app.counted(2)
     ce = cached_entries(app.counted)
     @test length(ce) == 2
     @test Set(v for (_, v) in ce) == Set([2, 4])
