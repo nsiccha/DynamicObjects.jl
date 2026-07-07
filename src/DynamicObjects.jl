@@ -1971,6 +1971,25 @@ else
         _computeproperty(o, name; __status__=s)
     end
 end
+
+# `getproperty` is emitted as a tiny shim `getproperty(o,name) = _getprop(o, Val(name))`.
+# Dispatching on `Val{name}` makes `name` a STATIC parameter, so
+# `hasfield(typeof(o), name)` is a compile-time constant — the fold is
+# GUARANTEED, not merely const-prop-dependent: at a literal `o.x`, const-prop
+# carries `:x` through the shim, the `Val{:x}` method specializes, `hasfield`
+# folds, and a FIXED field reduces to a type-stable `getfield` (so `o.x` infers
+# as its declared type instead of `Any`). Val is injected HERE, in the shim —
+# NOT at the `__self__.x` callsite: the emitted access FORM stays a dot
+# expression, so `_is_self_access` / `_progress_self_rewrite` and the
+# HTMXObjects routing layer keep seeing it. This `Val{name}` entry point is also
+# where per-name typed-slot dispatch will hang off next. A runtime-`Symbol`
+# access (e.g. HTMXObjects URL routing) can't fold — it pays a `Val`
+# construction + dynamic dispatch, then takes the same branch. Behaviourally
+# IDENTICAL to `getorcomputeproperty(o, name)` for every `name`: a fixed field's
+# `getorcomputeproperty` already IS `getfield` (line ~1938).
+@inline _getprop(o, ::Val{name}) where {name} =
+    hasfield(typeof(o), name) ? getfield(o, name) : getorcomputeproperty(o, name)
+
 _bare_substatus_f(o, name) =
     if name != :__substatus__ && name != :__status__ &&
        !(startswith(string(name), "__") && endswith(string(name), "__")) &&
@@ -4699,7 +4718,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         (is_child ? :($type) : :(Base.@__doc__ $type)),
         quote
             $Base.hasproperty(__self__::$type, name::Symbol) = name in $(Tuple(prop_names))
-            $Base.getproperty(__self__::$type, name::Symbol) = $getorcomputeproperty(__self__, name)
+            $Base.getproperty(__self__::$type, name::Symbol) = $_getprop(__self__, $(Val)(name))
             $Base.setproperty!(__self__::$type, name::Symbol, value) = getfield(__self__, :cache)[name] = value
             $DynamicObjects.meta(::Type{$type}) = $properties
             $DynamicObjects.is_generated_property(::$type, name::Symbol) = name in $generated_names
