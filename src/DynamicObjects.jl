@@ -197,17 +197,24 @@ _disk_eltype(o, ::Val) = nothing
 
 iscached(o, ::Val) = false
 cache_version(o, ::Val) = nothing
-compute_property(o, ::Val{:hash_fields}) = ntuple(Base.Fix1(getfield, o), fieldcount(typeof(o))-1)
-compute_property(o, ::Val{:hash}) = persistent_hash((typeof(o), _hash_replace(o.hash_fields)))
-# Shallow walker used only by the :hash compute. Leaves non-DO values
+compute_property(o, ::Val{:__hash_fields__}) = ntuple(Base.Fix1(getfield, o), fieldcount(typeof(o))-1)
+compute_property(o, ::Val{:__hash__}) = persistent_hash((typeof(o), _hash_replace(o.__hash_fields__)))
+# Shallow walker used only by the :__hash__ compute. Leaves non-DO values
 # structurally identical so hashes stay stable for DOs that don't nest DOs,
-# and substitutes any DO with its own (stable) `.hash` string. Per-type
-# `_hash_replace(::MyType) = x.hash` overloads are emitted by @dynamicstruct.
+# and substitutes any DO with its own (stable) `.__hash__` string. Per-type
+# `_hash_replace(::MyType) = x.__hash__` overloads are emitted by @dynamicstruct.
 _hash_replace(x::Tuple) = map(_hash_replace, x)
 _hash_replace(x::NamedTuple) = map(_hash_replace, x)
 _hash_replace(x) = x
-compute_property(o, ::Val{:cache_base}) = "cache"
-compute_property(o, ::Val{:cache_path}) = joinpath(o.cache_base, o.hash)
+compute_property(o, ::Val{:__cache_base__}) = "cache"
+compute_property(o, ::Val{:__cache_path__}) = joinpath(o.__cache_base__, o.__hash__)
+# Deprecation shims — the data-side magic properties were renamed to dunders
+# (2026-07-07, decision 2canrl). Loud error on old-name ACCESS; the parse-time
+# error on old-name DECLARATION lives in the macro. Remove post-migration.
+compute_property(o, ::Val{:hash}) = error("`hash` was renamed to `__hash__` (2026-07-07, decision 2canrl); use `o.__hash__`.")
+compute_property(o, ::Val{:hash_fields}) = error("`hash_fields` was renamed to `__hash_fields__` (2026-07-07, decision 2canrl); use `o.__hash_fields__`.")
+compute_property(o, ::Val{:cache_base}) = error("`cache_base` was renamed to `__cache_base__` (2026-07-07, decision 2canrl); use `o.__cache_base__`.")
+compute_property(o, ::Val{:cache_path}) = error("`cache_path` was renamed to `__cache_path__` (2026-07-07, decision 2canrl); use `o.__cache_path__`.")
 compute_property(o, ::Val{:__status__}) = nothing
 compute_property(o, ::Val{:__strict__}) = true
 compute_property(o, ::Val{:__cache_type__}) = error("`__cache_type__` was removed (2026-07-07, decision 2canrl); the cache is always threadsafe (`ThreadsafeDict`) now.")
@@ -1661,7 +1668,7 @@ instance. In-memory values are left intact (they'll be stale until
 """
 function clear_disk_caches!(obj)
     m = meta(typeof(obj))
-    cp = obj.cache_path
+    cp = obj.__cache_path__
     isdir(cp) || return nothing
     for (name, info) in m
         isfixed(info) && continue
@@ -1765,7 +1772,7 @@ DynamicObjects.key_tracker(o::MyType, ::Val{name}) where {name} =
 ```
 """
 key_tracker(o, ::Val{name}) where {name} =
-    SharedFileTracker(joinpath(o.cache_path, string(name) * "_keys.sjl"))
+    SharedFileTracker(joinpath(o.__cache_path__, string(name) * "_keys.sjl"))
 
 # --- Accessed-keys tracking for IndexableProperty ---
 
@@ -2035,7 +2042,7 @@ get_cache_path(o, name, args...; kwargs...) = begin
     seg = cache_segment(name, args...; kwargs...)
     ver = cache_version(o, Val(name))
     !isnothing(ver) && (seg = seg * "_v" * string(ver))
-    joinpath(o.cache_path, seg * ".sjl")
+    joinpath(o.__cache_path__, seg * ".sjl")
 end
 get_cache_status(o, args...; kwargs...) = get_cache_status(get_cache_path(o, args...; kwargs...)) 
 get_cache_status(cache_path::AbstractString) = begin
@@ -2628,7 +2635,7 @@ clear_cache!(o, name::Symbol, indices...; kwargs...) = begin
         # Clear in-memory (whole property, including IndexableProperty wrapper)
         delete!(cache, name)
         # Clear all disk cache files for this property
-        cp = o.cache_path
+        cp = o.__cache_path__
         if isdir(cp)
             prefix = string(name)
             for f in readdir(cp)
@@ -3030,7 +3037,7 @@ function _check_singleton_struct!(msgs, type, oproperties)
         n in _AUTO_DUNDERS && continue
         s = String(n)
         startswith(s, "_tuple_") && continue
-        n === :hash_fields && continue
+        n === :__hash_fields__ && continue
         push!(user, (n, info))
     end
     length(user) == 1 || return
@@ -4290,23 +4297,23 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             Meta.isexpr(clhs, :(::)) && (clhs = clhs.args[1])
             _push_if_symbol!(child_props, clhs)
         end
-        # Prepend __parent__, index params, hash_fields override, and
+        # Prepend __parent__, index params, __hash_fields__ override, and
         # forwarded parent properties to the child body.
         child_body = child_struct.args[3]
         kwarg_names = Symbol[n for (n, _) in index_kwargs]
         prepend_names = Set{Symbol}([:__parent__, index_params..., kwarg_names...])
-        # For indexed inline structs we override hash_fields to
+        # For indexed inline structs we override __hash_fields__ to
         # (__parent__, indices..., kwargs...) so the child's disk-cache
         # namespace is tied to the parent hash AND to the kwarg values. Skip
-        # if the user declared hash_fields inside the child body.
-        will_prepend_hash_fields = (!isempty(index_params) || !isempty(index_kwargs)) && !(:hash_fields in child_props)
-        will_prepend_hash_fields && push!(prepend_names, :hash_fields)
+        # if the user declared __hash_fields__ inside the child body.
+        will_prepend_hash_fields = (!isempty(index_params) || !isempty(index_kwargs)) && !(:__hash_fields__ in child_props)
+        will_prepend_hash_fields && push!(prepend_names, :__hash_fields__)
         # Never forward DO-internal cache/identity properties from the parent
         # into the child — they have per-instance semantics (the child has its
-        # own hash/cache_path/cache_base) and forwarding them collides with the
-        # automatic machinery (e.g. with our hash_fields prepend, producing
+        # own hash/cache_path/__cache_base__) and forwarding them collides with the
+        # automatic machinery (e.g. with our __hash_fields__ prepend, producing
         # duplicate compute_property method definitions).
-        nonforwardable = Set{Symbol}([:hash_fields, :hash, :cache_path, :cache])
+        nonforwardable = Set{Symbol}([:__hash_fields__, :__hash__, :__cache_path__, :cache])
         # Forward parent properties that (a) aren't overridden in the child,
         # (b) aren't __status__ (scoped separately), (c) aren't DO-internal
         # cache/identity names, (d) aren't one of the names we're about
@@ -4335,7 +4342,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             push!(prepend, :($kname = $rhs))
         end
         if will_prepend_hash_fields
-            push!(prepend, :(hash_fields = $(Expr(:tuple, :__parent__, index_params..., kwarg_names...))))
+            push!(prepend, :(__hash_fields__ = $(Expr(:tuple, :__parent__, index_params..., kwarg_names...))))
         end
         # Forward each parent prop as a `@fetch!`-marked property
         # (`@fetch! nm = __parent__.nm`) rather than one
@@ -4367,7 +4374,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         # On disk this nests as "base/<parent_segment>/<child_segment>/…",
         # ending at the leaf "<property>_<args>.sjl". Skipped when the child
         # body explicitly declares cache_path — explicit wins.
-        if !(:cache_path in child_props)
+        if !(:__cache_path__ in child_props)
             # Expr(:call) layout: (func, [parameters], positional...). The
             # parameters expression must come right after the function, not
             # after positional args, otherwise Julia's parser rejects it.
@@ -4377,7 +4384,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             push!(seg_call_args, QuoteNode(prop_name))
             append!(seg_call_args, index_params)
             seg_call = Expr(:call, seg_call_args...)
-            push!(prepend, :(cache_path = joinpath(__parent__.cache_path, $seg_call)))
+            push!(prepend, :(__cache_path__ = joinpath(__parent__.__cache_path__, $seg_call)))
         end
         child_body.args = vcat(prepend, child_body.args)
         push!(extracted_structs, child_struct)
@@ -4647,7 +4654,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     struct_expr = Expr(:struct, mut, head, Expr(:block,
         fixed_lhs..., :(cache::$PropertyCache),
         :(function $type($(fixed_lhs...); cache_type=nothing, kwargs...)
-            isnothing(cache_type) || @warn "`cache_type` is deprecated and ignored — the cache is always threadsafe now (decision 2canrl); drop this kwarg." maxlog=1
+            isnothing(cache_type) || error("`cache_type` was removed (2026-07-07, decision 2canrl); the cache is always threadsafe now — drop this kwarg.")
             __inst__ = new(
                 $(fixed_names...),
                 $PropertyCache(
@@ -4703,7 +4710,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             $DynamicObjects.meta(::Type{$type}) = $properties
             $DynamicObjects.is_generated_property(::$type, name::Symbol) = name in $generated_names
             $DynamicObjects.is_indexed_property(::$type, name::Symbol) = name in $indexed_names
-            $DynamicObjects._hash_replace(__self__::$type) = __self__.hash
+            $DynamicObjects._hash_replace(__self__::$type) = __self__.__hash__
             $([:(
                 $DynamicObjects._disk_cache(::$type, ::Val{$(QuoteNode(name))}) = $varname
             ) for (name, varname) in cached_names]...)
@@ -5047,8 +5054,8 @@ does not matter — cycles will result in a stack overflow at runtime.
 `cache_type=:serial` was removed (deprecated 2026-06); use `:parallel` (the default).
 
 Properties marked `@cached` are additionally persisted to disk under
-`__self__.cache_path` (which itself defaults to
-`joinpath(__self__.cache_base, __self__.hash)`).
+`__self__.__cache_path__` (which itself defaults to
+`joinpath(__self__.__cache_base__, __self__.__hash__)`).
 
 Keyword arguments passed to the constructor pre-populate the cache, so they act
 as overrides for any computed property.
@@ -5261,9 +5268,9 @@ _print_struct_skip(::Type{T}, name::Symbol) where {T} = begin
     is_dunder && _walk_nested_type(T, name) !== nothing && return false
     is_dunder ||
         startswith(s, "_tuple_") ||
-        name === :hash_fields ||
-        name === :cache_path ||
-        name === :hash ||
+        name === :__hash_fields__ ||
+        name === :__cache_path__ ||
+        name === :__hash__ ||
         name === :cache
 end
 

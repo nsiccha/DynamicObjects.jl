@@ -12,7 +12,7 @@ end
 
 _multi_lhs_cached_path = Ref("")
 @dynamicstruct struct CachedMultiLhs
-    cache_path = _multi_lhs_cached_path[]
+    __cache_path__ = _multi_lhs_cached_path[]
     @cached a, b = (1, 2)
 end
 
@@ -48,7 +48,7 @@ end
 
 _clearable_path = Ref("")
 @dynamicstruct struct Clearable
-    cache_path = _clearable_path[]
+    __cache_path__ = _clearable_path[]
     @cached result = sum(rand(10))
     @cached indexed(k) = k ^ 2
 end
@@ -85,7 +85,7 @@ end
 
 _disk_cache_path = Ref("")
 @dynamicstruct struct Cached
-    cache_path = _disk_cache_path[]
+    __cache_path__ = _disk_cache_path[]
     a = 1
     b = 2 * a
     @cached c = a * b
@@ -94,23 +94,23 @@ end
 
 _version_cache_path = Ref("")
 @dynamicstruct struct VersionedCache
-    cache_path = _version_cache_path[]
+    __cache_path__ = _version_cache_path[]
     @cached v"1" result = 42
 end
 
 @dynamicstruct struct UnversionedCache
-    cache_path = _version_cache_path[]
+    __cache_path__ = _version_cache_path[]
     @cached result = 42
 end
 
 @dynamicstruct struct VersionedIndexedCache
-    cache_path = _version_cache_path[]
+    __cache_path__ = _version_cache_path[]
     @cached v"1" result(key) = key ^ 2
 end
 
 _idx_path = Ref("")
 @dynamicstruct struct Idx
-    cache_path = _idx_path[]
+    __cache_path__ = _idx_path[]
     i(idx)              = idx
     @cached ci(idx)     = idx ^ 2
     @cached ci3(i, j, k) = i + 10 * j + 100 * k
@@ -133,7 +133,7 @@ end
 
 _regression_path = Ref("")
 @dynamicstruct struct D1
-    cache_path = _regression_path[]
+    __cache_path__ = _regression_path[]
     a = 1
     b = 2 * a
     @cached c = a * b
@@ -226,7 +226,7 @@ end
 
 _clearall_path = Ref("")
 @dynamicstruct struct ClearAllApp
-    cache_path = _clearall_path[]
+    __cache_path__ = _clearall_path[]
     @cached a = 42
     @cached b(k) = k * 2
     uncached = 99
@@ -766,30 +766,30 @@ end
     #    unaffected by the _hash_replace walker (values pass through).
     no_dos = HashNoDOs(7, [1.0, 2.0, 3.0])
     expected = DynamicObjects.persistent_hash((HashNoDOs, (7, [1.0, 2.0, 3.0])))
-    @test no_dos.hash == expected
+    @test no_dos.__hash__ == expected
 
-    # 2. Nested DO as a fixed field: parent.hash depends on child.hash
+    # 2. Nested DO as a fixed field: parent.__hash__ depends on child.__hash__
     #    only, not on the child's cache dict contents.
     leaf = HashLeaf(1, "a")
     parent1 = HashParent(leaf, 42)
-    h1 = parent1.hash
-    # Mutate the leaf's cache dict. Pre-fix, this would change parent.hash
+    h1 = parent1.__hash__
+    # Mutate the leaf's cache dict. Pre-fix, this would change parent.__hash__
     # because the raw leaf (including its cache) got serialized.
     getfield(leaf, :cache)[:garbage] = rand(100)
     parent2 = HashParent(leaf, 42)  # fresh parent wrapping the mutated leaf
-    @test parent2.hash == h1
+    @test parent2.__hash__ == h1
 
     # 3. Different leaf fixed fields → different parent hash.
     parent3 = HashParent(HashLeaf(2, "a"), 42)
-    @test parent3.hash != h1
+    @test parent3.__hash__ != h1
 
     # 4. Tuple of DOs: shallow recursion collapses each DO via _hash_replace.
     leaves = (HashLeaf(1, "a"), HashLeaf(2, "b"))
     p_tup1 = HashParentTuple(leaves, 0)
-    h_tup = p_tup1.hash
+    h_tup = p_tup1.__hash__
     getfield(leaves[1], :cache)[:junk] = :junk
     p_tup2 = HashParentTuple(leaves, 0)
-    @test p_tup2.hash == h_tup
+    @test p_tup2.__hash__ == h_tup
 end
 
 @testset "DataFrame hash canonicalization" begin
