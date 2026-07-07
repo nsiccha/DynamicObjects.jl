@@ -245,6 +245,18 @@ end
     derived = __cache_base__ * "/x"
 end
 
+# Typed read path (Step 5.1 fixed-field + 5.2 computed-prop accessor +
+# topological inference): computed props infer concretely through the DAG,
+# where before Step 5 every `o.<computed>` collapsed to `Any`.
+@dynamicstruct struct TypedRead
+    x::Int
+    y::Int
+    a = x + y        # computed ← fixed fields
+    b = a * 2        # computed ← computed sibling
+    c = string(a)    # computed String
+    v = [x, y]       # Vector{Int}
+end
+
 # --- Tests ---
 
 @testset "Multi-lhs assignment" begin
@@ -750,6 +762,24 @@ end
     o = BareRefOverride()
     @test o.__cache_base__ == "custom"
     @test o.derived == "custom/x"
+end
+
+@testset "typed read path (5.1 fixed + 5.2 computed accessor)" begin
+    ti = TypedRead(3, 5); O = typeof(ti)
+    # every read infers concretely through the DAG (was Any before Step 5)
+    @test only(Base.return_types(o -> o.x, (O,))) === Int          # 5.1 fixed field
+    @test only(Base.return_types(o -> o.a, (O,))) === Int          # computed ← fixed
+    @test only(Base.return_types(o -> o.b, (O,))) === Int          # computed ← computed
+    @test only(Base.return_types(o -> o.c, (O,))) === String
+    @test only(Base.return_types(o -> o.v, (O,))) === Vector{Int}
+    # end-to-end type stability (@inferred throws on instability) + correct values
+    fa(o) = o.a; fb(o) = o.b; fc(o) = o.c
+    @test (@inferred fa(ti)) == 8
+    @test (@inferred fb(ti)) == 16
+    @test (@inferred fc(ti)) == "8"
+    # the slot topology carries the inferred types
+    S = DynamicObjects._slot_types(O)
+    @test fieldtype(S, :a) === Int && fieldtype(S, :b) === Int && fieldtype(S, :c) === String
 end
 
 @testset "DataFrame hash canonicalization" begin
