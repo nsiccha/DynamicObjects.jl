@@ -1981,14 +1981,23 @@ end
 # as its declared type instead of `Any`). Val is injected HERE, in the shim —
 # NOT at the `__self__.x` callsite: the emitted access FORM stays a dot
 # expression, so `_is_self_access` / `_progress_self_rewrite` and the
-# HTMXObjects routing layer keep seeing it. This `Val{name}` entry point is also
-# where per-name typed-slot dispatch will hang off next. A runtime-`Symbol`
-# access (e.g. HTMXObjects URL routing) can't fold — it pays a `Val`
-# construction + dynamic dispatch, then takes the same branch. Behaviourally
-# IDENTICAL to `getorcomputeproperty(o, name)` for every `name`: a fixed field's
-# `getorcomputeproperty` already IS `getfield` (line ~1938).
-@inline _getprop(o, ::Val{name}) where {name} =
-    hasfield(typeof(o), name) ? getfield(o, name) : getorcomputeproperty(o, name)
+# HTMXObjects routing layer keep seeing it. A runtime-`Symbol` access (e.g.
+# HTMXObjects URL routing) can't fold — it pays a `Val` construction + dynamic
+# dispatch, then takes the same branch.
+#
+# The `Val{name}` static parameter is also where per-name typed-slot dispatch
+# hangs off: a bare COMPUTED property's result is asserted to its inferred slot
+# type `_slot_eltype(typeof(o), Val(name))` (point 2). This is what makes a
+# type-stable read — `getorcomputeproperty` returns from a `::Any` cache, and the
+# assert re-narrows it to the compile-time-constant inferred type. Sound by
+# construction: `return_type` over-approximates, so the actual value is always
+# `<:` the asserted type (fixed fields skip the assert — `getfield` is already
+# typed; unslotted names widen to `::Any`, a no-op). Behaviourally identical to
+# `getorcomputeproperty(o, name)` for every `name` bar the (safe) narrowing.
+@inline function _getprop(o, ::Val{name}) where {name}
+    hasfield(typeof(o), name) && return getfield(o, name)
+    getorcomputeproperty(o, name)::_slot_eltype(typeof(o), Val(name))
+end
 
 # ── Slot-type inference (typed storage, point 2) ──────────────────────────
 # Each bare computed property gets a typed slot whose element type we infer
@@ -2048,11 +2057,30 @@ function _slot_types_expr(::Type{O}, plan) where {O}
     for (name, dep_params) in plan
         depTs = Any[get(known, dp, Any) for dp in dep_params]
         T = Core.Compiler.return_type(_infer_rhs, Tuple{O, Val{name}, depTs...})
+        # A property whose compute provably never returns normally (e.g.
+        # `will_fail = error(…)`) infers `Union{}`. `Tuple{Union{}}` is an
+        # ILLEGAL type ("Tuple field type cannot be Union{}"), so building the
+        # NamedTuple with it would throw from the `@generated` body and mask the
+        # property's real error. It has no storable value anyway — widen to `Any`.
+        T === Union{} && (T = Any)
         known[name] = T
         push!(names, name)
         push!(Texprs, T)
     end
     :(NamedTuple{$(Tuple(names)), Tuple{$(Texprs...)}})
+end
+
+# Static element type of property `name`'s slot for parent type `O`: the inferred
+# slot type, or `Any` when `name` has no slot (fixed field, IP wrapper) or its
+# inference collapsed to `Union{}` (a provably-never-returns compute — asserting
+# `::Union{}` on an actual return would wrongly throw, so widen it). `_slot_types`
+# is `@generated`, so `hasfield`/`fieldtype` on its constant result fold: for a
+# literal `name` this reduces to a compile-time constant type.
+@inline function _slot_eltype(::Type{O}, ::Val{name}) where {O, name}
+    S = _slot_types(O)
+    hasfield(S, name) || return Any
+    T = fieldtype(S, name)
+    T === Union{} ? Any : T
 end
 
 # Deterministic topological order of `names` (a node emitted only once all its

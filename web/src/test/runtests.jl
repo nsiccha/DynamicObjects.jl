@@ -428,7 +428,10 @@ end
     serial_d1 = D1()
     @test hasproperty(serial_d1, :a) == hasproperty(serial_d1, :b) == true
     @test 2 * serial_d1.a == serial_d1.b == 2
-    @test_throws ErrorException @inferred getb(serial_d1)
+    # Point 2 (slot-type inference) made bare-computed access `x.b` type-stable,
+    # so `@inferred` now SUCCEEDS. This previously asserted the (then-unavoidable)
+    # instability — `b` inferred `Any` — via `@test_throws ErrorException`.
+    @test @inferred(getb(serial_d1)) == 2
     @test @cache_status(serial_d1.c) == :unstarted
     @test serial_d1.c == serial_d1.a * serial_d1.b
     @test @cache_status(serial_d1.c) == :ready
