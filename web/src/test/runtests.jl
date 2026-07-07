@@ -792,6 +792,32 @@ end
     @test p_tup2.__hash__ == h_tup
 end
 
+@testset "magic-property dunderization + deprecations" begin
+    o = HashNoDOs(7, [1.0, 2.0, 3.0])
+    # dunder access works
+    @test o.__hash__ isa String
+    @test o.__cache_base__ == "cache"
+    @test o.__cache_path__ == joinpath(o.__cache_base__, o.__hash__)
+    # ACCESS surface: old data-side names + removed __cache_type__ error
+    @test_throws PropertyComputationError o.hash
+    @test_throws PropertyComputationError o.cache_path
+    @test_throws PropertyComputationError o.cache_base
+    @test_throws PropertyComputationError o.hash_fields
+    @test_throws PropertyComputationError o.__cache_type__
+    # cache_type kwarg is a hard removal error, not a warning
+    @test_throws ErrorException HashNoDOs(7, [1.0]; cache_type=:parallel)
+    # DEFINITION surface: declaring an old name errors at expansion time
+    for ex in (:(@dynamicstruct struct _DepBadCP; a=1; cache_path="x"; end),
+               :(@dynamicstruct struct _DepBadHF; a=1; hash_fields=(1,); end),
+               :(@dynamicstruct struct _DepBadCT; a=1; __cache_type__=1; end))
+        threw = false
+        try; macroexpand(@__MODULE__, ex); catch; threw = true; end
+        @test threw
+    end
+    # a MIGRATED declaration still expands cleanly
+    @test macroexpand(@__MODULE__, :(@dynamicstruct struct _DepGoodCP; a=1; __cache_path__="x"; end)) isa Expr
+end
+
 @testset "DataFrame hash canonicalization" begin
     # Ext-provided _hash_replace(::AbstractDataFrame). Shape assertion
     # doubles as a load guard: if the ext failed to load, _hash_replace(df)
