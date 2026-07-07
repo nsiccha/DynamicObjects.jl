@@ -273,6 +273,21 @@ end
     y::Vector{Float64}
 end
 
+# Bare references to the injected magic dunders (uniform bare-ref injection):
+# a body may write `__hash__`/`__cache_base__`/… bare, resolved like a sibling.
+@dynamicstruct struct BareRefMagic
+    w::Int
+    fromhash   = "h:" * __hash__
+    frombase   = __cache_base__
+    fromstrict = __strict__
+    fromfields = __hash_fields__
+end
+# A user override of a data dunder still wins (injection guard is user-only).
+@dynamicstruct struct BareRefOverride
+    __cache_base__ = "custom"
+    derived = __cache_base__ * "/x"
+end
+
 # --- Tests ---
 
 @testset "Multi-lhs assignment" begin
@@ -816,6 +831,21 @@ end
     end
     # a MIGRATED declaration still expands cleanly
     @test macroexpand(@__MODULE__, :(@dynamicstruct struct _DepGoodCP; a=1; __cache_path__="x"; end)) isa Expr
+end
+
+@testset "magic-property bare-ref resolution" begin
+    b = BareRefMagic(3)
+    @test b.fromhash   == "h:" * b.__hash__
+    @test b.frombase   == "cache"
+    @test b.fromstrict === true
+    @test b.fromfields == b.__hash_fields__ == (3,)
+    # a body reading a magic dunder inherits its slot type (String, not Any)
+    gh(o) = o.fromhash
+    @test only(Base.return_types(gh, (typeof(b),))) === String
+    # user override wins, and a sibling bare-ref sees it
+    o = BareRefOverride()
+    @test o.__cache_base__ == "custom"
+    @test o.derived == "custom/x"
 end
 
 @testset "DataFrame hash canonicalization" begin
