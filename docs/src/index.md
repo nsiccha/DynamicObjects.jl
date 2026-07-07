@@ -350,12 +350,13 @@ stale `.sjl` files to load:
 The version mixes into the cache filename
 (`result_v2.sjl`); old `result.sjl` files just sit there until cleared.
 
-#### Disk-write locking: `__strict__`
+#### Disk-write locking
 
-`__strict__ = true` (the default) makes `@cached` writes go through a per-path
-`ReentrantLock` so concurrent computations of the same key never race on the
-file. Set `__strict__ = false` if you've already coordinated externally and
-want to skip the lock.
+`@cached` disk writes go through a per-path `ReentrantLock`, so concurrent
+computations of the same key never race on the same file. This locking is
+unconditional whenever a disk cache is configured. (It was previously gated by
+a `__strict__` property, removed 2026-07-07 — the `__strict__ = false` opt-out
+was a corruption footgun and the safe default was always `true`.)
 
 ### `@persist`: write the in-memory value to disk
 
