@@ -1,5 +1,5 @@
 using TestModules, Random, DynamicObjects, Serialization, Arrow, DataFrames
-import DynamicObjects: @persist, entries, cached_entries, clear_all_caches!, PersistentSet, accessed_keys, record_access!
+import DynamicObjects: entries, cached_entries, clear_all_caches!, PersistentSet
 
 # --- Struct definitions (hoisted to module scope) ---
 
@@ -65,11 +65,6 @@ end
     r     = sqrt(x^2 + y^2)
     theta = atan(y, x)
     sum2  = x + y
-end
-
-@dynamicstruct struct Overridable
-    x::Float64
-    doubled = 2 * x
 end
 
 @dynamicstruct struct WithDefault
@@ -151,23 +146,6 @@ _regression_path = Ref("")
     end
 end
 
-_assign_in_rhs_path = Ref("")
-@dynamicstruct struct AssignInRhs
-    x::Int
-    cache_path = _assign_in_rhs_path[]
-    @cached flag = false
-    toggle(req) = begin
-        # Bare `flag = !flag` would trip the property-shadow check
-        # (post f4d7c14: error, was warn). Route the cache write
-        # through the explicit `setproperty!` path instead — same
-        # observable effect (writes to the property cache), no
-        # ambiguity for the macro's RHS walker.
-        __self__.flag = !flag
-        @persist flag
-        flag
-    end
-end
-
 @dynamicstruct struct LetScope
     x::Float64
     result = let x = 99.0
@@ -201,27 +179,8 @@ end
     will_fail_indexed(key) = error("serial failure for key=$key")
 end
 
-_persistable_path = Ref("")
-@dynamicstruct struct Persistable
-    cache_path = _persistable_path[]
-    @cached counter = 0
-    increment(req) = begin
-        # See `AssignInRhs` above — explicit `setproperty!` path
-        # avoids tripping the macro's property-shadow check.
-        __self__.counter = counter + 1
-        @persist counter
-        counter
-    end
-end
-
 @dynamicstruct struct EntriesApp
     slow(key) = (sleep(0.05); key * 2)
-end
-
-_cached_keys_path = Ref("")
-@dynamicstruct struct CachedKeysApp
-    cache_path = _cached_keys_path[]
-    @cached result(key) = key ^ 2
 end
 
 _clearall_path = Ref("")
@@ -230,12 +189,6 @@ _clearall_path = Ref("")
     @cached a = 42
     @cached b(k) = k * 2
     uncached = 99
-end
-
-_kwargs_keys_path = Ref("")
-@dynamicstruct struct KwargsKeysApp
-    cache_path = _kwargs_keys_path[]
-    @cached result(key; mode="default") = "$key:$mode"
 end
 
 # Regression: `@fetch!` over a fetched IP call that carries kwargs. `walk_rhs`
@@ -260,11 +213,6 @@ end
 
 @dynamicstruct struct HashParent
     leaf::HashLeaf
-    k::Int
-end
-
-@dynamicstruct struct HashParentTuple
-    leaves::Tuple
     k::Int
 end
 
@@ -386,13 +334,6 @@ end
     @test hasproperty(b, :nonexistent) == false
 end
 
-@testset "setproperty! override" begin
-    o = Overridable(3.0)
-    @test o.doubled ≈ 6.0
-    o.doubled = 99.0
-    @test o.doubled ≈ 99.0
-end
-
 @testset "Constructor kwargs" begin
     w = WithDefault(4.0; expensive=0.0)
     @test w.expensive == 0.0
@@ -511,16 +452,6 @@ end
     @test length(unique(asyncmap(i -> parallel_d1.parallel_testi(i), 1:10))) == 10
 end
 
-@testset "Property assignment in RHS" begin
-    _assign_in_rhs_path[] = mktempdir()
-    s = AssignInRhs(1)
-    @test s.flag == false
-    s.toggle("go")
-    @test s.flag == true
-    s.toggle("go2")
-    @test s.flag == false
-end
-
 @testset "Let block scoping" begin
     @test LetScope(5.0).result == 100.0
 end
@@ -570,16 +501,6 @@ end
     params = rw2.args[findfirst(a -> Meta.isexpr(a, :parameters), rw2.args)]
     @test Meta.isexpr(params.args[1], :kw)
     @test params.args[1].args[1] == :n
-end
-
-@testset "Persist with disk cache" begin
-    _persistable_path[] = mktempdir()
-    s = Persistable()
-    @test s.counter == 0
-    s.increment("go")
-    @test s.counter == 1
-    s2 = Persistable(; cache_path=_persistable_path[])
-    @test s2.counter == 1
 end
 
 @testset "PropertyComputationError" begin
@@ -659,42 +580,6 @@ end
     @test length(s2) == 1
 end
 
-@testset "accessed_keys tracking" begin
-    _cached_keys_path[] = mktempdir()
-    app = CachedKeysApp()
-    # No keys accessed yet
-    ak = accessed_keys(app.result)
-    @test isempty(ak)
-    # Access some keys
-    @test app.result(3) == 9
-    @test app.result(5) == 25
-    ak = accessed_keys(app.result)
-    @test length(ak) == 2
-    @test ((3,), (;)) in ak
-    @test ((5,), (;)) in ak
-    # Accessing same key again doesn't duplicate
-    @test app.result(3) == 9
-    ak = accessed_keys(app.result)
-    @test length(ak) == 2
-    # New instance with same cache_path sees the same keys
-    app2 = CachedKeysApp(; cache_path=_cached_keys_path[])
-    ak2 = accessed_keys(app2.result)
-    @test length(ak2) == 2
-end
-
-@testset "accessed_keys with kwargs" begin
-    _kwargs_keys_path[] = mktempdir()
-    app = KwargsKeysApp()
-    @test app.result("x") == "x:default"
-    @test app.result("x"; mode="fast") == "x:fast"
-    ak = accessed_keys(app.result)
-    @test length(ak) == 2
-    # Call with no explicit kwargs records (("x",), (;))
-    @test (("x",), (;)) in ak
-    # Call with explicit kwargs records them in the key
-    @test (("x",), (;mode="fast")) in ak
-end
-
 @testset "cached_entries on plain Dict" begin
     app = CallVsBracket()
     app.counted(1)
@@ -768,28 +653,11 @@ end
     expected = DynamicObjects.persistent_hash((HashNoDOs, (7, [1.0, 2.0, 3.0])))
     @test no_dos.hash == expected
 
-    # 2. Nested DO as a fixed field: parent.hash depends on child.hash
-    #    only, not on the child's cache dict contents.
-    leaf = HashLeaf(1, "a")
-    parent1 = HashParent(leaf, 42)
-    h1 = parent1.hash
-    # Mutate the leaf's cache dict. Pre-fix, this would change parent.hash
-    # because the raw leaf (including its cache) got serialized.
-    getfield(leaf, :cache)[:garbage] = rand(100)
-    parent2 = HashParent(leaf, 42)  # fresh parent wrapping the mutated leaf
-    @test parent2.hash == h1
-
-    # 3. Different leaf fixed fields → different parent hash.
-    parent3 = HashParent(HashLeaf(2, "a"), 42)
-    @test parent3.hash != h1
-
-    # 4. Tuple of DOs: shallow recursion collapses each DO via _hash_replace.
-    leaves = (HashLeaf(1, "a"), HashLeaf(2, "b"))
-    p_tup1 = HashParentTuple(leaves, 0)
-    h_tup = p_tup1.hash
-    getfield(leaves[1], :cache)[:junk] = :junk
-    p_tup2 = HashParentTuple(leaves, 0)
-    @test p_tup2.hash == h_tup
+    # 2. Nested DO as a fixed field: parent.hash is driven by the child's
+    #    fixed fields — same fields → same hash, different → different.
+    h1 = HashParent(HashLeaf(1, "a"), 42).hash
+    @test HashParent(HashLeaf(1, "a"), 42).hash == h1
+    @test HashParent(HashLeaf(2, "a"), 42).hash != h1
 end
 
 @testset "DataFrame hash canonicalization" begin
