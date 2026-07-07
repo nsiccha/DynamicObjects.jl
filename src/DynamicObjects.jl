@@ -1990,6 +1990,94 @@ end
 @inline _getprop(o, ::Val{name}) where {name} =
     hasfield(typeof(o), name) ? getfield(o, name) : getorcomputeproperty(o, name)
 
+# ── Slot-type inference (typed storage, point 2) ──────────────────────────
+# Each bare computed property gets a typed slot whose element type we infer
+# topologically at struct-definition time. Two pieces cooperate:
+#
+#   * a per-property INFERENCE HELPER emitted by the macro:
+#       _infer_rhs(o::T, ::Val{name}, dep1, dep2, …) = <RHS>
+#     — the property's RHS with computed-sibling refs turned into typed
+#     PARAMETERS (`dep1,…`) and fixed-field refs into concrete
+#     `getfield(o, :field)`. Because the deps arrive as typed args and the
+#     parent's fields are concrete (point 1), `return_type` on this helper
+#     recovers the property's true type (validated Int→Int→String→Vector).
+#   * a `@generated _slot_types(::Type{T})` the macro emits, driven by
+#     `_slot_types_expr`: it walks properties in dependency order and
+#     `return_type`s each helper, threading already-inferred sibling types in.
+#     The `@generated` wrapper folds the resulting `NamedTuple{names,Tuple{T…}}`
+#     to a compile-time constant.
+#
+# `_to_infer_body` turns a walked RHS (`__self__.name` everywhere) into a helper
+# body: fixed refs → `getfield`, every other self-access → a bare param name
+# (collected into `params`). Nested access (`__self__.p.q`) recurses so `p`
+# becomes a param / getfield and `.q` rides along.
+function _to_infer_body(e, fixed_set, params)
+    if _is_self_access(e)
+        name = e.args[2].value
+        if name in fixed_set
+            return :($getfield(__self__, $(QuoteNode(name))))
+        else
+            push!(params, name)
+            return name
+        end
+    elseif e isa Expr
+        return Expr(e.head, Any[_to_infer_body(a, fixed_set, params) for a in e.args]...)
+    else
+        return e
+    end
+end
+
+# `_infer_rhs` and `_slot_types` have only per-struct methods (emitted by the
+# macro); declare the generic functions so `_slot_types_expr` can name `_infer_rhs`
+# and the macro can add `_slot_types` methods by qualified name.
+function _infer_rhs end
+function _slot_types end
+
+# Topological driver for the emitted `@generated _slot_types`. `plan` is a tuple
+# of `(name, dep_params)` in dependency order (deps before dependents), baked by
+# the macro to match each helper's parameter order. For each property,
+# `return_type` its helper with the parent type `O`, `Val{name}`, and the
+# already-known type of every computed dep (fixed deps were folded into the
+# helper as `getfield`s; an as-yet-unknown dep — IP wrapper, forward ref —
+# degrades to `Any`, which stays correct). Returns the
+# `NamedTuple{names,Tuple{T…}}` EXPR the generator emits verbatim.
+function _slot_types_expr(::Type{O}, plan) where {O}
+    known = Dict{Symbol,Any}()
+    names = Symbol[]
+    Texprs = Any[]
+    for (name, dep_params) in plan
+        depTs = Any[get(known, dp, Any) for dp in dep_params]
+        T = Core.Compiler.return_type(_infer_rhs, Tuple{O, Val{name}, depTs...})
+        known[name] = T
+        push!(names, name)
+        push!(Texprs, T)
+    end
+    :(NamedTuple{$(Tuple(names)), Tuple{$(Texprs...)}})
+end
+
+# Deterministic topological order of `names` (a node emitted only once all its
+# in-`nameset` deps are placed). Best-effort on an unsatisfiable/cyclic input:
+# the stuck remainder is flushed in input order (DO forbids true cycles).
+function _topo_order(names, nameset, deps)
+    ordered = Symbol[]
+    placed = Set{Symbol}()
+    remaining = collect(names)
+    while !isempty(remaining)
+        rest = Symbol[]
+        progressed = false
+        for n in remaining
+            if all(d -> !(d in nameset) || d in placed, deps[n])
+                push!(ordered, n); push!(placed, n); progressed = true
+            else
+                push!(rest, n)
+            end
+        end
+        remaining = rest
+        progressed || (append!(ordered, remaining); break)
+    end
+    ordered
+end
+
 _bare_substatus_f(o, name) =
     if name != :__substatus__ && name != :__status__ &&
        !(startswith(string(name), "__") && endswith(string(name), "__")) &&
@@ -4698,6 +4786,40 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             __inst__
         end)
     ))
+    # ── Point 2: per-property slot-type inference emission ─────────────────
+    # For every bare computed property emit an `_infer_rhs` helper (RHS with
+    # computed-sibling refs as typed params, fixed refs as `getfield`), then one
+    # `@generated _slot_types(::Type{<:$type})` that return_types them in
+    # dependency order. Pure addition here — nothing reads these yet; they're the
+    # typed-storage substrate the next increment wires in.
+    fixed_set = Set{Symbol}(fixed_names)
+    bare_computed = [(name, info) for (name, info) in oproperties
+                     if !isfixed(info) && !info.indexed]
+    bare_set = Set{Symbol}(n for (n, _) in bare_computed)
+    infer_specs = map(bare_computed) do (name, info)
+        _locals = info.locals isa Set ? info.locals : Set{Symbol}()
+        walked = walk_rhs(info.rhs; locals=_locals, properties=prop_names, lnn=info.lnn)
+        params = Set{Symbol}()
+        body = _to_infer_body(walked, fixed_set, params)
+        (; name, dep_params=sort!(collect(params)), body)
+    end
+    infer_deps = Dict(s.name => s.dep_params for s in infer_specs)
+    infer_topo = _topo_order([s.name for s in infer_specs], bare_set, infer_deps)
+    spec_by_name = Dict(s.name => s for s in infer_specs)
+    infer_helper_defs = [
+        :($DynamicObjects._infer_rhs(__self__::$type, ::$(Val){$(QuoteNode(s.name))},
+              $(s.dep_params...)) = $(s.body))
+        for s in infer_specs
+    ]
+    slot_plan_expr = Expr(:tuple, [
+        Expr(:tuple, QuoteNode(nm),
+             Expr(:tuple, [QuoteNode(d) for d in spec_by_name[nm].dep_params]...))
+        for nm in infer_topo
+    ]...)
+    slot_types_def = Expr(:macrocall,
+        Expr(:., :Base, QuoteNode(Symbol("@generated"))), nothing,
+        :($DynamicObjects._slot_types(::Type{OO}) where {OO <: $type} =
+            $DynamicObjects._slot_types_expr(OO, $slot_plan_expr)))
     result = Expr(:block)
     # Emit per-cached-property DiskCacheLocks
     for (name, varname) in cached_names
@@ -4740,6 +4862,9 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             $Base.getproperty(__self__::$type, name::Symbol) = $_getprop(__self__, $(Val)(name))
             $Base.setproperty!(__self__::$type, name::Symbol, value) = getfield(__self__, :cache)[name] = value
             $DynamicObjects.meta(::Type{<:$type}) = $properties
+            # Point 2: per-property inference helpers + the @generated slot-type map.
+            $(infer_helper_defs...)
+            $slot_types_def
             $DynamicObjects.is_generated_property(::$type, name::Symbol) = name in $generated_names
             $DynamicObjects.is_indexed_property(::$type, name::Symbol) = name in $indexed_names
             $DynamicObjects._hash_replace(__self__::$type) = __self__.hash
