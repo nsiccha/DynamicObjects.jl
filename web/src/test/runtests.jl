@@ -236,7 +236,6 @@ end
     w::Int
     fromhash   = "h:" * __hash__
     frombase   = __cache_base__
-    fromstrict = __strict__
     fromfields = __hash_fields__
 end
 # A user override of a data dunder still wins (injection guard is user-only).
@@ -753,7 +752,6 @@ end
     b = BareRefMagic(3)
     @test b.fromhash   == "h:" * b.__hash__
     @test b.frombase   == "cache"
-    @test b.fromstrict === true
     @test b.fromfields == b.__hash_fields__ == (3,)
     # a body reading a magic dunder inherits its slot type (String, not Any)
     gh(o) = o.fromhash

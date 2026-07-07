@@ -219,7 +219,6 @@ _hash_replace(x) = x
 compute_property(o, ::Val{:__cache_base__}) = "cache"
 compute_property(o, ::Val{:__cache_path__}) = joinpath(o.__cache_base__, o.__hash__)
 compute_property(o, ::Val{:__status__}) = nothing
-compute_property(o, ::Val{:__strict__}) = true
 compute_property(o, ::Val{:__substatus__}, name, args...; kwargs...) =
     _default_substatus(o.__status__, o, name, args...; kwargs...)
 _default_substatus(status, o, name, args...; kwargs...) = nothing
@@ -259,7 +258,7 @@ end
 # (`__status__` is threaded as a kwarg-local and must STAY the local, never
 # `__self__.__status__`; `__substatus__` is an indexed call, not a value).
 const _BAREREF_MAGIC = Set{Symbol}([
-    :__hash__, :__hash_fields__, :__cache_base__, :__cache_path__, :__strict__,
+    :__hash__, :__hash_fields__, :__cache_base__, :__cache_path__,
 ])
 
 # Substatus lifecycle hooks — the generic methods are no-ops so DO stays
@@ -1303,12 +1302,11 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
         if iscached(o, vname, indices...; kwargs...)
             cache_path = get_cache_path(o, name, indices...; kwargs...)
             mkpath(dirname(cache_path))
-            __strict__ = getorcomputeproperty(o, :__strict__)
             _cache_context = """Object type: $(nameof(typeof(o))) (objectid: $(objectid(o)), hash: $(hash(o)))
 Cache dict: ThreadsafeDict (parallel)
 If multiple objects with the same hash are writing here concurrently, this may indicate a concurrency issue or a hashing collision."""
             disk_locks = _disk_cache(o, vname)
-            rv = if __strict__ && !isnothing(disk_locks)
+            rv = if !isnothing(disk_locks)
                 path_lock = get_path_lock!(disk_locks, cache_path)
                 # Concurrent access to the same cache file means N distinct but
                 # content-equal instances of this type are racing the same disk
@@ -1375,7 +1373,7 @@ $_cache_context""")
                     try
                         load(_disk_format(o, vname), cache_path, _disk_eltype(o, vname))
                     catch e
-                        @warn "Deserialization failed for $cache_path, recomputing.\n$_cache_context\nEnable __strict__=true for disk cache locking to prevent concurrent write issues." exception=e
+                        @warn "Deserialization failed for $cache_path, recomputing.\n$_cache_context" exception=e
                         rm(cache_path; force=true)
                         cache_status = :unstarted
                         touch(cache_path)
@@ -1383,7 +1381,7 @@ $_cache_context""")
                     end
                 else
                     if cache_status == :started
-                        @warn "Cache file $cache_path exists but has size 0.\nAssuming a previous run failed.\n$_cache_context\nEnable __strict__=true for disk cache locking to prevent concurrent write issues."
+                        @warn "Cache file $cache_path exists but has size 0.\nAssuming a previous run failed.\n$_cache_context"
                     end
                     touch(cache_path)
                     nothing
@@ -4437,8 +4435,8 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         (; name, dep_params=sort!(collect(params)), body, annotated)
     end
     # ── Machinery-dunder acyclicity contract ───────────────────────────────
-    # `__status__`/`__strict__` are fetched by `_computeproperty`
-    # as implicit per-compute deps (~L1823/1830), so a COMPUTED-property
+    # `__status__` is fetched by `_computeproperty`
+    # as an implicit per-compute dep (~L1823/1830), so a COMPUTED-property
     # dependency forms a compute cycle (the fetch re-enters) — a runtime
     # infinite-recursion that the slot asserts surface as an inference overflow.
     # Forbid it at expansion. `dep_params` are exactly the computed-sibling
@@ -4448,7 +4446,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     # computed properties. (User directive 2026-07-07; `__status__` may later
     # become an always-present field, retiring this.)
     for s in infer_specs
-        if s.name in (:__status__, :__strict__) && !isempty(s.dep_params)
+        if s.name === :__status__ && !isempty(s.dep_params)
             error("`@dynamicstruct $type`: `$(s.name)` may not depend on computed " *
                   "propert$(length(s.dep_params) == 1 ? "y" : "ies") " *
                   "`$(join(s.dep_params, "`, `"))` — it is fetched as an implicit " *
@@ -4470,11 +4468,11 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     # thread them as typed params (explicit RHS) — delegating there would recurse
     # into `_slot_types` via getproperty during generation. A user definition of
     # any auto-prop lands in `oproperties` above and is skipped here (its own type
-    # wins). The MACHINERY dunders `__status__`/`__strict__` are
-    # deliberately EXCLUDED: `_computeproperty` fetches them as implicit
-    # per-compute deps, so asserting their type can force a `dunder ↔ sibling`
+    # wins). The MACHINERY dunder `__status__` is
+    # deliberately EXCLUDED: `_computeproperty` fetches it as an implicit
+    # per-compute dep, so asserting its type can force a `dunder ↔ sibling`
     # compute cycle into a hard inference overflow (`_slot_eltype` returns `Any`
-    # for them). The value path (generic computes) is UNTOUCHED — this adds only
+    # for it). The value path (generic computes) is UNTOUCHED — this adds only
     # the slot type, so behaviour is bit-identical.
     infer_specs = Vector{Any}(infer_specs)
     for nm in (:__hash_fields__, :__cache_base__)
