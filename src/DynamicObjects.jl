@@ -210,7 +210,7 @@ compute_property(o, ::Val{:cache_base}) = "cache"
 compute_property(o, ::Val{:cache_path}) = joinpath(o.cache_base, o.hash)
 compute_property(o, ::Val{:__status__}) = nothing
 compute_property(o, ::Val{:__strict__}) = true
-compute_property(o, ::Val{:__cache_type__}) = typeof(getfield(o, :cache).cache)
+compute_property(o, ::Val{:__cache_type__}) = error("`__cache_type__` was removed (2026-07-07, decision 2canrl); the cache is always threadsafe (`ThreadsafeDict`) now.")
 compute_property(o, ::Val{:__substatus__}, name, args...; kwargs...) =
     _default_substatus(o.__status__, o, name, args...; kwargs...)
 _default_substatus(status, o, name, args...; kwargs...) = nothing
@@ -1804,9 +1804,8 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
             cache_path = get_cache_path(o, name, indices...; kwargs...)
             mkpath(dirname(cache_path))
             __strict__ = getorcomputeproperty(o, :__strict__)
-            _is_threadsafe = getorcomputeproperty(o, :__cache_type__) <: AbstractThreadsafeDict
             _cache_context = """Object type: $(nameof(typeof(o))) (objectid: $(objectid(o)), hash: $(hash(o)))
-Cache dict: $(_is_threadsafe ? "ThreadsafeDict (parallel)" : "non-threadsafe Dict — if concurrent access is intended, use cache_type=:parallel")
+Cache dict: ThreadsafeDict (parallel)
 If multiple objects with the same hash are writing here concurrently, this may indicate a concurrency issue or a hashing collision."""
             disk_locks = _disk_cache(o, vname)
             rv = if __strict__ && !isnothing(disk_locks)
@@ -4530,7 +4529,6 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             Expr(:kw, :__parent__, :__self__),
             (Expr(:kw, ip, ip) for ip in index_params)...,
             (Expr(:kw, kname, kname) for (kname, _) in index_kwargs)...,
-            Expr(:kw, :cache_type, :(__self__.__cache_type__)),
         ]
         # Auto-wire __status__ as a substatus of the parent, UNLESS the child
         # body declares its own __status__ (opt-out). Declaring
@@ -4799,7 +4797,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     untyped_fixed = [lhs for (_, lhs) in fixed_fields if lhs isa Symbol]
     fixed_field_decls = Any[lhs isa Symbol ? :($lhs::$(Symbol("_T_", lhs))) : lhs
                             for (_, lhs) in fixed_fields]
-    cache_ctor = :($PropertyCache($(resolve_cache_type)(cache_type), (;kwargs...)))
+    cache_ctor = :($PropertyCache($ThreadsafeDict, (;kwargs...)))
     if isempty(untyped_fixed)
         parametric_head = head
         new_call = :(new($(fixed_names...), $cache_ctor))
@@ -4813,7 +4811,8 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     end
     struct_expr = Expr(:struct, mut, parametric_head, Expr(:block,
         fixed_field_decls..., :(cache::$PropertyCache),
-        :(function $type($(fixed_lhs...); cache_type=$(Meta.quot(cache_type)), kwargs...)
+        :(function $type($(fixed_lhs...); cache_type=nothing, kwargs...)
+            isnothing(cache_type) || @warn "`cache_type` is deprecated and ignored — the cache is always threadsafe now (decision 2canrl); drop this kwarg." maxlog=1
             __inst__ = $new_call
             $(_link_owner!)(getfield(__inst__, :cache), __inst__)
             __inst__
