@@ -1073,6 +1073,14 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     end
     # No value, no in-flight task — build substatus outside the lock.
     s = isnothing(substatus) ? nothing : substatus()
+    # Blocking DEFAULT (`fetch === Base.fetch`): the caller blocks on
+    # `fetch(task)` anyway, so a spawned task is pure overhead (spawn + thread
+    # handoff + the c.status/c.tasks bookkeeping only a poller needs). Compute
+    # synchronously on the calling thread instead (the `:compute_sync` branch
+    # below). Non-blocking callers (`fetch !== Base.fetch`, e.g. `fetchindex` /
+    # `ensure!` polling — they pass `fetch=identity`) keep the spawn path so
+    # they get a pollable Task.
+    sync = fetch === Base.fetch
     rv = lock(c.lock) do
         v = get(c.cache, key, _missing_sentinel)
         if v !== _missing_sentinel
@@ -1084,6 +1092,11 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
             haskey(c.status, key) && pop!(c.status, key)
         end
         haskey(c.tasks, key) && return (:lost_task, c.tasks[key])
+        if sync
+            # Compute after releasing the lock — `f` recurses into sibling
+            # properties on the same cache, which must NOT run under `c.lock`.
+            return (:compute_sync, nothing)
+        end
         if !isnothing(s)
             c.status[key] = s
         end
@@ -1117,6 +1130,34 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
         return (:won, task)
     end
     kind, x = rv
+    if kind === :compute_sync
+        # Synchronous blocking compute on the calling thread, OUTSIDE the lock.
+        # No c.tasks/c.status registration — the compute is invisible to the
+        # polling dicts. Relaxed dedup: a concurrent caller may compute the same
+        # key, but the store below is first-write-wins, so the cache holds ONE
+        # value and every caller returns it. Safe under DO's pure-property
+        # contract; expensive `@cached` props are further deduped by the disk
+        # path lock inside `_computeproperty`.
+        local v
+        try
+            v = f(s)
+        catch e
+            _fail_substatus!(s, e)
+            rethrow()
+        end
+        stored = lock(c.lock) do
+            existing = get(c.cache, key, _missing_sentinel)
+            if existing !== _missing_sentinel
+                _on_hit!(c, key)          # lost the race — return the winner's value
+                return existing
+            end
+            c.cache[key] = v
+            _on_store!(c, key)
+            return v
+        end
+        !isnothing(s) && _finalize_substatus!(s)
+        return stored
+    end
     if kind === :lost_value || kind === :lost_task
         # We built `s` but didn't install it — finalize so the Treebars
         # node (if any) detaches instead of leaking.
