@@ -1485,14 +1485,13 @@ end
 # dispatch, then takes the same branch.
 #
 # The `Val{name}` static parameter is also where per-name typed-slot dispatch
-# hangs off: a bare COMPUTED property's result is asserted to its inferred slot
-# type `_slot_eltype(typeof(o), Val(name))` (point 2). This is what makes a
-# type-stable read — `getorcomputeproperty` returns from a `::Any` cache, and the
-# assert re-narrows it to the compile-time-constant inferred type. Sound by
-# construction: `return_type` over-approximates, so the actual value is always
-# `<:` the asserted type (fixed fields skip the assert — `getfield` is already
-# typed; unslotted names widen to `::Any`, a no-op). Behaviourally identical to
-# `getorcomputeproperty(o, name)` for every `name` bar the (safe) narrowing.
+# hangs off: `_has_slot(O, Val(name))` folds, and a slotted bare COMPUTED property
+# reads its value DIRECTLY from the concrete `Slot{T}` in the `slots` field — a
+# type-stable, lock-free, 0-alloc warm hit (no cache lookup, no assert; Phase B).
+# Fixed fields short-circuit to `getfield` above; only NON-slotted names (IP
+# wrappers) reach the `getorcomputeproperty(...)::_slot_eltype(...)` fallthrough,
+# where `_slot_eltype` is `Any` — a no-op assert. (Pre-Phase-B this assert
+# re-narrowed a `::Any` cache read to the inferred type; slots supersede it.)
 # Does parent type `O` store property `name` in a typed `slots` field? Compile-time
 # constant (folds at every literal `o.name`).
 @inline _has_slot(::Type{O}, ::Val{name}) where {O, name} =
