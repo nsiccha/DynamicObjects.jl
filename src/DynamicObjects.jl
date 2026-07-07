@@ -238,6 +238,20 @@ for (old, why) in pairs(_REMOVED_MAGIC)
     @eval compute_property(o, ::Val{$(QuoteNode(old))}) = error($msg)
 end
 
+# ── Magic properties resolvable as BARE references inside a body ───────────
+# So a property body may write `__hash__` (not `__self__.__hash__`) and have it
+# resolved like a sibling property. The injected data-side auto-properties are
+# otherwise absent from a struct's `prop_names` (they live only in the slot-
+# inference topology), so `walk_rhs` would leave a bare `__hash__` as a free
+# variable. NOT here: `__parent__` (children already declare it via a
+# `__parent__ = nothing` prepend, so it's a real entry in their `prop_names`;
+# a top-level struct has no parent) and `__status__`/`__substatus__`
+# (`__status__` is threaded as a kwarg-local and must STAY the local, never
+# `__self__.__status__`; `__substatus__` is an indexed call, not a value).
+const _BAREREF_MAGIC = Set{Symbol}([
+    :__hash__, :__hash_fields__, :__cache_base__, :__cache_path__, :__strict__,
+])
+
 # Substatus lifecycle hooks — the generic methods are no-ops so DO stays
 # correct with progress disabled (`__status__===nothing`); the
 # `::Treebars.ProgressNode` specializations below forward to Treebars'
@@ -4785,6 +4799,12 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     # property name?" use the `prop_names` set built from it.
     properties = collect(oproperties)
     prop_names = Set{Symbol}(first.(oproperties))
+    # Bare-ref resolution set: user property names PLUS the injected magic
+    # dunders, so a body may reference `__hash__`/`__cache_path__`/… bare and
+    # have `walk_rhs` resolve them to `__self__.…` just like a sibling. Keep
+    # `prop_names` itself user-only — the injection guard and `hasproperty`
+    # below rely on it meaning "names the user actually declared".
+    walk_props = union(prop_names, _BAREREF_MAGIC)
 
     # Struct-level lint passes: repeated-prefix and shared-arg-signature.
     # Lints have moved to `analyze_structure(T)` — run from `print_structure`,
@@ -4868,7 +4888,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     end
     infer_specs = map(bare_computed) do (name, info)
         _locals = info.locals isa Set ? info.locals : Set{Symbol}()
-        walked = walk_rhs(info.rhs; locals=_locals, properties=prop_names, lnn=info.lnn)
+        walked = walk_rhs(info.rhs; locals=_locals, properties=walk_props, lnn=info.lnn)
         params = Set{Symbol}()
         body = _to_infer_body(walked, fixed_set, params)
         # `name::U = rhs` (`lhs = Expr(:(::), name, U)`) is the annotation OVERRIDE.
@@ -5074,7 +5094,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     if Meta.isexpr(idx, :parameters)
                         Expr(:parameters, map(idx.args) do a
                             if Meta.isexpr(a, :kw)
-                                Expr(:kw, a.args[1], walk_rhs(a.args[2]; locals=defaults_locals, properties=prop_names, lnn=info.lnn))
+                                Expr(:kw, a.args[1], walk_rhs(a.args[2]; locals=defaults_locals, properties=walk_props, lnn=info.lnn))
                             else
                                 a
                             end
@@ -5124,12 +5144,12 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                     # plain locals (they're in the emitted method signature).
                     # String literals with no interpolation are passed through
                     # unchanged by `walk_rhs`.
-                    walked_doc = walk_rhs(pdoc; info.locals, properties=prop_names, lnn=info.lnn)
+                    walked_doc = walk_rhs(pdoc; info.locals, properties=walk_props, lnn=info.lnn)
                     (_lnn, Expr(:(=), _call(:_property_description, doc_extras...), Expr(:block, _lnn, walked_doc)))
                 else
                     nothing
                 end
-                walked_rhs = walk_rhs(info.rhs; info.locals, properties=prop_names, lnn=info.lnn)
+                walked_rhs = walk_rhs(info.rhs; info.locals, properties=walk_props, lnn=info.lnn)
                 # `@dynamic_progress`-marked: emit the 2-arg form
                 # `@dynamic_progress __status__ <body>`. The macro (defined
                 # above) handles both the call-site rewrite AND the Tb
@@ -5258,7 +5278,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             Meta.isexpr(wp, :(<:)) && wp.args[1] isa Symbol && push!(method_locals, wp.args[1])
             Meta.isexpr(wp, :comparison) && wp.args[1] isa Symbol && push!(method_locals, wp.args[1])
         end
-        walked_body = walk_rhs(m.body; locals=method_locals, properties=prop_names, lnn=m.lnn)
+        walked_body = walk_rhs(m.body; locals=method_locals, properties=walk_props, lnn=m.lnn)
         sig = Expr(:call, m.fname, sig_args...)
         if !isempty(m.where_params)
             sig = Expr(:where, sig, m.where_params...)
