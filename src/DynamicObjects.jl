@@ -370,22 +370,38 @@ Base.show(io::IO, pc::PropertyCache) = print(io, "PropertyCache(", length(pc.cac
 # (unfilled); 1-arg ctor = pre-seeded (a construction kwarg override).
 mutable struct Slot{T}
     @atomic set::Bool
+    seeded::Bool          # true = a construction override (never reset by cache-clearing)
     value::T
-    Slot{T}() where {T} = new{T}(false)
-    Slot{T}(v) where {T} = new{T}(true, v)
+    Slot{T}() where {T} = new{T}(false, false)      # lazy/computed
+    Slot{T}(v) where {T} = new{T}(true, true, v)    # pre-seeded (kwarg override)
 end
 
-# Build the per-instance `slots` NamedTuple of EMPTY typed Slots for parent type
-# `O`, driven by 5.2's `_slot_types(O)`. `typeof(result)` is the concrete slots
-# type the constructor stamps into `new{…, __DO_S__}`. (Phase B increment 1:
-# slots are built but DORMANT — reads still route through the cache; the
-# override-aware fill + slot reads land in increment 2.)
-@generated function _slots_from_types(::Type{ST}) where {ST<:NamedTuple}
-    ns = fieldnames(ST)
-    slot_exprs = Any[:($(Slot){$t}()) for t in fieldtypes(ST)]
-    :(NamedTuple{$ns}(($(slot_exprs...),)))
+# Build the per-instance `slots` NamedTuple — one typed `Slot{T}` per bare
+# computed property — from the override-aware value-type NT `ST` (`_ov_slot_types`)
+# + the constructor's kwarg overrides `kw`. A property named in `kw` is SEEDED,
+# `convert`ed to its slot type `T`: for an annotated `x::U = …` slot `T` is `U`,
+# so a non-convertible override ERRORS here (the "hard" firewall — e.g.
+# `__parent__::Nothing = nothing` rejects a real parent); for an un-annotated slot
+# `T` already IS the override's type, so convert is identity. The rest are empty
+# (lazy). `typeof(result)` is the concrete slots type `__DO_S__` the ctor stamps
+# into `new{…, __DO_S__}`.
+@generated function _build_slots(::Type{ST}, kw::NamedTuple) where {ST<:NamedTuple}
+    kwns = fieldnames(kw)
+    exprs = Any[n in kwns ?
+        :($(Slot){$t}($(convert)($t, $(getfield)(kw, $(QuoteNode(n)))))) :
+        :($(Slot){$t}())
+        for (n, t) in zip(fieldnames(ST), fieldtypes(ST))]
+    :(NamedTuple{$(fieldnames(ST))}(($(exprs...),)))
 end
-_build_empty_slots(::Type{O}) where {O} = _slots_from_types(_slot_types(O))
+
+# The subset of constructor kwargs that are NOT bare-computed slots (IP args,
+# user-overridden indexed properties, …). These are the ONLY overrides that still
+# seed the cache dict; slotted overrides live solely in `slots` (Phase B).
+@generated function _nonslot_kwargs(::Type{ST}, kw::NamedTuple) where {ST<:NamedTuple}
+    slot_ns = fieldnames(ST)
+    keep = Tuple(n for n in fieldnames(kw) if !(n in slot_ns))
+    :(NamedTuple{$keep}(kw))
+end
 
 struct IndexableProperty{N,O,D<:AbstractDict}
     o::O
@@ -1105,8 +1121,34 @@ This is useful after hot-reloading code via Revise: property values computed by
 old method definitions stay memoized until the process restarts or this function
 is called.
 """
+# Reset a single bare-computed slot to "unfilled" so the next read recomputes.
+# Skips a SEEDED slot (a construction override — provided data, not a memoized
+# computation). Runtime `name` (type-unstable, but clearing is not a hot path).
+function _reset_slot!(o, name::Symbol)
+    slots = getfield(o, :slots)
+    if hasfield(typeof(slots), name)
+        s = getfield(slots, name)
+        if !s.seeded
+            @atomic :release s.set = false
+        end
+    end
+    nothing
+end
+
+# Reset every non-seeded slot (whole-object mem clear), unrolled over the concrete
+# slots NamedTuple.
+@generated function _clear_slots!(slots::NamedTuple)
+    exprs = Any[:(let s = getfield(slots, $(QuoteNode(n)))
+                     if !s.seeded
+                         @atomic :release s.set = false
+                     end
+                 end) for n in fieldnames(slots)]
+    Expr(:block, exprs..., :nothing)
+end
+
 function clear_mem_caches!(obj)
     empty!(getfield(obj, :cache).cache)
+    _clear_slots!(getfield(obj, :slots))
     nothing
 end
 
@@ -1451,9 +1493,55 @@ end
 # `<:` the asserted type (fixed fields skip the assert — `getfield` is already
 # typed; unslotted names widen to `::Any`, a no-op). Behaviourally identical to
 # `getorcomputeproperty(o, name)` for every `name` bar the (safe) narrowing.
+# Does parent type `O` store property `name` in a typed `slots` field? Compile-time
+# constant (folds at every literal `o.name`).
+@inline _has_slot(::Type{O}, ::Val{name}) where {O, name} =
+    hasfield(O, :slots) && hasfield(fieldtype(O, :slots), name)
+
 @inline function _getprop(o, ::Val{name}) where {name}
     hasfield(typeof(o), name) && return getfield(o, name)
+    if _has_slot(typeof(o), Val(name))
+        slot = getfield(getfield(o, :slots), name)
+        (@atomic :acquire slot.set) && return slot.value   # lock-free typed warm hit
+        return _compute_into_slot!(o, Val(name), slot)     # miss → compute once
+    end
     getorcomputeproperty(o, name)::_slot_eltype(typeof(o), Val(name))
+end
+
+# Slow path for a bare-computed slot miss: compute the property ONCE and publish it
+# into `slot`, mirroring `ThreadsafeDict.get!`'s synchronous once-compute lifecycle.
+# Build the substatus + run the compute OUTSIDE the cache lock (the RHS recurses
+# into sibling slots on the same lock, which must not run under it), then publish
+# first-write-wins under it. `slot.value` is a typed `Slot{T}` field, so the store
+# `convert`s to `T` and the returned read is type-stable `T`.
+@noinline function _compute_into_slot!(o, ::Val{name}, slot::Slot{T}) where {name, T}
+    c = getfield(getfield(o, :cache), :cache)          # the underlying ThreadsafeDict
+    subf = _bare_substatus_f(o, name)
+    sub = isnothing(subf) ? nothing : subf()
+    local v
+    try
+        v = _computeproperty(o, name; __status__=sub)
+    catch e
+        _fail_substatus!(sub, e)
+        rethrow()
+    end
+    # Publish first-write-wins. Explicit lock/unlock (not `lock() do`): the do-block
+    # closure boxes `v` and widens the returned `slot.value` to `Any`, which would
+    # union into `_getprop`'s slot branch and de-stabilise every slotted read. The
+    # typed `r::T` pins the return to the slot element type.
+    lock(c.lock)
+    local r::T
+    try
+        if !(@atomic :acquire slot.set)
+            slot.value = v
+            @atomic :release slot.set = true
+        end
+        r = slot.value
+    finally
+        unlock(c.lock)
+    end
+    isnothing(sub) || _finalize_substatus!(sub)
+    r
 end
 
 # ── Slot-type inference (typed storage, point 2) ──────────────────────────
@@ -1500,31 +1588,44 @@ end
 # rides the same `return_type` path — no separate annotation function.
 function _infer_rhs end
 function _slot_types end
+# Override-aware slot types: `_ov_slot_types(O, OverrideNT)` — same as `_slot_types(O)`
+# but re-typing un-annotated slots the constructor overrode (+ their dependents).
+# Emitted per-struct as `@generated` alongside `_slot_types`; the constructor uses it.
+function _ov_slot_types end
 
-# Topological driver for the emitted `@generated _slot_types`. `plan` is a tuple
-# of `(name, dep_params)` in dependency order (deps before dependents), baked by
-# the macro to match each helper's parameter order. For each property,
-# `return_type` its helper with the parent type `O`, `Val{name}`, and the
-# already-known type of every computed dep (fixed deps were folded into the
-# helper as `getfield`s; an as-yet-unknown dep — IP wrapper, forward ref —
-# degrades to `Any`, which stays correct). Returns the
-# `NamedTuple{names,Tuple{T…}}` EXPR the generator emits verbatim.
-function _slot_types_expr(::Type{O}, plan) where {O}
+# Topological driver for the emitted `@generated _slot_types` / `_ov_slot_types`.
+# `plan` is a tuple of `(name, dep_params, annotated)` in dependency order (deps
+# before dependents), baked by the macro. `OV` is the constructor's kwarg-override
+# NamedTuple TYPE (empty for the no-override `_slot_types`). Per property:
+#   * UN-annotated AND overridden in `OV` → the slot FOLLOWS the override's type
+#     (soft), and dependents re-infer through it (an override propagates down).
+#   * otherwise → `return_type` its `_infer_rhs` helper with the parent type `O`,
+#     `Val{name}`, and the already-known type of every computed dep. An annotated
+#     `name::U = rhs` is baked into the helper as `(body)::U`, so it stays `U`
+#     REGARDLESS of any override — a type firewall for its dependents. Fixed deps
+#     were folded into the helper as `getfield`s; an as-yet-unknown dep (IP
+#     wrapper, forward ref) degrades to `Any`, which stays correct.
+# Returns the `NamedTuple{names,Tuple{T…}}` EXPR the generator emits verbatim.
+_slot_types_expr(::Type{O}, plan) where {O} =
+    _slot_types_expr(O, plan, NamedTuple{(),Tuple{}})
+function _slot_types_expr(::Type{O}, plan, ::Type{OV}) where {O, OV<:NamedTuple}
+    ov = fieldnames(OV)
     known = Dict{Symbol,Any}()
     names = Symbol[]
     Texprs = Any[]
-    for (name, dep_params) in plan
-        depTs = Any[get(known, dp, Any) for dp in dep_params]
-        # `name::U = rhs` annotation overrides are baked into the helper body as
-        # `(body)::U`, so they flow through this same `return_type` — no special
-        # case needed here.
-        T = Core.Compiler.return_type(_infer_rhs, Tuple{O, Val{name}, depTs...})
-        # A property whose compute provably never returns normally (e.g.
-        # `will_fail = error(…)`) infers `Union{}`. `Tuple{Union{}}` is an
-        # ILLEGAL type ("Tuple field type cannot be Union{}"), so building the
-        # NamedTuple with it would throw from the `@generated` body and mask the
-        # property's real error. It has no storable value anyway — widen to `Any`.
-        T === Union{} && (T = Any)
+    for (name, dep_params, annotated) in plan
+        if !annotated && (name in ov)
+            T = fieldtype(OV, name)
+        else
+            depTs = Any[get(known, dp, Any) for dp in dep_params]
+            T = Core.Compiler.return_type(_infer_rhs, Tuple{O, Val{name}, depTs...})
+            # A property whose compute provably never returns normally (e.g.
+            # `will_fail = error(…)`) infers `Union{}`. `Tuple{Union{}}` is an
+            # ILLEGAL type ("Tuple field type cannot be Union{}"), so building the
+            # NamedTuple with it would throw from the `@generated` body and mask the
+            # property's real error. It has no storable value anyway — widen to `Any`.
+            T === Union{} && (T = Any)
+        end
         known[name] = T
         push!(names, name)
         push!(Texprs, T)
@@ -2225,6 +2326,7 @@ clear_cache!(o, name::Symbol, indices...; kwargs...) = begin
     if isempty(indices) && isempty(kwargs)
         # Clear in-memory (whole property, including IndexableProperty wrapper)
         delete!(cache, name)
+        _reset_slot!(o, name)      # a slotted bare prop lives in `slots`, not the dict
         # Clear all disk cache files for this property
         cp = o.__cache_path__
         if isdir(cp)
@@ -4264,7 +4366,6 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     untyped_fixed = [lhs for (_, lhs) in fixed_fields if lhs isa Symbol]
     fixed_field_decls = Any[lhs isa Symbol ? :($lhs::$(Symbol("_T_", lhs))) : lhs
                             for (_, lhs) in fixed_fields]
-    cache_ctor = :($PropertyCache($ThreadsafeDict, (;kwargs...)))
     tparams = [Symbol("_T_", n) for n in untyped_fixed]      # POINT 1 params (may be empty)
     typeofs = [:(typeof($n)) for n in untyped_fixed]
     # Phase B: every struct gains a trailing slots type param `__DO_S__ <: NamedTuple`,
@@ -4276,15 +4377,23 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         Expr(:(<:), Expr(:curly, head.args[1], all_tparams...), head.args[2]) :
         Expr(:curly, head, all_tparams...)
     # Probe type carries a dummy (empty-NT) slots param: slot inference is
-    # S-independent, so `_build_empty_slots` recovers the real slot eltypes from it.
+    # S-independent, so `_ov_slot_types` recovers the real (override-aware) slot
+    # eltypes from it.
     probe_type = :($type{$(typeofs...), $(typeof((;)))})
-    new_call = :(new{$(typeofs...), $(typeof)(__slots__)}($(fixed_names...), $cache_ctor, __slots__))
     struct_expr = Expr(:struct, mut, parametric_head, Expr(:block,
         fixed_field_decls..., :(cache::$PropertyCache), :(slots::__DO_S__),
         :(function $type($(fixed_lhs...); cache_type=nothing, kwargs...)
             isnothing(cache_type) || error("`cache_type` was removed (2026-07-07, decision 2canrl); the cache is always threadsafe now — drop this kwarg.")
-            __slots__ = $(_build_empty_slots)($probe_type)
-            __inst__ = $new_call
+            __kw__ = $(values)(kwargs)
+            # Override-aware slot types (an un-annotated kwarg override RE-TYPES its
+            # slot + propagates to dependents; annotated slots stay `U`), then build
+            # the slots (seed overrides, lazy rest). Non-slotted overrides (IP args /
+            # user-overridden indexed props) seed the cache dict; slotted overrides
+            # live ONLY in `slots` — the Dict no longer holds bare computed props.
+            __ST__ = $(_ov_slot_types)($probe_type, $(typeof)(__kw__))
+            __slots__ = $(_build_slots)(__ST__, __kw__)
+            __cache__ = $PropertyCache($ThreadsafeDict, $(_nonslot_kwargs)(__ST__, __kw__))
+            __inst__ = new{$(typeofs...), $(typeof)(__slots__)}($(fixed_names...), __cache__, __slots__)
             __inst__
         end)
     ))
@@ -4324,10 +4433,9 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         # which is `U` exactly when inference gave up (`inferred = Any`) — the
         # "circumvent failures" case. Routing it through `return_type` (not a
         # regular call inside the `@generated` body) keeps folding reliable.
-        if Meta.isexpr(info.lhs, :(::))
-            body = Expr(:(::), body, info.lhs.args[2])
-        end
-        (; name, dep_params=sort!(collect(params)), body)
+        annotated = Meta.isexpr(info.lhs, :(::))
+        annotated && (body = Expr(:(::), body, info.lhs.args[2]))
+        (; name, dep_params=sort!(collect(params)), body, annotated)
     end
     # ── Machinery-dunder acyclicity contract ───────────────────────────────
     # `__status__`/`__strict__` are fetched by `_computeproperty`
@@ -4372,17 +4480,17 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     infer_specs = Vector{Any}(infer_specs)
     for nm in (:__hash_fields__, :__cache_base__)
         nm in prop_names && continue
-        push!(infer_specs, (; name=nm, dep_params=Symbol[],
+        push!(infer_specs, (; name=nm, dep_params=Symbol[], annotated=false,
             body=:($compute_property(__self__, $(Val)($(QuoteNode(nm)))))))
         push!(bare_set, nm)
     end
     if !(:__hash__ in prop_names)
-        push!(infer_specs, (; name=:__hash__, dep_params=[:__hash_fields__],
+        push!(infer_specs, (; name=:__hash__, dep_params=[:__hash_fields__], annotated=false,
             body=:($persistent_hash(($(_hash_typekey)(__self__), $_hash_replace(__hash_fields__))))))
         push!(bare_set, :__hash__)
     end
     if !(:__cache_path__ in prop_names)
-        push!(infer_specs, (; name=:__cache_path__, dep_params=[:__cache_base__, :__hash__],
+        push!(infer_specs, (; name=:__cache_path__, dep_params=[:__cache_base__, :__hash__], annotated=false,
             body=:($joinpath(__cache_base__, __hash__))))
         push!(bare_set, :__cache_path__)
     end
@@ -4396,13 +4504,17 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     ]
     slot_plan_expr = Expr(:tuple, [
         Expr(:tuple, QuoteNode(nm),
-             Expr(:tuple, [QuoteNode(d) for d in spec_by_name[nm].dep_params]...))
+             Expr(:tuple, [QuoteNode(d) for d in spec_by_name[nm].dep_params]...),
+             spec_by_name[nm].annotated)
         for nm in infer_topo
     ]...)
-    slot_types_def = Expr(:macrocall,
-        Expr(:., :Base, QuoteNode(Symbol("@generated"))), nothing,
-        :($DynamicObjects._slot_types(::Type{OO}) where {OO <: $type} =
-            $DynamicObjects._slot_types_expr(OO, $slot_plan_expr)))
+    slot_types_def = Expr(:block,
+        Expr(:macrocall, Expr(:., :Base, QuoteNode(Symbol("@generated"))), nothing,
+            :($DynamicObjects._slot_types(::Type{OO}) where {OO <: $type} =
+                $DynamicObjects._slot_types_expr(OO, $slot_plan_expr))),
+        Expr(:macrocall, Expr(:., :Base, QuoteNode(Symbol("@generated"))), nothing,
+            :($DynamicObjects._ov_slot_types(::Type{OO}, ::Type{OVV}) where {OO <: $type, OVV <: $NamedTuple} =
+                $DynamicObjects._slot_types_expr(OO, $slot_plan_expr, OVV))))
     result = Expr(:block)
     # Emit per-cached-property DiskCacheLocks
     for (name, varname) in cached_names
