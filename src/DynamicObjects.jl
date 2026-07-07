@@ -37,7 +37,7 @@ optionally disk-cached properties.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, set_cache_budget!, cache_budget, cache_bytes, cache_entries, subtree_bytes, subtree_budget, last_evicted, is_pinnable_value
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!
 
 import SHA, Serialization, Mmap, Treebars
 
@@ -326,482 +326,17 @@ function _format_size(n::Integer)
 end
 
 """
-    PropertyCache{D}(cache, sizes, pinned, bytes, budget, parent_pc, owner_ref, last_evicted)
+    PropertyCache(D, c::NamedTuple)
 
 Per-DO-instance memoization cache for `@dynamicstruct` properties. `cache::D` is
 the underlying `Dict` (`:serial`) or `ThreadsafeDict` (`:parallel`) holding the
 memoized values for non-indexed properties.
-
-The remaining fields back the LRU/eviction layer:
-- `sizes` — bytes recorded at store for each `(name, args_key)` entry; written
-  once at store via `_summarysize_capped`, never re-measured on hit.
-- `pinned` — entries that the eviction loop must skip (auto-pinned via
-  `is_pinnable_value` at store; never evicted).
-- `bytes` — atomic running subtotal of `sizes` for THIS cache only (no
-  recursion). Subtree totals are tracked at the budget-holder via push-up.
-- `budget` — `0` = not a budget-holder, push deltas up to parent; `>0` = this
-  PropertyCache is the budget-holder for its subtree.
-- `parent_pc` — strong ref to the parent DO's PropertyCache (or `nothing` for
-  roots), eagerly resolved at construction by `_link_owner!`. Used for push-up
-  byte-delta traversal.
-- `owner_ref` — strong ref to the owning DO instance, set right after `new(...)`
-  in the `@dynamicstruct` constructor via `_link_owner!`. Lets the eviction
-  walker find metadata about the owner (e.g. `@cached`-ness of a property)
-  without plumbing the DO through every `get!`. Forms a child_PC ↔ child_DO
-  cycle; Julia's tracing GC handles it when no external strong ref keeps
-  the cycle alive (i.e. when the parent's cache evicts the child).
-- `last_evicted` — single-slot history on the budget-holder; `Tuple{Symbol,Any}`
-  of the most recent evicted entry, or `nothing`. Used by `last_evicted(obj)`.
 """
 struct PropertyCache{D<:AbstractDict{Symbol,Any}}
     cache::D
-    sizes::Dict{Tuple{Symbol,Any}, Int}
-    pinned::Set{Tuple{Symbol,Any}}
-    bytes::Threads.Atomic{Int}
-    budget::Threads.Atomic{Int}
-    parent_pc::Base.RefValue{Any}    # Union{Nothing, PropertyCache} — strong ref to parent
-    owner_ref::Base.RefValue{Any}    # Union{Nothing, owning DO} — strong ref
-    last_evicted::Base.RefValue{Any} # Union{Nothing, Tuple{Symbol,Any}}
-    lru_order::Vector{Tuple{Symbol,Any}}  # access-order (MRU-last); local to this PC
-    lru_lock::ReentrantLock          # protects lru_order mutation
-    PropertyCache(D, c::NamedTuple) = new{D{Symbol,Any}}(
-        D{Symbol,Any}(pairs(c)),
-        Dict{Tuple{Symbol,Any},Int}(),
-        Set{Tuple{Symbol,Any}}(),
-        Threads.Atomic{Int}(0),
-        Threads.Atomic{Int}(0),
-        Ref{Any}(nothing),
-        Ref{Any}(nothing),
-        Ref{Any}(nothing),
-        Tuple{Symbol,Any}[],
-        ReentrantLock(),
-    )
+    PropertyCache(D, c::NamedTuple) = new{D{Symbol,Any}}(D{Symbol,Any}(pairs(c)))
 end
 
-# Owner-link injection. Called by `@dynamicstruct` lowering right after
-# `new(...)` constructs the instance so the eviction walker can find
-# `__parent__` from any PropertyCache without plumbing the owning DO through
-# every `get!`. Safe to call repeatedly (idempotent after first set).
-#
-# Also eagerly resolves `parent_pc`: `__parent__` is passed as a kwarg by the
-# child-constructor lowering (see ~L3574) and therefore lives as an entry in
-# `pc.cache` immediately after construction, NOT as a struct field. Resolving
-# it here avoids any later `owner.__parent__` / `getfield(owner, :__parent__)`
-# lookup at hit/store time — both are wrong (one recurses through the cache
-# machinery, the other misses because `__parent__` isn't a struct slot).
-function _link_owner!(pc::PropertyCache, owner)
-    pc.owner_ref[] === nothing || return nothing
-    pc.owner_ref[] = owner  # strong ref — pc and owner share lifetime by design
-    parent_obj = get(pc.cache, :__parent__, nothing)
-    if parent_obj !== nothing && parent_obj !== owner
-        parent_pc = getfield(parent_obj, :cache)
-        parent_pc isa PropertyCache && (pc.parent_pc[] = parent_pc)  # strong ref
-    end
-    nothing
-end
-_link_owner!(_, _) = nothing  # tolerate non-PropertyCache (e.g. unit tests / fixed-only structs)
-
-# --- Native-handle detection (D1 resolution: shallow direct-field check) ---
-
-_is_handle_field_type(::Type{<:Ptr}) = true
-_is_handle_field_type(::Type{<:IO}) = true
-_is_handle_field_type(::Type{<:Base.RefValue}) = true
-_is_handle_field_type(::Type{<:Threads.AbstractLock}) = true
-_is_handle_field_type(::Type) = false
-
-"""
-    is_pinnable_value(::Type{T}) -> Bool
-    is_pinnable_value(v) -> Bool
-
-Whether values of type `T` (or value `v`) should be auto-pinned in the cache —
-i.e. never evicted by the LRU layer. The default implementation does a shallow
-direct-field check: returns `true` iff any of `fieldtypes(T)` is `Ptr`, `IO`,
-`Base.RefValue`, `Threads.AbstractLock`, or a subtype thereof.
-
-Pure-data types like `Array`, `Dict`, `DataFrame`, `String`, `Vector{Any}` are
-NOT pinned by default (no direct pointer field) and remain eviction
-candidates. Wrapper types whose direct fields are pure data but which
-transitively hold a native resource should add a one-line override:
-
-```julia
-DynamicObjects.is_pinnable_value(::Type{<:MyBridgeHandle}) = true
-```
-"""
-# Bounded type-level walk: true iff T (or any of its transitive field
-# types, the eltype of an array, or key/value type of a dict) is a
-# native-handle type. Depth cap (8) terminates pathological types and
-# any mutable cycles. Catches `Tuple{BridgeStanModel, X}` where the
-# direct field type isn't itself a Ptr/IO but contains one.
-function _type_has_handle(::Type{T}, depth::Int=8) where {T}
-    _is_handle_field_type(T) && return true
-    depth <= 0 && return false
-    isbitstype(T) && return false
-    # Abstract / Union / Any-typed slots: we can't see inside them at the
-    # type level. Treat as "no handle" so eviction stays effective; users
-    # whose Any-typed cache values transitively hold a native resource
-    # should add an override for their wrapper type.
-    isconcretetype(T) || return false
-    T <: Type && return false  # types-of-types aren't user data
-    if T <: AbstractArray
-        return _type_has_handle(eltype(T), depth - 1)
-    end
-    if T <: AbstractDict
-        return _type_has_handle(keytype(T), depth - 1) ||
-               _type_has_handle(valtype(T), depth - 1)
-    end
-    for ft in fieldtypes(T)
-        _type_has_handle(ft, depth - 1) && return true
-    end
-    false
-end
-
-is_pinnable_value(::Type{T}) where {T} = _type_has_handle(T)
-is_pinnable_value(v) = is_pinnable_value(typeof(v))
-
-# --- Size measurement (D5 resolution: bounded recursion-depth walker) ---
-
-"""
-    _summarysize_capped(v, depth=8) -> Int
-
-Approximate byte size of `v` with a bounded recursion depth. Walks the
-common container shapes (`AbstractArray` of non-isbits elements,
-`AbstractDict`, `Tuple`, generic struct fields) up to `depth` levels and
-falls back to `sizeof(typeof(v))` for the unwalked remainder.
-
-Measured once at store and stored in `PropertyCache.sizes`; never re-measured
-on hit. This is intentionally an approximation — exact byte accounting under
-`Base.summarysize` is non-trivial to bound (no depth knob exposed) and the
-LRU layer only needs eviction-order signal, not accuracy. Pathological inputs
-(deep Vega-Lite spec Dicts, nested Stan draw matrices) stop walking at
-`depth` and contribute their nominal type-shell size instead of a full walk.
-"""
-# --- Push-up bookkeeping (D6 sync-on-store; eviction trigger lands next commit) ---
-
-# Resolve and cache the parent PropertyCache via the owning DO's __parent__.
-# Called from the cache write path (post-`get!` closure) which runs OUTSIDE
-# the cache lock — see Base.get!(::AbstractThreadsafeDict, ...) below at the
-# spawn task body — so triggering `__parent__` resolution here can recurse
-# into the cache machinery without deadlocking on a held lock.
-# Parent PropertyCache lookup. `parent_pc` is resolved eagerly by
-# `_link_owner!` from the `:__parent__` kwarg stored in `pc.cache` at
-# construction time. Strong ref — parents and children share lifetime
-# by design (parent's cache holds the child, the child can't outlive it).
-function _parent_pc(pc::PropertyCache)
-    p = pc.parent_pc[]
-    p isa PropertyCache ? p : nothing
-end
-
-# Opt-in gate: bookkeeping (sizing, LRU ordering, push-up, descendant
-# registration) is entirely skipped unless some PC in the parent chain
-# has a budget set via `set_cache_budget!`. Without this, every cache
-# store would do O(tree-depth + value-size) work for no eviction benefit.
-# Stores that happen before `set_cache_budget!` is called won't count
-# toward the budget — acceptable: callers are expected to set the budget
-# early in startup, before significant cache traffic.
-function _any_budget_in_chain(pc::PropertyCache)
-    cur::Union{PropertyCache,Nothing} = pc
-    while cur !== nothing
-        cur.budget[] > 0 && return true
-        cur = _parent_pc(cur)
-    end
-    false
-end
-
-# Walk __parent__ chain bumping each PropertyCache's local `bytes` by delta.
-# Returns the nearest budget-holder (if any) so the caller can fire eviction.
-# No descendant bookkeeping needed — eviction walks the cache tree directly
-# via the existing strong refs that the cache structure already maintains.
-function _push_delta_up!(originating_pc::PropertyCache, delta::Int)
-    first_holder = nothing
-    parent_pc = _parent_pc(originating_pc)
-    while parent_pc !== nothing
-        Threads.atomic_add!(parent_pc.bytes, delta)
-        if parent_pc.budget[] > 0 && first_holder === nothing
-            first_holder = parent_pc
-        end
-        parent_pc = _parent_pc(parent_pc)
-    end
-    first_holder
-end
-
-# Hit recorder — intentionally a no-op. Tracking per-hit access order
-# would require an O(N) findfirst+move on `pc.lru_order` per cache hit,
-# which dominates on hot PCs with many entries. Instead we accept that
-# `lru_order` records INSERTION order, not access order: eviction picks
-# oldest-inserted within a tier. Approximate LRU is fine for best-effort
-# eviction; the per-hit cost is gone.
-function _record_pc_hit!(pc::PropertyCache, name::Symbol, args_key)
-    return nothing
-end
-
-# Called on cache miss (after the body returns `v`), inside the user-callback
-# closure that runs OUTSIDE the cache lock per Base.get!(::AbstractThreadsafeDict)
-# spawn pattern. Records size, pin status, LRU order, propagates the byte
-# delta up the __parent__ chain, and fires eviction if a budget-holder is
-# over budget.
-function _record_pc_store!(pc::PropertyCache, name::Symbol, args_key, v)
-    _any_budget_in_chain(pc) || return
-    # If v is a DO (has a PropertyCache) that wasn't constructed with an
-    # explicit __parent__ kwarg, wire its parent_pc to us now — this is the
-    # moment we know v's parent. Without this, IPs that return a DO via a
-    # plain constructor call (no @include lowering) end up with a child PC
-    # that has no parent link, so push-up from the child can't reach the
-    # budget-holder. Only fills `nothing` slots; explicit __parent__ still wins.
-    if hasfield(typeof(v), :cache)
-        v_cache = getfield(v, :cache)
-        if v_cache isa PropertyCache && v_cache.parent_pc[] === nothing
-            v_cache.parent_pc[] = pc  # strong ref
-        end
-    end
-    key = (name, args_key)
-    # `@mmap` slots (D5): pin + zero-bill. The value is a bare `Array{T,N}`
-    # backed by a read-only mmap region, so the runtime `is_pinnable_value`
-    # trait cannot detect the mapping from the value alone — the `meta(T)`
-    # `@mmap` marker is the reliable signal. Zero-billing keeps mmap arrays
-    # (already memory-resident on disk, paged on demand) off the cache budget.
-    if _is_mmap_slot(pc, name)
-        sz = 0
-        pinnable = true
-    else
-        sz = _summarysize_capped(v)
-        pinnable = is_pinnable_value(v)
-    end
-    Threads.atomic_add!(pc.bytes, sz)
-    # Single critical section for pc.sizes / pc.pinned / pc.lru_order — all
-    # three are plain Base containers that MUST NOT be mutated concurrently
-    # (Base.Dict rehash-during-insert under threads is a textbook SIGABRT
-    # vector). Same `lru_lock` serves all three; cheap, simple.
-    lock(pc.lru_lock) do
-        pc.sizes[key] = sz
-        pinnable && push!(pc.pinned, key)
-        # If already in order (shouldn't normally happen on store, but defensive
-        # in case of overwrite via setindex!), bump to MRU; else append.
-        idx = findfirst(==(key), pc.lru_order)
-        idx !== nothing && deleteat!(pc.lru_order, idx)
-        push!(pc.lru_order, key)
-    end
-    holder = _push_delta_up!(pc, sz)
-    # Fire eviction if we are or are below a budget-holder. Self is checked
-    # too — if pc is a budget-holder, the push-up didn't go anywhere but pc
-    # itself may be over budget.
-    if pc.budget[] > 0
-        _maybe_evict!(pc)
-    elseif holder !== nothing
-        _maybe_evict!(holder)
-    end
-    nothing
-end
-
-# --- Push-down eviction (D6 sync-on-store + D3 cost-aware bias) ---
-
-# Determine whether a `(name, args_key)` slot on PropertyCache `pc` corresponds
-# to a `@cached` property. Looks up `meta(typeof(owner))` for the property's
-# info bag and checks `info.macros`.
-function _is_cached_slot(pc::PropertyCache, name::Symbol)
-    owner = pc.owner_ref[]
-    owner === nothing && return false
-    info = metafirst(typeof(owner), name)
-    info === nothing && return false
-    Symbol("@cached") in info.macros
-end
-
-# Whether a slot corresponds to an `@mmap` property — the reliable pin signal
-# for read-only memory-mapped arrays (D5), since their runtime value is a bare
-# `Array` with no inspectable handle field.
-function _is_mmap_slot(pc::PropertyCache, name::Symbol)
-    owner = pc.owner_ref[]
-    owner === nothing && return false
-    info = metafirst(typeof(owner), name)
-    info === nothing && return false
-    Symbol("@mmap") in info.macros
-end
-
-# Check whether `(name, args_key)` is currently the target of an in-flight
-# Task somewhere. For bare-prop slots, that's `pc.cache.tasks[name]`. For IP
-# slots, we'd need to dig into the IP's subcache — left for v2 (the bare-prop
-# tasks check covers the common case; an IP in-flight task evict-and-recompute
-# would mean wasted work but not corruption, since the cache machinery
-# spawns a fresh task on the next access).
-function _entry_in_flight(pc::PropertyCache, key::Tuple{Symbol,Any})
-    name, args_key = key
-    pc.cache isa AbstractThreadsafeDict || return false
-    if args_key === ()
-        return lock(pc.cache.lock) do; haskey(pc.cache.tasks, name); end
-    end
-    # IP slot — look up the IP wrapper in pc.cache (its own lock), then
-    # peek at the IP's subcache.tasks under that subcache's lock.
-    ip = get(pc.cache, name, nothing)
-    ip isa IndexableProperty || return false
-    ip.cache isa AbstractThreadsafeDict || return false
-    lock(ip.cache.lock) do; haskey(ip.cache.tasks, args_key); end
-end
-
-# Single eviction step: pop the entry, update sizes/bytes/lru_order, push
-# the negative delta up the parent chain (so the budget-holder's `bytes`
-# decreases too).
-function _evict_entry!(pc::PropertyCache, key::Tuple{Symbol,Any})
-    name, args_key = key
-    # Race-safe claim: pop sizes + pinned + lru_order in one critical
-    # section. A second concurrent evictor for the same key gets sz==0
-    # from pop! and bails — without this, both would atomic_sub by the
-    # same sz, drifting pc.bytes negative.
-    sz = lock(pc.lru_lock) do
-        s = pop!(pc.sizes, key, 0)
-        delete!(pc.pinned, key)
-        idx = findfirst(==(key), pc.lru_order)
-        idx !== nothing && deleteat!(pc.lru_order, idx)
-        s
-    end
-    sz > 0 || return  # already evicted by another caller
-    if args_key === ()
-        # Bare-prop slot. Use the cache's pop! (delegates through
-        # AbstractThreadsafeDict if applicable, with task cleanup).
-        haskey(pc.cache, name) && pop!(pc.cache, name)
-    else
-        # IP slot. The actual storage is on the IP's per-property subcache,
-        # not pc.cache. Reach it via the cached IP wrapper.
-        if haskey(pc.cache, name)
-            ip = pc.cache[name]
-            ip isa IndexableProperty && haskey(ip.cache, args_key) && pop!(ip.cache, args_key)
-        end
-    end
-    Threads.atomic_sub!(pc.bytes, sz)
-    # Push -sz up to all ancestor budget-holders
-    parent_pc = _parent_pc(pc)
-    while parent_pc !== nothing
-        Threads.atomic_sub!(parent_pc.bytes, sz)
-        parent_pc = _parent_pc(parent_pc)
-    end
-    nothing
-end
-
-# Walk the live cache subtree rooted at `holder` and collect every
-# (pc, key, is_cached, position) tuple eligible for eviction. The tree
-# is enumerated via the strong refs the cache itself maintains: each
-# value in `pc.cache` that is a DO (has a `:cache::PropertyCache` field)
-# contributes its own PC. No separate descendants registry — when a child
-# DO is evicted from its parent's cache, it falls out of this walk
-# automatically.
-function _gather_eviction_candidates(holder::PropertyCache)
-    out = Vector{Tuple{PropertyCache, Tuple{Symbol,Any}, Bool, Int}}()
-    # IdSet (identity-based) — Set{PropertyCache} would hash by field
-    # walking pc.cache / pc.sizes / pc.lru_order, O(cache-size) per
-    # check. IdSet is O(1) per op.
-    visited = Base.IdSet{Any}()
-    pcs = PropertyCache[]
-    _walk_subtree_pcs!(holder, visited, pcs)
-    for pc in pcs
-        lock(pc.lru_lock) do
-            for (i, key) in enumerate(pc.lru_order)
-                key in pc.pinned && continue
-                _entry_in_flight(pc, key) && continue
-                push!(out, (pc, key, _is_cached_slot(pc, key[1]), i))
-            end
-        end
-    end
-    out
-end
-
-function _walk_subtree_pcs!(pc::PropertyCache, visited::Base.IdSet, pcs::Vector{PropertyCache})
-    pc in visited && return
-    push!(visited, pc)
-    push!(pcs, pc)
-    # Snapshot the cache values under whatever lock the inner dict provides,
-    # then recurse outside the lock to avoid lock-while-recursing surprises.
-    vals = if pc.cache isa AbstractThreadsafeDict
-        lock(pc.cache.lock) do; collect(values(pc.cache.cache)); end
-    else
-        collect(values(pc.cache))
-    end
-    for v in vals
-        if hasfield(typeof(v), :cache)
-            child_pc = getfield(v, :cache)
-            child_pc isa PropertyCache && _walk_subtree_pcs!(child_pc, visited, pcs)
-        end
-    end
-    nothing
-end
-
-# Main eviction loop. Called when a store crosses the budget threshold on
-# `holder`. Runs synchronously inside the user-callback closure of the
-# triggering store — outside any cache lock — so the lock-hold profile is
-# unchanged from today's `_on_store!` semantics.
-function _maybe_evict!(holder::PropertyCache)
-    holder.budget[] <= 0 && return  # not a budget-holder
-    holder.bytes[] <= holder.budget[] && return  # under budget
-    candidates = _gather_eviction_candidates(holder)
-    # Sort: @cached slots first (cheap re-deserialize wins), then by LRU
-    # position (oldest-accessed first within each tier).
-    sort!(candidates, by = c -> (c[3] ? 0 : 1, c[4]))
-    for (pc, key, _, _) in candidates
-        holder.bytes[] <= holder.budget[] && break
-        _evict_entry!(pc, key)
-        holder.last_evicted[] = key
-    end
-    nothing
-end
-
-_safe_typesize(::Type{T}) where {T} = isbitstype(T) ? sizeof(T) : 0
-
-# Skip Julia-internal "infrastructure" objects whose memory is shared
-# globally and not user-controllable; descending into them also risks
-# UndefRefError / runaway recursion via Type<->MethodTable<->Vector{Any}
-# back-edges.
-_skip_summarysize(v) = v isa Type || v isa Function || v isa Module ||
-    v isa Task || v isa Core.MethodTable || v isa Method ||
-    v isa Core.CodeInstance || v isa Core.MethodInstance
-
-# Subtree-root boundary: a nested DynamicObject (anything with a
-# `__cache__::PropertyCache` field) is already tracked by its own PC
-# via push-up bookkeeping, an IndexableProperty's entries are charged
-# at memoize-store time, and a PropertyCache is itself the tracker.
-# Descending into them is both double-counting AND O(tree) per store
-# because IPs hold back-references to their owner DO — without this
-# boundary, every store walks the whole tree (terminating only via
-# the depth/visited cap, but pathologically slow).
-_is_subtree_root(v) = v isa PropertyCache || v isa IndexableProperty ||
-    hasfield(typeof(v), :__cache__)
-
-function _summarysize_capped(v, depth::Int=8, visited::Base.IdSet=Base.IdSet())
-    _skip_summarysize(v) && return 0
-    v in visited && return 0
-    !isbits(v) && push!(visited, v)
-    if v isa String
-        return sizeof(v)
-    elseif v isa Symbol
-        return ncodeunits(string(v))
-    end
-    n = _safe_typesize(typeof(v))
-    _is_subtree_root(v) && return n
-    depth <= 0 && return n
-    if v isa AbstractArray
-        # Bulk charge: sizeof(v) gives the contiguous storage. For isbits
-        # eltype that's the full size; for non-isbits (Vector{String},
-        # Vector{Any}) it's the pointer array — a *lower bound*. We
-        # deliberately do NOT iterate non-isbits arrays: Bruno caches
-        # multi-million-row String / Vector{Float64} columns, and per-element
-        # recursion in a hot path made request handlers spin (each cache
-        # store walked every element). Approximate size is fine for LRU.
-        n = sizeof(v)
-    elseif v isa AbstractDict
-        # Bulk charge: hashmap struct + a rough per-entry constant covering
-        # slot+key+value pointer storage. Iterating entries one-by-one for
-        # an N-entry Dict is O(N) on the cache-store hot path — same shape
-        # as the array element-walk fix above. Approximate, monotonic in
-        # length(v), fine for LRU.
-        n = sizeof(v) + length(v) * 24
-    elseif v isa Tuple || v isa NamedTuple
-        for elt in v
-            n += _summarysize_capped(elt, depth - 1, visited)
-        end
-    elseif !isbits(v)
-        for i in 1:nfields(v)
-            isdefined(v, i) || continue
-            n += _summarysize_capped(getfield(v, i), depth - 1, visited)
-        end
-    end
-    n
-end
 
 # Bare-prop path: forwards `substatus` so the inner `ThreadsafeDict.get!`
 # creates a Treebars node + lifecycle just like it does for IPs. Closure
@@ -812,124 +347,12 @@ end
 # `getorcomputeproperty` routes around this layer when indices/kwargs are
 # present (see ~L1109), so this overload only needs to handle the
 # bare-name case.
-Base.get!(f::Function, c::PropertyCache, key; substatus=nothing, kwargs...) = begin
-    # Hit-vs-miss detection: race-prone but LRU ordering is approximate —
-    # a wrong move-to-back has no correctness impact, just suboptimal
-    # eviction order. The store path is correct regardless.
-    was_hit = haskey(c.cache, key)
-    rv = get!(c.cache, key; substatus) do s
-        v = f(s)
-        _record_pc_store!(c, key, (), v)
-        v
-    end
-    was_hit && _record_pc_hit!(c, key, ())
-    rv
-end
+Base.get!(f::Function, c::PropertyCache, key; substatus=nothing, kwargs...) =
+    get!(f, c.cache, key; substatus)
 Base.get!(f::Function, ::PropertyCache, key, indices...; kwargs...) = f(nothing)
 Base.setindex!(c::PropertyCache, args...) = setindex!(c.cache, args...)
-Base.show(io::IO, pc::PropertyCache) = print(io, "PropertyCache(",
-    length(pc.cache), " properties, ", _format_size(pc.bytes[]),
-    pc.budget[] > 0 ? string(" / budget ", _format_size(pc.budget[])) : "",
-    ")")
+Base.show(io::IO, pc::PropertyCache) = print(io, "PropertyCache(", length(pc.cache), " properties)")
 
-# --- LRU/eviction API ---
-
-"""
-    set_cache_budget!(obj, n_bytes::Integer)
-
-Mark `obj` (a `@dynamicstruct` instance) as the cache budget-holder for its
-subtree, with a budget of `n_bytes` bytes. All `@dynamicstruct` instances
-hanging off `obj` via `__parent__` push their cache-byte deltas up to `obj` on
-store; when the subtotal exceeds the budget, eviction runs to drain it back
-under the limit. A budget of `0` disables eviction at this node (delegates up
-to the next ancestor with a budget set, if any).
-
-There is no opt-in marker on the type — any DO instance can become a
-budget-holder by calling this function. Push-up walks via `__parent__` stop
-at the nearest ancestor with `budget > 0`. If no ancestor in the chain has a
-budget set, push-up terminates without effect; the cache behaves identically
-to today (no eviction, no overhead beyond a single atomic add per store).
-
-Typical usage in app init:
-```julia
-const APPDATA = AppData()
-set_cache_budget!(APPDATA, parse(Int, get(ENV, "JULIA_HEAP_SIZE", "0")) ÷ 2)
-```
-"""
-set_cache_budget!(obj, n_bytes::Integer) = (getfield(obj, :cache).budget[] = Int(n_bytes); nothing)
-
-"""
-    cache_budget(obj) -> Int
-
-The cache budget set on `obj`'s PropertyCache (the value passed to
-`set_cache_budget!`). Returns `0` if `obj` is not a budget-holder. Does NOT
-walk `__parent__` — see [`subtree_budget`](@ref) for the recursive variant.
-"""
-cache_budget(obj) = getfield(obj, :cache).budget[]
-
-"""
-    cache_bytes(obj) -> Int
-
-LOCAL byte subtotal of `obj`'s PropertyCache — sum of `summarysize` over the
-entries memoized directly on this instance. Does NOT walk `__parent__`. For
-the budget-holder's subtree total, see [`subtree_bytes`](@ref). For a
-budget-holder these return the same value (the push-up sum lands here).
-"""
-cache_bytes(obj) = getfield(obj, :cache).bytes[]
-
-"""
-    cache_entries(obj) -> Int
-
-Number of memoized entries currently held on `obj`'s PropertyCache (this
-instance only, no recursion).
-"""
-cache_entries(obj) = length(getfield(obj, :cache).cache)
-
-"""
-    subtree_bytes(obj) -> Int
-
-Total bytes in the budget-holder's subtree containing `obj`. Walks `__parent__`
-upward to the nearest ancestor with `budget > 0` and returns its `bytes[]`. If
-no ancestor in the chain has a budget set, falls back to `cache_bytes(obj)`.
-"""
-subtree_bytes(obj) = let holder = _find_budget_holder_obj(obj)
-    holder === nothing ? cache_bytes(obj) : cache_bytes(holder)
-end
-
-"""
-    subtree_budget(obj) -> Int
-
-Budget of the nearest ancestor budget-holder (including `obj` itself), or `0`
-if no budget is set anywhere in the chain.
-"""
-subtree_budget(obj) = let holder = _find_budget_holder_obj(obj)
-    holder === nothing ? 0 : cache_budget(holder)
-end
-
-"""
-    last_evicted(obj) -> Union{Nothing, Tuple{Symbol, Any}}
-
-`(name, args_key)` of the most recent entry evicted from the budget-holder's
-subtree containing `obj`, or `nothing` if no eviction has happened yet (or no
-budget-holder in the chain). Single-slot history; the previous value is
-overwritten on each new eviction.
-"""
-last_evicted(obj) = let holder = _find_budget_holder_obj(obj)
-    holder === nothing ? nothing : getfield(holder, :cache).last_evicted[]
-end
-
-# Walks `__parent__` from `obj` upward, returning the nearest DO whose
-# PropertyCache has `budget > 0`, or `nothing` if no budget-holder in the chain.
-# Used by `subtree_*` and `last_evicted` getters; not exported.
-function _find_budget_holder_obj(obj)
-    cur = obj
-    while cur !== nothing
-        pc = getfield(cur, :cache)
-        pc isa PropertyCache && pc.budget[] > 0 && return cur
-        cur = hasproperty(cur, :__parent__) ? cur.__parent__ : nothing
-    end
-    nothing
-end
 struct IndexableProperty{N,O,D<:AbstractDict}
     o::O
     cache::D
@@ -967,8 +390,7 @@ plain functions can share the same syntax.
 """
 memoize!(ip::IndexableProperty{name}, args...; fetch=Base.fetch, kwargs...) where {name} = begin
     args_key = (args, (;kwargs...))
-    was_hit = haskey(ip.cache, args_key)
-    rv = get!(ip.cache, args_key) do
+    get!(ip.cache, args_key) do
         # Compute via `_computeproperty` directly, NOT the call form `ip(args...)`:
         # the bare call form `o.prop(args)` now routes THROUGH `memoize!` (cached by
         # default), so `ip(args...)` here would recurse into `memoize!` → stack
@@ -976,16 +398,8 @@ memoize!(ip::IndexableProperty{name}, args...; fetch=Base.fetch, kwargs...) wher
         # below, which already computes via `_computeproperty` (for the
         # 0-arg-wrapper-trap reason documented there). After this, BOTH `memoize!`
         # methods compute via `_computeproperty`, never via the call form.
-        v = _computeproperty(ip.o, name, args...; kwargs...)
-        owner_pc = getfield(ip.o, :cache)
-        owner_pc isa PropertyCache && _record_pc_store!(owner_pc, name, args_key, v)
-        v
+        _computeproperty(ip.o, name, args...; kwargs...)
     end
-    if was_hit
-        owner_pc = getfield(ip.o, :cache)
-        owner_pc isa PropertyCache && _record_pc_hit!(owner_pc, name, args_key)
-    end
-    rv
 end
 """
     fresh(ip::IndexableProperty, args...; kwargs...)
@@ -1045,8 +459,7 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
         nothing
     end
     args_key = (indices, (;kwargs...))
-    was_hit = lock(cache.lock) do; haskey(cache.cache, args_key); end
-    rv = get!(cache, args_key; fetch, substatus=substatus_f, retry_failed) do s
+    get!(cache, args_key; fetch, substatus=substatus_f, retry_failed) do s
         # Call `_computeproperty` directly, NOT `getorcomputeproperty`:
         # the latter, when `indices` and `kwargs` are both empty AND
         # `is_indexed_property(o, name)` (we're already inside the IP wrapper,
@@ -1056,20 +469,8 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
         # the body — `@memo! o.foo()` on a 0-arg IP would never actually
         # compute anything. `_computeproperty` skips the wrapper short-circuit
         # and goes straight to the body.
-        v = _computeproperty(o, name, indices...; __status__=s, kwargs...)
-        # Push-up bookkeeping: record IP slot's size+pin status on the OWNING
-        # PropertyCache (not the per-IP subcache `cache`). One sizes/pinned
-        # dict per DO tracks both bare-prop AND IP entries, keyed by
-        # `(prop_name, args_key)`.
-        owner_pc = getfield(o, :cache)
-        owner_pc isa PropertyCache && _record_pc_store!(owner_pc, name, args_key, v)
-        v
+        _computeproperty(o, name, indices...; __status__=s, kwargs...)
     end
-    if was_hit
-        owner_pc = getfield(o, :cache)
-        owner_pc isa PropertyCache && _record_pc_hit!(owner_pc, name, args_key)
-    end
-    rv
 end
 # `substatus()` is invoked OUTSIDE the cache lock. Calling it under the
 # lock is unsafe: substatus factories can recurse into other DO properties
@@ -1199,9 +600,9 @@ end
 struct _Missing end
 const _missing_sentinel = _Missing()
 
-# Hooks into get! for cache bookkeeping. Now always no-ops at this layer;
-# the new per-PropertyCache LRU layer handles ordering and eviction (see
-# `_record_pc_store!` / `_record_pc_hit!` / `_maybe_evict!` above).
+# Vestigial get! bookkeeping hooks — no-ops. Kept as extension points on the
+# ThreadsafeDict layer; the former per-PropertyCache LRU/eviction layer that
+# used them has been removed.
 _on_hit!(::AbstractThreadsafeDict, key) = nothing
 _on_store!(::AbstractThreadsafeDict, key) = nothing
 _drop_order!(::AbstractThreadsafeDict, key) = nothing
@@ -1349,7 +750,6 @@ fetchproperty(fetch, o, name::Symbol) = begin
     substatus_f = _bare_substatus_f(o, name)
     rv = get!(c, name; substatus=substatus_f, fetch=identity) do s
         v = _computeproperty(o, name; __status__=s)
-        _record_pc_store!(pc, name, (), v)
         v
     end
     s = lock(c.lock) do; get(c.status, name, nothing); end
@@ -1975,7 +1375,7 @@ else
     # Fast hit path: a cached bare property returns WITHOUT building the
     # `substatus` factory or the `get!` do-block closure below — both allocate
     # on every access and were the dominant warm-access cost. Hit bookkeeping is
-    # a no-op (`_on_hit!` / `_record_pc_hit!`), so returning the cached value
+    # a no-op (`_on_hit!`), so returning the cached value
     # directly is behaviourally identical to routing through `get!`. Only misses
     # pay the closures.
     hit = _peek_hit(cache, name)
@@ -4847,7 +4247,6 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         :(function $type($(fixed_lhs...); cache_type=nothing, kwargs...)
             isnothing(cache_type) || error("`cache_type` was removed (2026-07-07, decision 2canrl); the cache is always threadsafe now — drop this kwarg.")
             __inst__ = $new_call
-            $(_link_owner!)(getfield(__inst__, :cache), __inst__)
             __inst__
         end)
     ))
