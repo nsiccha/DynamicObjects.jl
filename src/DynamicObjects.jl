@@ -1590,6 +1590,15 @@ function _slot_types end
 # Emitted per-struct as `@generated` alongside `_slot_types`; the constructor uses it.
 function _ov_slot_types end
 
+# Joint inference (attempt 1): `_infer_all(__self__::T, __ov__::OV)` — emitted per-struct
+# as `@generated` — computes ALL bare computed properties in ONE body (topo order; the
+# compiler threads dep types itself), returning them as a NamedTuple. A single
+# `return_type` over it recovers every slot eltype at once, replacing the N per-property
+# `return_type(_infer_rhs, …)` calls. Falls back to per-property when it can't (see
+# `_slot_types_expr_joint`) — an always-thrower makes it never return (`Union{}`), and a
+# hard/huge inference can widen to an abstract `NamedTuple`.
+function _infer_all end
+
 # Topological driver for the emitted `@generated _slot_types` / `_ov_slot_types`.
 # `plan` is a tuple of `(name, dep_params, annotated)` in dependency order (deps
 # before dependents), baked by the macro. `OV` is the constructor's kwarg-override
@@ -1628,6 +1637,53 @@ function _slot_types_expr(::Type{O}, plan, ::Type{OV}) where {O, OV<:NamedTuple}
         push!(Texprs, T)
     end
     :(NamedTuple{$(Tuple(names)), Tuple{$(Texprs...)}})
+end
+
+# Joint slot-type driver with a per-property fallback (attempt 1, everything-concrete
+# path). Fire ONE `return_type` over the struct's `_infer_all`; if it yields a usable
+# concrete `NamedTuple{names,Tuple{…}}` (the common case — no always-thrower in the
+# struct, inference didn't collapse) use it verbatim. Otherwise fall back to the proven
+# per-property `_slot_types_expr`:
+#   * an always-thrower makes `_infer_all` never return normally → `return_type` = `Union{}`;
+#   * a hard/huge inference can widen to an abstract `NamedTuple` (no field types).
+# Both are exactly the cases where per-property isolation wins, so correctness is never
+# worse than per-property — joint is a pure speed layer on top. NO sentinel/try-catch:
+# a sentinel leaks into nested invariant positions (`Vector{Union{T,Sentinel}}`) that a
+# strip can't reach, so we let the joint FAIL and fall back instead of laundering it.
+function _slot_types_expr_joint(::Type{O}, plan, ::Type{OV}) where {O, OV<:NamedTuple}
+    names = Tuple(p[1] for p in plan)
+    RT = Core.Compiler.return_type(_infer_all, Tuple{O, OV})
+    if RT isa DataType && RT <: NamedTuple
+        ps = RT.parameters
+        if length(ps) == 2 && ps[1] === names && ps[2] isa DataType &&
+                ps[2] <: Tuple && length(ps[2].parameters) == length(names)
+            return :($RT)                    # joint succeeded — use it verbatim
+        end
+    end
+    _slot_types_expr(O, plan, OV)            # fallback: per-property, isolated
+end
+
+# Build the joint-inference body for a struct's `@generated _infer_all`. `plan` is a
+# tuple of `(name, annotated, body)` in dependency order; `ov_names` are the
+# constructor's kwarg-override field names. Un-annotated overridden props bind to the
+# override value (`getfield(__ov__, name)`, typed by OV — so dependents thread the
+# override type, the same firewall `_slot_types_expr` applies); everything else binds to
+# its RHS (annotated bodies already carry `::U`). The block computes each property once,
+# in dependency order (the compiler threads sibling types), and returns them as a
+# NamedTuple — one `return_type` over it recovers every slot eltype at once.
+function _infer_all_body(plan, ov_names)
+    stmts = Any[]
+    names = Symbol[]
+    for (name, annotated, body) in plan
+        push!(names, name)
+        if !annotated && (name in ov_names)
+            push!(stmts, :($name = $(getfield)(__ov__, $(QuoteNode(name)))))
+        else
+            push!(stmts, :($name = $body))
+        end
+    end
+    push!(stmts, Expr(:tuple, Expr(:parameters, [Expr(:kw, n, n) for n in names]...)))
+    Expr(:block, stmts...)
 end
 
 # Static element type of property `name`'s slot for parent type `O`: the inferred
@@ -4505,13 +4561,26 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
              spec_by_name[nm].annotated)
         for nm in infer_topo
     ]...)
+    # Joint-inference plan (attempt 1): (name, annotated, QuoteNode'd RHS body) in topo
+    # order. The per-struct `@generated _infer_all` reconstructs the joint body from it.
+    infer_all_plan_expr = Expr(:tuple, [
+        Expr(:tuple, QuoteNode(nm), spec_by_name[nm].annotated,
+             QuoteNode(spec_by_name[nm].body))
+        for nm in infer_topo
+    ]...)
     slot_types_def = Expr(:block,
+        # Joint body: compute every bare property once in dependency order (the compiler
+        # threads dep types), packed into a NamedTuple. `_slot_types_expr_joint` fires ONE
+        # `return_type` over it and falls back to per-property when it can't.
+        Expr(:macrocall, Expr(:., :Base, QuoteNode(Symbol("@generated"))), nothing,
+            :($DynamicObjects._infer_all(__self__::OO, __ov__::OVV) where {OO <: $type, OVV <: $NamedTuple} =
+                $DynamicObjects._infer_all_body($infer_all_plan_expr, $(fieldnames)(OVV)))),
         Expr(:macrocall, Expr(:., :Base, QuoteNode(Symbol("@generated"))), nothing,
             :($DynamicObjects._slot_types(::Type{OO}) where {OO <: $type} =
-                $DynamicObjects._slot_types_expr(OO, $slot_plan_expr))),
+                $DynamicObjects._slot_types_expr_joint(OO, $slot_plan_expr, $(NamedTuple{(),Tuple{}})))),
         Expr(:macrocall, Expr(:., :Base, QuoteNode(Symbol("@generated"))), nothing,
             :($DynamicObjects._ov_slot_types(::Type{OO}, ::Type{OVV}) where {OO <: $type, OVV <: $NamedTuple} =
-                $DynamicObjects._slot_types_expr(OO, $slot_plan_expr, OVV))))
+                $DynamicObjects._slot_types_expr_joint(OO, $slot_plan_expr, OVV))))
     result = Expr(:block)
     # Emit per-cached-property DiskCacheLocks
     for (name, varname) in cached_names
