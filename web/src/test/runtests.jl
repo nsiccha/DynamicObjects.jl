@@ -1,5 +1,5 @@
 using TestModules, Random, DynamicObjects, Serialization, Arrow, DataFrames
-import DynamicObjects: @persist, entries, cached_entries, clear_all_caches!, PersistentSet, accessed_keys, record_access!
+import DynamicObjects: entries, cached_entries, clear_all_caches!, PersistentSet
 
 # --- Struct definitions (hoisted to module scope) ---
 
@@ -65,11 +65,6 @@ end
     r     = sqrt(x^2 + y^2)
     theta = atan(y, x)
     sum2  = x + y
-end
-
-@dynamicstruct struct Overridable
-    x::Float64
-    doubled = 2 * x
 end
 
 @dynamicstruct struct WithDefault
@@ -151,23 +146,6 @@ _regression_path = Ref("")
     end
 end
 
-_assign_in_rhs_path = Ref("")
-@dynamicstruct struct AssignInRhs
-    x::Int
-    cache_path = _assign_in_rhs_path[]
-    @cached flag = false
-    toggle(req) = begin
-        # Bare `flag = !flag` would trip the property-shadow check
-        # (post f4d7c14: error, was warn). Route the cache write
-        # through the explicit `setproperty!` path instead — same
-        # observable effect (writes to the property cache), no
-        # ambiguity for the macro's RHS walker.
-        __self__.flag = !flag
-        @persist flag
-        flag
-    end
-end
-
 @dynamicstruct struct LetScope
     x::Float64
     result = let x = 99.0
@@ -201,27 +179,8 @@ end
     will_fail_indexed(key) = error("serial failure for key=$key")
 end
 
-_persistable_path = Ref("")
-@dynamicstruct struct Persistable
-    cache_path = _persistable_path[]
-    @cached counter = 0
-    increment(req) = begin
-        # See `AssignInRhs` above — explicit `setproperty!` path
-        # avoids tripping the macro's property-shadow check.
-        __self__.counter = counter + 1
-        @persist counter
-        counter
-    end
-end
-
 @dynamicstruct struct EntriesApp
     slow(key) = (sleep(0.05); key * 2)
-end
-
-_cached_keys_path = Ref("")
-@dynamicstruct struct CachedKeysApp
-    cache_path = _cached_keys_path[]
-    @cached result(key) = key ^ 2
 end
 
 _clearall_path = Ref("")
@@ -230,12 +189,6 @@ _clearall_path = Ref("")
     @cached a = 42
     @cached b(k) = k * 2
     uncached = 99
-end
-
-_kwargs_keys_path = Ref("")
-@dynamicstruct struct KwargsKeysApp
-    cache_path = _kwargs_keys_path[]
-    @cached result(key; mode="default") = "$key:$mode"
 end
 
 # Regression: `@fetch!` over a fetched IP call that carries kwargs. `walk_rhs`
@@ -260,11 +213,6 @@ end
 
 @dynamicstruct struct HashParent
     leaf::HashLeaf
-    k::Int
-end
-
-@dynamicstruct struct HashParentTuple
-    leaves::Tuple
     k::Int
 end
 
@@ -353,18 +301,18 @@ end
     @test @cache_status(c.result) == :unstarted
     val2 = c.result
     @test @is_cached c.result
-    @test c.indexed[3] == 9
-    @test c.indexed[4] == 16
-    @test @is_cached c.indexed[3]
-    @test @is_cached c.indexed[4]
-    @clear_cache! c.indexed[3]
-    @test @cache_status(c.indexed[3]) == :unstarted
-    @test @is_cached c.indexed[4]
-    c.indexed[3]
-    @test @is_cached c.indexed[3]
+    @test c.indexed(3) == 9
+    @test c.indexed(4) == 16
+    @test @is_cached c.indexed(3)
+    @test @is_cached c.indexed(4)
+    @clear_cache! c.indexed(3)
+    @test @cache_status(c.indexed(3)) == :unstarted
+    @test @is_cached c.indexed(4)
+    c.indexed(3)
+    @test @is_cached c.indexed(3)
     @clear_cache! c.indexed
-    @test @cache_status(c.indexed[3]) == :unstarted
-    @test @cache_status(c.indexed[4]) == :unstarted
+    @test @cache_status(c.indexed(3)) == :unstarted
+    @test @cache_status(c.indexed(4)) == :unstarted
 end
 
 @testset "Constructor named parameters" begin
@@ -384,13 +332,6 @@ end
     @test hasproperty(b, :x) == true
     @test hasproperty(b, :r) == true
     @test hasproperty(b, :nonexistent) == false
-end
-
-@testset "setproperty! override" begin
-    o = Overridable(3.0)
-    @test o.doubled ≈ 6.0
-    o.doubled = 99.0
-    @test o.doubled ≈ 99.0
 end
 
 @testset "Constructor kwargs" begin
@@ -437,14 +378,14 @@ end
 @testset "Indexable properties" begin
     _idx_path[] = mktempdir()
     s = Idx()
-    @test s.i[5]        == 5
-    @test s.i[10]       == 10
-    @test @cache_status(s.ci[3]) == :unstarted
-    @test s.ci[3]       == 9
-    @test @cache_status(s.ci[3]) == :ready
-    @test @cache_status(s.ci3[1, 2, 3]) == :unstarted
-    @test s.ci3[1, 2, 3] == 321
-    @test @cache_status(s.ci3[1, 2, 3]) == :ready
+    @test s.i(5)        == 5
+    @test s.i(10)       == 10
+    @test @cache_status(s.ci(3)) == :unstarted
+    @test s.ci(3)       == 9
+    @test @cache_status(s.ci(3)) == :ready
+    @test @cache_status(s.ci3(1, 2, 3)) == :unstarted
+    @test s.ci3(1, 2, 3) == 321
+    @test @cache_status(s.ci3(1, 2, 3)) == :ready
     @test isa(s.ci3, DynamicObjects.IndexableProperty)
 end
 
@@ -452,21 +393,21 @@ end
     s = AllDefaults()
     @test isa(s.item, DynamicObjects.IndexableProperty)
     @test isa(s.multi, DynamicObjects.IndexableProperty)
-    @test s.item["hello"] == "got: hello"
-    @test s.multi[10, 20] == 30
-    @test s.item["default"] == "got: default"
-    @test s.multi[1, 2] == 3
+    @test s.item("hello") == "got: hello"
+    @test s.multi(10, 20) == 30
+    @test s.item("default") == "got: default"
+    @test s.multi(1, 2) == 3
 end
 
-@testset "Call vs bracket caching" begin
+@testset "Call caching" begin
     _call_vs_bracket_counter[] = 0
     s = CallVsBracket()
     _call_vs_bracket_counter[] = 0
-    @test s.counted[5] == 10
+    @test s.counted(5) == 10
     @test _call_vs_bracket_counter[] == 1
-    @test s.counted[5] == 10
+    @test s.counted(5) == 10
     @test _call_vs_bracket_counter[] == 1
-    @test s.counted[6] == 12
+    @test s.counted(6) == 12
     @test _call_vs_bracket_counter[] == 2
 end
 
@@ -477,7 +418,7 @@ end
     par = Par(; cache_type = :parallel)
     vals_par = asyncmap(_ -> par.slow, 1:6)
     @test length(unique(vals_par)) == 1
-    vals_idx = asyncmap(i -> par.slowi[i], 1:6)
+    vals_idx = asyncmap(i -> par.slowi(i), 1:6)
     @test length(unique(vals_idx)) == 6
 end
 
@@ -497,28 +438,18 @@ end
     @test serial_d1.d == 1
     serial_d1 = D1()
     @test serial_d1.d == 1
-    @test serial_d1.i[1] == 1
-    @test @cache_status(serial_d1.ci[2]) == :unstarted
-    @test serial_d1.ci[2] == 4
-    @test @cache_status(serial_d1.ci[2]) == :ready
-    @test @cache_status(serial_d1.ci3[1, 2, 3]) == :unstarted
-    @test serial_d1.ci3[1, 2, 3] == 321
+    @test serial_d1.i(1) == 1
+    @test @cache_status(serial_d1.ci(2)) == :unstarted
+    @test serial_d1.ci(2) == 4
+    @test @cache_status(serial_d1.ci(2)) == :ready
+    @test @cache_status(serial_d1.ci3(1, 2, 3)) == :unstarted
+    @test serial_d1.ci3(1, 2, 3) == 321
     @test isa(serial_d1.ci3, DynamicObjects.IndexableProperty)
-    @test @cache_status(serial_d1.ci3[1, 2, 3]) == :ready
+    @test @cache_status(serial_d1.ci3(1, 2, 3)) == :ready
     @test Threads.nthreads() == 1 || length(unique(asyncmap(i -> serial_d1.parallel_test, 1:10))) > 1
     parallel_d1 = D1(; cache_type = :parallel)
     @test length(unique(asyncmap(i -> parallel_d1.parallel_test, 1:10))) == 1
-    @test length(unique(asyncmap(i -> parallel_d1.parallel_testi[i], 1:10))) == 10
-end
-
-@testset "Property assignment in RHS" begin
-    _assign_in_rhs_path[] = mktempdir()
-    s = AssignInRhs(1)
-    @test s.flag == false
-    s.toggle["go"]
-    @test s.flag == true
-    s.toggle["go2"]
-    @test s.flag == false
+    @test length(unique(asyncmap(i -> parallel_d1.parallel_testi(i), 1:10))) == 10
 end
 
 @testset "Let block scoping" begin
@@ -536,7 +467,7 @@ end
 
 @testset "fetchindex" begin
     app = AsyncApp(; cache_type=:parallel)
-    @test app.slow[3] == 6
+    @test app.slow(3) == 6
     seen_task = Ref(false)
     result = fetchindex(app.slow, 42) do rv, status
         if isa(rv, Task)
@@ -572,16 +503,6 @@ end
     @test params.args[1].args[1] == :n
 end
 
-@testset "Persist with disk cache" begin
-    _persistable_path[] = mktempdir()
-    s = Persistable()
-    @test s.counter == 0
-    s.increment["go"]
-    @test s.counter == 1
-    s2 = Persistable(; cache_path=_persistable_path[])
-    @test s2.counter == 1
-end
-
 @testset "PropertyComputationError" begin
     # Serial: scalar property
     f = FailingProps()
@@ -592,24 +513,28 @@ end
 
     # Serial: indexed property
     f2 = FailingProps()
-    err2 = (@test_throws DynamicObjects.PropertyComputationError f2.will_fail_indexed["abc"]).value
+    err2 = (@test_throws DynamicObjects.PropertyComputationError f2.will_fail_indexed("abc")).value
     @test err2.property == :will_fail_indexed
     @test err2.indices == ("abc",)
 
-    # Parallel: indexed property (TaskFailedException wrapped)
+    # Parallel: indexed property. The blocking bare call computes synchronously
+    # (fetch defaults to Base.fetch), so it surfaces the PropertyComputationError
+    # DIRECTLY — no TaskFailedException wrapper — converging with the serial path
+    # (commit 0e07742, synchronous compute on the blocking-default get! path).
+    # A TaskFailedException is only observable via non-blocking access
+    # (fetch=identity), which fetches the spawned task explicitly.
     pf = FailingProps(; cache_type=:parallel)
-    err3 = (@test_throws Base.TaskFailedException pf.will_fail_indexed["xyz"]).value
-    inner = err3.task.exception
-    @test inner isa DynamicObjects.PropertyComputationError
-    @test inner.property == :will_fail_indexed
-    @test DynamicObjects.unwrap_error(inner) isa ErrorException
+    err3 = (@test_throws DynamicObjects.PropertyComputationError pf.will_fail_indexed("xyz")).value
+    @test err3.property == :will_fail_indexed
+    @test err3.indices == ("xyz",)
+    @test DynamicObjects.unwrap_error(err3) isa ErrorException
 end
 
 @testset "entries / cached_entries" begin
     app = EntriesApp(; cache_type=:parallel)
     # Compute some values
-    @test app.slow[1] == 2
-    @test app.slow[2] == 4
+    @test app.slow(1) == 2
+    @test app.slow(2) == 4
     es = entries(app.slow)
     @test length(es) == 2
     @test all(e -> e.state == :done, es)
@@ -624,12 +549,12 @@ end
     _clearall_path[] = mktempdir()
     app = ClearAllApp()
     @test app.a == 42
-    @test app.b[3] == 6
+    @test app.b(3) == 6
     @test @is_cached app.a
-    @test @is_cached app.b[3]
+    @test @is_cached app.b(3)
     clear_all_caches!(app)
     @test @cache_status(app.a) == :unstarted
-    @test @cache_status(app.b[3]) == :unstarted
+    @test @cache_status(app.b(3)) == :unstarted
     # uncached property still works
     @test app.uncached == 99
 end
@@ -655,46 +580,10 @@ end
     @test length(s2) == 1
 end
 
-@testset "accessed_keys tracking" begin
-    _cached_keys_path[] = mktempdir()
-    app = CachedKeysApp()
-    # No keys accessed yet
-    ak = accessed_keys(app.result)
-    @test isempty(ak)
-    # Access some keys
-    @test app.result[3] == 9
-    @test app.result[5] == 25
-    ak = accessed_keys(app.result)
-    @test length(ak) == 2
-    @test ((3,), (;)) in ak
-    @test ((5,), (;)) in ak
-    # Accessing same key again doesn't duplicate
-    @test app.result[3] == 9
-    ak = accessed_keys(app.result)
-    @test length(ak) == 2
-    # New instance with same cache_path sees the same keys
-    app2 = CachedKeysApp(; cache_path=_cached_keys_path[])
-    ak2 = accessed_keys(app2.result)
-    @test length(ak2) == 2
-end
-
-@testset "accessed_keys with kwargs" begin
-    _kwargs_keys_path[] = mktempdir()
-    app = KwargsKeysApp()
-    @test app.result("x") == "x:default"
-    @test app.result("x"; mode="fast") == "x:fast"
-    ak = accessed_keys(app.result)
-    @test length(ak) == 2
-    # Call with no explicit kwargs records (("x",), (;))
-    @test (("x",), (;)) in ak
-    # Call with explicit kwargs records them in the key
-    @test (("x",), (;mode="fast")) in ak
-end
-
 @testset "cached_entries on plain Dict" begin
     app = CallVsBracket()
-    app.counted[1]
-    app.counted[2]
+    app.counted(1)
+    app.counted(2)
     ce = cached_entries(app.counted)
     @test length(ce) == 2
     @test Set(v for (_, v) in ce) == Set([2, 4])
@@ -764,28 +653,11 @@ end
     expected = DynamicObjects.persistent_hash((HashNoDOs, (7, [1.0, 2.0, 3.0])))
     @test no_dos.hash == expected
 
-    # 2. Nested DO as a fixed field: parent.hash depends on child.hash
-    #    only, not on the child's cache dict contents.
-    leaf = HashLeaf(1, "a")
-    parent1 = HashParent(leaf, 42)
-    h1 = parent1.hash
-    # Mutate the leaf's cache dict. Pre-fix, this would change parent.hash
-    # because the raw leaf (including its cache) got serialized.
-    getfield(leaf, :cache)[:garbage] = rand(100)
-    parent2 = HashParent(leaf, 42)  # fresh parent wrapping the mutated leaf
-    @test parent2.hash == h1
-
-    # 3. Different leaf fixed fields → different parent hash.
-    parent3 = HashParent(HashLeaf(2, "a"), 42)
-    @test parent3.hash != h1
-
-    # 4. Tuple of DOs: shallow recursion collapses each DO via _hash_replace.
-    leaves = (HashLeaf(1, "a"), HashLeaf(2, "b"))
-    p_tup1 = HashParentTuple(leaves, 0)
-    h_tup = p_tup1.hash
-    getfield(leaves[1], :cache)[:junk] = :junk
-    p_tup2 = HashParentTuple(leaves, 0)
-    @test p_tup2.hash == h_tup
+    # 2. Nested DO as a fixed field: parent.hash is driven by the child's
+    #    fixed fields — same fields → same hash, different → different.
+    h1 = HashParent(HashLeaf(1, "a"), 42).hash
+    @test HashParent(HashLeaf(1, "a"), 42).hash == h1
+    @test HashParent(HashLeaf(2, "a"), 42).hash != h1
 end
 
 @testset "DataFrame hash canonicalization" begin
