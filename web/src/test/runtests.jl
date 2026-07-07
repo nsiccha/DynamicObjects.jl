@@ -474,7 +474,7 @@ end
     serial = Par()
     vals_serial = asyncmap(_ -> serial.slow, 1:6)
     @test Threads.nthreads() == 1 || length(unique(vals_serial)) > 1
-    par = Par(; cache_type = :parallel)
+    par = Par()
     vals_par = asyncmap(_ -> par.slow, 1:6)
     @test length(unique(vals_par)) == 1
     vals_idx = asyncmap(i -> par.slowi[i], 1:6)
@@ -506,7 +506,7 @@ end
     @test isa(serial_d1.ci3, DynamicObjects.IndexableProperty)
     @test @cache_status(serial_d1.ci3[1, 2, 3]) == :ready
     @test Threads.nthreads() == 1 || length(unique(asyncmap(i -> serial_d1.parallel_test, 1:10))) > 1
-    parallel_d1 = D1(; cache_type = :parallel)
+    parallel_d1 = D1()
     @test length(unique(asyncmap(i -> parallel_d1.parallel_test, 1:10))) == 1
     @test length(unique(asyncmap(i -> parallel_d1.parallel_testi[i], 1:10))) == 10
 end
@@ -535,8 +535,8 @@ end
 end
 
 @testset "fetchindex" begin
-    app = AsyncApp(; cache_type=:parallel)
-    @test app.slow[3] == 6
+    app = AsyncApp()
+    @test app.slow(3) == 6
     seen_task = Ref(false)
     result = fetchindex(app.slow, 42) do rv, status
         if isa(rv, Task)
@@ -596,17 +596,21 @@ end
     @test err2.property == :will_fail_indexed
     @test err2.indices == ("abc",)
 
-    # Parallel: indexed property (TaskFailedException wrapped)
-    pf = FailingProps(; cache_type=:parallel)
-    err3 = (@test_throws Base.TaskFailedException pf.will_fail_indexed["xyz"]).value
-    inner = err3.task.exception
-    @test inner isa DynamicObjects.PropertyComputationError
-    @test inner.property == :will_fail_indexed
-    @test DynamicObjects.unwrap_error(inner) isa ErrorException
+    # Parallel: indexed property. The blocking bare call computes synchronously
+    # (fetch defaults to Base.fetch), so it surfaces the PropertyComputationError
+    # DIRECTLY — no TaskFailedException wrapper — converging with the serial path
+    # (commit 0e07742, synchronous compute on the blocking-default get! path).
+    # A TaskFailedException is only observable via non-blocking access
+    # (fetch=identity), which fetches the spawned task explicitly.
+    pf = FailingProps()
+    err3 = (@test_throws DynamicObjects.PropertyComputationError pf.will_fail_indexed("xyz")).value
+    @test err3.property == :will_fail_indexed
+    @test err3.indices == ("xyz",)
+    @test DynamicObjects.unwrap_error(err3) isa ErrorException
 end
 
 @testset "entries / cached_entries" begin
-    app = EntriesApp(; cache_type=:parallel)
+    app = EntriesApp()
     # Compute some values
     @test app.slow[1] == 2
     @test app.slow[2] == 4
@@ -723,7 +727,7 @@ end
 end
 
 @testset "cancel! and cancel_all!" begin
-    app = CancelApp(; cache_type=:parallel)
+    app = CancelApp()
     # Trigger a slow computation (returns Task via fetch=identity)
     task = app.slow(42; fetch=identity)
     @test task isa Task
