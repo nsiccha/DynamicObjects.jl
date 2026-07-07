@@ -2928,8 +2928,11 @@ _is_forwarded(rhs::Expr) = rhs.head === :. && length(rhs.args) == 2 &&
                             rhs.args[1] === :__parent__
 _is_forwarded(::Any) = false
 
-# Dunders auto-injected by DO/HTMXO machinery — never user-state.
-const _AUTO_DUNDERS = Set([:__parent__, :__prefix__, :__req__, :__route__])
+# Dunders auto-injected by DO machinery — never user-state. Only `__parent__`
+# is DO's (children get a `__parent__ = nothing` prepend); `__prefix__`,
+# `__req__`, and `__route__` were HTMXObjects' and had leaked in here — removed
+# 2026-07-07 (user directive). HTMXObjects owns those on its own side now.
+const _AUTO_DUNDERS = Set([:__parent__])
 
 # --- Per-property checks ---------------------------------------------------
 
