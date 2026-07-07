@@ -266,6 +266,34 @@ end
     boom = error("always throws")
     ok = x + 1
 end
+# Joint slot-type inference (attempt 1, commit 5a33e48): `_slot_types_expr_joint`
+# fires ONE `return_type` over a per-struct `_infer_all` and uses the resulting concrete
+# NamedTuple, falling back to per-property `_slot_types_expr` when it can't.
+@dynamicstruct struct JointClean
+    x::Int
+    a = x + 1        # Int ← fixed field
+    b = a * 2        # Int ← computed sibling (joint threads the type)
+    s = string(b)    # String
+end
+@dynamicstruct struct JointThrower
+    x::Int
+    boom = error("boom")   # always-throws → _infer_all is Bottom → driver falls back
+    d = x + 1              # per-property fallback still types this concretely
+end
+@dynamicstruct struct JointChild
+    n::Int
+    cy = n * 2
+end
+@dynamicstruct struct JointParent
+    m::Int
+    child  = JointChild(m)   # computed nested-DO prop — joint threads the concrete type
+    childy = child.cy        # reads into the nested DO
+end
+@dynamicstruct struct JointIP
+    x::Int
+    ipf(k)  = k + x          # IndexableProperty
+    uses_ip = ipf(10) + 1    # bare computed referencing an IP → IP unbound in joint body
+end
 
 # --- Tests ---
 
@@ -800,6 +828,40 @@ end
     @test fieldtype(S, :ok) === Int   # sibling stays concrete via the per-property fallback
     @test o.ok == 6                   # and still computes
     @test_throws DynamicObjects.PropertyComputationError o.boom   # thrower still throws
+end
+@testset "joint slot-type inference" begin
+    # clean struct: _infer_all returns a CONCRETE NamedTuple ⇒ driver uses joint
+    jc = JointClean(2); Oc = typeof(jc)
+    rt = Core.Compiler.return_type(DynamicObjects._infer_all, Tuple{Oc, @NamedTuple{}})
+    @test rt isa DataType && rt <: NamedTuple           # joint succeeded (not fallback)
+    Sc = DynamicObjects._slot_types(Oc)
+    @test fieldtype(Sc, :a) === Int && fieldtype(Sc, :b) === Int && fieldtype(Sc, :s) === String
+    _jc_b(o) = o.b
+    @test (@inferred _jc_b(jc)) == 6
+    @test jc.s == "6"
+
+    # always-thrower: _infer_all never returns ⇒ Union{} ⇒ driver FALLS BACK to per-prop,
+    # which still types the non-throwing dependent and isolates the thrower.
+    jt = JointThrower(5); Ot = typeof(jt)
+    @test Core.Compiler.return_type(DynamicObjects._infer_all, Tuple{Ot, @NamedTuple{}}) === Union{}
+    @test fieldtype(DynamicObjects._slot_types(Ot), :d) === Int
+    @test jt.d == 6
+    @test_throws DynamicObjects.PropertyComputationError jt.boom
+
+    # computed nested-DO prop: joint threads the concrete nested type into the slot
+    jp = JointParent(3)
+    @test jp.child.cy == 6 && jp.childy == 6
+    @test fieldtype(DynamicObjects._slot_types(typeof(jp)), :child) <: JointChild
+
+    # bare computed prop referencing an IP: the IP name is unbound in the joint body →
+    # degrades gracefully (no crash), value path unaffected.
+    ji = JointIP(5)
+    @test ji.uses_ip == 16 && ji.ipf(3) == 8
+
+    # override propagation through the joint body: overriding un-annotated `a` with a
+    # Float64 re-types the dependent `b = a*2`.
+    jo = JointClean(2; a=2.5)
+    @test jo.a == 2.5 && jo.b == 5.0 && jo.s == "5.0"
 end
 
 @testset "DataFrame hash canonicalization" begin
