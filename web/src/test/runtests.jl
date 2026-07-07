@@ -78,6 +78,15 @@ end
     sum_xy = x + y
 end
 
+# Untyped fixed fields → parametric struct (Step 1). Exercises remake on the
+# parametric path: it must dispatch to the bare inner ctor via the UnionAll
+# wrapper and stay type-stable (incl. type-changing overrides).
+@dynamicstruct struct RemakeableU
+    x
+    y
+    sum_xy = x + y
+end
+
 _disk_cache_path = Ref("")
 @dynamicstruct struct Cached
     cache_path = _disk_cache_path[]
@@ -354,6 +363,23 @@ end
     @test r3.x == 1.0
     @test r3.y == 2.0
     @test r3.sum_xy == 99.0
+
+    # Parametric struct (untyped fixed fields, Step 1). Pre-fix this threw
+    # MethodError (remake called the concrete `RemakeableU{Int,Int}(…)`, which
+    # has no ctor method — only the bare UnionAll does).
+    u = RemakeableU(1, 2)
+    @test u isa RemakeableU{Int,Int}
+    @test remake(u; x=10).x == 10
+    @test remake(u; x=10).sum_xy == 12
+    @test remake(u; x=10) isa RemakeableU{Int,Int}
+    # type-CHANGING override: Int field → Float64 (only expressible now fields are parametric)
+    @test remake(u; x=1.5) isa RemakeableU{Float64,Int}
+    @test remake(u; x=1.5).sum_xy == 3.5
+    # remake stays a type-stable first-class citizen (incl. type-changing)
+    _ru_same(o) = remake(o; x=10)
+    _ru_change(o) = remake(o; x=1.5)
+    @test @inferred(_ru_same(u)) isa RemakeableU{Int,Int}
+    @test @inferred(_ru_change(u)) isa RemakeableU{Float64,Int}
 end
 
 @testset "Disk cache" begin

@@ -5405,12 +5405,26 @@ c3 = remake(c; scale=3.0)   # n=100, scale=3.0, result recomputed fresh
 c4 = remake(c; result=0.0)  # n=100, scale=2.0, result pre-set to 0.0
 ```
 """
-function remake(obj; kwargs...)
-    T = typeof(obj)
-    fixed_names = fieldnames(T)[1:end-1]  # all fields except :cache
-    args = [get(kwargs, name, getfield(obj, name)) for name in fixed_names]
-    cache_kwargs = filter(p -> !(first(p) in fixed_names), kwargs)
-    T(args...; cache_kwargs...)
+function remake(obj::T; kwargs...) where {T}
+    # `T(args...)` would call the concrete PARAMETRIC type (e.g. `CNode{Int,Int}`
+    # once Step-1 made untyped fixed fields parametric), but the @dynamicstruct
+    # inner constructor is defined bare (`CNode(x,y;…)`), so only the UnionAll
+    # wrapper dispatches to it — `.wrapper` (`CNode`) re-derives the concrete
+    # params from the arg types via the ctor's `new{typeof(x),…}`. (Non-parametric
+    # structs: `wrapper === T`, so this is a no-op for them.)
+    W = Base.typename(T).wrapper
+    kw = values(kwargs)
+    N = fieldcount(T) - 1                       # fixed fields (all but :cache)
+    # Build the fixed args UNROLLED (`Val(N)` + constant field names) so each
+    # field's type is preserved: a kwarg override contributes its own type, an
+    # untouched field its stored type — inference then folds the result to the
+    # concrete `CNode{…}` (incl. type-changing overrides). remake stays a
+    # type-stable first-class citizen; a runtime comprehension over field names
+    # (the previous form) boxed every arg to `Any`.
+    args = ntuple(i -> get(kw, fieldname(T, i), getfield(obj, i)), Val(N))
+    # Remaining kwargs (cache config etc.) — everything that isn't a fixed field.
+    cache_kwargs = Base.structdiff(kw, NamedTuple{fieldnames(T)[1:N]})
+    W(args...; cache_kwargs...)
 end
 
 # --- Error display for property computations ---
