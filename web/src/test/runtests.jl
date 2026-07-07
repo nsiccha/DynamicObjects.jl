@@ -256,6 +256,17 @@ end
     v = [x, y]       # Vector{Int}
 end
 
+# Joint slot-type inference (attempt 1, commit 5a33e48): an always-throwing bare
+# property makes the single joint `_infer_all` bottom (`return_type` = `Union{}`), so
+# `_slot_types_expr_joint` falls back to the per-property path — which must keep a typed
+# SIBLING concrete. This is the isolation the fallback exists to preserve; a joint with
+# no fallback would poison the whole struct's slots to `Any`.
+@dynamicstruct struct JointFallbackSibling
+    x::Int
+    boom = error("always throws")
+    ok = x + 1
+end
+
 # --- Tests ---
 
 @testset "Multi-lhs assignment" begin
@@ -778,6 +789,17 @@ end
     # the slot topology carries the inferred types
     S = DynamicObjects._slot_types(O)
     @test fieldtype(S, :a) === Int && fieldtype(S, :b) === Int && fieldtype(S, :c) === String
+end
+
+@testset "joint fallback isolates an always-thrower's typed sibling" begin
+    # A struct with an always-throwing bare prop: the single joint `_infer_all` bottoms,
+    # so `_slot_types_expr_joint` falls back to per-property inference, which keeps the
+    # typed sibling concrete (the thrower widens to Any in isolation, not the whole struct).
+    o = JointFallbackSibling(5)
+    S = DynamicObjects._slot_types(typeof(o))
+    @test fieldtype(S, :ok) === Int   # sibling stays concrete via the per-property fallback
+    @test o.ok == 6                   # and still computes
+    @test_throws DynamicObjects.PropertyComputationError o.boom   # thrower still throws
 end
 
 @testset "DataFrame hash canonicalization" begin
