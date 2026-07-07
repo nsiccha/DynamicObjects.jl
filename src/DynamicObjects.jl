@@ -208,19 +208,35 @@ _hash_replace(x::NamedTuple) = map(_hash_replace, x)
 _hash_replace(x) = x
 compute_property(o, ::Val{:__cache_base__}) = "cache"
 compute_property(o, ::Val{:__cache_path__}) = joinpath(o.__cache_base__, o.__hash__)
-# Deprecation shims — the data-side magic properties were renamed to dunders
-# (2026-07-07, decision 2canrl). Loud error on old-name ACCESS; the parse-time
-# error on old-name DECLARATION lives in the macro. Remove post-migration.
-compute_property(o, ::Val{:hash}) = error("`hash` was renamed to `__hash__` (2026-07-07, decision 2canrl); use `o.__hash__`.")
-compute_property(o, ::Val{:hash_fields}) = error("`hash_fields` was renamed to `__hash_fields__` (2026-07-07, decision 2canrl); use `o.__hash_fields__`.")
-compute_property(o, ::Val{:cache_base}) = error("`cache_base` was renamed to `__cache_base__` (2026-07-07, decision 2canrl); use `o.__cache_base__`.")
-compute_property(o, ::Val{:cache_path}) = error("`cache_path` was renamed to `__cache_path__` (2026-07-07, decision 2canrl); use `o.__cache_path__`.")
 compute_property(o, ::Val{:__status__}) = nothing
 compute_property(o, ::Val{:__strict__}) = true
-compute_property(o, ::Val{:__cache_type__}) = error("`__cache_type__` was removed (2026-07-07, decision 2canrl); the cache is always threadsafe (`ThreadsafeDict`) now.")
 compute_property(o, ::Val{:__substatus__}, name, args...; kwargs...) =
     _default_substatus(o.__status__, o, name, args...; kwargs...)
 _default_substatus(status, o, name, args...; kwargs...) = nothing
+
+# ── Magic-property deprecations (2026-07-07, decision 2canrl) ──────────────
+# The data-side auto-properties were renamed to the dunder namespace and
+# __cache_type__ was removed (single threadsafe cache). ONE registry drives
+# BOTH the runtime access-shim (generated just below) AND the parse-time
+# declaration error (in `dynamicstruct`), so the two can't drift. Remove the
+# whole block once every consumer has migrated off the old names.
+const _RENAMED_MAGIC = (;
+    hash        = :__hash__,
+    hash_fields = :__hash_fields__,
+    cache_base  = :__cache_base__,
+    cache_path  = :__cache_path__,
+)
+const _REMOVED_MAGIC = (;
+    __cache_type__ = "the cache is always threadsafe (`ThreadsafeDict`) now — drop it",
+)
+for (old, new) in pairs(_RENAMED_MAGIC)
+    msg = "`$old` was renamed to `$new` (2026-07-07, decision 2canrl); use `$new`."
+    @eval compute_property(o, ::Val{$(QuoteNode(old))}) = error($msg)
+end
+for (old, why) in pairs(_REMOVED_MAGIC)
+    msg = "`$old` was removed (2026-07-07, decision 2canrl); $why."
+    @eval compute_property(o, ::Val{$(QuoteNode(old))}) = error($msg)
+end
 
 # Substatus lifecycle hooks — the generic methods are no-ops so DO stays
 # correct with progress disabled (`__status__===nothing`); the
@@ -4835,6 +4851,21 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     bare_computed = [(name, info) for (name, info) in oproperties
                      if !isfixed(info) && !info.indexed]
     bare_set = Set{Symbol}(n for (n, _) in bare_computed)
+    # ── Magic-property deprecation: reject an OLD name DECLARED in a body ────
+    # (2026-07-07, decision 2canrl). Declaring an old data-side name would
+    # silently become a plain user property (no disk-cache/content-addressing
+    # behavior) now that the magic property lives under its dunder name — so
+    # error at expansion. Same registry as the runtime access-shims (no drift).
+    for (nm, _) in oproperties
+        if haskey(_RENAMED_MAGIC, nm)
+            error("`@dynamicstruct $type`: property `$nm` was renamed to " *
+                  "`$(_RENAMED_MAGIC[nm])` (2026-07-07, decision 2canrl) — declare " *
+                  "`$(_RENAMED_MAGIC[nm]) = …` instead of `$nm = …`.")
+        elseif haskey(_REMOVED_MAGIC, nm)
+            error("`@dynamicstruct $type`: property `$nm` was removed " *
+                  "(2026-07-07, decision 2canrl); $(_REMOVED_MAGIC[nm]).")
+        end
+    end
     infer_specs = map(bare_computed) do (name, info)
         _locals = info.locals isa Set ? info.locals : Set{Symbol}()
         walked = walk_rhs(info.rhs; locals=_locals, properties=prop_names, lnn=info.lnn)
