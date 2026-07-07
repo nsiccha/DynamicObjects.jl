@@ -4665,16 +4665,35 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     fixed_fields = [(name, info.lhs) for (name, info) in oproperties if isfixed(info)]
     fixed_names = [n for (n, _) in fixed_fields]
     fixed_lhs = [lhs for (_, lhs) in fixed_fields]
-    struct_expr = Expr(:struct, mut, head, Expr(:block,
-        fixed_lhs..., :(cache::$PropertyCache),
+    # --- Parametrize untyped fixed fields (slot storage, point 1) --------------
+    # A fixed field declared WITHOUT a `::T` annotation would land as `::Any`, so
+    # `getfield(o, name)` — and every property reading it — infers as `Any`. Give
+    # each such field a struct type parameter so the concrete argument type is
+    # captured at construction (`Foo(3,5) :: Foo{Int,Int}`), making fixed-field
+    # reads type-stable. Annotated fields (`z::Int`) keep their declared type and
+    # get no parameter. `_T_<name>` is deterministic (not `gensym`) so Revise
+    # sees a stable struct across re-expansions. No existing @dynamicstruct is
+    # user-parametric, so `head` is `Foo` or `Foo <: Super`. The emitted
+    # `::Type{<:$type}` methods (below) then match every instantiation.
+    untyped_fixed = [lhs for (_, lhs) in fixed_fields if lhs isa Symbol]
+    fixed_field_decls = Any[lhs isa Symbol ? :($lhs::$(Symbol("_T_", lhs))) : lhs
+                            for (_, lhs) in fixed_fields]
+    cache_ctor = :($PropertyCache($(resolve_cache_type)(cache_type), (;kwargs...)))
+    if isempty(untyped_fixed)
+        parametric_head = head
+        new_call = :(new($(fixed_names...), $cache_ctor))
+    else
+        tparams = [Symbol("_T_", n) for n in untyped_fixed]
+        parametric_head = Meta.isexpr(head, :(<:)) ?
+            Expr(:(<:), Expr(:curly, head.args[1], tparams...), head.args[2]) :
+            Expr(:curly, head, tparams...)
+        typeofs = [:(typeof($n)) for n in untyped_fixed]
+        new_call = :(new{$(typeofs...)}($(fixed_names...), $cache_ctor))
+    end
+    struct_expr = Expr(:struct, mut, parametric_head, Expr(:block,
+        fixed_field_decls..., :(cache::$PropertyCache),
         :(function $type($(fixed_lhs...); cache_type=$(Meta.quot(cache_type)), kwargs...)
-            __inst__ = new(
-                $(fixed_names...),
-                $PropertyCache(
-                    $(resolve_cache_type)(cache_type),
-                    (;kwargs...)
-                )
-            )
+            __inst__ = $new_call
             $(_link_owner!)(getfield(__inst__, :cache), __inst__)
             __inst__
         end)
@@ -4710,7 +4729,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
     #      hoisted inline child structs.
     push!(result.args, Expr(:block,
         struct_expr,
-        :($Base.Docs.getdoc(::Type{$type}) = begin
+        :($Base.Docs.getdoc(::Type{<:$type}) = begin
             __b = $Base.Docs.Binding(parentmodule($type), nameof($type))
             __m = get($Base.Docs.meta(__b.mod), __b, nothing)
             (__m === nothing || isempty(__m.docs)) ? $docstring : nothing
@@ -4720,7 +4739,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             $Base.hasproperty(__self__::$type, name::Symbol) = name in $(Tuple(prop_names))
             $Base.getproperty(__self__::$type, name::Symbol) = $_getprop(__self__, $(Val)(name))
             $Base.setproperty!(__self__::$type, name::Symbol, value) = getfield(__self__, :cache)[name] = value
-            $DynamicObjects.meta(::Type{$type}) = $properties
+            $DynamicObjects.meta(::Type{<:$type}) = $properties
             $DynamicObjects.is_generated_property(::$type, name::Symbol) = name in $generated_names
             $DynamicObjects.is_indexed_property(::$type, name::Symbol) = name in $indexed_names
             $DynamicObjects._hash_replace(__self__::$type) = __self__.hash
@@ -4734,17 +4753,17 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
                 $DynamicObjects._disk_eltype(::$type, ::Val{$(QuoteNode(name))}) = $(something(mmap_eltypes[name], :nothing))
             ) for name in mmap_names]...)
             $([:(
-                $DynamicObjects._nested_struct_type(::Type{$type}, ::Val{$(QuoteNode(prop_name))}) = $gen_name
+                $DynamicObjects._nested_struct_type(::Type{<:$type}, ::Val{$(QuoteNode(prop_name))}) = $gen_name
             ) for (prop_name, gen_name) in inline_child_pairs]...)
             $([:(
-                $DynamicObjects._analysis_nested_type(::Type{$type}, ::Val{$(QuoteNode(prop_name))}) = $gen_name
+                $DynamicObjects._analysis_nested_type(::Type{<:$type}, ::Val{$(QuoteNode(prop_name))}) = $gen_name
             ) for (prop_name, gen_name) in analysis_child_pairs]...)
             # Per-T `_type_description` override — delegates to a runtime
             # resolver that reads the user-attached docstring (if any). Lets
             # `@include`-emitted `_property_description` overrides bubble
             # `T`'s docstring up as the progress label when `T(args)` is
             # constructed via an IP.
-            $DynamicObjects._type_description(::Type{$type}, args...; kwargs...) =
+            $DynamicObjects._type_description(::Type{<:$type}, args...; kwargs...) =
                 $DynamicObjects._resolve_type_description($type, args, (; kwargs...))
             $Base.show(io::IO, __self__::$type) = begin
                 print(io, $(string(type)), "(")
