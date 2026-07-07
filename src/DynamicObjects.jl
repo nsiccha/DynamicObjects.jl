@@ -2038,7 +2038,9 @@ end
 
 # `_infer_rhs` and `_slot_types` have only per-struct methods (emitted by the
 # macro); declare the generic functions so `_slot_types_expr` can name `_infer_rhs`
-# and the macro can add `_slot_types` methods by qualified name.
+# and the macro can add `_slot_types` methods by qualified name. A `name::U = rhs`
+# annotation is baked into that property's `_infer_rhs` body as `(body)::U`, so it
+# rides the same `return_type` path — no separate annotation function.
 function _infer_rhs end
 function _slot_types end
 
@@ -2056,6 +2058,9 @@ function _slot_types_expr(::Type{O}, plan) where {O}
     Texprs = Any[]
     for (name, dep_params) in plan
         depTs = Any[get(known, dp, Any) for dp in dep_params]
+        # `name::U = rhs` annotation overrides are baked into the helper body as
+        # `(body)::U`, so they flow through this same `return_type` — no special
+        # case needed here.
         T = Core.Compiler.return_type(_infer_rhs, Tuple{O, Val{name}, depTs...})
         # A property whose compute provably never returns normally (e.g.
         # `will_fail = error(…)`) infers `Union{}`. `Tuple{Union{}}` is an
@@ -4829,6 +4834,15 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         walked = walk_rhs(info.rhs; locals=_locals, properties=prop_names, lnn=info.lnn)
         params = Set{Symbol}()
         body = _to_infer_body(walked, fixed_set, params)
+        # `name::U = rhs` (`lhs = Expr(:(::), name, U)`) is the annotation OVERRIDE.
+        # Cap the helper body with `::U` so it flows through the SAME `return_type`
+        # path as inference: `return_type((body)::U)` = `typeintersect(inferred, U)`,
+        # which is `U` exactly when inference gave up (`inferred = Any`) — the
+        # "circumvent failures" case. Routing it through `return_type` (not a
+        # regular call inside the `@generated` body) keeps folding reliable.
+        if Meta.isexpr(info.lhs, :(::))
+            body = Expr(:(::), body, info.lhs.args[2])
+        end
         (; name, dep_params=sort!(collect(params)), body)
     end
     infer_deps = Dict(s.name => s.dep_params for s in infer_specs)
@@ -4890,7 +4904,8 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
             $Base.getproperty(__self__::$type, name::Symbol) = $_getprop(__self__, $(Val)(name))
             $Base.setproperty!(__self__::$type, name::Symbol, value) = getfield(__self__, :cache)[name] = value
             $DynamicObjects.meta(::Type{<:$type}) = $properties
-            # Point 2: per-property inference helpers + the @generated slot-type map.
+            # Point 2: per-property inference helpers (annotation overrides baked
+            # into their bodies as `(body)::U`) + the @generated slot-type map.
             $(infer_helper_defs...)
             $slot_types_def
             $DynamicObjects.is_generated_property(::$type, name::Symbol) = name in $generated_names
