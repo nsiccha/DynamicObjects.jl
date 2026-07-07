@@ -197,8 +197,18 @@ _disk_eltype(o, ::Val) = nothing
 
 iscached(o, ::Val) = false
 cache_version(o, ::Val) = nothing
-compute_property(o, ::Val{:__hash_fields__}) = ntuple(Base.Fix1(getfield, o), fieldcount(typeof(o))-1)
-compute_property(o, ::Val{:__hash__}) = persistent_hash((typeof(o), _hash_replace(o.__hash_fields__)))
+compute_property(o, ::Val{:__hash_fields__}) = ntuple(Base.Fix1(getfield, o), fieldcount(typeof(o))-2)  # all but :cache and :slots
+# The type component of a content hash: `typeof(o)` with the trailing Phase-B
+# `slots` type param stripped, so an instance's content hash never depends on its
+# (construction-derived) slot types — identical to the pre-Phase-B type key, so
+# hashes + disk-cache paths stay bit-stable.
+function _hash_typekey(::Type{T}) where {T}
+    W = Base.typename(T).wrapper
+    ps = Base.unwrap_unionall(T).parameters
+    length(ps) <= 1 ? W : W{ps[1:end-1]...}
+end
+_hash_typekey(o) = _hash_typekey(typeof(o))
+compute_property(o, ::Val{:__hash__}) = persistent_hash((_hash_typekey(o), _hash_replace(o.__hash_fields__)))
 # Shallow walker used only by the :__hash__ compute. Leaves non-DO values
 # structurally identical so hashes stay stable for DOs that don't nest DOs,
 # and substitutes any DO with its own (stable) `.__hash__` string. Per-type
@@ -352,6 +362,30 @@ Base.get!(f::Function, c::PropertyCache, key; substatus=nothing, kwargs...) =
 Base.get!(f::Function, ::PropertyCache, key, indices...; kwargs...) = f(nothing)
 Base.setindex!(c::PropertyCache, args...) = setindex!(c.cache, args...)
 Base.show(io::IO, pc::PropertyCache) = print(io, "PropertyCache(", length(pc.cache), " properties)")
+
+# ── Typed memo slot (Phase B / 5.3) ────────────────────────────────────────
+# A lazily-filled, type-stable memo cell for one bare computed property. `set`
+# is atomic for safe publication: a reader that observes `set == true` (acquire)
+# is guaranteed to see the fully-written `value` (release). Empty ctor = lazy
+# (unfilled); 1-arg ctor = pre-seeded (a construction kwarg override).
+mutable struct Slot{T}
+    @atomic set::Bool
+    value::T
+    Slot{T}() where {T} = new{T}(false)
+    Slot{T}(v) where {T} = new{T}(true, v)
+end
+
+# Build the per-instance `slots` NamedTuple of EMPTY typed Slots for parent type
+# `O`, driven by 5.2's `_slot_types(O)`. `typeof(result)` is the concrete slots
+# type the constructor stamps into `new{…, __DO_S__}`. (Phase B increment 1:
+# slots are built but DORMANT — reads still route through the cache; the
+# override-aware fill + slot reads land in increment 2.)
+@generated function _slots_from_types(::Type{ST}) where {ST<:NamedTuple}
+    ns = fieldnames(ST)
+    slot_exprs = Any[:($(Slot){$t}()) for t in fieldtypes(ST)]
+    :(NamedTuple{$ns}(($(slot_exprs...),)))
+end
+_build_empty_slots(::Type{O}) where {O} = _slots_from_types(_slot_types(O))
 
 struct IndexableProperty{N,O,D<:AbstractDict}
     o::O
@@ -4231,21 +4265,25 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     fixed_field_decls = Any[lhs isa Symbol ? :($lhs::$(Symbol("_T_", lhs))) : lhs
                             for (_, lhs) in fixed_fields]
     cache_ctor = :($PropertyCache($ThreadsafeDict, (;kwargs...)))
-    if isempty(untyped_fixed)
-        parametric_head = head
-        new_call = :(new($(fixed_names...), $cache_ctor))
-    else
-        tparams = [Symbol("_T_", n) for n in untyped_fixed]
-        parametric_head = Meta.isexpr(head, :(<:)) ?
-            Expr(:(<:), Expr(:curly, head.args[1], tparams...), head.args[2]) :
-            Expr(:curly, head, tparams...)
-        typeofs = [:(typeof($n)) for n in untyped_fixed]
-        new_call = :(new{$(typeofs...)}($(fixed_names...), $cache_ctor))
-    end
+    tparams = [Symbol("_T_", n) for n in untyped_fixed]      # POINT 1 params (may be empty)
+    typeofs = [:(typeof($n)) for n in untyped_fixed]
+    # Phase B: every struct gains a trailing slots type param `__DO_S__ <: NamedTuple`,
+    # stamped at construction from `typeof(the built slots)`. `slots` holds one typed
+    # `Slot{T}` per bare computed property. (Increment 1: built empty + DORMANT — reads
+    # still route through the cache; override-aware fill + slot reads land in increment 2.)
+    all_tparams = Any[tparams..., :(__DO_S__ <: $NamedTuple)]
+    parametric_head = Meta.isexpr(head, :(<:)) ?
+        Expr(:(<:), Expr(:curly, head.args[1], all_tparams...), head.args[2]) :
+        Expr(:curly, head, all_tparams...)
+    # Probe type carries a dummy (empty-NT) slots param: slot inference is
+    # S-independent, so `_build_empty_slots` recovers the real slot eltypes from it.
+    probe_type = :($type{$(typeofs...), $(typeof((;)))})
+    new_call = :(new{$(typeofs...), $(typeof)(__slots__)}($(fixed_names...), $cache_ctor, __slots__))
     struct_expr = Expr(:struct, mut, parametric_head, Expr(:block,
-        fixed_field_decls..., :(cache::$PropertyCache),
+        fixed_field_decls..., :(cache::$PropertyCache), :(slots::__DO_S__),
         :(function $type($(fixed_lhs...); cache_type=nothing, kwargs...)
             isnothing(cache_type) || error("`cache_type` was removed (2026-07-07, decision 2canrl); the cache is always threadsafe now — drop this kwarg.")
+            __slots__ = $(_build_empty_slots)($probe_type)
             __inst__ = $new_call
             __inst__
         end)
@@ -4340,7 +4378,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     end
     if !(:__hash__ in prop_names)
         push!(infer_specs, (; name=:__hash__, dep_params=[:__hash_fields__],
-            body=:($persistent_hash(($typeof(__self__), $_hash_replace(__hash_fields__))))))
+            body=:($persistent_hash(($(_hash_typekey)(__self__), $_hash_replace(__hash_fields__))))))
         push!(bare_set, :__hash__)
     end
     if !(:__cache_path__ in prop_names)
@@ -4856,7 +4894,7 @@ function remake(obj::T; kwargs...) where {T}
     # structs: `wrapper === T`, so this is a no-op for them.)
     W = Base.typename(T).wrapper
     kw = values(kwargs)
-    N = fieldcount(T) - 1                       # fixed fields (all but :cache)
+    N = fieldcount(T) - 2                       # fixed fields (all but :cache and :slots)
     # Build the fixed args UNROLLED (`Val(N)` + constant field names) so each
     # field's type is preserved: a kwarg override contributes its own type, an
     # untouched field its stored type — inference then folds the result to the
@@ -5073,7 +5111,7 @@ function _enclosing_scope(T::Type, parents)
     cur = T
     while true
         for f in fieldnames(cur)
-            f === :cache && continue
+            (f === :cache || f === :slots) && continue
             s = String(f)
             (startswith(s, "__") && endswith(s, "__")) && continue
             push!(names, f)
@@ -5302,7 +5340,7 @@ function _build_color_map(root::Type)
         T in visited && return
         push!(visited, T)
         for f in fieldnames(T)
-            f === :cache && continue
+            (f === :cache || f === :slots) && continue
             s = String(f); (startswith(s, "__") && endswith(s, "__")) && continue
             set_root!(f)
         end
@@ -5518,7 +5556,7 @@ function _build_section(T::Type, header;
         push!(body, sem.line(_lint_node(msg)))
     end
 
-    fixed = filter(n -> n !== :cache, collect(fieldnames(T)))
+    fixed = filter(n -> n !== :cache && n !== :slots, collect(fieldnames(T)))
     if !isempty(fixed)
         toks = Any[_tok("fields: "; italic=true)]
         for (i, f) in enumerate(fixed)
