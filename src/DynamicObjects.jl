@@ -4405,7 +4405,9 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         quote
             $Base.hasproperty(__self__::$type, name::Symbol) = name in $(Tuple(prop_names))
             $Base.getproperty(__self__::$type, name::Symbol) = $_getprop(__self__, $(Val)(name))
-            $Base.setproperty!(__self__::$type, name::Symbol, value) = getfield(__self__, :cache)[name] = value
+            $Base.setproperty!(__self__::$type, name::Symbol, value) = error(
+                "`", nameof(typeof(__self__)), "` is an immutable DynamicObject: cannot set property `",
+                name, "`. DynamicObjects disallow mutation; use `remake(__self__; ", name, "=…)` to build a modified copy.")
             $DynamicObjects.meta(::Type{<:$type}) = $properties
             # Point 2: per-property inference helpers (annotation overrides baked
             # into their bodies as `(body)::U`) + the @generated slot-type map.
