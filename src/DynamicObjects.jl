@@ -1021,17 +1021,6 @@ struct ThreadsafeDict{K,V} <: AbstractThreadsafeDict{K,V}
     ThreadsafeDict() = new{Any,Any}(ReentrantLock(), Dict{Any,Any}(), Dict{Any,Task}(), Dict{Any,Any}())
 end
 
-const _cache_types = (;serial=Dict, parallel=ThreadsafeDict)
-# `:serial` was removed (deprecated 2026-06; decision hw24wf) — error before the
-# `_cache_types` lookup. The const keeps `serial=Dict` (a const can't be redefined
-# under Julia-1.10 Revise); this method-level guard is what makes `:serial` fail.
-resolve_cache_type(s::Symbol) = begin
-    s === :serial && error("cache_type=:serial was removed (deprecated 2026-06); use cache_type=:parallel")
-    get(_cache_types, s, s)
-end
-resolve_cache_type(T::Type) = T.name.wrapper
-resolve_cache_type(T::UnionAll) = T
-
 Base.length(c::AbstractThreadsafeDict) = lock(c.lock) do; length(c.cache); end
 Base.haskey(c::AbstractThreadsafeDict, key) = lock(c.lock) do; haskey(c.cache, key); end
 Base.get(c::AbstractThreadsafeDict, key, default) = lock(c.lock) do; get(c.cache, key, default); end
@@ -1453,12 +1442,10 @@ maybepop!(c::AbstractThreadsafeDict, key) = begin
     end
 end
 
-# Subcache factory for indexed-property dicts. Default routes by cache_type:
-# `:serial` → `Dict`, `:parallel` → `ThreadsafeDict`. The 4-arg form is keyed
-# on `(ParentType, Val{name})` for future per-property overrides; currently
-# unused.
+# Subcache factory for indexed-property dicts — the cache is always a
+# `ThreadsafeDict`. The 4-arg form is keyed on `(ParentType, Val{name})` for
+# future per-property overrides; currently unused.
 subcache(pc::PropertyCache, ::Type, ::Val) = subcache(pc)
-subcache(::PropertyCache{<:Dict}) = Dict()
 subcache(::PropertyCache{<:AbstractThreadsafeDict}) = ThreadsafeDict()
 
 # --- PersistentSet ---
@@ -4094,7 +4081,7 @@ function _detect_inline_method_lhs(lhs::Expr)
     (; fname=sig.args[1], sig_args, where_params, self_idx)
 end
 
-dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothing, is_child=false, lint=true) = begin
+dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, lint=true) = begin
     # Short-form sugar: `T(arg1::T1, arg2::T2) = begin … end` is shorthand
     # for `struct T; arg1::T1; arg2::T2; … end`. Positional args become
     # fixed/constructor fields. `;`-separated kwargs become regular DO
@@ -4726,7 +4713,7 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         push!(result.args, :($varname = $DiskCacheLocks()))
     end
     # Prepend extracted inline child structs (processed recursively)
-    _child_handler = isnothing(child_handler) ? (s -> dynamicstruct(s; cache_type, is_child=true, lint)) : child_handler
+    _child_handler = isnothing(child_handler) ? (s -> dynamicstruct(s; is_child=true, lint)) : child_handler
     for s in extracted_structs
         child_result = _child_handler(s)
         # Unwrap esc() — parent handles escaping
@@ -5058,33 +5045,30 @@ function setlnn(lnn::Union{LineNumberNode,Nothing})
     end
 end
 
-# `cache_type=:serial` was removed (deprecated 2026-06; decision hw24wf). Reject it
-# at macro-parse so a struct definition fails at macroexpand, mirroring the runtime
-# `resolve_cache_type` guard. cache_type reaches `_parse_macro_opt` via TWO AST shapes
-# — a positional `:serial` (bare Symbol from the QuoteNode method) and `cache_type=:serial`
-# (a `QuoteNode(:serial)` from the `:(=)` branch) — so guard both. `_parse_macro_opt` is a
-# plain function the `@dynamicstruct` macro calls at expansion, so Revise hot-reloads it.
-_reject_serial_opt(v) = (v === :serial || v === QuoteNode(:serial)) &&
-    error("@dynamicstruct: cache_type=:serial was removed (deprecated 2026-06); use cache_type=:parallel")
+# The `cache_type` MACRO option (a bare `:parallel`/`:serial`, or `cache_type=…`)
+# was removed 2026-07-07 (decision 2canrl) — the cache is always a `ThreadsafeDict`
+# now. Reject it at macro-parse with a clear message (mirrors the ctor-kwarg
+# deprecation) rather than letting it fall through to an opaque unsupported-kwarg
+# error. `_parse_macro_opt` is a plain function the macro calls at expansion.
+_reject_cache_type_opt() = error("@dynamicstruct: the `cache_type` macro option was removed (2026-07-07, decision 2canrl); the cache is always threadsafe (`ThreadsafeDict`) now — drop it.")
 
 # Parse a single positional macro arg into a (kwarg-name => value) pair.
 # `name=value` Expr → `(name => value)`. String/`:string` → `(:docstring => …)`.
-# QuoteNode (`:parallel`) → `(:cache_type => sym)`. Anything else
-# is rejected with a pointer to the recognised forms.
+# Anything else is rejected with a pointer to the recognised forms.
 _parse_macro_opt(a::AbstractString) = (:docstring => a)
-_parse_macro_opt(a::QuoteNode) = (_reject_serial_opt(a.value); (:cache_type => a.value))
+_parse_macro_opt(a::QuoteNode) = _reject_cache_type_opt()
 _parse_macro_opt(a::Expr) = if a.head === :string
     (:docstring => a)
 elseif a.head === :(=) && a.args[1] isa Symbol
-    a.args[1] === :cache_type && _reject_serial_opt(a.args[2])
+    a.args[1] === :cache_type && _reject_cache_type_opt()
     (a.args[1] => a.args[2])
 else
-    error("@dynamicstruct: unsupported option `$a` — use a docstring, `:parallel`, or `name=value`.")
+    error("@dynamicstruct: unsupported option `$a` — use a docstring or `name=value`.")
 end
-_parse_macro_opt(a) = error("@dynamicstruct: unsupported option `$a` — use a docstring, `:parallel`, or `name=value`.")
+_parse_macro_opt(a) = error("@dynamicstruct: unsupported option `$a` — use a docstring or `name=value`.")
 
 """
-    @dynamicstruct [docstring] [cache_type] struct Name
+    @dynamicstruct [docstring] struct Name
         field                     # fixed field (constructor argument)
         prop = expr               # lazily computed property
         @cached prop = expr       # lazily computed + disk-cached property
@@ -5101,11 +5085,8 @@ Derived properties may reference any other field or property by name; the
 reference is automatically rewritten to `__self__.<name>`.  Order of definition
 does not matter — cycles will result in a stack overflow at runtime.
 
-`cache_type` controls the in-memory cache backend:
-- `:parallel` (default) — `ThreadsafeDict`, safe to access from multiple tasks
-  simultaneously; duplicate work is avoided by sharing in-flight `Task`s.
-
-`cache_type=:serial` was removed (deprecated 2026-06); use `:parallel` (the default).
+The in-memory cache is always a `ThreadsafeDict` — safe to access from multiple
+tasks simultaneously; duplicate work is avoided by sharing in-flight `Task`s.
 
 Properties marked `@cached` are additionally persisted to disk under
 `__self__.__cache_path__` (which itself defaults to
@@ -5163,7 +5144,7 @@ ds.top("a"; n=2)        # ["apple", "banana"] — kwargs supported
 
 # Async progress with `__status__`
 
-With `cache_type=:parallel`, indexed properties spawn background `Task`s.
+Indexed properties spawn background `Task`s.
 Define `__status__` (root progress node) to automatically wire progress into
 spawned tasks. A default `__substatus__` is provided that creates child progress
 nodes (Treebars is a hard dependency):
@@ -5173,7 +5154,7 @@ nodes (Treebars is a hard dependency):
     __status__ = initialize_progress!(:state; description="MyApp")
     results(key) = expensive_computation(__status__)  # __status__ is the substatus
 end
-app = MyApp(; cache_type=:parallel)
+app = MyApp()
 
 # Non-blocking access with progress:
 fetchindex(app.results, key) do rv, status

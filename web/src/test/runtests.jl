@@ -821,6 +821,13 @@ end
     @test_throws PropertyComputationError o.__cache_type__
     # cache_type kwarg is a hard removal error, not a warning
     @test_throws ErrorException HashNoDOs(7, [1.0]; cache_type=:parallel)
+    # the cache_type MACRO option (positional `:parallel` or `cache_type=…`) errors too
+    for ex in (:(@dynamicstruct :parallel struct _DepMacroCT; a=1; end),
+               :(@dynamicstruct cache_type=:parallel struct _DepMacroCT2; a=1; end))
+        threw = false
+        try; macroexpand(@__MODULE__, ex); catch; threw = true; end
+        @test threw
+    end
     # DEFINITION surface: declaring an old name errors at expansion time
     for ex in (:(@dynamicstruct struct _DepBadCP; a=1; cache_path="x"; end),
                :(@dynamicstruct struct _DepBadHF; a=1; hash_fields=(1,); end),
