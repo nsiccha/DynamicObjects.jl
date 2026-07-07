@@ -4845,6 +4845,63 @@ dynamicstruct(expr; docstring=nothing, cache_type=:parallel, child_handler=nothi
         end
         (; name, dep_params=sort!(collect(params)), body)
     end
+    # ── Machinery-dunder acyclicity contract ───────────────────────────────
+    # `__status__`/`__strict__`/`__cache_type__` are fetched by `_computeproperty`
+    # as implicit per-compute deps (~L1800/1806/1807), so a COMPUTED-property
+    # dependency forms a compute cycle (the fetch re-enters) — a runtime
+    # infinite-recursion that the slot asserts surface as an inference overflow.
+    # Forbid it at expansion. `dep_params` are exactly the computed-sibling
+    # self-refs; fixed ("proper") fields become `getfield` and auto-dunders
+    # (`__parent__`) aren't `__self__.X` self-refs — so `__status__` may still use
+    # proper fields, `__parent__.__status__`, and constants, just not sibling
+    # computed properties. (User directive 2026-07-07; `__status__` may later
+    # become an always-present field, retiring this.)
+    for s in infer_specs
+        if s.name in (:__status__, :__strict__, :__cache_type__) && !isempty(s.dep_params)
+            error("`@dynamicstruct $type`: `$(s.name)` may not depend on computed " *
+                  "propert$(length(s.dep_params) == 1 ? "y" : "ies") " *
+                  "`$(join(s.dep_params, "`, `"))` — it is fetched as an implicit " *
+                  "dependency of every property computation, so a computed-property " *
+                  "dependency forms a cycle. It may use fixed fields, constants, and " *
+                  "`__parent__`, but not sibling computed properties.")
+        end
+    end
+    # ── Auto-property slot injection ───────────────────────────────────────
+    # The generic `compute_property(o, ::Val{:name})` auto-properties (hash,
+    # cache_path, hash_fields, cache_base; src ~L200-213) are fallbacks, NOT in
+    # `oproperties` — so without this they'd read as `Any`. Fold each DATA
+    # auto-prop the struct doesn't already define into the SAME inference pass,
+    # so `o.hash`, `o.cache_path`, … fold to their real types (String / tuple).
+    # Type is INFERRED from the generic default (no hardcoded name→type table):
+    # dep-free auto-props DELEGATE to `compute_property` for inference (single
+    # source — the value path stays the sole definition); the two with
+    # computed-sibling deps (`hash`←`hash_fields`, `cache_path`←`cache_base`,`hash`)
+    # thread them as typed params (explicit RHS) — delegating there would recurse
+    # into `_slot_types` via getproperty during generation. A user definition of
+    # any auto-prop lands in `oproperties` above and is skipped here (its own type
+    # wins). The MACHINERY dunders `__status__`/`__strict__`/`__cache_type__` are
+    # deliberately EXCLUDED: `_computeproperty` fetches them as implicit
+    # per-compute deps, so asserting their type can force a `dunder ↔ sibling`
+    # compute cycle into a hard inference overflow (`_slot_eltype` returns `Any`
+    # for them). The value path (generic computes) is UNTOUCHED — this adds only
+    # the slot type, so behaviour is bit-identical.
+    infer_specs = Vector{Any}(infer_specs)
+    for nm in (:hash_fields, :cache_base)
+        nm in prop_names && continue
+        push!(infer_specs, (; name=nm, dep_params=Symbol[],
+            body=:($compute_property(__self__, $(Val)($(QuoteNode(nm)))))))
+        push!(bare_set, nm)
+    end
+    if !(:hash in prop_names)
+        push!(infer_specs, (; name=:hash, dep_params=[:hash_fields],
+            body=:($persistent_hash(($typeof(__self__), $_hash_replace(hash_fields))))))
+        push!(bare_set, :hash)
+    end
+    if !(:cache_path in prop_names)
+        push!(infer_specs, (; name=:cache_path, dep_params=[:cache_base, :hash],
+            body=:($joinpath(cache_base, hash))))
+        push!(bare_set, :cache_path)
+    end
     infer_deps = Dict(s.name => s.dep_params for s in infer_specs)
     infer_topo = _topo_order([s.name for s in infer_specs], bare_set, infer_deps)
     spec_by_name = Dict(s.name => s for s in infer_specs)
