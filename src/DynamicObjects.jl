@@ -219,6 +219,12 @@ _hash_replace(x) = x
 compute_property(o, ::Val{:__cache_base__}) = "cache"
 compute_property(o, ::Val{:__cache_path__}) = joinpath(o.__cache_base__, o.__hash__)
 compute_property(o, ::Val{:__status__}) = nothing
+# A standalone @dynamicstruct can be `@include`d / `__parent__=`-constructed (HTMXObjects
+# desugar → `_inject_include_kwargs!`), so EVERY struct needs a runtime `__parent__`
+# default — not only inline children (which declare it via the ~L4080 prepend). Default is
+# `nothing` (no parent); a `__parent__=` override seeds the slot (auto-prop injection
+# ~L4534) and returns from there, never reaching this fallback.
+compute_property(o, ::Val{:__parent__}) = nothing
 compute_property(o, ::Val{:__substatus__}, name, args...; kwargs...) =
     _default_substatus(o.__status__, o, name, args...; kwargs...)
 _default_substatus(status, o, name, args...; kwargs...) = nothing
@@ -252,13 +258,15 @@ end
 # resolved like a sibling property. The injected data-side auto-properties are
 # otherwise absent from a struct's `prop_names` (they live only in the slot-
 # inference topology), so `walk_rhs` would leave a bare `__hash__` as a free
-# variable. NOT here: `__parent__` (children already declare it via a
-# `__parent__ = nothing` prepend, so it's a real entry in their `prop_names`;
-# a top-level struct has no parent) and `__status__`/`__substatus__`
-# (`__status__` is threaded as a kwarg-local and must STAY the local, never
-# `__self__.__status__`; `__substatus__` is an indexed call, not a value).
+# variable. `__parent__` is included too: a standalone `@dynamicstruct` can be `@include`d /
+# `__parent__=`-constructed (HTMXObjects desugar), so its body may bare-reference `__parent__`
+# (e.g. `__appdata__ = isnothing(__parent__) ? nothing : __parent__.__appdata__`) and must
+# resolve it as a threaded sibling — otherwise a standalone struct hits `UndefVarError`.
+# Inline children ALSO declare it via the ~L4080 prepend (in their `prop_names`); `union`
+# dedupes. NOT here: `__status__`/`__substatus__` (`__status__` is threaded as a kwarg-local
+# and must STAY the local, never `__self__.__status__`; `__substatus__` is an indexed call).
 const _BAREREF_MAGIC = Set{Symbol}([
-    :__hash__, :__hash_fields__, :__cache_base__, :__cache_path__,
+    :__hash__, :__hash_fields__, :__cache_base__, :__cache_path__, :__parent__,
 ])
 
 # Substatus lifecycle hooks — the generic methods are no-ops so DO stays
@@ -4475,6 +4483,19 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     # for it). The value path (generic computes) is UNTOUCHED — this adds only
     # the slot type, so behaviour is bit-identical.
     infer_specs = Vector{Any}(infer_specs)
+    # __parent__: EVERY @dynamicstruct needs a SEEDABLE parent slot (default `nothing`),
+    # not only inline-@struct children — a standalone struct can be `@include`'d or
+    # `__parent__=`-constructed (HTMXObjects desugar → `_inject_include_kwargs!` ~L3717),
+    # and Phase-B slots-as-truth DROPS that override when there is no slot to seed
+    # (pre-Phase-B the cache Dict held it; user-bisected regression, Bruno /qt/fit/compute).
+    # Inline children already prepend `__parent__` (~L4080), so they're skipped via
+    # `prop_names`. Body is the plain `nothing` default; a `__parent__=` override re-types
+    # + seeds the slot through the normal override path (`name in ov` in `_slot_types_expr`).
+    if !(:__parent__ in prop_names)
+        push!(infer_specs, (; name=:__parent__, dep_params=Symbol[], annotated=false,
+            body=:(nothing)))
+        push!(bare_set, :__parent__)
+    end
     for nm in (:__hash_fields__, :__cache_base__)
         nm in prop_names && continue
         push!(infer_specs, (; name=nm, dep_params=Symbol[], annotated=false,
