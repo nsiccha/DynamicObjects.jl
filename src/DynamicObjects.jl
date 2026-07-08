@@ -5030,6 +5030,24 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                         :__status__,
                         Meta.isexpr(_rewritten, :block) ? _rewritten : Expr(:block, _rewritten))
                 end
+                # `@PROGRESS`-marked: the "throw everything at @progress" form. Exactly
+                # like `@progress` above, but rewrites the body with `_fetch_rewrite`
+                # (what `@fetch!` emits — every call → `maybefetchindex!(__progress__, …)`,
+                # every access → `maybefetchproperty!(__progress__, …)`) instead of the
+                # self-only `_progress_self_rewrite`. So EVERY call/access threads progress
+                # (and memoizes), not just bare sibling accesses. Same `Treebars.@progress
+                # __status__` wrap; `__progress__` stays literal in the emitted maybefetch*
+                # calls, so Tb's outside-in walker renames it — the same fecc238-footgun-free
+                # path as `@progress`, and inline `@progress`/`@phases` markers in the body
+                # still work (Tb expands the wrap first).
+                if Symbol("@PROGRESS") in info.macros
+                    _rewritten_all = _fetch_rewrite(:__progress__, walked_rhs)
+                    walked_rhs = Expr(:macrocall,
+                        GlobalRef(Treebars, Symbol("@progress")),
+                        something(info.lnn, LineNumberNode(0, :unknown)),
+                        :__status__,
+                        Meta.isexpr(_rewritten_all, :block) ? _rewritten_all : Expr(:block, _rewritten_all))
+                end
                 block = Expr(:block,
                     _lnn, Expr(:(=), _call(:compute_property, cp_kwargs...), Expr(:block, _lnn, walked_rhs)),
                     _lnn, Expr(:(=), _call(:iscached), Expr(:block, _lnn, iscached_val)),
