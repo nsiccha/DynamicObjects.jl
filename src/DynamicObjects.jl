@@ -488,8 +488,15 @@ struct ThreadsafeDict{K,V} <: AbstractThreadsafeDict{K,V}
     cache::Dict{K,V}
     tasks::Dict{K,Task}
     status::Dict{K,Any}
-    ThreadsafeDict{K,V}(c) where {K,V} = new{K,V}(ReentrantLock(), Dict{K,V}(c), Dict{K,Task}(), Dict{K,Any}())
-    ThreadsafeDict() = new{Any,Any}(ReentrantLock(), Dict{Any,Any}(), Dict{Any,Task}(), Dict{Any,Any}())
+    # In-flight SYNCHRONOUS computes — the slot / blocking-default path that does NOT
+    # spawn a Task. Maps an in-flight key to a `Threads.Condition` bound to `lock`. The
+    # first caller registers here and computes on its own thread; concurrent callers see
+    # the marker, `wait` on the condition, and read the published value instead of
+    # recomputing — restoring compute-at-most-once WITHOUT a Task spawn. Populated only
+    # while a sync compute is mid-flight; the computer removes its entry under `lock`.
+    computing::Dict{K,Threads.Condition}
+    ThreadsafeDict{K,V}(c) where {K,V} = new{K,V}(ReentrantLock(), Dict{K,V}(c), Dict{K,Task}(), Dict{K,Any}(), Dict{K,Threads.Condition}())
+    ThreadsafeDict() = new{Any,Any}(ReentrantLock(), Dict{Any,Any}(), Dict{Any,Task}(), Dict{Any,Any}(), Dict{Any,Threads.Condition}())
 end
 
 Base.length(c::AbstractThreadsafeDict) = lock(c.lock) do; length(c.cache); end
@@ -500,7 +507,7 @@ Base.get(c::AbstractThreadsafeDict, key, default) = lock(c.lock) do; get(c.cache
 # lock(c.lock) do ... end or entries(ip) which holds the lock for the full sweep.
 Base.iterate(c::AbstractThreadsafeDict) = lock(c.lock) do; iterate(c.cache); end
 Base.iterate(c::AbstractThreadsafeDict, state) = lock(c.lock) do; iterate(c.cache, state); end
-Base.empty!(c::ThreadsafeDict) = (lock(c.lock) do; empty!(c.cache); empty!(c.tasks); empty!(c.status); end; c)
+Base.empty!(c::ThreadsafeDict) = (lock(c.lock) do; empty!(c.cache); empty!(c.tasks); empty!(c.status); empty!(c.computing); end; c)
 n_running(c::AbstractThreadsafeDict) = lock(c.lock) do; length(c.tasks); end
 Base.show(io::IO, c::ThreadsafeDict{K,V}) where {K,V} = lock(c.lock) do
     print(io, "ThreadsafeDict{", K, ",", V, "}(", length(c.cache), " cached, ", length(c.tasks), " running)")
@@ -1512,19 +1519,46 @@ end
         slot = getfield(getfield(o, :slots), name)
         R = _slot_eltype(typeof(o), Val(name))             # recovered read type (folds to a constant)
         (@atomic :acquire slot.set) && return slot.value::R   # lock-free warm hit, narrowed
-        return _compute_into_slot!(o, Val(name), slot)::R     # miss → compute once, narrowed
+        return _compute_into_slot!(o, Val(name), slot)::R     # miss → compute at most once (in-flight latch), narrowed
     end
     getorcomputeproperty(o, name)::_slot_eltype(typeof(o), Val(name))
 end
 
-# Slow path for a bare-computed slot miss: compute the property ONCE and publish it
-# into `slot`, mirroring `ThreadsafeDict.get!`'s synchronous once-compute lifecycle.
-# Build the substatus + run the compute OUTSIDE the cache lock (the RHS recurses
-# into sibling slots on the same lock, which must not run under it), then publish
-# first-write-wins under it. `slot.value` is a typed `Slot{T}` field, so the store
-# `convert`s to `T` and the returned read is type-stable `T`.
+# Slow path for a bare-computed slot miss: compute the property AT MOST ONCE and
+# publish it into `slot`. Concurrent cold misses coordinate through the per-key in-flight
+# latch `c.computing`: the FIRST caller registers a `Threads.Condition` (bound to
+# `c.lock`) and becomes the sole computer; concurrent callers see the marker and `wait`
+# on it, then read the published slot instead of recomputing. So the RHS runs at most
+# once per successful materialization; a FAILED compute clears the marker and wakes
+# waiters so exactly one of them retries (the `retry_failed` dual). Bare slotted
+# properties are blocking-only (never polled via `fetchindex`), so the latch is the
+# whole story here — no cross-path Task coordination is needed.
+#
+# The compute runs OUTSIDE `c.lock` (the RHS recurses into sibling slots on the same
+# lock, which must not run under it); arbitration/publish/notify happen under it.
+# Explicit lock/unlock (not `lock() do`) on the publish: a do-block closure boxes `v`
+# and widens the returned `slot.value` to `Any`, de-stabilising every slotted read — the
+# typed `r::T` pins the return to the slot element type. Phase 1's do-block returns only
+# a `Union{Nothing,Threads.Condition}`, so it never touches `slot.value`'s type.
 @noinline function _compute_into_slot!(o, ::Val{name}, slot::Slot{T}) where {name, T}
     c = getfield(getfield(o, :cache), :cache)          # the underlying ThreadsafeDict
+    # Phase 1 — arbitrate winner vs waiter under the lock. A waiter blocks on the
+    # in-flight computer's condition until the slot is published, or until that computer
+    # fails and clears the marker (then the waiter falls through and computes itself).
+    cond = lock(c.lock) do
+        while true
+            (@atomic :acquire slot.set) && return nothing          # already published
+            existing = get(c.computing, name, nothing)
+            existing === nothing && break                          # no computer → we win
+            wait(existing::Threads.Condition)                      # releases c.lock; wakes on notify
+        end
+        cnd = Threads.Condition(c.lock)
+        c.computing[name] = cnd
+        return cnd
+    end
+    cond === nothing && return slot.value                          # a peer materialised it
+    cnd = cond::Threads.Condition
+    # Phase 2 — compute OUTSIDE the lock (we are the sole computer).
     subf = _bare_substatus_f(o, name)
     sub = isnothing(subf) ? nothing : subf()
     local v
@@ -1532,12 +1566,13 @@ end
         v = _computeproperty(o, name; __status__=sub)
     catch e
         _fail_substatus!(sub, e)
+        lock(c.lock) do                                            # release marker + wake a retrier
+            get(c.computing, name, nothing) === cnd && delete!(c.computing, name)
+            notify(cnd)
+        end
         rethrow()
     end
-    # Publish first-write-wins. Explicit lock/unlock (not `lock() do`): the do-block
-    # closure boxes `v` and widens the returned `slot.value` to `Any`, which would
-    # union into `_getprop`'s slot branch and de-stabilise every slotted read. The
-    # typed `r::T` pins the return to the slot element type.
+    # Phase 3 — publish first-write-wins, drop the marker, wake waiters, under the lock.
     lock(c.lock)
     local r::T
     try
@@ -1546,6 +1581,8 @@ end
             @atomic :release slot.set = true
         end
         r = slot.value
+        get(c.computing, name, nothing) === cnd && delete!(c.computing, name)
+        notify(cnd)
     finally
         unlock(c.lock)
     end
