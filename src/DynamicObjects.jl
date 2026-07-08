@@ -1626,40 +1626,40 @@ function _widen_slot_type(@nospecialize T)
     T
 end
 
-# Topological driver for the emitted `@generated _slot_types` / `_ov_slot_types`.
-# `plan` is a tuple of `(name, dep_params, annotated)` in dependency order (deps
-# before dependents), baked by the macro. `OV` is the constructor's kwarg-override
-# NamedTuple TYPE (empty for the no-override `_slot_types`). Per property:
-#   * UN-annotated AND overridden in `OV` → the slot FOLLOWS the override's type
-#     (soft), and dependents re-infer through it (an override propagates down).
-#   * otherwise → `return_type` its `_infer_rhs` helper with the parent type `O`,
-#     `Val{name}`, and the already-known type of every computed dep. An annotated
-#     `name::U = rhs` is baked into the helper as `(body)::U`, so it stays `U`
-#     REGARDLESS of any override — a type firewall for its dependents. Fixed deps
-#     were folded into the helper as `getfield`s; an as-yet-unknown dep (IP
-#     wrapper, forward ref) degrades to `Any`, which stays correct.
+# Read-side slot types (what `getproperty(o,name)` narrows to), driven PER-PROPERTY over the
+# ACTUAL `typeof(o)` — NOT the joint `_infer_all`. Per-property is robust where the joint is
+# not: the joint packs every property into ONE `NamedTuple` type, so a single property inferring
+# `Union{}` (an always-thrower, or a dunder that can't be pinned in this context) makes that
+# `NamedTuple{…,Tuple{…Union{}…}}` an illegal type and collapses the WHOLE result to the abstract
+# `NamedTuple` → every read degrades to `Any`. Here each property is inferred on its own
+# (`Union{}`→`Any` widened LOCALLY, so one poisoned property can't take out its neighbours),
+# while already-inferred sibling types are still threaded in as deps. `plan` is a tuple of
+# `(name, dep_params, annotated)` in dependency order, baked by the macro. Per property:
+#   * PASSED slot — its `Slot{T}` in `O` is concrete (`T≠Any`), i.e. a constructor override
+#     (seeded kwarg like `__parent__`) → take that concrete `T` straight from the slot; it is
+#     the seed the dependents thread through.
+#   * else → `return_type` its `_infer_rhs` helper with the parent type `O`, `Val{name}`, and
+#     the already-known type of every computed dep. An annotated `name::U = rhs` is baked into
+#     the helper as `(body)::U`, so it stays `U`. `Union{}` (never-returns) → `Any` locally. NO
+#     base-widen: over the ACTUAL type a nested-DO read already infers a bounded
+#     `Child{…Slot{Any}…}` (a DO's type never embeds its computed children), so widening would
+#     only discard precision we now get for free.
 # Returns the `NamedTuple{names,Tuple{T…}}` EXPR the generator emits verbatim.
-_slot_types_expr(::Type{O}, plan) where {O} =
-    _slot_types_expr(O, plan, NamedTuple{(),Tuple{}})
-function _slot_types_expr(::Type{O}, plan, ::Type{OV}) where {O, OV<:NamedTuple}
-    ov = fieldnames(OV)
+function _read_slot_types_expr(::Type{O}, plan) where {O}
+    ST = (O isa DataType && hasfield(O, :slots)) ? fieldtype(O, :slots) : Union{}
     known = Dict{Symbol,Any}()
     names = Symbol[]
     Texprs = Any[]
     for (name, dep_params, annotated) in plan
-        if !annotated && (name in ov)
-            T = fieldtype(OV, name)
+        FT = (ST isa DataType && hasfield(ST, name)) ? fieldtype(ST, name) : Any
+        passedT = (FT isa DataType && FT <: Slot) ? FT.parameters[1] : Any
+        if !annotated && passedT !== Any
+            T = passedT
         else
             depTs = Any[get(known, dp, Any) for dp in dep_params]
             T = Core.Compiler.return_type(_infer_rhs, Tuple{O, Val{name}, depTs...})
-            # A property whose compute provably never returns normally (e.g.
-            # `will_fail = error(…)`) infers `Union{}`. `Tuple{Union{}}` is an
-            # ILLEGAL type ("Tuple field type cannot be Union{}"), so building the
-            # NamedTuple with it would throw from the `@generated` body and mask the
-            # property's real error. It has no storable value anyway — widen to `Any`.
             T === Union{} && (T = Any)
         end
-        T = _widen_slot_type(T)   # nested-DO slot → base (see _widen_slot_type)
         known[name] = T
         push!(names, name)
         push!(Texprs, T)
@@ -1736,32 +1736,11 @@ function _infer_all_body(plan, ov_names)
     Expr(:block, stmts...)
 end
 
-# Read-side slot types — what `getproperty(o, name)` narrows to. STORAGE now boxes every
-# COMPUTED slot as `Slot{Any}` (so `__DO_S__` stays bounded, no composite); the concrete read
-# type is recovered HERE, per parent type, by ONE joint `return_type` over the ACTUAL
-# `typeof(o)`. `O`'s PASSED slots already carry their concrete `Slot{concrete}` types — rebuild
-# the constructor override-NT from exactly those and thread it through the struct's `_infer_all`
-# (the same firewall the joint body applies to overrides); COMPUTED props (`Slot{Any}`) are
-# inferred from their RHS, threading sibling types. Bounded: every nested-DO reference bottoms
-# out at the `Any` storage (a DO's type never embeds its computed children), so no whole-tree
-# composite and no fixpoint — and it equals the runtime type by construction (we infer over the
-# very type `o` has). `@generated` ⇒ folds to a constant `NamedTuple`.
-@generated function _read_slot_types(::Type{O}) where {O}
-    (O isa DataType && hasfield(O, :slots)) || return :($(NamedTuple{(),Tuple{}}))
-    ST = fieldtype(O, :slots)
-    (ST isa DataType && ST <: NamedTuple) || return :($(NamedTuple{(),Tuple{}}))
-    ovn = Symbol[]; ovt = Any[]
-    for nm in fieldnames(ST)
-        FT = fieldtype(ST, nm)                         # each slot field is a `Slot{T}`
-        (FT isa DataType && FT <: Slot) || continue
-        T = FT.parameters[1]
-        T === Any && continue                          # computed slot → infer from its RHS
-        push!(ovn, nm); push!(ovt, T)                  # passed slot → concrete seed for the join
-    end
-    OV = NamedTuple{Tuple(ovn), Tuple{ovt...}}
-    RT = Core.Compiler.return_type(_infer_all, Tuple{O, OV})
-    (RT isa DataType && RT <: NamedTuple) ? :($RT) : :($(NamedTuple{(),Tuple{}}))
-end
+# `_read_slot_types` has only per-struct `@generated` methods (emitted by the macro, driven by
+# `_read_slot_types_expr`); declare the generic here so `_slot_eltype` can name it. It gives the
+# READ types — inferred per-property over the ACTUAL `typeof(o)` — as distinct from `_slot_types`
+# / `_ov_slot_types`, which give the (all-`Any`-for-computed) STORAGE types baked into `__DO_S__`.
+function _read_slot_types end
 
 # Static element type of property `name`'s slot for parent type `O`: the read-side inferred
 # type (above), or `Any` when `name` has no slot (fixed field, IP wrapper) or its inference
@@ -4658,9 +4637,12 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         for nm in infer_topo
     ]...)
     slot_types_def = Expr(:block,
-        # Joint body: compute every bare property once in dependency order (the compiler
-        # threads dep types), packed into a NamedTuple. `_slot_types_expr_joint` fires ONE
-        # `return_type` over it and falls back to per-property when it can't.
+        # `_infer_all`: joint body (kept for now; the read path uses per-property `_infer_rhs`
+        # instead). `_slot_types` / `_ov_slot_types`: STORAGE types baked into `__DO_S__` — a
+        # passed slot keeps `typeof(override)`, every computed slot is `Any`
+        # (`_slot_types_expr_joint`). `_read_slot_types`: READ types, inferred PER-PROPERTY over
+        # the actual `typeof(o)` (`_read_slot_types_expr`) — robust where the joint collapses
+        # wholesale on a single `Union{}`/hard-to-infer property.
         Expr(:macrocall, Expr(:., :Base, QuoteNode(Symbol("@generated"))), nothing,
             :($DynamicObjects._infer_all(__self__::OO, __ov__::OVV) where {OO <: $type, OVV <: $NamedTuple} =
                 $DynamicObjects._infer_all_body($infer_all_plan_expr, $(fieldnames)(OVV)))),
@@ -4669,7 +4651,10 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 $DynamicObjects._slot_types_expr_joint(OO, $slot_plan_expr, $(NamedTuple{(),Tuple{}})))),
         Expr(:macrocall, Expr(:., :Base, QuoteNode(Symbol("@generated"))), nothing,
             :($DynamicObjects._ov_slot_types(::Type{OO}, ::Type{OVV}) where {OO <: $type, OVV <: $NamedTuple} =
-                $DynamicObjects._slot_types_expr_joint(OO, $slot_plan_expr, OVV))))
+                $DynamicObjects._slot_types_expr_joint(OO, $slot_plan_expr, OVV))),
+        Expr(:macrocall, Expr(:., :Base, QuoteNode(Symbol("@generated"))), nothing,
+            :($DynamicObjects._read_slot_types(::Type{OO}) where {OO <: $type} =
+                $DynamicObjects._read_slot_types_expr(OO, $slot_plan_expr))))
     result = Expr(:block)
     # Emit per-cached-property DiskCacheLocks
     for (name, varname) in cached_names
