@@ -154,7 +154,7 @@ end
 _assign_in_rhs_path = Ref("")
 @dynamicstruct struct AssignInRhs
     x::Int
-    cache_path = _assign_in_rhs_path[]
+    __cache_path__ = _assign_in_rhs_path[]
     @cached flag = false
     toggle(req) = begin
         # Bare `flag = !flag` would trip the property-shadow check
@@ -199,7 +199,7 @@ end
 
 _persistable_path = Ref("")
 @dynamicstruct struct Persistable
-    cache_path = _persistable_path[]
+    __cache_path__ = _persistable_path[]
     @cached counter = 0
     increment(req) = begin
         # See `AssignInRhs` above — explicit `setproperty!` path
@@ -216,7 +216,7 @@ end
 
 _cached_keys_path = Ref("")
 @dynamicstruct struct CachedKeysApp
-    cache_path = _cached_keys_path[]
+    __cache_path__ = _cached_keys_path[]
     @cached result(key) = key ^ 2
 end
 
@@ -230,7 +230,7 @@ end
 
 _kwargs_keys_path = Ref("")
 @dynamicstruct struct KwargsKeysApp
-    cache_path = _kwargs_keys_path[]
+    __cache_path__ = _kwargs_keys_path[]
     @cached result(key; mode="default") = "$key:$mode"
 end
 
@@ -592,7 +592,7 @@ end
     @test s.counter == 0
     s.increment["go"]
     @test s.counter == 1
-    s2 = Persistable(; cache_path=_persistable_path[])
+    s2 = Persistable(; __cache_path__=_persistable_path[])
     @test s2.counter == 1
 end
 
@@ -691,7 +691,7 @@ end
     ak = accessed_keys(app.result)
     @test length(ak) == 2
     # New instance with same cache_path sees the same keys
-    app2 = CachedKeysApp(; cache_path=_cached_keys_path[])
+    app2 = CachedKeysApp(; __cache_path__=_cached_keys_path[])
     ak2 = accessed_keys(app2.result)
     @test length(ak2) == 2
 end
