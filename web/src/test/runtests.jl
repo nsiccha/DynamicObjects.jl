@@ -481,6 +481,30 @@ end
     @test _call_vs_bracket_counter[] == 2
 end
 
+@testset "Fast-hit path: repeat bare read hits cache (no recompute)" begin
+    # Exercises the `_peek_hit` early-return in getorcomputeproperty: a second
+    # read of a cached bare property returns the memoized value without rerunning
+    # the body (ba00aa9). MultiLhs bumps _multi_lhs_counter once per (a,b) compute.
+    _multi_lhs_counter[] = 0
+    m = MultiLhs(5.0)
+    v1 = m.a
+    @test _multi_lhs_counter[] == 1     # first read computes
+    v2 = m.a
+    @test _multi_lhs_counter[] == 1     # fast-hit: no recompute
+    @test v1 === v2                     # returns the identical cached value
+end
+
+@testset "Fast-hit path: cached IndexableProperty wrapper is returned, not rebuilt" begin
+    # A bare read of an indexed property caches its IndexableProperty wrapper
+    # under the property name; the fast-hit path must return that SAME cached
+    # wrapper on repeat access, not build a fresh one (ba00aa9).
+    s = AllDefaults()
+    ip1 = s.item
+    @test isa(ip1, DynamicObjects.IndexableProperty)
+    ip2 = s.item
+    @test ip1 === ip2
+end
+
 @testset "Parallel cache" begin
     serial = Par()
     vals_serial = asyncmap(_ -> serial.slow, 1:6)
