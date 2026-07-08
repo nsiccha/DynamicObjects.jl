@@ -1680,19 +1680,22 @@ function _joint_raw(::Type{Oi}, names, ::Type{OV}) where {Oi, OV}
     Any[ps[2].parameters...]
 end
 
-# The far pole of the soundness perturbation: widen a nested-DO slot ALL the way to `Any`
-# (differs from `_widen_slot_type`'s base ONLY for nested-DO slots — exactly where probe-slot
-# dependence must show up); a non-DO slot is left as-is (a no-op pole for it).
-_any_slot_type(@nospecialize T) = _widen_slot_type(T) === T ? T : Any
-
-# Rebuild the inference probe with a concrete slots parameter: `Base{fixed-field params…,
-# NamedTuple{names, Tuple{Slot{f1},…}}}` — the SAME shape the constructor stamps
-# (`typeof(_build_slots(…))`), so a nested child built with `__parent__=__self__` embeds a
-# probe whose slots match runtime. Only ever fed to `return_type`, never constructed.
-function _reprobe(::Type{O}, names, fills) where {O}
-    (O isa DataType && !isempty(O.parameters)) || return O
-    slotsNT = NamedTuple{names, Tuple{Any[Slot{f} for f in fills]...}}
-    O.name.wrapper{O.parameters[1:end-1]..., slotsNT}
+# Does type `T` transitively mention `O` anywhere in its structure? Spots a slot whose
+# inferred type embeds the empty-slots probe `O` (= `typeof(__self__)` at inference) — a
+# construction-dependent slot whose runtime parent carries DIFFERENT (real) slots. A pure
+# static type-walk over `T`'s parameters — no inference, no probe construction.
+function _mentions(@nospecialize(T), @nospecialize(O))
+    T === O && return true
+    if T isa DataType
+        for p in T.parameters
+            p isa Type && _mentions(p, O) && return true
+        end
+    elseif T isa UnionAll
+        return _mentions(T.body, O)
+    elseif T isa Union
+        return _mentions(T.a, O) || _mentions(T.b, O)
+    end
+    false
 end
 
 # Joint slot-type driver with a per-property fallback. Fire ONE `return_type` over the
@@ -1700,45 +1703,23 @@ end
 # can't yield the concrete `NamedTuple{names,Tuple{…}}` shape (always-thrower → `Union{}`;
 # hard/huge inference → abstract NamedTuple) — correctness is never worse than per-property.
 #
-# Rung 2 (bounded fixpoint). A slot holding a nested DO whose type embeds `__self__`'s SLOTS
-# param is construction-dependent (the empty probe ≠ the runtime parent), so it MUST be
-# base-widened (rung 1) — else runtime's real parameterization won't `convert` (the
+# Rung 2 (precision recovery). A slot holding a nested DO whose type embeds `__self__`'s
+# SLOTS param is construction-dependent (the empty probe `O` ≠ the runtime parent), so it
+# MUST be base-widened (rung 1) — else runtime's real parameterization won't `convert` (the
 # S-dependence crash). But MOST nested-DO slots are INDEPENDENT of the parent's slots (built
 # with no `__parent__`, or reading the parent only through its own base-widened `__parent__`
-# → `Any`), and base-widening those is pure precision loss. Recover them SOUNDLY: infer
-# against two probes that differ ONLY in the non-accepted slots' fill (each nested-DO slot
-# base-widened vs `Any`); a slot whose inferred type is IDENTICAL under both is provably
-# invariant to those slots → depends only on already-accepted (pinned-concrete) + fixed
-# fields → its inferred type equals the runtime type → keep it concrete. Slots that differ
-# stay base-widened. Monotone (accepted only grows), sound (accept ⇒ matches runtime, never
-# re-freezes a wrong concrete), multi-level within `K`. Structs with NO nested-DO slot pay
-# nothing beyond the single round-0 inference (the fast path).
+# → `Any`); base-widening those is pure precision loss. Discriminate STATICALLY: a slot is
+# construction-dependent IFF its inferred type transitively mentions `O` — base-widen exactly
+# those, keep the rest concrete. Sound (keep ⇒ invariant to the parent's slots ⇒ inferred
+# type equals runtime, never re-freezes a wrong concrete), and O(1) beyond the single
+# inference: NO probe variation, so NO `@generated` re-instantiation cascade. (The earlier
+# two-probe fixpoint was correct but varied the probe → varied each child's `__parent__`
+# override signature → regenerated its inference, EXPONENTIAL on deep nests — `1530bdf`.)
 function _slot_types_expr_joint(::Type{O}, plan, ::Type{OV}) where {O, OV<:NamedTuple}
     names = Tuple(p[1] for p in plan)
     raw = _joint_raw(O, names, OV)
     raw === nothing && return _slot_types_expr(O, plan, OV)   # fallback: per-property, isolated
-    n = length(raw)
-    # Fast path: no nested-DO slot anywhere (base-widen a no-op) → all concrete-and-correct.
-    any(i -> _widen_slot_type(raw[i]) !== raw[i], 1:n) ||
-        return :(NamedTuple{$names, Tuple{$(raw...)}})
-    accepted = falses(n)
-    for _ in 1:4                                              # K: freeze needed 2 rounds
-        fillA = Any[accepted[i] ? raw[i] : _widen_slot_type(raw[i]) for i in 1:n]
-        fillB = Any[accepted[i] ? raw[i] : _any_slot_type(raw[i])  for i in 1:n]
-        rawA = _joint_raw(_reprobe(O, names, fillA), names, OV)
-        rawB = fillA == fillB ? rawA : _joint_raw(_reprobe(O, names, fillB), names, OV)
-        (rawA === nothing || rawB === nothing) && break       # keep what we have; widen the rest
-        progressed = false
-        for i in 1:n
-            accepted[i] && continue
-            raw[i] = rawA[i]                                  # latest, against the realistic (base) probe
-            if rawA[i] === rawB[i]
-                accepted[i] = true; progressed = true
-            end
-        end
-        progressed || break
-    end
-    Ts = Any[accepted[i] ? raw[i] : _widen_slot_type(raw[i]) for i in 1:n]
+    Ts = Any[_mentions(V, O) ? _widen_slot_type(V) : V for V in raw]
     :(NamedTuple{$names, Tuple{$(Ts...)}})
 end
 
