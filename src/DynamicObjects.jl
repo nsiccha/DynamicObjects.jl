@@ -1698,28 +1698,18 @@ function _mentions(@nospecialize(T), @nospecialize(O))
     false
 end
 
-# Joint slot-type driver with a per-property fallback. Fire ONE `return_type` over the
-# struct's `_infer_all`; fall back to the proven per-property `_slot_types_expr` when it
-# can't yield the concrete `NamedTuple{names,Tuple{…}}` shape (always-thrower → `Union{}`;
-# hard/huge inference → abstract NamedTuple) — correctness is never worse than per-property.
-#
-# Rung 2 (precision recovery). A slot holding a nested DO whose type embeds `__self__`'s
-# SLOTS param is construction-dependent (the empty probe `O` ≠ the runtime parent), so it
-# MUST be base-widened (rung 1) — else runtime's real parameterization won't `convert` (the
-# S-dependence crash). But MOST nested-DO slots are INDEPENDENT of the parent's slots (built
-# with no `__parent__`, or reading the parent only through its own base-widened `__parent__`
-# → `Any`); base-widening those is pure precision loss. Discriminate STATICALLY: a slot is
-# construction-dependent IFF its inferred type transitively mentions `O` — base-widen exactly
-# those, keep the rest concrete. Sound (keep ⇒ invariant to the parent's slots ⇒ inferred
-# type equals runtime, never re-freezes a wrong concrete), and O(1) beyond the single
-# inference: NO probe variation, so NO `@generated` re-instantiation cascade. (The earlier
-# two-probe fixpoint was correct but varied the probe → varied each child's `__parent__`
-# override signature → regenerated its inference, EXPONENTIAL on deep nests — `1530bdf`.)
+# Storage slot types (baked into `__DO_S__`). A PASSED slot — a constructor override in `OV`
+# (a seeded kwarg, e.g. `__parent__`) — keeps its concrete `typeof(override)`: free (we already
+# hold the object) and bounded (that object's OWN computed slots are already `Any`). Every
+# COMPUTED slot is `Any`. This breaks the recursion at the root — a DO's type never embeds its
+# computed children — so `__DO_S__` stays bounded (no whole-tree composite baked into the type,
+# no inference at construction, no fixpoint). Type-stable READS are recovered separately at the
+# read site (`_slot_eltype` → `_read_slot_types`: one bounded joint `return_type` over the
+# actual `typeof(o)`, whose passed slots carry the concrete types this OV threads).
 function _slot_types_expr_joint(::Type{O}, plan, ::Type{OV}) where {O, OV<:NamedTuple}
+    ov = fieldnames(OV)
     names = Tuple(p[1] for p in plan)
-    raw = _joint_raw(O, names, OV)
-    raw === nothing && return _slot_types_expr(O, plan, OV)   # fallback: per-property, isolated
-    Ts = Any[_mentions(V, O) ? _widen_slot_type(V) : V for V in raw]
+    Ts = Any[(nm in ov) ? fieldtype(OV, nm) : Any for nm in names]
     :(NamedTuple{$names, Tuple{$(Ts...)}})
 end
 
@@ -1746,14 +1736,40 @@ function _infer_all_body(plan, ov_names)
     Expr(:block, stmts...)
 end
 
-# Static element type of property `name`'s slot for parent type `O`: the inferred
-# slot type, or `Any` when `name` has no slot (fixed field, IP wrapper) or its
-# inference collapsed to `Union{}` (a provably-never-returns compute — asserting
-# `::Union{}` on an actual return would wrongly throw, so widen it). `_slot_types`
-# is `@generated`, so `hasfield`/`fieldtype` on its constant result fold: for a
-# literal `name` this reduces to a compile-time constant type.
+# Read-side slot types — what `getproperty(o, name)` narrows to. STORAGE now boxes every
+# COMPUTED slot as `Slot{Any}` (so `__DO_S__` stays bounded, no composite); the concrete read
+# type is recovered HERE, per parent type, by ONE joint `return_type` over the ACTUAL
+# `typeof(o)`. `O`'s PASSED slots already carry their concrete `Slot{concrete}` types — rebuild
+# the constructor override-NT from exactly those and thread it through the struct's `_infer_all`
+# (the same firewall the joint body applies to overrides); COMPUTED props (`Slot{Any}`) are
+# inferred from their RHS, threading sibling types. Bounded: every nested-DO reference bottoms
+# out at the `Any` storage (a DO's type never embeds its computed children), so no whole-tree
+# composite and no fixpoint — and it equals the runtime type by construction (we infer over the
+# very type `o` has). `@generated` ⇒ folds to a constant `NamedTuple`.
+@generated function _read_slot_types(::Type{O}) where {O}
+    (O isa DataType && hasfield(O, :slots)) || return :($(NamedTuple{(),Tuple{}}))
+    ST = fieldtype(O, :slots)
+    (ST isa DataType && ST <: NamedTuple) || return :($(NamedTuple{(),Tuple{}}))
+    ovn = Symbol[]; ovt = Any[]
+    for nm in fieldnames(ST)
+        FT = fieldtype(ST, nm)                         # each slot field is a `Slot{T}`
+        (FT isa DataType && FT <: Slot) || continue
+        T = FT.parameters[1]
+        T === Any && continue                          # computed slot → infer from its RHS
+        push!(ovn, nm); push!(ovt, T)                  # passed slot → concrete seed for the join
+    end
+    OV = NamedTuple{Tuple(ovn), Tuple{ovt...}}
+    RT = Core.Compiler.return_type(_infer_all, Tuple{O, OV})
+    (RT isa DataType && RT <: NamedTuple) ? :($RT) : :($(NamedTuple{(),Tuple{}}))
+end
+
+# Static element type of property `name`'s slot for parent type `O`: the read-side inferred
+# type (above), or `Any` when `name` has no slot (fixed field, IP wrapper) or its inference
+# collapsed to `Union{}` (a provably-never-returns compute — asserting `::Union{}` on a real
+# return would wrongly throw, so widen it). `_read_slot_types` is `@generated`, so the
+# `hasfield`/`fieldtype` here fold to a compile-time constant for a literal `name`.
 @inline function _slot_eltype(::Type{O}, ::Val{name}) where {O, name}
-    S = _slot_types(O)
+    S = _read_slot_types(O)
     hasfield(S, name) || return Any
     T = fieldtype(S, name)
     T === Union{} ? Any : T
