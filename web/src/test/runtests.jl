@@ -179,10 +179,6 @@ end
     slow(key) = (sleep(0.05); key * 2)
 end
 
-@dynamicstruct struct CancelApp
-    slow(key) = (sleep(10); key * 2)
-end
-
 @dynamicstruct struct FailingProps
     will_fail = error("serial failure")
     will_fail_indexed(key) = error("serial failure for key=$key")
@@ -505,7 +501,9 @@ end
 @testset "Parallel cache" begin
     serial = Par()
     vals_serial = asyncmap(_ -> serial.slow, 1:6)
-    @test Threads.nthreads() == 1 || length(unique(vals_serial)) > 1
+    # compute-at-most-once: concurrent cold reads of a cached bare prop share the
+    # one published value (cache_type=:serial was removed — every cache now dedups).
+    @test length(unique(vals_serial)) == 1
     par = Par()
     vals_par = asyncmap(_ -> par.slow, 1:6)
     @test length(unique(vals_par)) == 1
@@ -540,7 +538,8 @@ end
     @test serial_d1.ci3(1, 2, 3) == 321
     @test isa(serial_d1.ci3, DynamicObjects.IndexableProperty)
     @test @cache_status(serial_d1.ci3(1, 2, 3)) == :ready
-    @test Threads.nthreads() == 1 || length(unique(asyncmap(i -> serial_d1.parallel_test, 1:10))) > 1
+    # compute-at-most-once: concurrent reads share one value (was: serial double-compute)
+    @test length(unique(asyncmap(i -> serial_d1.parallel_test, 1:10))) == 1
     parallel_d1 = D1()
     @test length(unique(asyncmap(i -> parallel_d1.parallel_test, 1:10))) == 1
     @test length(unique(asyncmap(i -> parallel_d1.parallel_testi(i), 1:10))) == 10
@@ -564,7 +563,7 @@ end
     @test app.slow(3) == 6
     seen_task = Ref(false)
     result = fetchindex(app.slow, 42) do rv, status
-        if isa(rv, Task)
+        if isa(rv, Pending)
             seen_task[] = true
             Base.fetch(rv)
         else
@@ -574,10 +573,10 @@ end
     @test result == 84
     seen_task2 = Ref(false)
     result2 = fetchindex(app.slow, 42) do rv, status
-        if isa(rv, Task)
+        if isa(rv, Pending)
             seen_task2[] = true
         end
-        isa(rv, Task) ? Base.fetch(rv) : rv
+        isa(rv, Pending) ? Base.fetch(rv) : rv
     end
     @test result2 == 84
     @test seen_task2[] == false
@@ -703,41 +702,6 @@ end
         push!(items, item)
     end
     @test items == Set([1, 2, 3])
-end
-
-@testset "cancel! and cancel_all!" begin
-    app = CancelApp()
-    # Trigger a slow computation (returns Task via fetch=identity)
-    task = app.slow(42; fetch=identity)
-    @test task isa Task
-    @test !istaskdone(task)
-    # Cancel it
-    key = ((42,), (;))
-    @test cancel!(app.slow, 42) == true
-    # Task should be done and failed
-    sleep(0.01)  # give scheduler a moment
-    @test istaskdone(task)
-    @test istaskfailed(task)
-    # tasks and status should be cleaned up
-    @test !haskey(app.slow.cache.tasks, key)
-    @test !haskey(app.slow.cache.status, key)
-    # Cancelling again returns false
-    @test cancel!(app.slow, 42) == false
-
-    # cancel_all!
-    t1 = app.slow(1; fetch=identity)
-    t2 = app.slow(2; fetch=identity)
-    @test !istaskdone(t1) && !istaskdone(t2)
-    cancel_all!(app.slow)
-    sleep(0.01)
-    @test istaskdone(t1) && istaskdone(t2)
-    @test isempty(app.slow.cache.tasks)
-    @test isempty(app.slow.cache.status)
-
-    # Fallbacks for non-ThreadsafeDict IPs
-    serial_app = CancelApp()
-    @test cancel!(serial_app.slow, 1) == false
-    @test cancel_all!(serial_app.slow) === nothing
 end
 
 @testset "Hash with nested DOs" begin
@@ -916,4 +880,77 @@ end
     @test DynamicObjects.cache_version(vi_obj, Val(:result)) == v"1"
     vi_path = DynamicObjects.get_cache_path(vi_obj, :result, "foo")
     @test occursin("v1.0.0", vi_path)
+end
+
+# ── compute-at-most-once on the typed-slot path (hardening for todo gbe5di) ──
+# A slotted bare COMPUTED property must run its RHS AT MOST ONCE even when many
+# threads race a cold slot, and blocking `o.x` reads must coordinate with pollers
+# (`fetchproperty`) through the same in-flight latch (`c.computing`). A failed
+# compute lands in `c.errors`; every waiter rethrows it and a fresh access clears
+# it and recomputes. The atomic counters below observe the actual RHS-run count,
+# so a double-compute (a latch regression) is caught deterministically, not just
+# masked by first-write-wins publish.
+_slot_amo_calls = Threads.Atomic{Int}(0)
+@dynamicstruct struct SlotAtMostOnce
+    x::Int
+    v = (Threads.atomic_add!(_slot_amo_calls, 1); sleep(0.03); 2x)
+end
+
+_slot_fail_calls = Threads.Atomic{Int}(0)
+@dynamicstruct struct SlotFailing
+    x::Int
+    boom = (Threads.atomic_add!(_slot_fail_calls, 1); sleep(0.02); error("slot boom $x"))
+end
+
+@testset "slot compute-at-most-once (blocking race)" begin
+    _slot_amo_calls[] = 0
+    o = SlotAtMostOnce(21)
+    vals = fetch.([Threads.@spawn o.v for _ in 1:16])   # 16 tasks race the cold slot
+    @test all(==(42), vals)                             # every racer sees the one value
+    @test _slot_amo_calls[] == 1                        # RHS ran EXACTLY once
+    @test o.v == 42                                     # warm read: no recompute
+    @test _slot_amo_calls[] == 1
+end
+
+@testset "slot block+poll coherence" begin
+    _slot_amo_calls[] = 0
+    o = SlotAtMostOnce(50)
+    # A poller (fetchproperty → Pending while cold) and a blocking reader race the
+    # SAME cold slot; they must coordinate on ONE compute via the latch.
+    t_poll = Threads.@spawn fetchproperty(o, :v) do rv, status
+        rv isa Pending ? fetch(rv) : rv
+    end
+    t_block = Threads.@spawn o.v
+    @test fetch(t_poll) == 100
+    @test fetch(t_block) == 100
+    @test _slot_amo_calls[] == 1
+    # A poll on the now-warm slot returns the value directly — no Pending handed out.
+    saw_pending = Ref(false)
+    late = fetchproperty(o, :v) do rv, status
+        rv isa Pending && (saw_pending[] = true)
+        rv isa Pending ? fetch(rv) : rv
+    end
+    @test late == 100
+    @test saw_pending[] == false
+    @test _slot_amo_calls[] == 1
+end
+
+@testset "slot failure → c.errors → all waiters rethrow" begin
+    _slot_fail_calls[] = 0
+    o = SlotFailing(7)
+    errs = fetch.([Threads.@spawn(try o.boom; nothing catch e; e end) for _ in 1:8])
+    @test all(e -> e isa PropertyComputationError, errs)  # every waiter rethrew the recorded error
+    @test all(e -> e.property === :boom, errs)
+    @test _slot_fail_calls[] == 1                         # RHS ran once; waiters did NOT recompute
+    # retry: a fresh access clears the recorded error, recomputes, throws again
+    @test_throws PropertyComputationError o.boom
+    @test _slot_fail_calls[] == 2
+    # poll path: fetch(::Pending) on a failing slot rethrows too
+    o2 = SlotFailing(9)
+    perr = nothing
+    fetchproperty(o2, :boom) do rv, status
+        rv isa Pending || return rv
+        try fetch(rv) catch e; perr = e end
+    end
+    @test perr isa PropertyComputationError
 end

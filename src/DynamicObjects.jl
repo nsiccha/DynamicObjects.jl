@@ -439,7 +439,7 @@ written `ip[args...]`, *especially* in kwargs-only call sites (`memoize!(ip; k=v
 which the legacy bracket syntax couldn't express at all (`ip[; k=v]` doesn't
 parse as Julia). For the uncached (fresh) call, use [`fresh`](@ref) / [`@fresh`](@ref).
 
-For two-phase access (returning a `Task` while computing) on
+For two-phase access (returning a [`Pending`](@ref) handle while computing) on
 `ThreadsafeDict`-backed IPs, see [`fetchindex`](@ref). Inside a
 `@dynamicstruct` body, the convenience macro [`@memo!`](@ref) wraps every
 call-site in `maybememoize!(callee, args...; kwargs...)` so cached IPs and
@@ -828,7 +828,8 @@ fetchindex!(::Nothing, ip, indices...; fetch=Base.fetch, kwargs...) = memoize!(i
 
 Like [`fetchindex`](@ref) but for bare (non-indexed) properties. Triggers
 computation via the `PropertyCache` and calls `fetch(rv, status)` where `rv`
-is the `Task` (still running) or the computed result, and `status` is the
+is a [`Pending`](@ref) handle (the compute is still in flight — `fetch` it to
+block for the value) or the already-computed result, and `status` is the
 substatus object or `nothing`.
 
 For `Dict`-backed caches (serial), falls through to `getproperty` (synchronous,
@@ -1602,11 +1603,26 @@ end
     role[1] === :done && return slot.value                         # a peer materialised it
     role[1] === :failed && throw(role[2])
     cnd = role[2]::Threads.Condition
-    # Phase 2 — compute OUTSIDE the lock (sole computer). Register the substatus first so
-    # pollers/getstatus can surface progress while we run.
+    # Register the substatus (built OUTSIDE the arbitration lock — factories recurse into DO
+    # props on the same lock) so pollers/getstatus can surface progress while we run, then
+    # hand off to the shared Phase 2+3 computer on the latch we just registered.
     subf = _bare_substatus_f(o, name)
     sub = isnothing(subf) ? nothing : subf()
     isnothing(sub) || lock(c.lock) do; c.status[name] = sub; end
+    return _run_slot_compute!(o, Val(name), slot, cnd, sub)
+end
+
+# Phase 2+3 for a slotted bare prop, run by the SOLE designated computer. Compute the RHS
+# OUTSIDE `c.lock` (it recurses into sibling slots on the same lock, which must not run under
+# it), then publish first-write-wins + drop the `cnd` latch + notify, all under the lock. On
+# failure record the exception in `c.errors`, drop the latch, wake waiters, and rethrow.
+# Shared by the blocking winner (`_compute_into_slot!`) and the poller's fire-and-forget
+# spawn (`_ensure_slot_compute!`) — BOTH pre-register `cnd` under the lock before calling, so
+# the latch is visible to `fetch(::Pending)` the instant a `Pending` can be observed.
+# Explicit lock/unlock (not `lock() do`) on the publish: a do-block closure boxes `v` and
+# widens the returned `slot.value` to `Any`, de-stabilising every slotted read — `r::T` pins it.
+@noinline function _run_slot_compute!(o, ::Val{name}, slot::Slot{T}, cnd::Threads.Condition, sub) where {name, T}
+    c = getfield(getfield(o, :cache), :cache)
     local v
     try
         v = _computeproperty(o, name; __status__=sub)
@@ -1619,7 +1635,6 @@ end
         !isnothing(sub) && _fail_substatus!(sub, e)
         rethrow()
     end
-    # Phase 3 — publish first-write-wins, drop the latch, wake waiters, under the lock.
     lock(c.lock)
     local r::T
     try
@@ -1637,20 +1652,33 @@ end
     r
 end
 
-# Poller-side trigger for a slotted bare prop (`fetchproperty`). If the slot is unset and
-# NO compute is in flight, kick the real compute off fire-and-forget — it runs through
-# `_compute_into_slot!`, so it registers the `c.computing` latch and coordinates
-# at-most-once with any concurrent blocking `o.$name` reader (whoever registers the latch
-# first is the sole computer; the other waits). The Task is not retained; the value lands
-# in the slot and a failure in `c.errors`. A stale recorded error is cleared here so a poll
-# retries (the retry_failed dual).
+# Poller-side trigger for a slotted bare prop (`fetchproperty`). If the slot is unset and NO
+# compute is in flight, register the in-flight latch `c.computing[name]` SYNCHRONOUSLY and
+# kick the real compute off fire-and-forget through the shared `_run_slot_compute!` (as the
+# pre-designated computer for the `cnd` we just registered). Registering BEFORE we return is
+# what makes the `Pending` that `fetchproperty` hands back safe to `fetch`: a concurrent
+# blocking `o.$name` reader sees the latch and waits (whoever registered first is the sole
+# computer), and `fetch(::Pending)` sees the latch and waits on it — instead of racing a
+# not-yet-registered spawn and spuriously reporting "no compute in flight". The Task is not
+# retained; the value lands in the slot and a failure in `c.errors`. A stale recorded error is
+# cleared here so a poll retries (the retry_failed dual).
 function _ensure_slot_compute!(o, ::Val{name}, slot::Slot, c) where {name}
-    lock(c.lock) do
-        (@atomic :acquire slot.set) && return
-        haskey(c.computing, name) && return                        # already in flight
+    (@atomic :acquire slot.set) && return nothing
+    subf = _bare_substatus_f(o, name)                              # build nothing under the lock
+    newcnd = lock(c.lock) do
+        (@atomic :acquire slot.set) && return nothing
+        haskey(c.computing, name) && return nothing                # already in flight
         haskey(c.errors, name) && delete!(c.errors, name)          # stale failure → retry
-        Threads.@spawn try; _compute_into_slot!(o, Val(name), slot); catch; end
+        cnd = Threads.Condition(c.lock)
+        c.computing[name] = cnd                                    # register BEFORE we return
+        cnd
     end
+    newcnd === nothing && return nothing
+    # Register the substatus (built OUTSIDE the lock — factories recurse on c.lock), then spawn
+    # the designated computer on the latch we hold.
+    sub = isnothing(subf) ? nothing : subf()
+    isnothing(sub) || lock(c.lock) do; c.status[name] = sub; end
+    Threads.@spawn try; _run_slot_compute!(o, Val(name), slot, newcnd::Threads.Condition, sub); catch; end
     nothing
 end
 
