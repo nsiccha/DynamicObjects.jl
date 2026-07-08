@@ -37,7 +37,7 @@ optionally disk-cached properties.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, cancel!, cancel_all!, set_cache_budget!, cache_budget, cache_bytes, cache_entries, subtree_bytes, subtree_budget, last_evicted, is_pinnable_value
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, set_cache_budget!, cache_budget, cache_bytes, cache_entries, subtree_bytes, subtree_budget, last_evicted, is_pinnable_value, Pending
 
 import SHA, Serialization, Mmap, Treebars
 
@@ -617,23 +617,24 @@ function _is_mmap_slot(pc::PropertyCache, name::Symbol)
 end
 
 # Check whether `(name, args_key)` is currently the target of an in-flight
-# Task somewhere. For bare-prop slots, that's `pc.cache.tasks[name]`. For IP
-# slots, we'd need to dig into the IP's subcache — left for v2 (the bare-prop
-# tasks check covers the common case; an IP in-flight task evict-and-recompute
-# would mean wasted work but not corruption, since the cache machinery
-# spawns a fresh task on the next access).
+# compute somewhere. Post-Pending there is no retained Task — an in-flight key
+# registers a `Threads.Condition` in `c.computing`, so that's the marker to
+# check. For bare-prop slots that's `pc.cache.computing[name]`. For IP slots
+# we'd need to dig into the IP's subcache — left for v2 (the bare-prop check
+# covers the common case; an IP in-flight evict-and-recompute would mean wasted
+# work but not corruption, since the cache machinery recomputes on next access).
 function _entry_in_flight(pc::PropertyCache, key::Tuple{Symbol,Any})
     name, args_key = key
     pc.cache isa AbstractThreadsafeDict || return false
     if args_key === ()
-        return lock(pc.cache.lock) do; haskey(pc.cache.tasks, name); end
+        return lock(pc.cache.lock) do; haskey(pc.cache.computing, name); end
     end
     # IP slot — look up the IP wrapper in pc.cache (its own lock), then
-    # peek at the IP's subcache.tasks under that subcache's lock.
+    # peek at the IP's subcache.computing under that subcache's lock.
     ip = get(pc.cache, name, nothing)
     ip isa IndexableProperty || return false
     ip.cache isa AbstractThreadsafeDict || return false
-    lock(ip.cache.lock) do; haskey(ip.cache.tasks, args_key); end
+    lock(ip.cache.lock) do; haskey(ip.cache.computing, args_key); end
 end
 
 # Single eviction step: pop the entry, update sizes/bytes/lru_order, push
@@ -1004,28 +1005,35 @@ fresh(ip::IndexableProperty{name}, args...; kwargs...) where {name} =
 """
     AbstractThreadsafeDict{K,V}
 
-Supertype for the lock-protected, task-spawning dicts that back `:parallel`
-indexed properties. The concrete subtype `ThreadsafeDict`
-share the `(lock, cache, tasks, status)` shape so that `getstatus`/`cancel!`/
-`fetchindex`/`entries` and the `IndexableProperty` task-spawning `getindex`
-dispatch generically.
+Supertype for the lock-protected dicts that back `:parallel` indexed properties.
+The concrete subtype `ThreadsafeDict` shares the
+`(lock, cache, status, computing, errors)` shape so that `getstatus` / `fetchindex` /
+`entries` and the `IndexableProperty` `getindex` dispatch generically. In-flight computes
+are coordinated by the `computing` condition latch (no retained Task — the value lands in
+`cache`/the slot); a failure lands in `errors`.
 """
 abstract type AbstractThreadsafeDict{K,V} <: AbstractDict{K,V} end
 
 struct ThreadsafeDict{K,V} <: AbstractThreadsafeDict{K,V}
     lock::ReentrantLock
     cache::Dict{K,V}
-    tasks::Dict{K,Task}
     status::Dict{K,Any}
-    # In-flight SYNCHRONOUS computes — the blocking-default path that does NOT
-    # spawn a Task. Maps an in-flight key to a `Threads.Condition` bound to `lock`. The
-    # first caller registers here and computes on its own thread; concurrent callers see
-    # the marker, `wait` on the condition, and read the published value instead of
-    # recomputing — restoring compute-at-most-once WITHOUT a Task spawn. Populated only
-    # while a sync compute is mid-flight; the computer removes its entry under `lock`.
+    # In-flight computes. Maps an in-flight key to a `Threads.Condition` bound to `lock`.
+    # The first accessor — a blocking caller computing INLINE, or a poller that spawned a
+    # fire-and-forget compute — registers here; concurrent accessors see the marker and
+    # either `wait` on it (blocking) or return a `Pending` handle (polling) instead of
+    # recomputing → compute-at-most-once. Populated only while a compute is mid-flight;
+    # the computer removes its entry + `notify`s under `lock`. We deliberately do NOT
+    # retain the compute Task: the value lands in `cache`, and a failure lands in
+    # `errors` (below), so the Task carries nothing we need (no value, no cancel).
     computing::Dict{K,Threads.Condition}
-    ThreadsafeDict{K,V}(c) where {K,V} = new{K,V}(ReentrantLock(), Dict{K,V}(c), Dict{K,Task}(), Dict{K,Any}(), Dict{K,Threads.Condition}())
-    ThreadsafeDict() = new{Any,Any}(ReentrantLock(), Dict{Any,Any}(), Dict{Any,Task}(), Dict{Any,Any}(), Dict{Any,Threads.Condition}())
+    # Captured exception for a compute that threw. The value never lands in `cache`, so a
+    # waiter / `fetch(::Pending)` reads the failure here and rethrows it, a poll surfaces
+    # `:failed`, and `retry_failed` clears it to allow a fresh compute. Replaces the former
+    # "leave the failed Task in `tasks` until retry_failed clears it".
+    errors::Dict{K,Any}
+    ThreadsafeDict{K,V}(c) where {K,V} = new{K,V}(ReentrantLock(), Dict{K,V}(c), Dict{K,Any}(), Dict{K,Threads.Condition}(), Dict{K,Any}())
+    ThreadsafeDict() = new{Any,Any}(ReentrantLock(), Dict{Any,Any}(), Dict{Any,Any}(), Dict{Any,Threads.Condition}(), Dict{Any,Any}())
 end
 
 Base.length(c::AbstractThreadsafeDict) = lock(c.lock) do; length(c.cache); end
@@ -1036,10 +1044,10 @@ Base.get(c::AbstractThreadsafeDict, key, default) = lock(c.lock) do; get(c.cache
 # lock(c.lock) do ... end or entries(ip) which holds the lock for the full sweep.
 Base.iterate(c::AbstractThreadsafeDict) = lock(c.lock) do; iterate(c.cache); end
 Base.iterate(c::AbstractThreadsafeDict, state) = lock(c.lock) do; iterate(c.cache, state); end
-Base.empty!(c::ThreadsafeDict) = (lock(c.lock) do; empty!(c.cache); empty!(c.tasks); empty!(c.status); empty!(c.computing); end; c)
-n_running(c::AbstractThreadsafeDict) = lock(c.lock) do; length(c.tasks); end
+Base.empty!(c::ThreadsafeDict) = (lock(c.lock) do; empty!(c.cache); empty!(c.status); empty!(c.computing); empty!(c.errors); end; c)
+n_running(c::AbstractThreadsafeDict) = lock(c.lock) do; length(c.computing); end
 Base.show(io::IO, c::ThreadsafeDict{K,V}) where {K,V} = lock(c.lock) do
-    print(io, "ThreadsafeDict{", K, ",", V, "}(", length(c.cache), " cached, ", length(c.tasks), " running)")
+    print(io, "ThreadsafeDict{", K, ",", V, "}(", length(c.cache), " cached, ", length(c.computing), " running)")
 end
 memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...; fetch=Base.fetch, retry_failed=true, kwargs...) where {name} = begin
     (;o, cache) = ip
@@ -1078,172 +1086,73 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
     end
     rv
 end
-# `substatus()` is invoked OUTSIDE the cache lock. Calling it under the
-# lock is unsafe: substatus factories can recurse into other DO properties
-# (e.g. user-defined `_property_description` reads `o.foo`) which spawn a
-# task on the SAME `c`, and that task's `lock(c.lock)` write-back blocks
-# behind the lock the parent holds while fetching → deadlock.
-# Slow path: do a fast-path check first; only if we genuinely need to spawn
-# do we drop the lock, build `s`, and re-take the lock to install. A race
-# (someone else won between phases) means we discard `s` via finalize.
+# `substatus()` is invoked OUTSIDE the cache lock. Calling it under the lock is unsafe:
+# substatus factories can recurse into other DO properties (e.g. a user-defined
+# `_property_description` reads `o.foo`) which re-enter this cache; building `s` under
+# `c.lock` would deadlock. So we fast-path first, then build `s` outside the lock and
+# re-take it to arbitrate; if we lose the arbitration we discard `s` via finalize.
 Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substatus=nothing, retry_failed=true) = begin
-    fast = lock(c.lock) do
+    # Fast path: a ready value returns immediately, no substatus cost. (`_missing_sentinel`
+    # distinguishes "absent" from a legitimately-cached `nothing`.)
+    hit = lock(c.lock) do
         v = get(c.cache, key, _missing_sentinel)
-        if v !== _missing_sentinel
-            _on_hit!(c, key)
-            return (:value, v)
-        end
-        if retry_failed && haskey(c.tasks, key) && istaskdone(c.tasks[key]) && istaskfailed(c.tasks[key])
-            pop!(c.tasks, key)
-            haskey(c.status, key) && pop!(c.status, key)
-        end
-        haskey(c.tasks, key) && return (:task, c.tasks[key])
-        nothing
+        v !== _missing_sentinel && (_on_hit!(c, key); return v)
+        _missing_sentinel
     end
-    if fast !== nothing
-        kind, x = fast
-        return kind === :value ? x : fetch(x)
-    end
-    # No value, no in-flight task — build substatus outside the lock.
+    hit === _missing_sentinel || return hit
+    # Build the substatus OUTSIDE the lock — factories recurse into DO props on the SAME
+    # lock, so building under it would deadlock.
     s = isnothing(substatus) ? nothing : substatus()
-    # Blocking DEFAULT (`fetch === Base.fetch`): compute synchronously on the calling
-    # thread — NO Task spawn (the caller would block on `fetch(task)` anyway). Concurrent
-    # callers coordinate AT-MOST-ONCE through the `c.computing` condition latch: the first
-    # blocking caller registers a `Threads.Condition` (bound to `c.lock`) and computes;
-    # other blocking callers wait on it (`:wait_sync`), and pollers wait via a spawned
-    # proxy Task (below) — none recompute. Non-blocking callers (`fetch !== Base.fetch`,
-    # e.g. `fetchindex` / `ensure!`) keep the spawn path so they get a pollable Task.
     sync = fetch === Base.fetch
-    rv = lock(c.lock) do
+    action = lock(c.lock) do
         v = get(c.cache, key, _missing_sentinel)
-        if v !== _missing_sentinel
-            _on_hit!(c, key)
-            return (:lost_value, v)
-        end
-        if retry_failed && haskey(c.tasks, key) && istaskdone(c.tasks[key]) && istaskfailed(c.tasks[key])
-            pop!(c.tasks, key)
-            haskey(c.status, key) && pop!(c.status, key)
-        end
-        haskey(c.tasks, key) && return (:lost_task, c.tasks[key])
-        inflight = get(c.computing, key, nothing)   # an inline (blocking) sync compute, if any
-        if sync
-            # Another blocking caller already owns the inline compute — wait for it.
-            inflight !== nothing && return (:wait_sync, inflight)
-            # Become the sole synchronous computer. Register the latch + status so
-            # concurrent callers dedup onto us and getstatus/pollers can see progress.
-            cnd = Threads.Condition(c.lock)
-            c.computing[key] = cnd
-            !isnothing(s) && (c.status[key] = s)
-            return (:compute_sync, cnd)
-        end
-        # Poller (needs a pollable Task). If an inline sync compute is mid-flight, do NOT
-        # recompute — spawn a WAITER Task that blocks on the latch and returns the value.
-        if inflight !== nothing
-            cnd = inflight
-            wtask = Threads.@spawn begin
-                lock(c.lock) do
-                    while !haskey(c.cache, key) && get(c.computing, key, nothing) === cnd
-                        wait(cnd)
-                    end
-                    get(c.tasks, key, nothing) === Base.current_task() && pop!(c.tasks, key)
-                    got = get(c.cache, key, _missing_sentinel)
-                    got === _missing_sentinel && error("get!: in-flight synchronous compute failed for key ", key)
-                    got
-                end
-            end
-            c.tasks[key] = wtask
-            return (:won, wtask)
-        end
-        if !isnothing(s)
-            c.status[key] = s
-        end
-        task = Threads.@spawn begin
-            try
-                tmp = f(s)
-                lock(c.lock) do
-                    # Only commit if we still own this key's registration.
-                    # An external `maybepop!` / `force` / `clear` (or a newer
-                    # task spawned after ours was retracted) may have removed
-                    # or replaced `c.tasks[key]` while we were in flight —
-                    # popping blindly `KeyError`s, and clobbering would
-                    # resurrect a cleared key or overwrite a fresher result.
-                    # The caller still receives `tmp` via `fetch(x)` below.
-                    if get(c.tasks, key, nothing) === task
-                        c.cache[key] = tmp
-                        pop!(c.tasks, key)
-                        _on_store!(c, key)
-                    end
-                end
-                _finalize_substatus!(s)
-                tmp
-            catch e
-                # Leave c.tasks/c.status populated so entries()/getstatus()
-                # can surface the failure until retry_failed clears it.
-                _fail_substatus!(s, e)
-                rethrow()
-            end
-        end
-        c.tasks[key] = task
-        return (:won, task)
-    end
-    kind, x = rv
-    if kind === :compute_sync
-        # Sole synchronous computer: compute OUTSIDE the lock (`f` recurses into sibling
-        # properties on the same cache, which must NOT run under `c.lock`), then publish +
-        # drop the latch + wake waiters under it. Concurrent blocking callers took
-        # `:wait_sync` and pollers spawned waiter Tasks, so the RHS runs AT MOST ONCE.
-        cnd = x::Threads.Condition
-        local v
-        try
-            v = f(s)
-        catch e
-            _fail_substatus!(s, e)
-            lock(c.lock) do   # release the latch + wake waiters/pollers so one may retry
-                get(c.computing, key, nothing) === cnd && delete!(c.computing, key)
-                notify(cnd)    # leave c.status[key] so getstatus surfaces the failure (spawn-path parity)
-            end
-            rethrow()
-        end
-        stored = lock(c.lock) do
-            existing = get(c.cache, key, _missing_sentinel)
-            if existing === _missing_sentinel
-                c.cache[key] = v
-                _on_store!(c, key)
-                existing = v
+        v !== _missing_sentinel && (_on_hit!(c, key); return (:value, v))
+        if haskey(c.errors, key)
+            if retry_failed
+                delete!(c.errors, key)          # clear the old failure and recompute below
             else
-                _on_hit!(c, key)          # defensive: someone published first
-            end
-            get(c.computing, key, nothing) === cnd && delete!(c.computing, key)
-            notify(cnd)        # leave c.status[key] finalized — getstatus + the "(cached)" relabel rely on it
-            existing
-        end
-        !isnothing(s) && _finalize_substatus!(s)
-        return stored
-    end
-    if kind === :wait_sync
-        # Another blocking caller is computing this key — wait on its latch, then read the
-        # published value. We built `s` but aren't the computer; finalize it so the node
-        # detaches instead of leaking (the winner owns the surfaced status).
-        cnd = x::Threads.Condition
-        !isnothing(s) && _finalize_substatus!(s)
-        outcome = lock(c.lock) do
-            while true
-                v = get(c.cache, key, _missing_sentinel)
-                v !== _missing_sentinel && (_on_hit!(c, key); return (:got, v))
-                get(c.computing, key, nothing) === cnd || return (:retry, nothing)
-                wait(cnd)
+                return (:error, c.errors[key])  # surface the recorded failure
             end
         end
-        outcome[1] === :got && return outcome[2]
-        return get!(f, c, key; fetch, substatus, retry_failed)   # winner failed → retry OUTSIDE the lock
+        cnd = get(c.computing, key, nothing)
+        if cnd !== nothing
+            # A compute is already in flight (inline, or a prior poller's fire-and-forget).
+            return sync ? (:wait, cnd) : (:pending, nothing)
+        end
+        # Nobody computing — WE become the sole computer. Register the latch + (optional)
+        # status so concurrent accessors dedup onto us and getstatus/pollers see progress.
+        cnd = Threads.Condition(c.lock)
+        c.computing[key] = cnd
+        !isnothing(s) && (c.status[key] = s)
+        return sync ? (:inline, cnd) : (:spawn, cnd)
     end
-    if kind === :lost_value || kind === :lost_task
-        # We built `s` but didn't install it — finalize so the Treebars
-        # node (if any) detaches instead of leaking.
+    kind = action[1]
+    kind === :value && (!isnothing(s) && _finalize_substatus!(s); return action[2])
+    if kind === :error
         !isnothing(s) && _finalize_substatus!(s)
-        return kind === :lost_value ? x : fetch(x)
+        throw(action[2])
     end
-    fetch(x)
+    if kind === :wait
+        # Blocking waiter: block on the in-flight computer's latch, then read value/error.
+        # We built `s` but aren't the computer; finalize it (the winner owns the status).
+        !isnothing(s) && _finalize_substatus!(s)
+        return _await_cache_value!(c, key, action[2]::Threads.Condition, f; fetch, substatus, retry_failed)
+    end
+    if kind === :pending
+        # Poller, compute already in flight elsewhere — hand back a cheap Pending, no spawn.
+        !isnothing(s) && _finalize_substatus!(s)
+        return fetch(Pending(c, key, nothing))
+    end
+    if kind === :inline
+        # Blocking first-arriver: compute on THIS thread (no spawn), publish, return value.
+        return _run_cache_compute!(c, key, action[2]::Threads.Condition, f, s)
+    end
+    # :spawn — poller first-arriver: kick the REAL compute off fire-and-forget (it writes
+    # the cache, or records a failure in `c.errors`), and hand back a Pending. The Task is
+    # NOT retained — its value/error both reach us through the cache/errors + the latch.
+    cnd = action[2]::Threads.Condition
+    Threads.@spawn try; _run_cache_compute!(c, key, cnd, f, s); catch; end  # error already recorded
+    return fetch(Pending(c, key, nothing))
 end
 
 # Singleton sentinel so a single `get` lookup distinguishes "key absent" from
@@ -1252,9 +1161,119 @@ end
 struct _Missing end
 const _missing_sentinel = _Missing()
 
-# Hooks into get! for cache bookkeeping. Now always no-ops at this layer;
-# the new per-PropertyCache LRU layer handles ordering and eviction (see
-# `_record_pc_store!` / `_record_pc_hit!` / `_maybe_evict!` above).
+# Run a `c.cache`-backed compute to completion under the `cnd` latch. Compute OUTSIDE the
+# lock (the RHS recurses into siblings on the same lock), then publish the value + drop the
+# latch + notify; on failure record the exception in `c.errors` + drop the latch + notify,
+# and rethrow. Used inline (blocking first-arriver) and inside the fire-and-forget spawn
+# (poller first-arriver) alike — the value/error both reach every other accessor through
+# `cache`/`errors` + the latch, so the compute Task is never retained.
+function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condition, f, s)
+    local v
+    try
+        v = f(s)
+    catch e
+        lock(c.lock) do
+            get(c.computing, key, nothing) === cnd && delete!(c.computing, key)
+            c.errors[key] = e
+            notify(cnd)
+        end
+        !isnothing(s) && _fail_substatus!(s, e)
+        rethrow()
+    end
+    stored = lock(c.lock) do
+        existing = get(c.cache, key, _missing_sentinel)
+        if existing === _missing_sentinel
+            c.cache[key] = v
+            _on_store!(c, key)
+            existing = v
+        else
+            _on_hit!(c, key)          # defensive: someone published first
+        end
+        get(c.computing, key, nothing) === cnd && delete!(c.computing, key)
+        notify(cnd)                    # leave c.status[key] finalized — getstatus / "(cached)" relabel rely on it
+        existing
+    end
+    !isnothing(s) && _finalize_substatus!(s)
+    stored
+end
+
+# Blocking waiter: block on `cnd` until the value lands (return it) or the compute fails
+# (rethrow the recorded exception). If the computer vanished with neither (evicted mid
+# flight), recompute from scratch OUTSIDE the lock.
+function _await_cache_value!(c::AbstractThreadsafeDict, key, cnd::Threads.Condition, f; fetch=Base.fetch, substatus=nothing, retry_failed=true)
+    outcome = lock(c.lock) do
+        while true
+            v = get(c.cache, key, _missing_sentinel)
+            v !== _missing_sentinel && (_on_hit!(c, key); return (:value, v))
+            haskey(c.errors, key) && return (:error, c.errors[key])
+            get(c.computing, key, nothing) === cnd || return (:gone, nothing)
+            wait(cnd)
+        end
+    end
+    outcome[1] === :value && return outcome[2]
+    outcome[1] === :error && throw(outcome[2])
+    return get!(f, c, key; fetch, substatus, retry_failed)   # :gone → recompute
+end
+
+"""
+    Pending
+
+Cheap, non-`Task` handle a poller (`fetchindex` / `fetchproperty` / `get!(…; fetch=identity)`)
+gets back while a value is still being computed. It points at where the value will land — a
+`Slot` (bare props) or the backing `(cache, key)` — plus the in-flight latch, so a caller can
+`fetch(p)` to BLOCK for the value (rethrowing if the compute failed) or ignore it and poll
+again later. Replaces the former "`rv` is a `Task` while in-flight" poll contract: callers
+now branch on `rv isa Pending` (still computing) vs. the value (done). The progress/status
+node stays optional and is never relied on for readiness.
+"""
+struct Pending{C<:AbstractThreadsafeDict, K, S}
+    cache::C
+    key::K
+    slot::S   # a `Slot{T}` for slotted bare props; `nothing` for `cache`-backed keys
+end
+
+# Non-blocking readiness probe — a `Task`-like surface for callers migrating off `rv isa Task`.
+Base.isready(p::Pending) = p.slot === nothing ? haskey(p.cache, p.key) : (@atomic :acquire p.slot.set)
+
+# Block until the value lands (return it) or the compute fails (rethrow). Mirrors
+# `fetch(::Task)` so `fetch=Base.fetch` and an explicit `fetch(::Pending)` behave alike.
+function Base.fetch(p::Pending)
+    c = p.cache
+    if p.slot !== nothing
+        slot = p.slot
+        while !(@atomic :acquire slot.set)
+            again = lock(c.lock) do
+                (@atomic :acquire slot.set) && return false
+                haskey(c.errors, p.key) && throw(c.errors[p.key])
+                cnd = get(c.computing, p.key, nothing)
+                cnd === nothing && return false
+                wait(cnd::Threads.Condition)
+                true
+            end
+            again || break
+        end
+        (@atomic :acquire slot.set) && return slot.value
+        error("Pending: slot ", p.key, " is unset with no compute in flight")
+    end
+    while true
+        step = lock(c.lock) do
+            v = get(c.cache, p.key, _missing_sentinel)
+            v !== _missing_sentinel && return (:value, v)
+            haskey(c.errors, p.key) && return (:error, c.errors[p.key])
+            cnd = get(c.computing, p.key, nothing)
+            cnd === nothing && return (:gone, nothing)
+            wait(cnd::Threads.Condition)
+            (:retry, nothing)
+        end
+        step[1] === :value && return step[2]
+        step[1] === :error && throw(step[2])
+        step[1] === :gone && error("Pending: key ", p.key, " has no value and no compute in flight")
+    end
+end
+
+# `_on_hit!` / `_on_store!` are ThreadsafeDict-layer bookkeeping hooks — no-ops here;
+# the per-PropertyCache LRU layer (`_record_pc_store!` / `_record_pc_hit!` /
+# `_maybe_evict!` above) does ordering and eviction.
 _on_hit!(::AbstractThreadsafeDict, key) = nothing
 _on_store!(::AbstractThreadsafeDict, key) = nothing
 _drop_order!(::AbstractThreadsafeDict, key) = nothing
@@ -1269,7 +1288,8 @@ end
 Base.delete!(c::AbstractThreadsafeDict, key) = begin
     lock(c.lock) do
         delete!(c.status, key)
-        delete!(c.tasks, key)
+        delete!(c.computing, key)
+        delete!(c.errors, key)
         _drop_order!(c, key)
         delete!(c.cache, key)
     end
@@ -1292,61 +1312,28 @@ getstatus(ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}, indices..
 end
 getstatus(::IndexableProperty, indices...; kwargs...) = nothing
 
-"""
-    cancel!(ip::IndexableProperty, indices...; kwargs...)
-
-Cancel a running task for the given key on a `ThreadsafeDict`-backed `IndexableProperty`.
-Returns `true` if a running task was found and interrupted, `false` otherwise.
-"""
-cancel!(ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}, indices...; kwargs...) = begin
-    key = (indices, (;kwargs...))
-    lock(ip.cache.lock) do
-        if haskey(ip.cache.tasks, key) && !istaskdone(ip.cache.tasks[key])
-            Base.schedule(ip.cache.tasks[key], InterruptException(); error=true)
-            pop!(ip.cache.tasks, key)
-            haskey(ip.cache.status, key) && pop!(ip.cache.status, key)
-            true
-        else
-            false
-        end
-    end
-end
-cancel!(::IndexableProperty, args...; kwargs...) = false
-
-"""
-    cancel_all!(ip::IndexableProperty)
-
-Cancel all running tasks on a `ThreadsafeDict`-backed `IndexableProperty`.
-"""
-cancel_all!(ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}) = begin
-    lock(ip.cache.lock) do
-        for (key, task) in ip.cache.tasks
-            istaskdone(task) || Base.schedule(task, InterruptException(); error=true)
-        end
-        empty!(ip.cache.tasks)
-        empty!(ip.cache.status)
-    end
-    nothing
-end
-cancel_all!(::IndexableProperty) = nothing
+# `cancel!` / `cancel_all!` were removed (2026-07): interrupting a running compute required
+# the retained compute Task, which we no longer keep — the value lands in `cache`/the slot
+# and failures in `errors`, so the Task carries nothing. There is no cooperative-cancellation
+# replacement; cancellation is not a supported operation.
 
 """
     fetchindex(fetch, ip, indices...; kwargs...)
 
 Call `memoize!(ip, indices...; kwargs...)` with a custom `fetch` function.
 
-For `IndexableProperty` backed by a `ThreadsafeDict`, `memoize!` spawns a `Task`
-for the computation. The `fetch` callback receives `(rv, status)` where `rv` is
-the `Task` (still running) or the computed result (done), and `status` is the
-substatus object (from `__substatus__`) or `nothing`.
+For `IndexableProperty` backed by a `ThreadsafeDict`, the `fetch` callback receives
+`(rv, status)` where `rv` is a `Pending` handle (still computing) or the computed
+result (done), and `status` is the substatus object (from `__substatus__`) or
+`nothing`. `fetch(::Pending)` blocks for the value (rethrowing if the compute failed).
 
 Pass `force=true` to unconditionally recompute: clears both the in-memory cache
-entry and the on-disk cache file so `memoize!` always spawns a fresh Task.
+entry and the on-disk cache file so the next access recomputes from scratch.
 
 # Example
 ```julia
 fetchindex(app.results, key) do rv, status
-    if rv isa Task
+    if rv isa Pending
         # still computing — status is the progress node
         render_progress(status)
     else
@@ -1427,8 +1414,8 @@ fetchproperty!(::Nothing, o, name::Symbol) = getproperty(o, name)
 # generic "read from memory cache" wrapper).
 #
 # `fetchindex`/`fetchproperty` follow the contract: the callback's `rv` is a
-# `Task` while the computation is in flight, and the cached VALUE once it is done.
-# So at callback entry `!(rv isa Task)` means the value was already in the
+# `Pending` handle while the computation is in flight, and the VALUE once it is done.
+# So at callback entry `!(rv isa Pending)` means the value was already in the
 # in-memory cache — a hit. On a DOCUMENTED in-memory hit we KEEP the original
 # node `s` and its ENTIRE sub-step subtree intact, and swap ONLY the subtree
 # ROOT's LABEL — appending " (cached)" in place — so it renders e.g.
@@ -1447,13 +1434,13 @@ fetchproperty!(::Nothing, o, name::Symbol) = getproperty(o, name)
 # in place.
 #
 # UNDOCUMENTED hit (`s.impl.description` empty): no relabel — `s` stays a bare
-# wrapper the renderer inlines away. Running (`rv isa Task`) and no-substatus
+# wrapper the renderer inlines away. Running (`rv isa Pending`) and no-substatus
 # (`s === nothing`): no relabel. All four paths then attach `s` via `add_child!`
 # (idempotent on the `ThreadsafeSet`; no-op on `nothing`).
 const _CACHED_SUFFIX = " (cached)"
 
 function _attach_fetched!(status::Treebars.ProgressNode, rv, s)
-    if !(rv isa Task) && !isnothing(s) && !isempty(s.impl.description)
+    if !(rv isa Pending) && !isnothing(s) && !isempty(s.impl.description)
         _mark_cached!(s)                   # documented in-memory hit → relabel root in place
     end
     Treebars.add_child!(status, s)         # keep/attach the subtree root (no-op on `nothing`)
@@ -1489,7 +1476,8 @@ maybepop!(c::AbstractDict, key) = haskey(c, key) && pop!(c, key)
 maybepop!(c::AbstractThreadsafeDict, key) = begin
     lock(c.lock) do
         maybepop!(c.cache, key)
-        maybepop!(c.tasks, key)
+        maybepop!(c.computing, key)
+        maybepop!(c.errors, key)
         maybepop!(c.status, key)
         _drop_order!(c, key)
     end
@@ -1671,27 +1659,24 @@ end
 
 Return a vector of `(; key, state, status, value)` for all entries in a
 `ThreadsafeDict`-backed `IndexableProperty`. `state` is one of `:running`,
-`:failed`, `:finishing`, or `:done`. `value` is the cached result (for `:done`)
-or the `Task` (for running/failed/finishing). `status` is the substatus object
-or `nothing`.
+`:failed`, or `:done`. `value` is the cached result (for `:done`), a `Pending`
+handle (for `:running`), or the captured exception (for `:failed`). `status` is
+the substatus object or `nothing`.
 """
 function entries(ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict})
     result = NamedTuple{(:key, :state, :status, :value), Tuple{Any, Symbol, Any, Any}}[]
-    lock(ip.cache.lock) do
-        for (k, task) in ip.cache.tasks
-            status = get(ip.cache.status, k, nothing)
-            state = if istaskfailed(task)
-                :failed
-            elseif istaskdone(task)
-                :finishing
-            else
-                :running
-            end
-            push!(result, (; key=k, state, status, value=task))
-        end
-        for (k, v) in ip.cache.cache
-            haskey(ip.cache.tasks, k) && continue
+    c = ip.cache
+    lock(c.lock) do
+        for (k, v) in c.cache
             push!(result, (; key=k, state=:done, status=nothing, value=v))
+        end
+        for (k, _cnd) in c.computing
+            haskey(c.cache, k) && continue
+            push!(result, (; key=k, state=:running, status=get(c.status, k, nothing), value=Pending(c, k, nothing)))
+        end
+        for (k, e) in c.errors
+            haskey(c.cache, k) && continue
+            push!(result, (; key=k, state=:failed, status=get(c.status, k, nothing), value=e))
         end
     end
     result
@@ -5211,11 +5196,11 @@ app = MyApp()
 
 # Non-blocking access with progress:
 fetchindex(app.results, key) do rv, status
-    rv isa Task ? render_progress(status) : render_result(rv)
+    rv isa Pending ? render_progress(status) : render_result(rv)
 end
 ```
 
-`__substatus__` is called before each Task spawn.
+`__substatus__` is called before each compute begins.
 `name` is the property symbol, `args`/`kwargs` are the indices. The returned
 object is stored in `ThreadsafeDict.status` (accessible via `getstatus`) and
 passed to the computation body as the local `__status__`.
