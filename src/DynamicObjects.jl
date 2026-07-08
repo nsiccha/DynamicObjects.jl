@@ -1839,10 +1839,18 @@ end
 # no inference at construction, no fixpoint). Type-stable READS are recovered separately at the
 # read site (`_slot_eltype` → `_read_slot_types`: one bounded joint `return_type` over the
 # actual `typeof(o)`, whose passed slots carry the concrete types this OV threads).
+# A passed override that is ITSELF a DO (has a `slots` field) must NOT bake its whole
+# concrete type into this struct's `__DO_S__`: that type embeds the override's OWN passed
+# `__parent__`, nesting up the ancestor chain (`__parent__ → Slot{AnalysisData{…Slot{AppData{…}}…}}`)
+# until `_slot_types_expr_joint` inference overflows the C-stack ("recursion over very long tuples").
+# Store such overrides as `Any` — breaking the up-chain exactly as computed slots break the
+# down-chain. Non-DO passed values (leaf config/data) keep their concrete, type-stable type.
+_passed_slot_type(@nospecialize T) = (T isa DataType && hasfield(T, :slots)) ? Any : T
+
 function _slot_types_expr_joint(::Type{O}, plan, ::Type{OV}) where {O, OV<:NamedTuple}
     ov = fieldnames(OV)
     names = Tuple(p[1] for p in plan)
-    Ts = Any[(nm in ov) ? fieldtype(OV, nm) : Any for nm in names]
+    Ts = Any[(nm in ov) ? _passed_slot_type(fieldtype(OV, nm)) : Any for nm in names]
     :(NamedTuple{$names, Tuple{$(Ts...)}})
 end
 
