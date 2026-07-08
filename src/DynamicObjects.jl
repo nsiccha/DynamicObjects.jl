@@ -1492,12 +1492,15 @@ end
 #
 # The `Val{name}` static parameter is also where per-name typed-slot dispatch
 # hangs off: `_has_slot(O, Val(name))` folds, and a slotted bare COMPUTED property
-# reads its value DIRECTLY from the concrete `Slot{T}` in the `slots` field — a
-# type-stable, lock-free, 0-alloc warm hit (no cache lookup, no assert; Phase B).
-# Fixed fields short-circuit to `getfield` above; only NON-slotted names (IP
-# wrappers) reach the `getorcomputeproperty(...)::_slot_eltype(...)` fallthrough,
-# where `_slot_eltype` is `Any` — a no-op assert. (Pre-Phase-B this assert
-# re-narrowed a `::Any` cache read to the inferred type; slots supersede it.)
+# reads its value DIRECTLY from the `Slot` in the `slots` field — a lock-free,
+# 0-alloc warm hit (no cache lookup). Storage is `Slot{Any}` (computed slots), so
+# the read is narrowed back to its recovered type by `::_slot_eltype(typeof(o),
+# Val(name))` — a compile-time constant (`@generated _read_slot_types`, per-property
+# over the actual `typeof(o)`), so the assert folds and the warm hit stays
+# type-stable. Fixed fields short-circuit to `getfield` above; NON-slotted names (IP
+# wrappers) reach the `getorcomputeproperty(...)::_slot_eltype(...)` fallthrough with
+# the same narrowing. (Pre-Phase-B this assert re-narrowed a `::Any` cache read; with
+# `Slot{Any}` storage it is needed again — typed `Slot{T}` no longer supersedes it.)
 # Does parent type `O` store property `name` in a typed `slots` field? Compile-time
 # constant (folds at every literal `o.name`).
 @inline _has_slot(::Type{O}, ::Val{name}) where {O, name} =
@@ -1507,8 +1510,9 @@ end
     hasfield(typeof(o), name) && return getfield(o, name)
     if _has_slot(typeof(o), Val(name))
         slot = getfield(getfield(o, :slots), name)
-        (@atomic :acquire slot.set) && return slot.value   # lock-free typed warm hit
-        return _compute_into_slot!(o, Val(name), slot)     # miss → compute once
+        R = _slot_eltype(typeof(o), Val(name))             # recovered read type (folds to a constant)
+        (@atomic :acquire slot.set) && return slot.value::R   # lock-free warm hit, narrowed
+        return _compute_into_slot!(o, Val(name), slot)::R     # miss → compute once, narrowed
     end
     getorcomputeproperty(o, name)::_slot_eltype(typeof(o), Val(name))
 end
