@@ -960,7 +960,7 @@ written `ip[args...]`, *especially* in kwargs-only call sites (`memoize!(ip; k=v
 which the legacy bracket syntax couldn't express at all (`ip[; k=v]` doesn't
 parse as Julia). For the uncached (fresh) call, use [`fresh`](@ref) / [`@fresh`](@ref).
 
-For two-phase access (returning a `Task` while computing) on
+For two-phase access (returning a [`Pending`](@ref) handle while computing) on
 `ThreadsafeDict`-backed IPs, see [`fetchindex`](@ref). Inside a
 `@dynamicstruct` body, the convenience macro [`@memo!`](@ref) wraps every
 call-site in `maybememoize!(callee, args...; kwargs...)` so cached IPs and
@@ -1371,7 +1371,8 @@ fetchindex!(::Nothing, ip, indices...; fetch=Base.fetch, kwargs...) = memoize!(i
 
 Like [`fetchindex`](@ref) but for bare (non-indexed) properties. Triggers
 computation via the `PropertyCache` and calls `fetch(rv, status)` where `rv`
-is the `Task` (still running) or the computed result, and `status` is the
+is a [`Pending`](@ref) handle (the compute is still in flight — `fetch` it to
+block for the value) or the already-computed result, and `status` is the
 substatus object or `nothing`.
 
 For `Dict`-backed caches (serial), falls through to `getproperty` (synchronous,
