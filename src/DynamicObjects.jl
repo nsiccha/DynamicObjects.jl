@@ -1607,6 +1607,25 @@ function _ov_slot_types end
 # hard/huge inference can widen to an abstract `NamedTuple`.
 function _infer_all end
 
+# A slot holding a nested DO must be typed by that DO's BASE (slots param stripped), NOT a
+# specific parameterization. The nested DO's slots param is construction-dependent: it's built
+# with a `__parent__=` override that is the empty PROBE at inference time but the REAL parent at
+# runtime, so a frozen concrete parameterization won't match the runtime value → convert error
+# in `_compute_into_slot!` (the S-dependence bug). The base holds ANY parameterization (the
+# runtime value is always a subtype) AND breaks self-referential parent↔child recursion. Cost:
+# nested-DO reads become base-typed (abstract); leaf data + non-DO props stay precise. Recovering
+# precision for the resolvable ones is later (iteration) work.
+function _widen_slot_type(@nospecialize T)
+    if T isa DataType && hasfield(T, :slots) && hasfield(T, :cache) &&
+            fieldtype(T, :slots) <: NamedTuple
+        base = T.name.wrapper
+        np = length(T.parameters)
+        np <= 1 && return base                                  # only slots param → bare base
+        return base{Any[T.parameters[i] for i in 1:np-1]...}    # keep fixed-field params, free slots
+    end
+    T
+end
+
 # Topological driver for the emitted `@generated _slot_types` / `_ov_slot_types`.
 # `plan` is a tuple of `(name, dep_params, annotated)` in dependency order (deps
 # before dependents), baked by the macro. `OV` is the constructor's kwarg-override
@@ -1640,6 +1659,7 @@ function _slot_types_expr(::Type{O}, plan, ::Type{OV}) where {O, OV<:NamedTuple}
             # property's real error. It has no storable value anyway — widen to `Any`.
             T === Union{} && (T = Any)
         end
+        T = _widen_slot_type(T)   # nested-DO slot → base (see _widen_slot_type)
         known[name] = T
         push!(names, name)
         push!(Texprs, T)
@@ -1665,7 +1685,8 @@ function _slot_types_expr_joint(::Type{O}, plan, ::Type{OV}) where {O, OV<:Named
         ps = RT.parameters
         if length(ps) == 2 && ps[1] === names && ps[2] isa DataType &&
                 ps[2] <: Tuple && length(ps[2].parameters) == length(names)
-            return :($RT)                    # joint succeeded — use it verbatim
+            Ts = Any[_widen_slot_type(V) for V in ps[2].parameters]
+            return :(NamedTuple{$names, Tuple{$(Ts...)}})   # nested-DO slots → base
         end
     end
     _slot_types_expr(O, plan, OV)            # fallback: per-property, isolated
