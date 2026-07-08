@@ -1017,8 +1017,15 @@ struct ThreadsafeDict{K,V} <: AbstractThreadsafeDict{K,V}
     cache::Dict{K,V}
     tasks::Dict{K,Task}
     status::Dict{K,Any}
-    ThreadsafeDict{K,V}(c) where {K,V} = new{K,V}(ReentrantLock(), Dict{K,V}(c), Dict{K,Task}(), Dict{K,Any}())
-    ThreadsafeDict() = new{Any,Any}(ReentrantLock(), Dict{Any,Any}(), Dict{Any,Task}(), Dict{Any,Any}())
+    # In-flight SYNCHRONOUS computes — the blocking-default path that does NOT
+    # spawn a Task. Maps an in-flight key to a `Threads.Condition` bound to `lock`. The
+    # first caller registers here and computes on its own thread; concurrent callers see
+    # the marker, `wait` on the condition, and read the published value instead of
+    # recomputing — restoring compute-at-most-once WITHOUT a Task spawn. Populated only
+    # while a sync compute is mid-flight; the computer removes its entry under `lock`.
+    computing::Dict{K,Threads.Condition}
+    ThreadsafeDict{K,V}(c) where {K,V} = new{K,V}(ReentrantLock(), Dict{K,V}(c), Dict{K,Task}(), Dict{K,Any}(), Dict{K,Threads.Condition}())
+    ThreadsafeDict() = new{Any,Any}(ReentrantLock(), Dict{Any,Any}(), Dict{Any,Task}(), Dict{Any,Any}(), Dict{Any,Threads.Condition}())
 end
 
 Base.length(c::AbstractThreadsafeDict) = lock(c.lock) do; length(c.cache); end
@@ -1029,7 +1036,7 @@ Base.get(c::AbstractThreadsafeDict, key, default) = lock(c.lock) do; get(c.cache
 # lock(c.lock) do ... end or entries(ip) which holds the lock for the full sweep.
 Base.iterate(c::AbstractThreadsafeDict) = lock(c.lock) do; iterate(c.cache); end
 Base.iterate(c::AbstractThreadsafeDict, state) = lock(c.lock) do; iterate(c.cache, state); end
-Base.empty!(c::ThreadsafeDict) = (lock(c.lock) do; empty!(c.cache); empty!(c.tasks); empty!(c.status); end; c)
+Base.empty!(c::ThreadsafeDict) = (lock(c.lock) do; empty!(c.cache); empty!(c.tasks); empty!(c.status); empty!(c.computing); end; c)
 n_running(c::AbstractThreadsafeDict) = lock(c.lock) do; length(c.tasks); end
 Base.show(io::IO, c::ThreadsafeDict{K,V}) where {K,V} = lock(c.lock) do
     print(io, "ThreadsafeDict{", K, ",", V, "}(", length(c.cache), " cached, ", length(c.tasks), " running)")
