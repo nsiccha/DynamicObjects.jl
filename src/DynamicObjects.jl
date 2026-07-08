@@ -1667,29 +1667,79 @@ function _slot_types_expr(::Type{O}, plan, ::Type{OV}) where {O, OV<:NamedTuple}
     :(NamedTuple{$(Tuple(names)), Tuple{$(Texprs...)}})
 end
 
-# Joint slot-type driver with a per-property fallback (attempt 1, everything-concrete
-# path). Fire ONE `return_type` over the struct's `_infer_all`; if it yields a usable
-# concrete `NamedTuple{names,Tuple{…}}` (the common case — no always-thrower in the
-# struct, inference didn't collapse) use it verbatim. Otherwise fall back to the proven
-# per-property `_slot_types_expr`:
-#   * an always-thrower makes `_infer_all` never return normally → `return_type` = `Union{}`;
-#   * a hard/huge inference can widen to an abstract `NamedTuple` (no field types).
-# Both are exactly the cases where per-property isolation wins, so correctness is never
-# worse than per-property — joint is a pure speed layer on top. NO sentinel/try-catch:
-# a sentinel leaks into nested invariant positions (`Vector{Union{T,Sentinel}}`) that a
-# strip can't reach, so we let the joint FAIL and fall back instead of laundering it.
+# Raw joint inference: ONE `return_type` over `_infer_all` for probe `Oi`; returns the vector
+# of inferred slot eltypes (in `names` order), or `nothing` when the result isn't the concrete
+# `NamedTuple{names,Tuple{…}}` shape (always-thrower → `Union{}`; hard/huge inference → abstract
+# NamedTuple) — the caller then falls back to per-property isolation.
+function _joint_raw(::Type{Oi}, names, ::Type{OV}) where {Oi, OV}
+    RT = Core.Compiler.return_type(_infer_all, Tuple{Oi, OV})
+    (RT isa DataType && RT <: NamedTuple) || return nothing
+    ps = RT.parameters
+    (length(ps) == 2 && ps[1] === names && ps[2] isa DataType &&
+        ps[2] <: Tuple && length(ps[2].parameters) == length(names)) || return nothing
+    Any[ps[2].parameters...]
+end
+
+# The far pole of the soundness perturbation: widen a nested-DO slot ALL the way to `Any`
+# (differs from `_widen_slot_type`'s base ONLY for nested-DO slots — exactly where probe-slot
+# dependence must show up); a non-DO slot is left as-is (a no-op pole for it).
+_any_slot_type(@nospecialize T) = _widen_slot_type(T) === T ? T : Any
+
+# Rebuild the inference probe with a concrete slots parameter: `Base{fixed-field params…,
+# NamedTuple{names, Tuple{Slot{f1},…}}}` — the SAME shape the constructor stamps
+# (`typeof(_build_slots(…))`), so a nested child built with `__parent__=__self__` embeds a
+# probe whose slots match runtime. Only ever fed to `return_type`, never constructed.
+function _reprobe(::Type{O}, names, fills) where {O}
+    (O isa DataType && !isempty(O.parameters)) || return O
+    slotsNT = NamedTuple{names, Tuple{Any[Slot{f} for f in fills]...}}
+    O.name.wrapper{O.parameters[1:end-1]..., slotsNT}
+end
+
+# Joint slot-type driver with a per-property fallback. Fire ONE `return_type` over the
+# struct's `_infer_all`; fall back to the proven per-property `_slot_types_expr` when it
+# can't yield the concrete `NamedTuple{names,Tuple{…}}` shape (always-thrower → `Union{}`;
+# hard/huge inference → abstract NamedTuple) — correctness is never worse than per-property.
+#
+# Rung 2 (bounded fixpoint). A slot holding a nested DO whose type embeds `__self__`'s SLOTS
+# param is construction-dependent (the empty probe ≠ the runtime parent), so it MUST be
+# base-widened (rung 1) — else runtime's real parameterization won't `convert` (the
+# S-dependence crash). But MOST nested-DO slots are INDEPENDENT of the parent's slots (built
+# with no `__parent__`, or reading the parent only through its own base-widened `__parent__`
+# → `Any`), and base-widening those is pure precision loss. Recover them SOUNDLY: infer
+# against two probes that differ ONLY in the non-accepted slots' fill (each nested-DO slot
+# base-widened vs `Any`); a slot whose inferred type is IDENTICAL under both is provably
+# invariant to those slots → depends only on already-accepted (pinned-concrete) + fixed
+# fields → its inferred type equals the runtime type → keep it concrete. Slots that differ
+# stay base-widened. Monotone (accepted only grows), sound (accept ⇒ matches runtime, never
+# re-freezes a wrong concrete), multi-level within `K`. Structs with NO nested-DO slot pay
+# nothing beyond the single round-0 inference (the fast path).
 function _slot_types_expr_joint(::Type{O}, plan, ::Type{OV}) where {O, OV<:NamedTuple}
     names = Tuple(p[1] for p in plan)
-    RT = Core.Compiler.return_type(_infer_all, Tuple{O, OV})
-    if RT isa DataType && RT <: NamedTuple
-        ps = RT.parameters
-        if length(ps) == 2 && ps[1] === names && ps[2] isa DataType &&
-                ps[2] <: Tuple && length(ps[2].parameters) == length(names)
-            Ts = Any[_widen_slot_type(V) for V in ps[2].parameters]
-            return :(NamedTuple{$names, Tuple{$(Ts...)}})   # nested-DO slots → base
+    raw = _joint_raw(O, names, OV)
+    raw === nothing && return _slot_types_expr(O, plan, OV)   # fallback: per-property, isolated
+    n = length(raw)
+    # Fast path: no nested-DO slot anywhere (base-widen a no-op) → all concrete-and-correct.
+    any(i -> _widen_slot_type(raw[i]) !== raw[i], 1:n) ||
+        return :(NamedTuple{$names, Tuple{$(raw...)}})
+    accepted = falses(n)
+    for _ in 1:4                                              # K: freeze needed 2 rounds
+        fillA = Any[accepted[i] ? raw[i] : _widen_slot_type(raw[i]) for i in 1:n]
+        fillB = Any[accepted[i] ? raw[i] : _any_slot_type(raw[i])  for i in 1:n]
+        rawA = _joint_raw(_reprobe(O, names, fillA), names, OV)
+        rawB = fillA == fillB ? rawA : _joint_raw(_reprobe(O, names, fillB), names, OV)
+        (rawA === nothing || rawB === nothing) && break       # keep what we have; widen the rest
+        progressed = false
+        for i in 1:n
+            accepted[i] && continue
+            raw[i] = rawA[i]                                  # latest, against the realistic (base) probe
+            if rawA[i] === rawB[i]
+                accepted[i] = true; progressed = true
+            end
         end
+        progressed || break
     end
-    _slot_types_expr(O, plan, OV)            # fallback: per-property, isolated
+    Ts = Any[accepted[i] ? raw[i] : _widen_slot_type(raw[i]) for i in 1:n]
+    :(NamedTuple{$names, Tuple{$(Ts...)}})
 end
 
 # Build the joint-inference body for a struct's `@generated _infer_all`. `plan` is a
