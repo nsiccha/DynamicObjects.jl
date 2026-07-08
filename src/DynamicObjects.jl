@@ -1106,13 +1106,13 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     end
     # No value, no in-flight task — build substatus outside the lock.
     s = isnothing(substatus) ? nothing : substatus()
-    # Blocking DEFAULT (`fetch === Base.fetch`): the caller blocks on
-    # `fetch(task)` anyway, so a spawned task is pure overhead (spawn + thread
-    # handoff + the c.status/c.tasks bookkeeping only a poller needs). Compute
-    # synchronously on the calling thread instead (the `:compute_sync` branch
-    # below). Non-blocking callers (`fetch !== Base.fetch`, e.g. `fetchindex` /
-    # `ensure!` polling — they pass `fetch=identity`) keep the spawn path so
-    # they get a pollable Task.
+    # Blocking DEFAULT (`fetch === Base.fetch`): compute synchronously on the calling
+    # thread — NO Task spawn (the caller would block on `fetch(task)` anyway). Concurrent
+    # callers coordinate AT-MOST-ONCE through the `c.computing` condition latch: the first
+    # blocking caller registers a `Threads.Condition` (bound to `c.lock`) and computes;
+    # other blocking callers wait on it (`:wait_sync`), and pollers wait via a spawned
+    # proxy Task (below) — none recompute. Non-blocking callers (`fetch !== Base.fetch`,
+    # e.g. `fetchindex` / `ensure!`) keep the spawn path so they get a pollable Task.
     sync = fetch === Base.fetch
     rv = lock(c.lock) do
         v = get(c.cache, key, _missing_sentinel)
@@ -1125,10 +1125,34 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
             haskey(c.status, key) && pop!(c.status, key)
         end
         haskey(c.tasks, key) && return (:lost_task, c.tasks[key])
+        inflight = get(c.computing, key, nothing)   # an inline (blocking) sync compute, if any
         if sync
-            # Compute after releasing the lock — `f` recurses into sibling
-            # properties on the same cache, which must NOT run under `c.lock`.
-            return (:compute_sync, nothing)
+            # Another blocking caller already owns the inline compute — wait for it.
+            inflight !== nothing && return (:wait_sync, inflight)
+            # Become the sole synchronous computer. Register the latch + status so
+            # concurrent callers dedup onto us and getstatus/pollers can see progress.
+            cnd = Threads.Condition(c.lock)
+            c.computing[key] = cnd
+            !isnothing(s) && (c.status[key] = s)
+            return (:compute_sync, cnd)
+        end
+        # Poller (needs a pollable Task). If an inline sync compute is mid-flight, do NOT
+        # recompute — spawn a WAITER Task that blocks on the latch and returns the value.
+        if inflight !== nothing
+            cnd = inflight
+            wtask = Threads.@spawn begin
+                lock(c.lock) do
+                    while !haskey(c.cache, key) && get(c.computing, key, nothing) === cnd
+                        wait(cnd)
+                    end
+                    get(c.tasks, key, nothing) === Base.current_task() && pop!(c.tasks, key)
+                    got = get(c.cache, key, _missing_sentinel)
+                    got === _missing_sentinel && error("get!: in-flight synchronous compute failed for key ", key)
+                    got
+                end
+            end
+            c.tasks[key] = wtask
+            return (:won, wtask)
         end
         if !isnothing(s)
             c.status[key] = s
@@ -1164,32 +1188,54 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     end
     kind, x = rv
     if kind === :compute_sync
-        # Synchronous blocking compute on the calling thread, OUTSIDE the lock.
-        # No c.tasks/c.status registration — the compute is invisible to the
-        # polling dicts. Relaxed dedup: a concurrent caller may compute the same
-        # key, but the store below is first-write-wins, so the cache holds ONE
-        # value and every caller returns it. Safe under DO's pure-property
-        # contract; expensive `@cached` props are further deduped by the disk
-        # path lock inside `_computeproperty`.
+        # Sole synchronous computer: compute OUTSIDE the lock (`f` recurses into sibling
+        # properties on the same cache, which must NOT run under `c.lock`), then publish +
+        # drop the latch + wake waiters under it. Concurrent blocking callers took
+        # `:wait_sync` and pollers spawned waiter Tasks, so the RHS runs AT MOST ONCE.
+        cnd = x::Threads.Condition
         local v
         try
             v = f(s)
         catch e
             _fail_substatus!(s, e)
+            lock(c.lock) do   # release the latch + wake waiters/pollers so one may retry
+                get(c.computing, key, nothing) === cnd && delete!(c.computing, key)
+                notify(cnd)    # leave c.status[key] so getstatus surfaces the failure (spawn-path parity)
+            end
             rethrow()
         end
         stored = lock(c.lock) do
             existing = get(c.cache, key, _missing_sentinel)
-            if existing !== _missing_sentinel
-                _on_hit!(c, key)          # lost the race — return the winner's value
-                return existing
+            if existing === _missing_sentinel
+                c.cache[key] = v
+                _on_store!(c, key)
+                existing = v
+            else
+                _on_hit!(c, key)          # defensive: someone published first
             end
-            c.cache[key] = v
-            _on_store!(c, key)
-            return v
+            get(c.computing, key, nothing) === cnd && delete!(c.computing, key)
+            notify(cnd)        # leave c.status[key] finalized — getstatus + the "(cached)" relabel rely on it
+            existing
         end
         !isnothing(s) && _finalize_substatus!(s)
         return stored
+    end
+    if kind === :wait_sync
+        # Another blocking caller is computing this key — wait on its latch, then read the
+        # published value. We built `s` but aren't the computer; finalize it so the node
+        # detaches instead of leaking (the winner owns the surfaced status).
+        cnd = x::Threads.Condition
+        !isnothing(s) && _finalize_substatus!(s)
+        outcome = lock(c.lock) do
+            while true
+                v = get(c.cache, key, _missing_sentinel)
+                v !== _missing_sentinel && (_on_hit!(c, key); return (:got, v))
+                get(c.computing, key, nothing) === cnd || return (:retry, nothing)
+                wait(cnd)
+            end
+        end
+        outcome[1] === :got && return outcome[2]
+        return get!(f, c, key; fetch, substatus, retry_failed)   # winner failed → retry OUTSIDE the lock
     end
     if kind === :lost_value || kind === :lost_task
         # We built `s` but didn't install it — finalize so the Treebars
