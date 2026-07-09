@@ -1911,6 +1911,16 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
             _cache_context = """Object type: $(nameof(typeof(o))) (objectid: $(objectid(o)), hash: $(hash(o)))
 Cache dict: ThreadsafeDict (parallel)
 If multiple objects with the same hash are writing here concurrently, this may indicate a concurrency issue or a hashing collision."""
+            # A failed cache READ must not reuse `_cache_context`: its
+            # concurrency/hash-collision hypothesis is apt for the trylock warning it
+            # was written for, but a read failure is far more often a partial or
+            # stale file (the disk filled mid-write, a writer was interrupted, the
+            # format changed). Asserting the wrong cause sends an operator hunting
+            # for hash collisions during a disk-full. Name the file; let the
+            # exception state the cause.
+            _load_fail_context = """Object type: $(nameof(typeof(o))) (objectid: $(objectid(o)), hash: $(hash(o)))
+Cache file: $cache_path ($(isfile(cache_path) ? string(filesize(cache_path), " bytes") : "missing"))
+A truncated/partial file usually means the disk filled or a writer was interrupted. The file is deleted and the value recomputed."""
             disk_locks = _disk_cache(o, vname)
             rv = if __strict__ && !isnothing(disk_locks)
                 path_lock = get_path_lock!(disk_locks, cache_path)
@@ -1952,11 +1962,12 @@ $_cache_context""")
                             load(_disk_format(o, vname), cache_path, _disk_eltype(o, vname))
                         catch e
                             # isa(e, ArgumentError) && rethrow()
-                            @warn "Deserialization failed for $cache_path, recomputing.\n$_cache_context" exception=e
+                            @warn "Cache read failed for $cache_path — deleting it and recomputing.\n$_load_fail_context" exception=e
                             rm(cache_path; force=true)
                             nothing
                         end
                     else
+                        cache_status == :started && @warn "Cache file $cache_path exists but has size 0 — assuming an interrupted write (e.g. the disk filled). Recomputing.\n$_load_fail_context"
                         nothing
                     end
                     if isnothing(rv) || resumes(o, vname, indices...; kwargs...)
@@ -1979,7 +1990,7 @@ $_cache_context""")
                     try
                         load(_disk_format(o, vname), cache_path, _disk_eltype(o, vname))
                     catch e
-                        @warn "Deserialization failed for $cache_path, recomputing.\n$_cache_context\nEnable __strict__=true for disk cache locking to prevent concurrent write issues." exception=e
+                        @warn "Cache read failed for $cache_path — deleting it and recomputing.\n$_load_fail_context" exception=e
                         rm(cache_path; force=true)
                         cache_status = :unstarted
                         touch(cache_path)
