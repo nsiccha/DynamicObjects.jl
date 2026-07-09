@@ -249,11 +249,46 @@ _hash_replace(x::NamedTuple) = map(_hash_replace, x)
 _hash_replace(x) = x
 compute_property(o, ::Val{:__cache_base__}) = "cache"
 compute_property(o, ::Val{:__cache_path__}) = joinpath(o.__cache_base__, o.__hash__)
-compute_property(o, ::Val{:__status__}) = nothing
+# Progress tracking defaults IN (2026-07-09, decision 2f84ap): every DO that
+# doesn't declare `__status__` gets its own `:state` root, so `htmx_render`
+# never meets a `nothing` tree and no app has to remember the boilerplate.
+#
+# `description=""` is Treebars' sentinel for a *structural* node, NOT a
+# missing one: `_is_bare_wrapper` (empty description + empty message + no
+# counter) with no explicit `displayed=` makes `_renders_self` false, so the
+# root emits nothing and its children hoist a level. `description=nothing`
+# is NOT an option — `StateProgress.description::String`, so it throws.
+# The type name was considered and rejected: it always renders a row, and
+# "PKPDDraws" means nothing to the humans reading the progress tree.
+#
+# Opt out with `__status__ = nothing`; that suppresses per-access Treebar
+# nodes on this struct and (via `_default_substatus(::Nothing, …)`) on every
+# child that inherits from it.
+compute_property(o, ::Val{:__status__}) = Treebars.initialize_progress!(:state; description="")
 compute_property(o, ::Val{:__strict__}) = true
 compute_property(o, ::Val{:__substatus__}, name, args...; kwargs...) =
     _default_substatus(o.__status__, o, name, args...; kwargs...)
 _default_substatus(status, o, name, args...; kwargs...) = nothing
+
+# `@include`d children get the parent's substatus injected as a *constructor
+# kwarg* (`_inject_include_kwargs!`), which beats whatever default the child
+# declared. That override is deliberate for a child declaring its own root —
+# it means "root when standalone, mounted when included" — but it silently
+# defeated `__status__ = nothing`, whose entire meaning is "never track me"
+# (bug found 2026-07-09; the inline-child path at `_extract_inline_structs`
+# always honoured it, so the two paths disagreed).
+#
+# `@dynamicstruct` emits the `true` method for a literal `__status__ = nothing`
+# declaration and nothing else, so only the opt-out is honoured here; a child
+# declaring a root keeps being mounted under its parent as before.
+_status_optout(::Type) = false
+_include_substatus(::Type{T}, o, ::Val{name}) where {T,name} =
+    _status_optout(T) ? nothing : compute_property(o, Val(:__substatus__), name)
+# Non-type callee (`@include x = some_factory(…)`): nothing to ask, so behave as
+# before. Unreachable in practice — the `__parent__` kwarg injected alongside
+# already makes a plain factory a MethodError — but keep the fallback so that
+# error stays the one about `__parent__`, not a confusing one about this.
+_include_substatus(f, o, ::Val{name}) where {name} = compute_property(o, Val(:__substatus__), name)
 
 # ── Magic-property deprecations (2026-07-07, decision 2canrl) ──────────────
 # The data-side auto-properties were renamed to the dunder namespace and
@@ -356,6 +391,15 @@ _fail_substatus!(s::Treebars.ProgressNode, e) = Treebars.fail_progress!(s, e)
 # is the running annotation Treebars renders alongside.
 _report_disk_load!(s::Treebars.ProgressNode, cache_path, size_bytes) =
     Treebars.update_progress!(s, "from disk: " * _format_size(size_bytes))
+
+# `__status__` is a normal cache entry, so the LRU could evict it — and a
+# re-computed root would silently fork the tree: the web layer keeps rendering
+# the old node while new work attaches to the new one. `is_pinnable_value`'s
+# default walk already returns `true` here, but only because `StateProgress`
+# happens to hold a `ReentrantLock` (a `_is_handle_field_type`). That is an
+# accident of Treebars' internals, not a contract. State the requirement
+# directly so a change over there can't quietly re-enable eviction.
+is_pinnable_value(::Type{<:Treebars.ProgressNode}) = true
 
 # Format a byte count as "1.2 MB" / "850 KB" / "42 B" for human-readable
 # progress messages.
@@ -4092,6 +4136,10 @@ _kwarg_name(kw::Expr) = Meta.isexpr(kw, :kw) ? kw.args[1] : nothing
 _kwarg_name(_) = nothing
 
 function _inject_include_kwargs!(call_expr, prop_name)
+    # The callee, captured before `insert!` shifts the arg list. It is the same
+    # expression `_process_include_externals!` records as the nested type, so
+    # referencing it twice is a repeated global lookup, not a side effect.
+    callee = call_expr.args[1]
     params_idx = findfirst(a -> Meta.isexpr(a, :parameters), call_expr.args)
     if params_idx === nothing
         params = Expr(:parameters)
@@ -4107,8 +4155,12 @@ function _inject_include_kwargs!(call_expr, prop_name)
         name === :__status__ && (has_status = true)
     end
     has_parent || push!(params.args, Expr(:kw, :__parent__, :__self__))
+    # Routed through `_include_substatus` rather than straight to
+    # `compute_property(…, Val(:__substatus__), …)` so a child declaring
+    # `__status__ = nothing` gets `nothing` instead of having its opt-out
+    # overridden by this very kwarg. See `_status_optout`.
     has_status || push!(params.args, Expr(:kw, :__status__,
-        Expr(:call, compute_property, :__self__, :(Val(:__substatus__)), QuoteNode(prop_name))))
+        Expr(:call, _include_substatus, callee, :__self__, :(Val($(QuoteNode(prop_name)))))))
     call_expr
 end
 
@@ -4795,6 +4847,13 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     # `@mmap` properties → (name, eltype-annotation-expr-or-nothing) for the
     # `_disk_format`/`_disk_eltype` per-property override emission.
     mmap_names = sort!(collect(keys(mmap_eltypes)))
+    # A literal `__status__ = nothing` declaration is the progress opt-out. It
+    # reaches us as the *Symbol* `:nothing` — `nothing` is an ordinary
+    # identifier until lowering, so `info.rhs === :nothing`, never `=== nothing`
+    # (that would mean `isfixed`, i.e. a plain struct field). Any other RHS is a
+    # real status expression and must NOT set the flag.
+    status_optout = any(kv -> kv[1] === :__status__ && !isfixed(kv[2]) && kv[2].rhs === :nothing,
+                        oproperties)
     fixed_fields = [(name, info.lhs) for (name, info) in oproperties if isfixed(info)]
     fixed_names = [n for (n, _) in fixed_fields]
     fixed_lhs = [lhs for (_, lhs) in fixed_fields]
@@ -4888,6 +4947,10 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             $([:(
                 $DynamicObjects._analysis_nested_type(::Type{$type}, ::Val{$(QuoteNode(prop_name))}) = $gen_name
             ) for (prop_name, gen_name) in analysis_child_pairs]...)
+            # Only emitted for a literal `__status__ = nothing`; read by
+            # `_include_substatus` so `@include`ing this type honours the
+            # opt-out instead of overriding it with the parent's substatus.
+            $(status_optout ? :($DynamicObjects._status_optout(::Type{$type}) = true) : :())
             # Per-T `_type_description` override — delegates to a runtime
             # resolver that reads the user-attached docstring (if any). Lets
             # `@include`-emitted `_property_description` overrides bubble
@@ -5265,14 +5328,17 @@ ds.top("a"; n=2)        # ["apple", "banana"] — kwargs supported
 
 # Async progress with `__status__`
 
-Indexed properties spawn background `Task`s.
-Define `__status__` (root progress node) to automatically wire progress into
-spawned tasks. A default `__substatus__` is provided that creates child progress
-nodes (Treebars is a hard dependency):
+Indexed properties spawn background `Task`s, and progress is wired into them
+automatically: `__status__` defaults to a `Treebars.initialize_progress!(:state;
+description="")` root, and the default `__substatus__` hangs a child node under
+it per property compute. Declare `__status__` only to *label* the root (an empty
+description makes it a structural node that renders nothing and hoists its
+children), or set it to `nothing` to switch progress off for the struct and
+everything under it:
 
 ```julia
 @dynamicstruct struct MyApp
-    __status__ = initialize_progress!(:state; description="MyApp")
+    __status__ = initialize_progress!(:state; description="MyApp")  # optional: labels the root
     results(key) = expensive_computation(__status__)  # __status__ is the substatus
 end
 app = MyApp()
@@ -5288,8 +5354,13 @@ end
 object is stored in `ThreadsafeDict.status` (accessible via `getstatus`) and
 passed to the computation body as the local `__status__`.
 
-`__substatus__` only fires on ThreadsafeDict `getindex` (bracket access).
-Call syntax and scalar property access do not trigger it.
+`__substatus__` fires on every generated-property compute — indexed (`memoize!`)
+and bare scalar (`_bare_substatus_f`) alike. It is skipped for dunder properties
+(`__hash__`, `__status__`, …) and for fixed struct fields, which have no body.
+
+An undocumented property gets `description=""`, i.e. a structural node that
+renders nothing and hoists its children; add a docstring to make it a labelled
+row in the tree.
 """
 macro dynamicstruct(args...)
     isempty(args) && error("@dynamicstruct: missing struct definition.")
