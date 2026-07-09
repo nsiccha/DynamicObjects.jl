@@ -25,11 +25,26 @@ DynamicObjects.save(::Val{:mmap}, path::AbstractString, df::DataFrame) =
 # and the empty table is served as a valid cache hit. Validate the Arrow file
 # magic (b"ARROW1") and throw on mismatch — mirroring the raw mmap path's
 # `_mmap_read_header` DOMM check — so the stale file is rm'd and recomputed.
+const _ARROW_MAGIC = (0x41, 0x52, 0x52, 0x4f, 0x57, 0x31)  # b"ARROW1"
+
 function DynamicObjects.load(::Val{:mmap}, path::AbstractString, ::Type{DataFrame})
+    fsz = filesize(path)
+    fsz >= 2 * length(_ARROW_MAGIC) ||
+        error("@mmap DataFrame: $path is $fsz bytes — too short to be an Arrow file; throwing so DynamicObjects recomputes.")
     open(path, "r") do io
         magic = ntuple(_ -> eof(io) ? 0x00 : read(io, UInt8), 6)
-        magic == (0x41, 0x52, 0x52, 0x4f, 0x57, 0x31) ||  # b"ARROW1"
+        magic == _ARROW_MAGIC ||
             error("@mmap DataFrame: $path is not an Arrow file (bad magic $magic, expected b\"ARROW1\") — likely a stale cache in a different format; throwing so DynamicObjects recomputes.")
+        # An Arrow IPC file repeats the magic AFTER its footer, so a truncated file
+        # keeps the leading magic and loses the trailing one. `Arrow.Table` does NOT
+        # throw on that — it silently yields a 0-row table (measured), which the disk
+        # cache would then serve as a valid hit: empty draws, no warning. Arrow also
+        # mmaps and `unsafe_wrap`s buffers at offsets read from the (now missing)
+        # footer, which is a fault waiting to happen. Reject before parsing.
+        seek(io, fsz - length(_ARROW_MAGIC))
+        tail = ntuple(_ -> read(io, UInt8), 6)
+        tail == _ARROW_MAGIC ||
+            error("@mmap DataFrame: $path is truncated — missing the trailing b\"ARROW1\" magic (found $tail). A partial cache file (e.g. the disk filled mid-write); it will be deleted and recomputed.")
     end
     DataFrame(Arrow.Table(path); copycols=false)
 end

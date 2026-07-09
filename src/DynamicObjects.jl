@@ -116,6 +116,9 @@ end
 const _MMAP_MAGIC = (UInt8('D'), UInt8('O'), UInt8('M'), UInt8('M'))
 const _MMAP_VERSION = UInt8(2)
 const _MMAP_ALIGN = 16
+# Upper bound on the `ndims` byte accepted from a header. Guards a single corrupt
+# byte turning into a 255-element `dims` read and a nonsense payload length.
+const _MMAP_MAXDIMS = 32
 # Stable integer tags (1-based index) for the isbits numeric eltypes the
 # self-describing (un-annotated) load path supports. Append-only — never
 # reorder, or existing files mis-decode. The annotated path uses the `::T`
@@ -162,32 +165,70 @@ function _mmap_read_header(io::IO)
     ver == _MMAP_VERSION || error("@mmap: file version $ver ≠ current v$(_MMAP_VERSION) — delete the cached file and re-run.")
     tag = read(io, UInt8)
     nd = Int(read(io, UInt8))
+    0 <= nd <= _MMAP_MAXDIMS || error("@mmap: header ndims $nd outside 0:$_MMAP_MAXDIMS — corrupt header.")
     dims = [Int(read(io, Int64)) for _ in 1:nd]
+    all(>=(0), dims) || error("@mmap: header dims $dims contain a negative extent — corrupt header.")
     offset = position(io) + mod(-position(io), _MMAP_ALIGN)
     (tag, nd, dims, offset)
+end
+
+# Payload byte count named by the header, overflow-checked: a corrupt `dims` must
+# not wrap into a small `len` that then passes the truncation check below.
+function _mmap_payload_bytes(::Type{ET}, dims::Vector{Int}, path) where {ET}
+    n = 1
+    for d in dims
+        n, ovf = Base.Checked.mul_with_overflow(n, d)
+        ovf && error("@mmap: element count overflows for dims $dims in $path — corrupt header.")
+    end
+    len, ovf = Base.Checked.mul_with_overflow(n, sizeof(ET))
+    ovf && error("@mmap: payload size overflows for dims $dims of $ET in $path — corrupt header.")
+    len
+end
+
+# `Mmap.mmap` maps BEYOND EOF. A file whose header is intact but whose payload is
+# short (the disk filled mid-write, an external truncation, a writer that died)
+# maps cleanly, and then touching a page past EOF raises SIGBUS — a signal, not an
+# exception. The disk-cache `catch`-and-recompute below never runs and the process
+# dies. So prove the payload is fully present BEFORE mapping: a short file becomes
+# a catchable error that the cache layer heals by `rm` + recompute.
+#
+# Julia's `Mmap.mmap` happens to reject this too (it tries to grow the file and a
+# read-only stream throws), but that is incidental — it depends on the stream's
+# permissions, not on the payload actually being there. Check it ourselves.
+function _mmap_check_complete(io::IO, path, offset::Int, len::Int)
+    fsz = filesize(io)
+    need = offset + len
+    fsz >= need && return nothing
+    error("@mmap: $path is truncated — need $need bytes (header offset $offset + payload $len) but the file holds $fsz. A partial cache file; it will be deleted and recomputed.")
 end
 
 # Annotated fast path: the property's `::T` array type is known → type-stable.
 function load(::Val{:mmap}, path::AbstractString, ::Type{A}) where {A<:AbstractArray}
     ET = eltype(A); N = ndims(A)
     io = open(path, "r")
-    tag, nd, dims, offset = _mmap_read_header(io)
-    nd == N || (close(io); error("@mmap: header ndims $nd ≠ annotated ndims $N for $path."))
-    _mmap_eltype_of(tag) === ET || (close(io); error("@mmap: header eltype $(_mmap_eltype_of(tag)) ≠ annotated eltype $ET for $path."))
-    arr = Mmap.mmap(io, Array{ET,N}, NTuple{N,Int}(dims), offset)
-    close(io)   # mapping survives the fd close
-    arr
+    try
+        tag, nd, dims, offset = _mmap_read_header(io)
+        nd == N || error("@mmap: header ndims $nd ≠ annotated ndims $N for $path.")
+        _mmap_eltype_of(tag) === ET || error("@mmap: header eltype $(_mmap_eltype_of(tag)) ≠ annotated eltype $ET for $path.")
+        _mmap_check_complete(io, path, offset, _mmap_payload_bytes(ET, dims, path))
+        Mmap.mmap(io, Array{ET,N}, NTuple{N,Int}(dims), offset)
+    finally
+        close(io)   # mapping survives the fd close
+    end
 end
 
 # Self-describing cold path: no annotation → eltype + ndims come from the
 # header (type-unstable return, accepted per D2-v2).
 function load(::Val{:mmap}, path::AbstractString, ::Nothing)
     io = open(path, "r")
-    tag, nd, dims, offset = _mmap_read_header(io)
-    ET = _mmap_eltype_of(tag)
-    arr = Mmap.mmap(io, Array{ET,nd}, NTuple{nd,Int}(dims), offset)
-    close(io)
-    arr
+    try
+        tag, nd, dims, offset = _mmap_read_header(io)
+        ET = _mmap_eltype_of(tag)
+        _mmap_check_complete(io, path, offset, _mmap_payload_bytes(ET, dims, path))
+        Mmap.mmap(io, Array{ET,nd}, NTuple{nd,Int}(dims), offset)
+    finally
+        close(io)
+    end
 end
 
 # Per-property disk-format / eltype-hint slots. `@dynamicstruct` emits an
