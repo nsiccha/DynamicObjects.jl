@@ -1423,6 +1423,9 @@ fetchproperty(fetch, o, name::Symbol) = begin
     if !(hasfield(typeof(o), :cache) && getfield(o, :cache) isa PropertyCache)
         return fetch(getproperty(o, name), nothing)
     end
+    if hasfield(typeof(o), name)
+        return fetch(getfield(o, name), nothing)
+    end
     pc = getfield(o, :cache)
     c = pc.cache
     if !(c isa AbstractThreadsafeDict) || is_indexed_property(o, name)
@@ -2377,6 +2380,12 @@ end
 # call (everything else).
 _call_rewrite(x, target::Symbol) = x
 function _call_rewrite(x::Expr, target::Symbol)
+    if Meta.isexpr(x, :do) && length(x.args) == 2 && Meta.isexpr(x.args[1], :call)
+        call = x.args[1]
+        lambda = _call_rewrite(x.args[2], target)
+        rewritten = Any[_call_rewrite(a, target) for a in call.args]
+        return fixcall(Expr(:call, GlobalRef(@__MODULE__, target), rewritten[1], lambda, rewritten[2:end]...))
+    end
     if Meta.isexpr(x, :call) && length(x.args) >= 1
         rewritten = Any[_call_rewrite(a, target) for a in x.args]
         return fixcall(Expr(:call, GlobalRef(@__MODULE__, target), rewritten...))
@@ -2438,6 +2447,12 @@ end
 
 _fetch_rewrite(pv::Symbol, x) = x
 function _fetch_rewrite(pv::Symbol, x::Expr)
+    if Meta.isexpr(x, :do) && length(x.args) == 2 && Meta.isexpr(x.args[1], :call)
+        call = x.args[1]
+        lambda = _fetch_rewrite(pv, x.args[2])
+        rewritten = Any[_fetch_rewrite(pv, a) for a in call.args]
+        return fixcall(Expr(:call, GlobalRef(@__MODULE__, :maybefetchindex!), pv, rewritten[1], lambda, rewritten[2:end]...))
+    end
     if Meta.isexpr(x, :call) && length(x.args) >= 1
         rewritten = Any[_fetch_rewrite(pv, a) for a in x.args]
         return fixcall(Expr(:call, GlobalRef(@__MODULE__, :maybefetchindex!), pv, rewritten...))
@@ -2550,6 +2565,15 @@ _is_self_access(x) = Meta.isexpr(x, :.) && length(x.args) == 2 &&
 # dangling-`__progress__` footgun that killed the 1-arg `@fetch!`.
 _progress_self_rewrite(x) = x
 function _progress_self_rewrite(x::Expr)
+    # do-block with self-IP callee: desugar so the lambda lands after progress+callee
+    if Meta.isexpr(x, :do) && length(x.args) == 2 && Meta.isexpr(x.args[1], :call) &&
+       length(x.args[1].args) >= 1 && _is_self_access(x.args[1].args[1])
+        call = x.args[1]
+        lambda = _progress_self_rewrite(x.args[2])
+        rest = Any[_progress_self_rewrite(a) for a in call.args[2:end]]
+        return fixcall(Expr(:call, GlobalRef(@__MODULE__, :maybefetchindex!),
+            :__progress__, call.args[1], lambda, rest...))
+    end
     # self-IP call `__self__.g(args…)` → `maybefetchindex!(__progress__, __self__.g, args…)`.
     # Keep the `__self__.g` callee literal; recurse into the args.
     if Meta.isexpr(x, :call) && length(x.args) >= 1 && _is_self_access(x.args[1])
@@ -2680,6 +2704,12 @@ end
 # do the right thing at runtime.
 _progress_rewrite(progress_var::Symbol, x) = x
 function _progress_rewrite(progress_var::Symbol, x::Expr)
+    if Meta.isexpr(x, :do) && length(x.args) == 2 && Meta.isexpr(x.args[1], :call)
+        call = x.args[1]
+        lambda = _progress_rewrite(progress_var, x.args[2])
+        rewritten = Any[_progress_rewrite(progress_var, a) for a in call.args]
+        return fixcall(Expr(:call, GlobalRef(@__MODULE__, :maybeprogress!), progress_var, rewritten[1], lambda, rewritten[2:end]...))
+    end
     if Meta.isexpr(x, :call) && length(x.args) >= 1
         rewritten = Any[_progress_rewrite(progress_var, a) for a in x.args]
         return fixcall(Expr(:call, GlobalRef(@__MODULE__, :maybeprogress!), progress_var, rewritten...))
