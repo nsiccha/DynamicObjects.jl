@@ -1001,6 +1001,18 @@ end
     @include kid = StatusChildQuiet(1; __status__ = nothing)
 end
 
+# The same opt-out written WITHOUT the semicolon. Julia parses `Child(k = v)` as
+# an `Expr(:kw, …)` among the POSITIONAL args, not into the `:parameters` block,
+# so `_inject_include_kwargs!` used to miss it, inject a second `__status__`, and
+# die at expansion with `keyword argument "__status__" repeated`.
+@dynamicstruct struct StatusParentSilencedNoSemi
+    @include kid = StatusChildQuiet(1, __status__ = nothing)
+end
+
+@dynamicstruct struct StatusParentParentNoSemi
+    @include kid = StatusChildQuiet(1, __parent__ = __self__)
+end
+
 _status_body_seen = Ref{Any}(:unset)
 @dynamicstruct struct StatusBodySees
     x::Int
@@ -1046,6 +1058,78 @@ end
 @testset "progress status include point of use optout" begin
     # The documented escape hatch: `has_status` at the call site suppresses injection.
     @test StatusParentSilenced().kid.__status__ === nothing
+end
+
+@testset "progress status include optout without a semicolon" begin
+    # Both spellings of the escape hatch must silence the subtree. The
+    # no-semicolon one is the spelling a user reaches for by mistake, and it used
+    # to fail at macro expansion rather than opt out.
+    @test StatusParentSilencedNoSemi().kid.__status__ === nothing
+    @test StatusParentSilencedNoSemi().kid.y == 2      # child still computes
+end
+
+@testset "progress status include explicit parent without a semicolon" begin
+    # `__parent__` had the identical hole. Supplying it before the semicolon must
+    # be honoured (not injected a second time), while `__status__` — which the
+    # call site did NOT supply — is still injected, so progress stays on.
+    p = StatusParentParentNoSemi()
+    @test p.kid.__parent__ === p
+    @test p.kid.__status__ isa _TBProgressNode
+end
+
+# Every kwarg name the finished call carries, in both places Julia may park one.
+# Deliberately independent of `_kwarg_name` / `_positional_kwarg_name` (the
+# functions under test) — the invariant is what LOWERING sees: each of
+# `__parent__` / `__status__` present exactly once.
+function _include_kw_names(e::Expr)
+    names = Symbol[]
+    for a in e.args
+        if Meta.isexpr(a, :parameters)
+            for kw in a.args
+                kw isa Symbol && (push!(names, kw); continue)          # `f(; x)` shorthand
+                Meta.isexpr(kw, :kw) && push!(names, kw.args[1])
+            end
+        elseif Meta.isexpr(a, :kw)
+            push!(names, a.args[1])
+        end
+    end
+    names
+end
+
+@testset "include kwarg injection is spelling agnostic" begin
+    # `Child(; x)` is the `x = x` shorthand and DOES supply the kwarg; `Child(x)`
+    # passes the variable positionally and does NOT. That asymmetry is exactly
+    # why the positional scan may only accept `Expr(:kw, …)`.
+    for src in ("Child()",
+                "Child(1)",
+                "Child(; __status__ = nothing)",           # after the semicolon
+                "Child(__status__ = nothing)",             # before it
+                "Child(1, __status__ = nothing)",          # after a positional value
+                "Child(; __parent__ = p)",
+                "Child(__parent__ = p)",
+                "Child(__parent__ = p, __status__ = nothing)",
+                "Child(; __status__)",                     # shorthand supplies it
+                "Child(__status__)",                       # a positional VALUE — does not
+                "Child(f(__status__ = 1))")                # nested call — not our kwarg
+        e = DynamicObjects._inject_include_kwargs!(Meta.parse(src), :kid)
+        ns = _include_kw_names(e)
+        @test count(==(:__status__), ns) == 1
+        @test count(==(:__parent__), ns) == 1
+        # The reported symptom was a LOWERING error, so assert against lowering.
+        @test !Meta.isexpr(Meta.lower(@__MODULE__, e), :error)
+    end
+end
+
+@testset "include kwarg injection preserves the call site" begin
+    e = DynamicObjects._inject_include_kwargs!(Meta.parse("Child(1, __status__ = nothing)"), :kid)
+    @test e.args[1] === :Child                       # callee untouched
+    @test 1 in e.args                                # positional value survives
+    # The call site's own `__status__` is kept where it was written, not moved.
+    # (`a.args[2]` is the AST node `:nothing`, not the value `nothing`.)
+    @test any(a -> Meta.isexpr(a, :kw) && a.args[1] === :__status__ && a.args[2] === :nothing, e.args)
+    # …and only `__parent__` was injected, into the `:parameters` block.
+    params = e.args[findfirst(a -> Meta.isexpr(a, :parameters), e.args)]
+    @test _include_kw_names(params) == [:__parent__]
 end
 
 @testset "progress substatus reaches property body" begin
