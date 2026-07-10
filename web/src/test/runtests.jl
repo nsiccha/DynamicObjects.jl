@@ -1199,7 +1199,9 @@ struct MmapHalfDone; a::Vector{Float64}; end
 DynamicObjects.save(::Val{:mmap}, path::AbstractString, x::MmapHalfDone) =
     (open(io -> write(io, x.a), path, "w"); x)
 
-# An `AbstractArray` *wrapper*: accepted, but round-trips to a bare `Array`.
+# An `AbstractArray` *wrapper*. `@mmap` would densify it on save and load it back
+# as a bare `Array`, so a `::MmapWrapArr{…}` annotation is REJECTED where the
+# struct is defined (D7) rather than silently violated on every read.
 struct MmapWrapArr{T,N} <: AbstractArray{T,N}; a::Array{T,N}; end
 Base.size(m::MmapWrapArr) = size(m.a)
 Base.getindex(m::MmapWrapArr, i...) = m.a[i...]
@@ -1211,7 +1213,9 @@ _mmap_base = Ref("")
     @mmap annotated::Matrix{Float64} = [1.0 2.0; 3.0 4.0]
     @mmap unannotated               = [5.0, 6.0, 7.0]
     @mmap tbl::DataFrame            = DataFrame(:a => [1.0, 2.0])
-    @mmap wrapper::MmapWrapArr{Float64,2} = MmapWrapArr([8.0 9.0; 10.0 11.0])
+    # An abstract supertype is fine: a bare `Matrix` IS an `AbstractMatrix`, so
+    # nothing is violated. Only a CONCRETE wrapper annotation is rejected.
+    @mmap absmat::AbstractMatrix{Float64} = [8.0 9.0; 10.0 11.0]
     @mmap opaque::MmapOpaque        = MmapOpaque([1.0 2.0; 3.0 4.0])
     # Same value, NO annotation: the gate is the runtime value, so this must fail
     # identically. This is the piece's central claim.
@@ -1240,11 +1244,26 @@ end
     @test o.tbl isa DataFrame
     @test o.tbl.a == [1.0, 2.0]
 
-    # An AbstractArray wrapper is densified on save and comes back a bare Array —
-    # the `::MmapWrapArr` annotation does NOT survive the round trip.
-    @test o.wrapper isa Matrix{Float64}
-    @test !(o.wrapper isa MmapWrapArr)
-    @test o.wrapper == [8.0 9.0; 10.0 11.0]
+    # A concrete AbstractArray WRAPPER annotation is rejected where the struct is
+    # defined (D7): `@mmap` densifies on save and always loads a bare `Array`, so
+    # `::MmapWrapArr{Float64,2}` could only ever be a lie. Previously this
+    # round-tripped silently to a `Matrix{Float64}`.
+    wrapper_err = try
+        @eval @dynamicstruct struct MmapBadWrapper
+            @mmap w::MmapWrapArr{Float64,2} = MmapWrapArr([8.0 9.0; 10.0 11.0])
+        end
+        nothing
+    catch e
+        e
+    end
+    @test wrapper_err !== nothing
+    wrapper_msg = sprint(showerror, wrapper_err)
+    @test occursin("MmapWrapArr", wrapper_msg)
+    @test occursin("Array{Float64,2}", wrapper_msg)   # names the annotation to use
+
+    # ...but an abstract supertype annotation still works: a `Matrix` satisfies it.
+    @test o.absmat isa Matrix{Float64}
+    @test o.absmat == [8.0 9.0; 10.0 11.0]
 
     # A non-AbstractArray, non-claimed payload is rejected at save, and the error
     # names the wrap-on-read escape hatch.

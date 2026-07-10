@@ -244,6 +244,44 @@ load(::Val{:mmap}, path::AbstractString, ::Type{T}) where {T} = error("""
         DynamicObjects.load(::Val{:mmap}, ::AbstractString, ::Type{$T})
     Or drop the annotation and `@mmap` the dense backing array instead.""")
 
+# `@mmap p::T` — reject an annotation `@mmap` cannot honour (D7).
+#
+# `save` densifies via `Array(x)` and the annotated `load` consumes `T` for its
+# `eltype` and `ndims` only, then always returns a bare `Array{ET,N}`. So a
+# concrete wrapper annotation (`MyArray{Float64,2}`, a `SubArray` type, …) is a
+# promise DO cannot keep: the property is *declared* one type and *delivers*
+# another, with nothing warning. That is `dev` §1's silent-swallow class, so
+# refuse the declaration instead of quietly rewriting its meaning.
+#
+# The predicate is exactly "can the value DO returns satisfy the annotation?" —
+# `Array{eltype(T),ndims(T)} <: T`. It admits `Matrix{Float64}` (which *is*
+# `Array{Float64,2}`) and an abstract supertype like `AbstractMatrix{Float64}`
+# (a `Matrix` is one, so nothing is violated), and rejects wrappers.
+#
+# Only CONCRETE annotations make a promise that can be broken; a non-concrete one
+# (`AbstractArray`, `Array{Float64}`) pins no shape. Non-`AbstractArray`
+# annotations belong to an extension (`DataFrame`) and are not checked here — an
+# unclaimed one still fails loudly at `save`/`load` above.
+#
+# Emitted by `@dynamicstruct` as a top-level call, so it fires when the struct is
+# DEFINED — before any property computes. (Not literally at macro-expansion: the
+# annotation is an expression there, and the type it names may not exist yet.)
+_check_mmap_annotation(type::Symbol, name::Symbol, ::Type{T}) where {T} = begin
+    (T <: AbstractArray && isconcretetype(T)) || return nothing
+    ET, N = eltype(T), ndims(T)
+    Array{ET,N} <: T && return nothing
+    error("""
+        @mmap $type.$name::$T — `@mmap` cannot deliver this type.
+        A memory-mapped property always loads back as a bare `Array{$ET,$N}`: `save`
+        densifies the value via `Array(x)`, and the annotation supplies only eltype
+        and ndims. Declaring `::$T` would be silently violated on every read.
+        Annotate the dense array, and rebuild the wrapper in a plain sibling:
+            @mmap raw::Array{$ET,$N} = <compute>
+            $name = $(nameof(T))(raw, <labels>)""")
+end
+# A non-`AbstractArray` annotation, or anything that is not a type at all.
+_check_mmap_annotation(::Symbol, ::Symbol, ::Any) = nothing
+
 # Self-describing cold path for DO's own `DOMM` container: no annotation →
 # eltype + ndims come from the header (type-unstable return, accepted per
 # D2-v2).
@@ -4399,6 +4437,9 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             $([:(
                 $DynamicObjects._disk_eltype(::$type, ::Val{$(QuoteNode(name))}) = $(something(mmap_eltypes[name], :nothing))
             ) for name in mmap_names]...)
+            $([:(
+                $DynamicObjects._check_mmap_annotation($(QuoteNode(type)), $(QuoteNode(name)), $(mmap_eltypes[name]))
+            ) for name in mmap_names if !isnothing(mmap_eltypes[name])]...)
             $([:(
                 $DynamicObjects._nested_struct_type(::Type{$type}, ::Val{$(QuoteNode(prop_name))}) = $gen_name
             ) for (prop_name, gen_name) in inline_child_pairs]...)
