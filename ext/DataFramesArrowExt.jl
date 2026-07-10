@@ -27,6 +27,14 @@ DynamicObjects.save(::Val{:mmap}, path::AbstractString, df::DataFrame) =
 # `_mmap_read_header` DOMM check — so the stale file is rm'd and recomputed.
 const _ARROW_MAGIC = (0x41, 0x52, 0x52, 0x4f, 0x57, 0x31)  # b"ARROW1"
 
+# `@mmap df = …` with NO `::DataFrame` annotation: the disk path calls
+# `load(Val(:mmap), path, nothing)`, which sniffs the file's leading magic and
+# routes here instead of into DO's own `DOMM` array container. Registered from
+# `__init__` because a top-level `push!` into DynamicObjects' registry would run
+# at precompile time and not survive into the loading process.
+__init__() = DynamicObjects.register_mmap_container!(collect(UInt8, _ARROW_MAGIC),
+    path -> DynamicObjects.load(Val(:mmap), path, DataFrame))
+
 function DynamicObjects.load(::Val{:mmap}, path::AbstractString, ::Type{DataFrame})
     fsz = filesize(path)
     fsz >= 2 * length(_ARROW_MAGIC) ||

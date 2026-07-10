@@ -217,9 +217,10 @@ function load(::Val{:mmap}, path::AbstractString, ::Type{A}) where {A<:AbstractA
     end
 end
 
-# Self-describing cold path: no annotation → eltype + ndims come from the
-# header (type-unstable return, accepted per D2-v2).
-function load(::Val{:mmap}, path::AbstractString, ::Nothing)
+# Self-describing cold path for DO's own `DOMM` container: no annotation →
+# eltype + ndims come from the header (type-unstable return, accepted per
+# D2-v2).
+function _mmap_load_domm(path::AbstractString)
     io = open(path, "r")
     try
         tag, nd, dims, offset = _mmap_read_header(io)
@@ -229,6 +230,56 @@ function load(::Val{:mmap}, path::AbstractString, ::Nothing)
     finally
         close(io)
     end
+end
+
+# --- `@mmap` container registry (annotation-optional loads) ---
+#
+# With a `::T` annotation the load routes on the type. Without one the third
+# argument is `nothing` and the FILE has to say what it holds: DO's own `DOMM`
+# array container, or a foreign one an extension owns (`ARROW1`, for the
+# `DataFrame` path in `DataFramesArrowExt`). So the un-annotated load sniffs the
+# leading magic bytes and routes on them — which is what makes `@mmap df = …`
+# work without `::DataFrame`.
+#
+# The registry holds only the FOREIGN containers. `DOMM` is built in and is also
+# the fallback, so a file nothing claims still hits `_mmap_read_header`'s
+# bad-magic error, which the disk cache heals by `rm` + recompute.
+#
+# Extensions register from their `__init__` — a `push!` at module top level runs
+# during precompilation and would not survive into the loading process:
+#
+#     DynamicObjects.register_mmap_container!(collect(UInt8, b"ARROW1"),
+#         path -> DynamicObjects.load(Val(:mmap), path, DataFrame))
+#
+# Registration is idempotent per magic (re-registering replaces the loader), so
+# a re-run `__init__` cannot grow the table.
+const _MMAP_CONTAINERS = Vector{Tuple{Vector{UInt8},Any}}()
+
+_has_prefix(head::AbstractVector{UInt8}, magic) =
+    length(head) >= length(magic) && all(i -> head[i] === UInt8(magic[i]), eachindex(magic))
+
+function register_mmap_container!(magic::AbstractVector{UInt8}, loader)
+    m = collect(UInt8, magic)
+    isempty(m) && error("register_mmap_container!: magic must be non-empty.")
+    _has_prefix(m, _MMAP_MAGIC) &&
+        error("register_mmap_container!: magic $m starts with DynamicObjects' own DOMM magic — a container that shadows the built-in array format can never be reached.")
+    i = findfirst(e -> first(e) == m, _MMAP_CONTAINERS)
+    isnothing(i) ? push!(_MMAP_CONTAINERS, (m, loader)) : (_MMAP_CONTAINERS[i] = (m, loader))
+    nothing
+end
+
+# Leading bytes needed to tell the containers apart.
+_mmap_sniff_length() =
+    max(length(_MMAP_MAGIC), maximum(length(first(e)) for e in _MMAP_CONTAINERS; init=0))
+
+function load(::Val{:mmap}, path::AbstractString, ::Nothing)
+    head = open(io -> read(io, _mmap_sniff_length()), path, "r")
+    if !_has_prefix(head, _MMAP_MAGIC)
+        for (magic, loader) in _MMAP_CONTAINERS
+            _has_prefix(head, magic) && return loader(path)
+        end
+    end
+    _mmap_load_domm(path)
 end
 
 # Per-property disk-format / eltype-hint slots. `@dynamicstruct` emits an
