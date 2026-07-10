@@ -109,10 +109,7 @@ end
 # `load` reads the header, then `Mmap.mmap`s the payload READONLY at the header
 # offset — Julia page-aligns the mapping internally, so any header size works.
 # The mapping is opened from a read-only stream, so the returned bare
-# `Array{T,N}` is backed by a PROT_READ region: mutations fault (D3). Because
-# the value is a bare `Array` with no inspectable handle field, the LRU layer
-# cannot detect the mmap backing from the value alone — the `@mmap` `meta`
-# marker is the reliable pin signal (D5).
+# `Array{T,N}` is backed by a PROT_READ region: mutations fault (D3).
 const _MMAP_MAGIC = (UInt8('D'), UInt8('O'), UInt8('M'), UInt8('M'))
 const _MMAP_VERSION = UInt8(2)
 const _MMAP_ALIGN = 16

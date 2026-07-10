@@ -14,7 +14,7 @@ using DynamicObjects, Arrow, DataFrames
 # `copycols=false` keeps the columns as Arrow's memory-mapped, read-only
 # vectors (mutation faults with ReadOnlyMemoryError) — the same PROT_READ
 # contract as the array `@mmap` path. The columns live in the OS page cache,
-# so `_is_mmap_slot`'s LRU zero-bill is correct for them.
+# not the GC heap.
 DynamicObjects.save(::Val{:mmap}, path::AbstractString, df::DataFrame) =
     Arrow.write(path, df)
 
