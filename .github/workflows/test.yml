@@ -3,7 +3,9 @@ on:
   push:
     branches: [master, main, dev]
   pull_request:
-    types: [opened, edited]
+    # `edited` fires on title/body edits, NOT on new commits — pushing a fix to
+    # a PR must re-run the suite, which is what `synchronize` reports.
+    types: [opened, synchronize, reopened]
 permissions:
   actions: write
   contents: read
