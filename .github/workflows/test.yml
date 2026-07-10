@@ -11,6 +11,7 @@ jobs:
   test:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         julia-version: ['1', 'pre']
         julia-arch: [x64]
@@ -27,4 +28,14 @@ jobs:
           version: ${{ matrix.julia-version }}
           arch: ${{ matrix.julia-arch }}
       - uses: julia-actions/cache@v2
-      - uses: julia-actions/julia-runtest@v1
+      # `Pkg.test`/`julia-actions/julia-runtest` is broken here: on Julia 1.10
+      # it re-resolves the test sandbox and dies on the git-`[sources]` deps
+      # (`can not merge projects`). run_tests.jl develops the LOCAL checkouts
+      # instead, so clone them into the workspace — it finds them as
+      # subdirectories (see `local_checkout` in run_tests.jl).
+      - name: Clone unregistered git-[sources] deps
+        run: |
+          git clone https://github.com/nsiccha/TestModules.jl.git
+          git clone https://github.com/nsiccha/Treebars.jl.git
+      - name: Run tests
+        run: julia --color=yes run_tests.jl
