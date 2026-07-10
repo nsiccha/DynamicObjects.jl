@@ -969,3 +969,141 @@ end
     end
     @test perr isa PropertyComputationError
 end
+
+# ── `__status__` defaults IN (decision 2f84ap; commits 96c63be → 15357f1) ──
+# `compute_property(o, ::Val{:__status__})` returns a `description=""` :state root
+# instead of `nothing`, so every DO gets a progress tree without boilerplate.
+# Two invariants make that flip safe, and both are load-bearing:
+#   * a fresh per-instance root must NOT leak into `__hash__` (else every disk
+#     cache lookup misses), and
+#   * the root must NOT be LRU-evictable (a re-computed root forks the tree: the
+#     web layer keeps rendering the old node while new work attaches to the new).
+# `__status__ = nothing` is an ordinary overrideable default — `@include` mounts a
+# child under the parent by overriding it, and the point-of-use kwarg opts out.
+const _TBProgressNode = DynamicObjects.Treebars.ProgressNode
+
+@dynamicstruct struct StatusPlain
+    x::Int
+    y = 2x
+end
+
+@dynamicstruct struct StatusChildQuiet
+    __status__ = nothing
+    x::Int
+    y = 2x
+end
+
+@dynamicstruct struct StatusParentDefault
+    @include kid = StatusChildQuiet(1)
+end
+
+@dynamicstruct struct StatusParentSilenced
+    @include kid = StatusChildQuiet(1; __status__ = nothing)
+end
+
+_status_body_seen = Ref{Any}(:unset)
+@dynamicstruct struct StatusBodySees
+    x::Int
+    y = (_status_body_seen[] = __status__; 2x)
+end
+
+@dynamicstruct struct StatusBudgeted
+    n::Int
+    big1 = randn(20_000)   # ~160 KB each
+    big2 = randn(20_000)
+    big3 = randn(20_000)
+end
+
+@testset "progress status defaults to a state root" begin
+    o = StatusPlain(3)
+    @test o.__status__ isa _TBProgressNode
+    @test o.__status__ === o.__status__          # cached: one root per instance
+    @test o.y == 6
+    @test StatusPlain(3).__status__ !== o.__status__  # distinct instances, distinct roots
+end
+
+@testset "progress status constructor kwarg overrides default" begin
+    o = StatusPlain(3; __status__ = nothing)
+    @test o.__status__ === nothing
+    @test o.y == 6                               # compute still works with progress off
+end
+
+@testset "progress status standalone nothing default" begin
+    o = StatusChildQuiet(1)
+    @test o.__status__ === nothing
+    @test o.y == 2
+end
+
+@testset "progress status include overrides child default" begin
+    # `@include` injects `__status__ = <parent substatus>` as a constructor kwarg,
+    # which beats the child's declared `__status__ = nothing`. That override is the
+    # point of @include — it is what mounts the child under the parent's tree.
+    p = StatusParentDefault()
+    @test p.kid.__status__ isa _TBProgressNode
+    @test p.kid.__status__.parent === p.__status__
+end
+
+@testset "progress status include point of use optout" begin
+    # The documented escape hatch: `has_status` at the call site suppresses injection.
+    @test StatusParentSilenced().kid.__status__ === nothing
+end
+
+@testset "progress substatus reaches property body" begin
+    _status_body_seen[] = :unset
+    o = StatusBodySees(3)
+    root = o.__status__
+    @test o.y == 6
+    @test _status_body_seen[] isa _TBProgressNode
+    @test _status_body_seen[] !== root           # body gets a child, not the root
+    @test _status_body_seen[].parent === root
+
+    _status_body_seen[] = :unset
+    o2 = StatusBodySees(3; __status__ = nothing)
+    @test o2.y == 6
+    @test _status_body_seen[] === nothing        # opted out ⇒ body sees nothing
+
+    # Dunder reads take the `_bare_substatus_f` early-out: no substatus, no recursion
+    # (`o.__status__` would otherwise re-enter `__substatus__` → `o.__status__`).
+    _status_body_seen[] = :unset
+    @test o.__hash__ isa AbstractString
+    @test _status_body_seen[] === :unset
+end
+
+@testset "progress status does not perturb cache key" begin
+    # `__hash_fields__` walks struct FIELDS; `__status__` is a PropertyCache entry,
+    # so per-instance roots must not reach the hash — otherwise the disk cache for a
+    # given input would miss on every fresh object.
+    a, b = StatusPlain(3), StatusPlain(3)
+    @test a.__status__ !== b.__status__
+    @test a.__hash__ == b.__hash__
+    @test a.__cache_path__ == b.__cache_path__
+    @test StatusPlain(3; __status__ = nothing).__hash__ == a.__hash__
+    @test StatusPlain(4).__hash__ != a.__hash__
+end
+
+@testset "progress status root pinned against eviction" begin
+    @test is_pinnable_value(_TBProgressNode)
+    # The budget must be set BEFORE the store: `_record_pc_store!` skips all LRU
+    # bookkeeping unless `_any_budget_in_chain` already holds.
+    o = StatusBudgeted(1)
+    set_cache_budget!(o, 200_000)
+    root = o.__status__
+    pc = getfield(o, :cache)
+    @test (:__status__, ()) in pc.pinned
+    o.big1; o.big2; o.big3                       # ~480 KB into a 200 KB budget
+    @test last_evicted(o) !== nothing            # eviction really ran …
+    @test (:__status__, ()) in pc.pinned         # … and skipped the pinned root
+    @test o.__status__ === root                  # tree not forked
+end
+
+@testset "progress status optout survives eviction" begin
+    # A seeded `nothing` is not pinnable, so it must stay out of the LRU entirely —
+    # else evicting it would recompute the DO-level fallback and silently hand an
+    # opted-out object a brand-new root.
+    o = StatusBudgeted(1; __status__ = nothing)
+    set_cache_budget!(o, 200_000)
+    @test o.__status__ === nothing
+    o.big1; o.big2; o.big3
+    @test last_evicted(o) !== nothing
+    @test o.__status__ === nothing
+end
