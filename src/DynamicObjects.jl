@@ -228,6 +228,22 @@ function load(::Val{:mmap}, path::AbstractString, ::Type{A}) where {A<:AbstractA
     end
 end
 
+# Mirror of the `save` fallback above, and the exact wall that message walks you
+# into: it says "define `save` … + the matching `load`", and if you define only
+# the first half the generic `load(::Val, …, ::Any)` answers with `no `load`
+# method for format Val{:mmap}()` — naming neither the type, nor the file, nor
+# the remedy. Reached whenever a `@mmap` property's `::T` annotation names a type
+# no `load` method claims.
+load(::Val{:mmap}, path::AbstractString, ::Type{T}) where {T} = error("""
+    @mmap: no `load` method for the annotated type $T (reading $path).
+    `$T` is neither an `AbstractArray` nor a type an extension claims. If it should \
+    be the latter, load that extension first (`DataFrame` needs `using Arrow, DataFrames`).
+    Otherwise define BOTH halves of the format — a `save` without its `load` writes a \
+    file nothing can read back:
+        DynamicObjects.save(::Val{:mmap}, ::AbstractString, ::$T)
+        DynamicObjects.load(::Val{:mmap}, ::AbstractString, ::Type{$T})
+    Or drop the annotation and `@mmap` the dense backing array instead.""")
+
 # Self-describing cold path for DO's own `DOMM` container: no annotation →
 # eltype + ndims come from the header (type-unstable return, accepted per
 # D2-v2).

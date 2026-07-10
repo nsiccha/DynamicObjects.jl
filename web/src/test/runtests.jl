@@ -1193,6 +1193,12 @@ end
 # Stands in for `TreeData`: deliberately NOT an `AbstractArray` subtype.
 struct MmapOpaque; a::Matrix{Float64}; end
 
+# A type whose owner defined `save` but forgot `load` — the trap the save-side
+# error message walks you into ("define save … + the matching load").
+struct MmapHalfDone; a::Vector{Float64}; end
+DynamicObjects.save(::Val{:mmap}, path::AbstractString, x::MmapHalfDone) =
+    (open(io -> write(io, x.a), path, "w"); x)
+
 # An `AbstractArray` *wrapper*: accepted, but round-trips to a bare `Array`.
 struct MmapWrapArr{T,N} <: AbstractArray{T,N}; a::Array{T,N}; end
 Base.size(m::MmapWrapArr) = size(m.a)
@@ -1207,6 +1213,13 @@ _mmap_base = Ref("")
     @mmap tbl::DataFrame            = DataFrame(:a => [1.0, 2.0])
     @mmap wrapper::MmapWrapArr{Float64,2} = MmapWrapArr([8.0 9.0; 10.0 11.0])
     @mmap opaque::MmapOpaque        = MmapOpaque([1.0 2.0; 3.0 4.0])
+    # Same value, NO annotation: the gate is the runtime value, so this must fail
+    # identically. This is the piece's central claim.
+    @mmap opaque_bare               = MmapOpaque([1.0 2.0; 3.0 4.0])
+    # Un-annotated DataFrame: `load` sniffs ARROW1 and routes to the ext (2dc42fe).
+    @mmap tbl_bare                  = DataFrame(:a => [3.0, 4.0])
+    # `save` defined, `load` missing: writes, then cannot be read back.
+    @mmap half::MmapHalfDone        = MmapHalfDone([1.0, 2.0])
     wrapped = MmapOpaque(annotated)   # the wrap-on-read escape hatch
 end
 
@@ -1248,4 +1261,33 @@ end
 
     # Direct `save` on a bare opaque value throws the same way.
     @test_throws ErrorException DynamicObjects.save(Val(:mmap), tempname(), MmapOpaque(zeros(1, 1)))
+
+    # THE CENTRAL CLAIM: the gate is the runtime VALUE, not the `::T` annotation
+    # (`_disk_eltype` only steers `load`). So dropping the annotation changes
+    # nothing — the same value is rejected the same way.
+    bare_err = try; o.opaque_bare; nothing catch e; e end
+    @test bare_err !== nothing
+    @test occursin("no `save` method", sprint(showerror, bare_err))
+    @test occursin("MmapOpaque", sprint(showerror, bare_err))
+
+    # Un-annotated `DataFrame`: `load` sniffs the file's ARROW1 magic and routes to
+    # the ext instead of DO's own DOMM array container (2dc42fe). Round-trips, and
+    # the columns stay memory-mapped read-only.
+    @test o.tbl_bare isa DataFrame
+    @test o.tbl_bare.a == [3.0, 4.0]
+    @test_throws ReadOnlyMemoryError o.tbl_bare.a[1] = 0.0
+
+    # `save` without its `load`: the file is written, then nothing can read it back.
+    # The error must name the type and the missing half, not just the format token.
+    half_err = try; o.half; nothing catch e; e end
+    @test half_err !== nothing
+    half_msg = sprint(showerror, half_err)
+    @test occursin("no `load` method", half_msg)
+    @test occursin("MmapHalfDone", half_msg)
+    @test occursin("BOTH halves", half_msg)
+
+    # Direct `load` with an unclaimed annotated type throws the same way.
+    @test_throws ErrorException DynamicObjects.load(Val(:mmap), tempname(), MmapOpaque)
+    direct = try; DynamicObjects.load(Val(:mmap), tempname(), MmapOpaque) catch e; e end
+    @test occursin("MmapOpaque", sprint(showerror, direct))
 end
