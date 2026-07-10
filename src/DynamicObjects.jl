@@ -127,6 +127,26 @@ end
 const _MMAPPED = Dict{UInt,Vector{WeakRef}}()
 const _MMAPPED_LOCK = ReentrantLock()
 
+# A bucket whose arrays were collected is pruned when its `objectid` is next
+# looked up — but an `objectid` never looked up again would hold its bucket for
+# the life of the process, and every mmap load mints a fresh array (so a fresh
+# `objectid`). Sweep the whole table every `_MMAPPED_SWEEP_EVERY` marks:
+# O(#buckets), amortized to nothing, and it restores `isempty`'s fast path once
+# the last mapping dies.
+const _MMAPPED_SWEEP_EVERY = 256
+const _MMAPPED_MARKS = Ref(0)
+
+# Caller must hold `_MMAPPED_LOCK`. Keys are collected first — deleting from a
+# `Dict` while iterating it is undefined.
+function _sweep_mmapped!()
+    for k in collect(keys(_MMAPPED))
+        bucket = _MMAPPED[k]
+        filter!(w -> w.value !== nothing, bucket)
+        isempty(bucket) && delete!(_MMAPPED, k)
+    end
+    nothing
+end
+
 # Unwrap `SubArray` / `Adjoint` / `ReinterpretArray` / … down to the array that
 # actually owns the bytes. `Base.parent` is the identity on an owner
 # (`parent(::Array) === it`, and likewise for an `Arrow.Primitive`), so the walk
@@ -153,6 +173,8 @@ function _mark_mmapped!(a)
         bucket = get!(() -> WeakRef[], _MMAPPED, objectid(r))
         filter!(w -> w.value !== nothing, bucket)
         any(w -> w.value === r, bucket) || push!(bucket, WeakRef(r))
+        _MMAPPED_MARKS[] += 1
+        _MMAPPED_MARKS[] % _MMAPPED_SWEEP_EVERY == 0 && _sweep_mmapped!()
     end
     a
 end
@@ -966,13 +988,30 @@ _is_subtree_root(v) = v isa PropertyCache || v isa IndexableProperty ||
 # An array whose elements are themselves arrays — a `DataFrame`'s
 # `columns::Vector{AbstractVector}`, a `Vector{Vector{Float64}}`. `sizeof` sees
 # only its POINTER array (measured: 32 bytes standing in for 30.5 MiB of
-# columns), so billing has to descend. Bounded by `length(v)` — the number of
-# COLUMNS, never the element count of a column — with a cap so a pathological
-# array-of-arrays cannot turn a cache store into an O(N) walk.
+# columns), so billing has to descend. The walk is bounded by `length(v)` — the
+# number of COLUMNS, never the element count of a column — and capped so a
+# pathological array-of-arrays cannot turn a cache store into an O(N) walk.
 const _MAX_CONTAINER_COLS = 1024
-_is_array_container(v::AbstractArray) =
-    eltype(v) <: AbstractArray && length(v) <= _MAX_CONTAINER_COLS
+_is_array_container(v::AbstractArray) = eltype(v) <: AbstractArray
 _is_array_container(v) = false
+
+# Bytes a LEAF array costs the GC heap.
+#
+# `sizeof` is only trustworthy on an `Array` or a `SubArray`. On a lazy wrapper
+# it returns the STRUCT size: measured, `sizeof(m')` is 8 for 2400 bytes of data
+# and `sizeof(::Arrow.Primitive)` is 64 for 800. When the eltype is isbits the
+# count is exactly `length * sizeof(eltype)`, so compute it instead of trusting
+# `sizeof`.
+#
+# A non-isbits eltype (`Vector{String}`, `Vector{Any}`) keeps `sizeof`'s pointer
+# array — a deliberate *lower bound*. Walking those per-element in a hot path is
+# what once made Bruno's request handlers spin, and approximate size is fine for
+# a best-effort LRU.
+_leaf_array_bytes(v::AbstractArray) =
+    isbitstype(eltype(v)) ? length(v) * sizeof(eltype(v)) : sizeof(v)
+# `eltype` is `Bool` but the storage is packed 64 elements to a word, so the
+# isbits rule above would over-bill it eightfold.
+_leaf_array_bytes(v::BitArray) = sizeof(v.chunks)
 
 function _summarysize_capped(v, depth::Int=8, visited::Base.IdSet=Base.IdSet())
     _skip_summarysize(v) && return 0
@@ -992,20 +1031,18 @@ function _summarysize_capped(v, depth::Int=8, visited::Base.IdSet=Base.IdSet())
         # `@mmap` property (a view, an Arrow column), which `_is_mmap_slot`
         # cannot see.
         _is_mmapped(v) && return n
-        if _is_array_container(v)
+        if !_is_array_container(v)
+            n = _leaf_array_bytes(v)
+        elseif length(v) > _MAX_CONTAINER_COLS
+            # Never silently under-bill: say so, then fall back to the pointer
+            # array. `@debug` because this sits on the cache-store hot path.
+            @debug "LRU billing: array-of-arrays of length $(length(v)) exceeds _MAX_CONTAINER_COLS=$_MAX_CONTAINER_COLS; charging only its pointer array, so its contents are under-billed."
+            n = _leaf_array_bytes(v)
+        else
             n = sizeof(v)   # the pointer array; the columns are charged below
             for elt in v
                 n += _summarysize_capped(elt, depth - 1, visited)
             end
-        else
-            # Bulk charge: sizeof(v) gives the contiguous storage. For isbits
-            # eltype that's the full size; for non-isbits (Vector{String},
-            # Vector{Any}) it's the pointer array — a *lower bound*. We
-            # deliberately do NOT iterate those: Bruno caches multi-million-row
-            # String columns, and per-element recursion in a hot path made
-            # request handlers spin (each cache store walked every element).
-            # Approximate size is fine for LRU.
-            n = sizeof(v)
         end
     elseif v isa AbstractDict
         # Bulk charge: hashmap struct + a rough per-entry constant covering

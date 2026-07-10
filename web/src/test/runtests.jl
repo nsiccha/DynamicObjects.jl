@@ -1107,3 +1107,109 @@ end
     @test last_evicted(o) !== nothing
     @test o.__status__ === nothing
 end
+
+# ---------------------------------------------------------------------------
+# LRU billing: container-of-arrays charge + mmap provenance (D6)
+# ---------------------------------------------------------------------------
+
+_billing_cache_path = Ref("")
+
+@dynamicstruct struct Billed
+    n::Int
+    __cache_path__ = _billing_cache_path[]
+    @mmap mat = reshape(collect(1.0:(4n)), n, 4)
+    # A DataFrame of SubArrays over the mmapped parent — Bruno's `subjectdf`
+    # shape. `copycols=false` is load-bearing: DataFrame COPIES columns by
+    # default, which would make these heap arrays that must be billed.
+    sub_df = DataFrame((a=view(mat, :, 1), b=view(mat, :, 2)); copycols=false)
+    # Un-annotated `@mmap` DataFrame -> Arrow container, memory-mapped columns.
+    @mmap arrow_df = DataFrame(x=collect(1.0:n), y=collect(1.0:n))
+end
+
+@testset "billing charges a container-of-arrays, not its pointer array" begin
+    # `sizeof` of a Vector{Vector} / DataFrame's `columns` is the pointer array:
+    # 32 bytes standing in for megabytes. Regression guard for the 99.9993%
+    # under-bill (a 30.5 MiB DataFrame billed 225 bytes).
+    vv = [collect(1.0:10_000) for _ in 1:4]
+    @test DynamicObjects._summarysize_capped(vv) > 0.95 * Base.summarysize(vv)
+
+    df = DataFrame(a=collect(1.0:10_000), b=collect(1.0:10_000))
+    @test DynamicObjects._summarysize_capped(df) > 0.95 * Base.summarysize(df)
+
+    # A non-isbits eltype keeps the cheap pointer-array lower bound: walking
+    # multi-million-row String columns per element is what made Bruno spin.
+    strs = ["x"^32 for _ in 1:1_000]
+    @test DynamicObjects._summarysize_capped(strs) == sizeof(strs)
+
+    # Over the cap we fall back to the pointer array rather than walk it.
+    many = [Float64[i] for i in 1:(DynamicObjects._MAX_CONTAINER_COLS + 1)]
+    @test DynamicObjects._summarysize_capped(many) == sizeof(many)
+end
+
+@testset "billing: sizeof lies on lazy wrappers, _leaf_array_bytes does not" begin
+    m = rand(100, 3)                        # 300 Float64 = 2400 bytes
+    @test sizeof(m') == 8                   # the wrapper struct, not the data
+    @test DynamicObjects._leaf_array_bytes(m') == 2400
+    @test DynamicObjects._leaf_array_bytes(m) == sizeof(m)
+    @test DynamicObjects._leaf_array_bytes(view(m, :, 1)) == 800
+    # eltype Bool, but 64 elements to a word
+    @test DynamicObjects._leaf_array_bytes(trues(1024)) == 128
+end
+
+@testset "billing: mmap provenance zero-bills page-cache bytes" begin
+    _billing_cache_path[] = mktempdir()
+    o = Billed(10_000)
+    mat, sub_df, arrow_df = o.mat, o.sub_df, o.arrow_df
+
+    # The mapping itself, and anything derived from it by a view.
+    @test DynamicObjects._is_mmapped(mat)
+    @test DynamicObjects._summarysize_capped(mat) == 0
+    @test DynamicObjects._is_mmapped(view(mat, :, 1))    # composes through _root_array
+
+    # `_is_mmap_slot` cannot see either of these — they are not `@mmap` slots.
+    @test DynamicObjects._summarysize_capped(sub_df) < 4096
+    @test all(DynamicObjects._is_mmapped(c) for c in eachcol(arrow_df))
+    @test DynamicObjects._summarysize_capped(arrow_df) < 4096
+
+    # A heap column beside a mapped one is still charged in full.
+    mixed = DataFrame((mapped=view(mat, :, 1), heap=collect(1.0:10_000)); copycols=false)
+    @test 0.9 * 80_000 < DynamicObjects._summarysize_capped(mixed) < 1.2 * 80_000
+
+    # No false positives, and marks are keyed by IDENTITY, not by content:
+    # WeakKeyDict would report a hit for an equal-but-distinct array.
+    @test !DynamicObjects._is_mmapped(collect(1.0:10))
+    @test !DynamicObjects._is_mmapped(copy(mat))
+end
+
+@testset "billing: the mmap registry is weak and self-pruning" begin
+    _billing_cache_path[] = mktempdir()
+    o = Billed(1_000)
+    o.mat                                            # populate the registry
+    @test !isempty(DynamicObjects._MMAPPED)
+    # A mark must never pin the mapping alive.
+    @test all(b -> b isa Vector{WeakRef}, values(DynamicObjects._MMAPPED))
+
+    # THE HAZARD: `objectid` is recycled once a mapping is collected. A heap
+    # array landing on a dead bucket's key must NOT inherit its zero-bill — and
+    # the lookup must drop the corpse on its way out. (Simulating the dead
+    # bucket beats waiting on `GC.gc()`, which gives no collection guarantee.)
+    x = collect(1.0:10)
+    lock(DynamicObjects._MMAPPED_LOCK) do
+        DynamicObjects._MMAPPED[objectid(x)] = [WeakRef(nothing)]
+    end
+    @test !DynamicObjects._is_mmapped(x)
+    @test !haskey(DynamicObjects._MMAPPED, objectid(x))
+
+    # The periodic sweep drops dead buckets nobody ever looks up again — without
+    # it they accumulate one per mmap load for the life of the process.
+    stale = 0xdead_beef_0000_0001
+    lock(DynamicObjects._MMAPPED_LOCK) do
+        DynamicObjects._MMAPPED[stale] = [WeakRef(nothing)]
+    end
+    @test haskey(DynamicObjects._MMAPPED, stale)
+    lock(DynamicObjects._MMAPPED_LOCK) do
+        DynamicObjects._sweep_mmapped!()
+    end
+    @test !haskey(DynamicObjects._MMAPPED, stale)
+    @test DynamicObjects._is_mmapped(o.mat)          # the live mapping survived
+end
