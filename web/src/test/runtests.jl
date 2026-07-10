@@ -1165,29 +1165,20 @@ end
     @test StatusPlain(4).__hash__ != a.__hash__
 end
 
-@testset "progress status root pinned against eviction" begin
-    @test is_pinnable_value(_TBProgressNode)
-    # The budget must be set BEFORE the store: `_record_pc_store!` skips all LRU
-    # bookkeeping unless `_any_budget_in_chain` already holds.
+@testset "progress status root is stable across property reads" begin
+    # Was two eviction testsets (the status root is pinned; a `nothing` optout
+    # stays out of the LRU). The LRU is gone, but the invariant they really
+    # guarded is not: reading properties must never replace the status root. A
+    # forked tree means the web layer keeps rendering the old node while new
+    # work attaches to the new one.
     o = StatusBudgeted(1)
-    set_cache_budget!(o, 200_000)
     root = o.__status__
-    pc = getfield(o, :cache)
-    @test (:__status__, ()) in pc.pinned
-    o.big1; o.big2; o.big3                       # ~480 KB into a 200 KB budget
-    @test last_evicted(o) !== nothing            # eviction really ran …
-    @test (:__status__, ()) in pc.pinned         # … and skipped the pinned root
-    @test o.__status__ === root                  # tree not forked
-end
-
-@testset "progress status optout survives eviction" begin
-    # A seeded `nothing` is not pinnable, so it must stay out of the LRU entirely —
-    # else evicting it would recompute the DO-level fallback and silently hand an
-    # opted-out object a brand-new root.
-    o = StatusBudgeted(1; __status__ = nothing)
-    set_cache_budget!(o, 200_000)
-    @test o.__status__ === nothing
     o.big1; o.big2; o.big3
-    @test last_evicted(o) !== nothing
-    @test o.__status__ === nothing
+    @test o.__status__ === root
+
+    # …and an explicit opt-out stays opted out.
+    o2 = StatusBudgeted(1; __status__ = nothing)
+    @test o2.__status__ === nothing
+    o2.big1; o2.big2; o2.big3
+    @test o2.__status__ === nothing
 end
