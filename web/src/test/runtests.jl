@@ -1182,3 +1182,70 @@ end
     o2.big1; o2.big2; o2.big3
     @test o2.__status__ === nothing
 end
+
+# --- `@mmap` payload contract (snag: `@mmap … ::TreeData`) ---------------------
+# `@mmap`'s gate is the property's RUNTIME VALUE, not its `::T` annotation
+# (`_disk_eltype` only steers `load`). Accepted: an `AbstractArray` of isbits
+# numeric eltype, or a type an extension claims (`DataFrame`). A non-AbstractArray
+# wrapper (`TreeData`, `AxisArray`, …) is rejected at save — after the body has
+# already run. Nothing pinned this; `@mmap` had no test coverage at all.
+
+# Stands in for `TreeData`: deliberately NOT an `AbstractArray` subtype.
+struct MmapOpaque; a::Matrix{Float64}; end
+
+# An `AbstractArray` *wrapper*: accepted, but round-trips to a bare `Array`.
+struct MmapWrapArr{T,N} <: AbstractArray{T,N}; a::Array{T,N}; end
+Base.size(m::MmapWrapArr) = size(m.a)
+Base.getindex(m::MmapWrapArr, i...) = m.a[i...]
+Base.Array(m::MmapWrapArr) = m.a
+
+_mmap_base = Ref("")
+@dynamicstruct struct MmapPayloads
+    __cache_base__ = _mmap_base[]
+    @mmap annotated::Matrix{Float64} = [1.0 2.0; 3.0 4.0]
+    @mmap unannotated               = [5.0, 6.0, 7.0]
+    @mmap tbl::DataFrame            = DataFrame(:a => [1.0, 2.0])
+    @mmap wrapper::MmapWrapArr{Float64,2} = MmapWrapArr([8.0 9.0; 10.0 11.0])
+    @mmap opaque::MmapOpaque        = MmapOpaque([1.0 2.0; 3.0 4.0])
+    wrapped = MmapOpaque(annotated)   # the wrap-on-read escape hatch
+end
+
+@testset "@mmap payload contract" begin
+    _mmap_base[] = mktempdir()
+    o = MmapPayloads()
+
+    # Annotated array: type-stable, mmap-backed, PROT_READ.
+    @test o.annotated isa Matrix{Float64}
+    @test o.annotated == [1.0 2.0; 3.0 4.0]
+    @test_throws ReadOnlyMemoryError o.annotated[1, 1] = 0.0
+
+    # Un-annotated array: self-describing DOMM load.
+    @test o.unannotated isa Vector{Float64}
+    @test o.unannotated == [5.0, 6.0, 7.0]
+
+    # A non-AbstractArray type an extension claims.
+    @test o.tbl isa DataFrame
+    @test o.tbl.a == [1.0, 2.0]
+
+    # An AbstractArray wrapper is densified on save and comes back a bare Array —
+    # the `::MmapWrapArr` annotation does NOT survive the round trip.
+    @test o.wrapper isa Matrix{Float64}
+    @test !(o.wrapper isa MmapWrapArr)
+    @test o.wrapper == [8.0 9.0; 10.0 11.0]
+
+    # A non-AbstractArray, non-claimed payload is rejected at save, and the error
+    # names the wrap-on-read escape hatch.
+    err = try; o.opaque; nothing catch e; e end
+    @test err !== nothing
+    msg = sprint(showerror, err)
+    @test occursin("no `save` method", msg)
+    @test occursin("MmapOpaque", msg)
+    @test occursin("rebuild the wrapper in a plain sibling", msg)
+
+    # …and that hatch works: mmap the backing array, wrap it in a plain sibling.
+    @test o.wrapped isa MmapOpaque
+    @test o.wrapped.a == [1.0 2.0; 3.0 4.0]
+
+    # Direct `save` on a bare opaque value throws the same way.
+    @test_throws ErrorException DynamicObjects.save(Val(:mmap), tempname(), MmapOpaque(zeros(1, 1)))
+end

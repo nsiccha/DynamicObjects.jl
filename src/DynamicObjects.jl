@@ -151,8 +151,22 @@ function save(::Val{:mmap}, path::AbstractString, x::AbstractArray)
     end
     A
 end
-save(::Val{:mmap}, path::AbstractString, x) =
-    error("@mmap: property value is a $(typeof(x)); @mmap only supports `AbstractArray` of isbits numeric eltype.")
+# Reached when the property's VALUE is neither an `AbstractArray` nor a type some
+# extension has claimed (`DataFrame`, via `DataFramesArrowExt`). Note the gate is
+# the runtime value, not the `::T` annotation — `_disk_eltype` only steers `load`.
+# The wrap-on-read escape hatch is the one every non-array wrapper wants
+# (`TreeData`, `AxisArray`, …): mmap the dense backing array, rebuild the wrapper
+# in a plain sibling — the wrapper is views + labels, so it costs nothing.
+save(::Val{:mmap}, path::AbstractString, x) = error("""
+    @mmap: no `save` method for a property value of type $(typeof(x)).
+    Supported payloads: an `AbstractArray` with eltype in $(_MMAP_ELTYPE_TAGS), \
+    or a type an extension claims (`DataFrame` — needs `using Arrow, DataFrames`).
+    For any other wrapper type, `@mmap` the dense backing array and rebuild the \
+    wrapper in a plain sibling property:
+        @mmap raw(i)::Matrix{Float64} = <compute>
+        wrapped(i) = Wrapper(raw(i), <labels>)
+    Or give the type its own format by defining `DynamicObjects.save(::Val{:mmap}, \
+    ::AbstractString, ::$(nameof(typeof(x))))` + the matching `load`.""")
 
 # Read + validate the header; return (eltype_tag::UInt8, ndims::Int, dims::Vector{Int}, offset::Int).
 function _mmap_read_header(io::IO)
