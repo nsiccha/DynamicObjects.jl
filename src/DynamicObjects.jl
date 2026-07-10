@@ -4273,6 +4273,13 @@ _kwarg_name(kw::Symbol) = kw
 _kwarg_name(kw::Expr) = Meta.isexpr(kw, :kw) ? kw.args[1] : nothing
 _kwarg_name(_) = nothing
 
+# Name of a keyword argument written BEFORE the semicolon: Julia parses
+# `Child(__status__ = nothing)` as an `Expr(:kw, …)` sitting in the positional
+# argument list. There, and unlike inside a `:parameters` block, a bare `Symbol`
+# is a positional VALUE — `Child(x)` passes `x`, it is not the `f(; x)`
+# shorthand — so only an `Expr(:kw, …)` names a kwarg.
+_positional_kwarg_name(a) = Meta.isexpr(a, :kw) ? a.args[1] : nothing
+
 function _inject_include_kwargs!(call_expr, prop_name)
     params_idx = findfirst(a -> Meta.isexpr(a, :parameters), call_expr.args)
     if params_idx === nothing
@@ -4283,8 +4290,15 @@ function _inject_include_kwargs!(call_expr, prop_name)
     end
     has_parent = false
     has_status = false
-    for kw in params.args
-        name = _kwarg_name(kw)
+    # A kwarg can arrive in either of two places, and both mean the same thing
+    # to the callee: after the semicolon (the `:parameters` block) or before it
+    # (an `Expr(:kw, …)` among the positional args). Scanning only `:parameters`
+    # missed `Child(__status__ = nothing)`, injected a second `__status__`, and
+    # the call site died with `keyword argument "__status__" repeated` — right
+    # on the escape hatch for silencing a subtree's progress.
+    for name in Iterators.flatten((
+            (_kwarg_name(kw) for kw in params.args),
+            (_positional_kwarg_name(a) for a in call_expr.args)))
         name === :__parent__ && (has_parent = true)
         name === :__status__ && (has_status = true)
     end
