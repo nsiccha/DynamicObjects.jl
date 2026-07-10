@@ -97,6 +97,86 @@ function _atomic_save(fmt::Val, path::AbstractString, x)
     end
 end
 
+# --- mmap provenance for LRU billing (D6) ---
+#
+# The LRU charges a cache entry the bytes it costs the GC heap. A memory-mapped
+# array costs none — its pages live in the OS page cache, backed by the cache
+# file. `_is_mmap_slot` catches a DIRECT `@mmap` property, but not a value
+# DERIVED from one (Bruno's `subjectdf` is a `DataFrame` of `SubArray`s over an
+# `@mmap` parent), so billing must be able to ask of an arbitrary array: are
+# your bytes heap, or page cache?
+#
+# Answer by PROVENANCE, not introspection. `load(Val(:mmap), …)` is the one
+# place DO ever hands out a mapping, so mark the mapped arrays there and let
+# billing resolve a value's root against the marks: O(1), no syscall, composes
+# through views. Introspection was measured and rejected — reading
+# `/proc/self/maps` is O(#mappings) per cache store, and probing a page by
+# WRITING to it is unsound: Julia's dead-store elimination deletes a
+# store-then-restore, so a `PROT_READ` page falsely reports as writable.
+#
+# Mark ONLY what is genuinely mapped (the array, or an Arrow table's columns) —
+# never a whole container walked field-by-field, which would silently zero-bill
+# the heap `Vector`s hiding in a `DataFrame`'s column index.
+#
+# Identity-keyed and weak: a mark must not keep the mapping alive, and two
+# distinct arrays with equal contents are not the same mapping. `WeakKeyDict` is
+# `hash`/`isequal`-keyed (content hashing — wrong AND O(n); verified: it reports
+# `haskey` for an equal-but-distinct array), and Julia 1.10 has no
+# `WeakKeyIdDict`. So bucket `WeakRef`s by `objectid` (stable across GC — the
+# collector does not move objects) and compare with `===`.
+const _MMAPPED = Dict{UInt,Vector{WeakRef}}()
+const _MMAPPED_LOCK = ReentrantLock()
+
+# Unwrap `SubArray` / `Adjoint` / `ReinterpretArray` / … down to the array that
+# actually owns the bytes. `Base.parent` is the identity on an owner
+# (`parent(::Array) === it`, and likewise for an `Arrow.Primitive`), so the walk
+# terminates at a fixpoint; the depth bound guards a pathological custom
+# `parent`.
+function _root_array(a, maxdepth::Int=16)
+    for _ in 1:maxdepth
+        p = parent(a)
+        p === a && return a
+        a = p
+    end
+    a
+end
+
+"""
+    _mark_mmapped!(a) -> a
+
+Record `a`'s backing array as memory-mapped, so the LRU bills it zero. Called at
+the `load(Val(:mmap), …)` ingress — the single point where DO creates a mapping.
+"""
+function _mark_mmapped!(a)
+    r = _root_array(a)
+    lock(_MMAPPED_LOCK) do
+        bucket = get!(() -> WeakRef[], _MMAPPED, objectid(r))
+        filter!(w -> w.value !== nothing, bucket)
+        any(w -> w.value === r, bucket) || push!(bucket, WeakRef(r))
+    end
+    a
+end
+
+# Are `a`'s bytes a mapping DO handed out? The unlocked `isempty` is a fast path
+# for the overwhelmingly common "no `@mmap` anywhere" case; racing a concurrent
+# first `_mark_mmapped!` can only make us answer `false` and charge the bytes —
+# an over-bill, never a wrong zero-bill.
+function _is_mmapped(a)
+    isempty(_MMAPPED) && return false
+    r = _root_array(a)
+    key = objectid(r)
+    lock(_MMAPPED_LOCK) do
+        bucket = get(_MMAPPED, key, nothing)
+        bucket === nothing && return false
+        # Prune as we go: a mapping whose array was collected is unmapped, and
+        # `objectid` may be reused by a heap array that must NOT inherit the
+        # zero-bill.
+        filter!(w -> w.value !== nothing, bucket)
+        isempty(bucket) && (delete!(_MMAPPED, key); return false)
+        any(w -> w.value === r, bucket)
+    end
+end
+
 # --- `Val{:mmap}` format (D2-v2, D3, layout) ---
 #
 # Single-file layout `[header][payload]`:
@@ -211,7 +291,7 @@ function load(::Val{:mmap}, path::AbstractString, ::Type{A}) where {A<:AbstractA
         nd == N || error("@mmap: header ndims $nd ≠ annotated ndims $N for $path.")
         _mmap_eltype_of(tag) === ET || error("@mmap: header eltype $(_mmap_eltype_of(tag)) ≠ annotated eltype $ET for $path.")
         _mmap_check_complete(io, path, offset, _mmap_payload_bytes(ET, dims, path))
-        Mmap.mmap(io, Array{ET,N}, NTuple{N,Int}(dims), offset)
+        _mark_mmapped!(Mmap.mmap(io, Array{ET,N}, NTuple{N,Int}(dims), offset))
     finally
         close(io)   # mapping survives the fd close
     end
@@ -226,7 +306,7 @@ function _mmap_load_domm(path::AbstractString)
         tag, nd, dims, offset = _mmap_read_header(io)
         ET = _mmap_eltype_of(tag)
         _mmap_check_complete(io, path, offset, _mmap_payload_bytes(ET, dims, path))
-        Mmap.mmap(io, Array{ET,nd}, NTuple{nd,Int}(dims), offset)
+        _mark_mmapped!(Mmap.mmap(io, Array{ET,nd}, NTuple{nd,Int}(dims), offset))
     finally
         close(io)
     end
@@ -883,6 +963,17 @@ _skip_summarysize(v) = v isa Type || v isa Function || v isa Module ||
 _is_subtree_root(v) = v isa PropertyCache || v isa IndexableProperty ||
     hasfield(typeof(v), :__cache__)
 
+# An array whose elements are themselves arrays — a `DataFrame`'s
+# `columns::Vector{AbstractVector}`, a `Vector{Vector{Float64}}`. `sizeof` sees
+# only its POINTER array (measured: 32 bytes standing in for 30.5 MiB of
+# columns), so billing has to descend. Bounded by `length(v)` — the number of
+# COLUMNS, never the element count of a column — with a cap so a pathological
+# array-of-arrays cannot turn a cache store into an O(N) walk.
+const _MAX_CONTAINER_COLS = 1024
+_is_array_container(v::AbstractArray) =
+    eltype(v) <: AbstractArray && length(v) <= _MAX_CONTAINER_COLS
+_is_array_container(v) = false
+
 function _summarysize_capped(v, depth::Int=8, visited::Base.IdSet=Base.IdSet())
     _skip_summarysize(v) && return 0
     v in visited && return 0
@@ -896,14 +987,26 @@ function _summarysize_capped(v, depth::Int=8, visited::Base.IdSet=Base.IdSet())
     _is_subtree_root(v) && return n
     depth <= 0 && return n
     if v isa AbstractArray
-        # Bulk charge: sizeof(v) gives the contiguous storage. For isbits
-        # eltype that's the full size; for non-isbits (Vector{String},
-        # Vector{Any}) it's the pointer array — a *lower bound*. We
-        # deliberately do NOT iterate non-isbits arrays: Bruno caches
-        # multi-million-row String / Vector{Float64} columns, and per-element
-        # recursion in a hot path made request handlers spin (each cache
-        # store walked every element). Approximate size is fine for LRU.
-        n = sizeof(v)
+        # Memory-mapped bytes live in the OS page cache, not the GC heap the
+        # budget models — charge nothing (D6). Covers values DERIVED from an
+        # `@mmap` property (a view, an Arrow column), which `_is_mmap_slot`
+        # cannot see.
+        _is_mmapped(v) && return n
+        if _is_array_container(v)
+            n = sizeof(v)   # the pointer array; the columns are charged below
+            for elt in v
+                n += _summarysize_capped(elt, depth - 1, visited)
+            end
+        else
+            # Bulk charge: sizeof(v) gives the contiguous storage. For isbits
+            # eltype that's the full size; for non-isbits (Vector{String},
+            # Vector{Any}) it's the pointer array — a *lower bound*. We
+            # deliberately do NOT iterate those: Bruno caches multi-million-row
+            # String columns, and per-element recursion in a hot path made
+            # request handlers spin (each cache store walked every element).
+            # Approximate size is fine for LRU.
+            n = sizeof(v)
+        end
     elseif v isa AbstractDict
         # Bulk charge: hashmap struct + a rough per-entry constant covering
         # slot+key+value pointer storage. Iterating entries one-by-one for

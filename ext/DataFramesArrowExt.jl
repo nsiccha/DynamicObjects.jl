@@ -54,7 +54,16 @@ function DynamicObjects.load(::Val{:mmap}, path::AbstractString, ::Type{DataFram
         tail == _ARROW_MAGIC ||
             error("@mmap DataFrame: $path is truncated — missing the trailing b\"ARROW1\" magic (found $tail). A partial cache file (e.g. the disk filled mid-write); it will be deleted and recomputed.")
     end
-    DataFrame(Arrow.Table(path); copycols=false)
+    df = DataFrame(Arrow.Table(path); copycols=false)
+    # LRU provenance (D6): `copycols=false` means these column objects ARE the
+    # memory-mapped buffers Arrow just handed us, so they are what billing will
+    # meet when it descends the DataFrame. Mark the columns, not the frame — a
+    # frame walked field-by-field would also sweep up the heap `Vector`s inside
+    # its column index and silently zero-bill them.
+    for col in eachcol(df)
+        DynamicObjects._mark_mmapped!(col)
+    end
+    df
 end
 
 # Content-canonical hash key for a bare `DataFrame` in `hash_fields`. Without
