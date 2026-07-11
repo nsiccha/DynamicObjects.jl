@@ -3819,6 +3819,21 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 macro_arg = macro_arg.args[end]
             end
         end
+        # Peel a leading `@fresh` wrapper. `@fresh @struct …` parses as
+        # `@fresh(@struct(…))`, so without this the `@struct` marker below is
+        # never seen and the inline-child rewrite is skipped. We rewrite the
+        # inner `@struct` and re-attach `@fresh` (at the `rewritten` re-wrap
+        # below) to the emitted `prop = struct …` form, so `@fresh` lands on the
+        # constructor property and marks it never-cache — the call form then
+        # builds a FRESH child on every call. Only `@fresh` is peeled here; a
+        # disk-cache marker (`@cached`/`@mmap`) on `@struct` stays unsupported
+        # and is rejected at the `@struct in info.macros` guard downstream.
+        fresh_wrapper = nothing
+        if Meta.isexpr(macro_arg, :macrocall) &&
+           _resolve_macro_name(macro_arg.args[1]) === Symbol("@fresh")
+            fresh_wrapper = macro_arg
+            macro_arg = macro_arg.args[end]
+        end
         Meta.isexpr(macro_arg, :macrocall) || continue
         macro_arg.args[1] == Symbol("@struct") || continue
         inner = macro_arg.args[end]
@@ -3844,6 +3859,10 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         end
         gen_child_name = Symbol(prop_sym, "_inline")
         rewritten = Expr(:(=), lhs, Expr(:struct, false, gen_child_name, rhs))
+        # Re-attach `@fresh` (peeled above) so it rides the rewritten form into
+        # the extraction loop and, ultimately, onto the constructor property.
+        isnothing(fresh_wrapper) ||
+            (rewritten = Expr(:macrocall, fresh_wrapper.args[1:end-1]..., rewritten))
         body.args[i] = isnothing(doc_wrapper) ? rewritten :
             Expr(:macrocall, doc_wrapper.args[1:end-1]..., rewritten)
     end
@@ -3918,6 +3937,17 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 doc_wrapper = form_arg
                 form_arg = form_arg.args[end]
             end
+        end
+        # Peel a `@fresh` wrapper (pass-1 re-attached it around the rewritten
+        # `prop = struct …` form). Peeling it lets Form 1/2 detection below match
+        # the inline child; it is re-attached to `constructor_assignment` at the
+        # end so `@fresh` reaches the property-info collector and emits
+        # `_never_cache` for the constructor property (→ fresh child per call).
+        fresh_wrapper = nothing
+        if Meta.isexpr(form_arg, :macrocall) &&
+           _resolve_macro_name(form_arg.args[1]) === Symbol("@fresh")
+            fresh_wrapper = form_arg
+            form_arg = form_arg.args[end]
         end
         prop_name = nothing
         child_struct = nothing
@@ -4121,6 +4151,10 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             Expr(:call, prop_name, Expr(:parameters, kw_nodes...), index_param_exprs...)
         end
         constructor_assignment = Expr(:(=), lhs_expr, constructor)
+        # Re-attach `@fresh` (peeled above) so the constructor property is marked
+        # never-cache → the call form builds a fresh child on every call.
+        isnothing(fresh_wrapper) ||
+            (constructor_assignment = Expr(:macrocall, fresh_wrapper.args[1:end-1]..., constructor_assignment))
         body.args[i] = isnothing(doc_wrapper) ? constructor_assignment :
             Expr(:macrocall, doc_wrapper.args[1:end-1]..., constructor_assignment)
     end
@@ -4477,6 +4511,27 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 if Symbol("@fresh") in info.macros
                     info.indexed || error("@fresh on property `$name`: the never-cache marker applies only to call-form / indexed properties (`@fresh $name() = …`). A bare scalar property `$name = …` memoizes via PropertyCache (a different mechanism) — use the call form, or drop @fresh.")
                     (Symbol("@cached") in info.macros || Symbol("@mmap") in info.macros) && error("@fresh on property `$name`: cannot combine with @cached/@mmap. `@fresh` declares the property never caches; @cached/@mmap declare a disk cache — these are contradictory. Drop one.")
+                end
+                # `@struct` inline-child validation (macro-time). The inline-child
+                # rewrite that turns `@struct $name(…) = begin … end` into a child
+                # type — with a `__parent__ = nothing` field the parent wires to
+                # `__self__` at construction — runs in EARLIER passes that peel only
+                # `@doc` and `@fresh` before finding `@struct`. Any OTHER wrapping
+                # marker parses as `@wrapper(@struct(…))` and is skipped by those
+                # passes, so `@struct` survives here in `info.macros` instead of
+                # having been consumed into a child. The child type and its
+                # `__parent__` field would then never be emitted, so the body's
+                # `__parent__` reference would be unbound and the call form would
+                # throw `UndefVarError: __parent__` the first time it is hit — a
+                # clean compile that breaks only live, the same failure class the
+                # bare-scalar `@fresh` guard above prevents. Reject it here.
+                # (`@fresh @struct` IS supported — it is threaded through the
+                # rewrite so the call form builds a fresh child per call; a
+                # disk-cache marker `@cached`/`@mmap` on an inline child is not.)
+                if Symbol("@struct") in info.macros
+                    _wrappers = sort!(string.(collect(setdiff(info.macros, [Symbol("@struct")]))))
+                    _wrapper_desc = isempty(_wrappers) ? "another macro" : join(_wrappers, ", ")
+                    error("@struct on property `$name`: `@struct` must be outermost (only `@doc` and `@fresh` may wrap it), but here it is wrapped by $_wrapper_desc. A wrapping marker shadows the inline-child rewrite, so the child type and its injected `__parent__` are never emitted and the property would throw `UndefVarError: __parent__` when its call form is first hit (a clean compile that breaks only live). Write `@struct $name(…) = begin … end` (optionally `@fresh @struct $name(…) = …` for a fresh child per call). Disk-cache markers `@cached`/`@mmap` on an inline child are not supported — disk-cache a plain computed property instead.")
                 end
                 cp_kwargs = [Expr(:kw, name, length(info.indices) > 0 ? :(__self__.$name) : nothing)]
                 name != :__status__ && push!(cp_kwargs, Expr(:kw, :__status__, :nothing))

@@ -1310,3 +1310,65 @@ end
     direct = try; DynamicObjects.load(Val(:mmap), tempname(), MmapOpaque) catch e; e end
     @test occursin("MmapOpaque", sprint(showerror, direct))
 end
+
+# --- @fresh @struct inline child (snag fresh-struct-no-6b7bb3e4) ---
+# `@fresh @struct` threads the never-cache marker onto the constructor property
+# so the call form builds a FRESH child each call, with `__parent__` wired the
+# same way the memoizing plain-`@struct` path does. Before the fix the `@fresh`
+# wrapper shadowed the inline-child rewrite (no child type, no `__parent__`),
+# giving a clean compile that threw `UndefVarError: __parent__` only when the
+# call form was first hit.
+@dynamicstruct struct FreshStructParent
+    disabled = Set([2, 4])
+    disabled_holidays_set() = disabled
+    @fresh @struct period(yr::Int, mo::Int) = begin
+        public_holidays = let d = __parent__.disabled_holidays_set()
+            [h for h in 1:5 if !(h in d)]
+        end
+        label = string(yr, "-", mo)
+    end
+end
+
+@dynamicstruct struct CachedStructParent
+    disabled = Set([2, 4])
+    disabled_holidays_set() = disabled
+    @struct period(yr::Int, mo::Int) = begin
+        public_holidays = let d = __parent__.disabled_holidays_set()
+            [h for h in 1:5 if !(h in d)]
+        end
+    end
+end
+
+@testset "@fresh @struct inline child (snag fresh-struct-no-6b7bb3e4)" begin
+    # @fresh @struct: never-cache marker rides onto the constructor property, so
+    # the call form builds a fresh child per call with __parent__ wired.
+    p = FreshStructParent()
+    @test DynamicObjects._never_cache(p, Val(:period)) == true
+    c1 = p.period(2026, 7)
+    @test c1.__parent__ === p                # __parent__ injected on the fresh path
+    @test c1.public_holidays == [1, 3, 5]    # __parent__.disabled_holidays_set() resolved
+    @test c1.label == "2026-7"
+    c2 = p.period(2026, 7)
+    @test c1 !== c2                          # fresh: a distinct instance each call
+
+    # plain @struct: memoized child (same instance), __parent__ still wired.
+    q = CachedStructParent()
+    @test DynamicObjects._never_cache(q, Val(:period)) == false
+    d1 = q.period(2026, 7); d2 = q.period(2026, 7)
+    @test d1.public_holidays == [1, 3, 5]
+    @test d1 === d2                          # memoized: same instance
+
+    # A disk-cache marker wrapping @struct stays rejected at macro time (the
+    # child + __parent__ would never be emitted → clean-compile/broken-live).
+    cached_err = try
+        @eval @dynamicstruct struct BadCachedStruct
+            d = Set([1])
+            @cached @struct kid(i::Int) = begin v = __parent__.d end
+        end
+        nothing
+    catch e
+        e
+    end
+    @test cached_err !== nothing
+    @test occursin("@cached", sprint(showerror, cached_err))
+end
