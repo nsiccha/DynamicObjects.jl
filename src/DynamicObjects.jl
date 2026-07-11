@@ -2522,6 +2522,35 @@ else
     e
 end
 
+# --- Static dependency extraction (for `property_source_info` + `remake` carry-over) ---
+# `walk_rhs` has already rewritten every in-scope bare property/field reference to
+# `__self__.<name>`, so a property's dependencies on the object's own state are
+# exactly the `__self__.<name>` accesses left in its walked RHS. `_collect_self_deps!`
+# harvests those names into `deps` and returns whether the RHS reaches object state
+# *opaquely* — any residual bare `__self__` (handed to a helper, `getfield(__self__,
+# dynamic)`, `__self__.$(expr)`) the static scan cannot attribute to a named field.
+# An opaque reach means `deps` is NOT a sound over-approximation, so callers that
+# rely on soundness (carry-over) must treat the property as always-invalidated.
+function _collect_self_deps!(deps::Set{Symbol}, e)
+    opaque = Ref(false)
+    _collect_self_deps_walk!(deps, opaque, e)
+    opaque[]
+end
+function _collect_self_deps_walk!(deps::Set{Symbol}, opaque::Ref{Bool}, e)
+    if e isa Symbol
+        e === :__self__ && (opaque[] = true)
+    elseif e isa Expr
+        if e.head === :. && length(e.args) == 2 && e.args[1] === :__self__ && e.args[2] isa QuoteNode
+            push!(deps, e.args[2].value::Symbol)   # `__self__.field` — a tracked dependency
+        else
+            for a in e.args
+                _collect_self_deps_walk!(deps, opaque, a)
+            end
+        end
+    end
+    nothing
+end
+
 # --- Linter ----------------------------------------------------------------
 #
 # Lints are computed by `analyze_structure(T)` — a tree-walk over `meta(T)`
@@ -4388,6 +4417,18 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     fixed_fields = [(name, info.lhs) for (name, info) in oproperties if isfixed(info)]
     fixed_names = [n for (n, _) in fixed_fields]
     fixed_lhs = [lhs for (_, lhs) in fixed_fields]
+    # ── Static dependency graph ──────────────────────────────────────────────
+    # Populate each computed property's `dependson` set (empty until now — the
+    # field was a placeholder). Walk a COPY of the RHS: `walk_rhs` mutates `:let`
+    # blocks in place, and the real per-property emission re-walks `info.rhs`
+    # later. The `dependson` Sets are shared by reference into the emitted `meta`
+    # (below), so mutating them here ships them populated — un-stubbing
+    # `property_source_info`/`reflect(T)` and feeding the `remake` carry-over bake.
+    for (name, info) in properties
+        (info.rhs === nothing) && continue        # fixed fields have no RHS
+        _collect_self_deps!(info.dependson,
+            walk_rhs(deepcopy(info.rhs); locals=copy(info.locals), properties=walk_props, lnn=info.lnn))
+    end
     struct_expr = Expr(:struct, mut, head, Expr(:block,
         fixed_lhs..., :(cache::$PropertyCache),
         :(function $type($(fixed_lhs...); cache_type=nothing, kwargs...)
