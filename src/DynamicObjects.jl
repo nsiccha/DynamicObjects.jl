@@ -395,6 +395,37 @@ compute_property(o, ::Val{:__cache_path__}) =
     has_versioned_fields(typeof(o)) ?
         joinpath(o.__cache_base__, o.__identity_hash__, o.__version_tag__) :
         joinpath(o.__cache_base__, o.__hash__)
+
+# "Hold only the most recent" (the user-requested automatic convenience). A
+# versioned object caches under `base/<identity>/<version>/`; when it touches
+# that dir, SIBLING version dirs under the same identity are pruned, so only the
+# current version's entry survives on disk. This is a *targeted, version-keyed*
+# cleanup — NOT the general byte-budget LRU deleted in cc84ee6. Disk only:
+# in-memory caches on other live instances are untouched. Default-on for
+# versioned types; opt out per-instance with `T(…; __hold_recent_version__=false)`
+# (the overrideable-default idiom) or per-type by overriding this compute.
+# NOTE: if two versions of one object are alive AND both compute, they take
+# turns pruning each other — expected under "hold only the most recent".
+compute_property(o, ::Val{:__hold_recent_version__}) = has_versioned_fields(typeof(o))
+function _prune_stale_versions!(o)
+    getorcomputeproperty(o, :__hold_recent_version__) || return nothing
+    dir = o.__cache_path__            # base/<identity>/<version>
+    keep = basename(dir)
+    isempty(keep) && return nothing   # not actually versioned → nothing to prune
+    identity_dir = dirname(dir)       # base/<identity>
+    isdir(identity_dir) || return nothing
+    entries = try readdir(identity_dir) catch; return nothing end
+    length(entries) <= 1 && return nothing   # cheap guard: only the current version present
+    for e in entries
+        e == keep && continue
+        try
+            rm(joinpath(identity_dir, e); recursive = true, force = true)
+        catch
+            # best-effort: a concurrent writer may be creating/removing it
+        end
+    end
+    nothing
+end
 # Progress tracking defaults IN (2026-07-09, decision 2f84ap): every DO that
 # doesn't declare `__status__` gets its own `:state` root, so `htmx_render`
 # never meets a `nothing` tree and no app has to remember the boilerplate.
@@ -1477,6 +1508,7 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
         if iscached(o, vname, indices...; kwargs...)
             cache_path = get_cache_path(o, name, indices...; kwargs...)
             mkpath(dirname(cache_path))
+            _prune_stale_versions!(o)   # @versioned "hold only the most recent" (no-op for non-versioned types)
             __strict__ = getorcomputeproperty(o, :__strict__)
             _cache_context = """Object type: $(nameof(typeof(o))) (objectid: $(objectid(o)), hash: $(hash(o)))
 Cache dict: ThreadsafeDict (parallel)
