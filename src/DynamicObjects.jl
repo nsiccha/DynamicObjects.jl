@@ -354,13 +354,6 @@ _disk_eltype(o, ::Val) = nothing
 
 iscached(o, ::Val) = false
 cache_version(o, ::Val) = nothing
-# Fixed fields declared `@versioned` — the "version dimension" @dynamicstruct
-# splits OUT of the disk-cache path so every version of one logical object shares
-# ONE identity directory (`cache/<identity>/<version>/…`). Default `()`: a struct
-# with no `@versioned` field keeps the flat `cache/<hash>` path, byte-for-byte.
-# Emitted per-type by @dynamicstruct; drives the identity/version cache split and
-# `evict_stale_versions!`.
-_versioned_fields(::Type) = ()
 compute_property(o, ::Val{:__hash_fields__}) = ntuple(Base.Fix1(getfield, o), fieldcount(typeof(o))-1)
 compute_property(o, ::Val{:__hash__}) = persistent_hash((typeof(o), _hash_replace(o.__hash_fields__)))
 # Shallow walker used only by the :__hash__ compute. Leaves non-DO values
