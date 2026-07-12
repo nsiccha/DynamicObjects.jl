@@ -106,4 +106,19 @@ end
               Set([basename(k1.__cache_path__), basename(k2.__cache_path__)])
         @test isdir(k1.__cache_path__)
     end
+
+    @testset "file_version probe helper" begin
+        dir = mktempdir()
+        f = joinpath(dir, "a.txt")
+        @test file_version(f) == ""                       # missing file → stable ""
+        @test file_version(f; by = :hash) == ""
+        write(f, "hello")
+        @test file_version(f; by = :mtime) != ""
+        h1 = file_version(f; by = :hash)
+        @test h1 == file_version(f; by = :hash)           # stable for unchanged content
+        write(f, "changed!!")
+        @test file_version(f; by = :hash) != h1           # content change → version changes
+        @test file_version(f; by = :git) != ""            # git blob id (or :hash fallback)
+        @test_throws ErrorException file_version(f; by = :bogus)
+    end
 end

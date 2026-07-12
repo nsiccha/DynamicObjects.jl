@@ -37,7 +37,7 @@ optionally disk-cached properties.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, file_version, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending
 
 import SHA, Serialization, Mmap, Treebars
 
@@ -418,6 +418,39 @@ function _prune_stale_versions!(o)
         end
     end
     nothing
+end
+
+"""
+    file_version(path; by=:mtime) -> String
+
+Probe a file's current state, for use as a `@versioned` field's value. This is
+the "DO derives the version" half of the file-backed pattern: compute it AT THE
+CALL SITE (no per-access I/O) and pass it to the constructor / `remake` at the
+mutation boundary. `by` trades cost against precision:
+
+- `:mtime` — modification time (one `stat`, cheapest; coarse: misses a
+  content-preserving rewrite, and a `git checkout` bumps mtimes).
+- `:hash`  — a stable hash of the file bytes (reads the whole file; exact).
+- `:git`   — the file's git blob id (`git hash-object`; exact, cheap for tracked
+  files), falling back to `:hash` if git is unavailable.
+
+Returns `""` for a missing file, so a not-yet-created file has a stable version.
+"""
+function file_version(path; by::Symbol = :mtime)
+    isfile(path) || return ""
+    if by === :mtime
+        string(mtime(path))
+    elseif by === :hash
+        persistent_hash(read(path))
+    elseif by === :git
+        try
+            strip(read(`git hash-object $path`, String))
+        catch
+            persistent_hash(read(path))
+        end
+    else
+        error("file_version: unknown probe `by=$by` — use :mtime, :hash, or :git.")
+    end
 end
 # Progress tracking defaults IN (2026-07-09, decision 2f84ap): every DO that
 # doesn't declare `__status__` gets its own `:state` root, so `htmx_render`
