@@ -2522,6 +2522,59 @@ else
     e
 end
 
+# --- Static dependency extraction (for `property_source_info` + `remake` carry-over) ---
+# `walk_rhs` has already rewritten every in-scope bare property/field reference to
+# `__self__.<name>`, so a property's dependencies on the object's own state are
+# exactly the `__self__.<name>` accesses left in its walked RHS. `_collect_self_deps!`
+# harvests those names into `deps` and returns whether the RHS reaches object state
+# *opaquely* — any residual bare `__self__` (handed to a helper, `getfield(__self__,
+# dynamic)`, `__self__.$(expr)`) the static scan cannot attribute to a named field.
+# An opaque reach means `deps` is NOT a sound over-approximation, so callers that
+# rely on soundness (carry-over) must treat the property as always-invalidated.
+function _collect_self_deps!(deps::Set{Symbol}, e)
+    opaque = Ref(false)
+    _collect_self_deps_walk!(deps, opaque, e)
+    opaque[]
+end
+function _collect_self_deps_walk!(deps::Set{Symbol}, opaque::Ref{Bool}, e)
+    if e isa Symbol
+        e === :__self__ && (opaque[] = true)
+    elseif e isa Expr
+        if e.head === :. && length(e.args) == 2 && e.args[1] === :__self__ && e.args[2] isa QuoteNode
+            push!(deps, e.args[2].value::Symbol)   # `__self__.field` — a tracked dependency
+        else
+            for a in e.args
+                _collect_self_deps_walk!(deps, opaque, a)
+            end
+        end
+    end
+    nothing
+end
+
+# Fixed fields that (transitively) invalidate `prop`'s value: the fixed-field
+# leaves reachable from `prop` in the direct-dependency graph. An opaque reach —
+# `prop` opaque, a dependency opaque, or a content-hash dunder in the closure —
+# means independence from a changed field cannot be proven, so ALL fixed fields
+# invalidate (conservative, keeps `remake` carry-over sound-by-construction).
+const _HASH_DUNDERS = (:__hash__, :__hash_fields__, :__cache_base__, :__cache_path__)
+function _carry_invalidators(prop::Symbol, direct_deps::AbstractDict, fixed_set, opaque_props)
+    (prop in opaque_props) && return copy(fixed_set)
+    inv = Set{Symbol}()
+    seen = Set{Symbol}()
+    stack = Symbol[prop]
+    while !isempty(stack)
+        n = pop!(stack)
+        (n in seen) && continue
+        push!(seen, n)
+        for d in get(direct_deps, n, ())
+            (d in _HASH_DUNDERS || d in opaque_props) && return copy(fixed_set)
+            (d in fixed_set) && push!(inv, d)
+            push!(stack, d)
+        end
+    end
+    inv
+end
+
 # --- Linter ----------------------------------------------------------------
 #
 # Lints are computed by `analyze_structure(T)` — a tree-walk over `meta(T)`
@@ -4388,6 +4441,49 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     fixed_fields = [(name, info.lhs) for (name, info) in oproperties if isfixed(info)]
     fixed_names = [n for (n, _) in fixed_fields]
     fixed_lhs = [lhs for (_, lhs) in fixed_fields]
+    # ── Static dependency graph ──────────────────────────────────────────────
+    # Populate each computed property's `dependson` set (empty until now — the
+    # field was a placeholder). Walk a COPY of the RHS: `walk_rhs` mutates `:let`
+    # blocks in place, and the real per-property emission re-walks `info.rhs`
+    # later. The `dependson` Sets are shared by reference into the emitted `meta`
+    # (below), so mutating them here ships them populated — un-stubbing
+    # `property_source_info`/`reflect(T)` and feeding the `remake` carry-over bake.
+    opaque_props = Set{Symbol}()
+    for (name, info) in properties
+        (info.rhs === nothing) && continue        # fixed fields have no RHS
+        _collect_self_deps!(info.dependson,
+            walk_rhs(deepcopy(info.rhs); locals=copy(info.locals), properties=walk_props, lnn=info.lnn)) &&
+            push!(opaque_props, name)
+    end
+    # ── `remake` carry-over bake (decision yf4z8x) ───────────────────────────
+    # A memoized bare property may be reused verbatim by `remake` when NONE of
+    # the fixed fields it (transitively) depends on is among the changed kwargs.
+    # Compute each carry-eligible property's invalidating fixed fields and emit a
+    # per-type `_carryover` with them baked as a literal, so the per-property
+    # `isdisjoint(changed_kwargs, invalidators)` gate const-folds at each call.
+    # Excluded (v1): fixed fields, indexed props (not PropertyCache-backed),
+    # inline `@struct` children (they wire `__parent__` to the SOURCE object),
+    # and the `__…__` machinery/status properties.
+    fixed_set = Set{Symbol}(fixed_names)
+    inline_child_names = Set{Symbol}(first(p) for p in inline_child_pairs)
+    direct_deps = Dict{Symbol,Set{Symbol}}()
+    for (name, info) in properties
+        isnothing(info.dependson) && continue
+        union!(get!(() -> Set{Symbol}(), direct_deps, name), info.dependson)
+    end
+    _carry_calls = Any[]
+    _seen_carry = Set{Symbol}()
+    for (name, info) in properties
+        (isfixed(info) || info.indexed || name in inline_child_names ||
+            name in _seen_carry || startswith(String(name), "__")) && continue
+        push!(_seen_carry, name)
+        inv = sort!(collect(_carry_invalidators(name, direct_deps, fixed_set, opaque_props)))
+        push!(_carry_calls, :($DynamicObjects._carry1(__obj__, Val(__KW__), Val($(QuoteNode(name))),
+            Val($(Expr(:tuple, (QuoteNode(f) for f in inv)...))))))
+    end
+    _carryover_expr = isempty(_carry_calls) ?
+        :($DynamicObjects._carryover(__obj__::$type, ::Val) = (;)) :
+        :($DynamicObjects._carryover(__obj__::$type, ::Val{__KW__}) where {__KW__} = merge($(_carry_calls...)))
     struct_expr = Expr(:struct, mut, head, Expr(:block,
         fixed_lhs..., :(cache::$PropertyCache),
         :(function $type($(fixed_lhs...); cache_type=nothing, kwargs...)
@@ -4459,6 +4555,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             $Base.getproperty(__self__::$type, name::Symbol) = $getorcomputeproperty(__self__, name)
             $Base.setproperty!(__self__::$type, name::Symbol, value) = getfield(__self__, :cache)[name] = value
             $DynamicObjects.meta(::Type{$type}) = $properties
+            $_carryover_expr
             $DynamicObjects.is_generated_property(::$type, name::Symbol) = name in $generated_names
             $DynamicObjects.is_indexed_property(::$type, name::Symbol) = name in $indexed_names
             $DynamicObjects._hash_replace(__self__::$type) = __self__.__hash__
@@ -4923,6 +5020,25 @@ macro dynamicstruct(args...)
     dynamicstruct(expr; kwargs...)
 end
 
+# --- `remake` carry-over machinery (decision yf4z8x) ---
+# `_carryover(obj, Val(KW))` returns a NamedTuple of the source's memoized
+# bare-property values that survive a `remake` whose changed kwargs are `KW` —
+# every carry-eligible property none of whose invalidating fixed fields is in
+# `KW`. `@dynamicstruct` bakes a per-type method with each property's
+# invalidators as a literal, so the `isdisjoint` gate below const-folds per
+# call; this generic fallback (untyped `Val`) carries nothing.
+_carryover(obj, ::Val) = (;)
+@inline _carry1(obj, ::Val{KW}, ::Val{P}, ::Val{INV}) where {KW,P,INV} =
+    isdisjoint(KW, INV) ? _carry_if_settled(obj, Val(P)) : (;)
+struct _CarryMiss end
+const _CARRY_MISS = _CarryMiss()
+# Peek the source cache without triggering compute/wait; carry only a settled
+# value (skip an in-flight `Pending` handle from the compute-at-most-once latch).
+@inline function _carry_if_settled(obj, ::Val{P}) where {P}
+    v = get(getfield(obj, :cache).cache, P, _CARRY_MISS)
+    (v === _CARRY_MISS || v isa Pending) ? (;) : NamedTuple{(P,)}((v,))
+end
+
 """
     remake(obj; kwargs...)
 
@@ -4933,26 +5049,38 @@ Keyword arguments that correspond to fixed fields replace those field values in
 the new instance. Any remaining keyword arguments are forwarded to the
 constructor as cache pre-population overrides.
 
+Because a `@dynamicstruct` is a pure function of its fixed fields, any already
+memoized property of `obj` whose (transitive) fixed-field dependencies are all
+unchanged is **carried over** to the new instance instead of being recomputed —
+the per-type carry set is baked from the `dependson` graph at macro-expansion,
+so the decision costs nothing at runtime. Impure properties (reading `rand`, the
+clock, or external mutable state) violate this contract and must not be relied
+on across `remake`.
+
 # Example
 ```julia
 @dynamicstruct struct Config
     n::Int
     scale::Float64
-    result = scale * sum(rand(n))
+    base = sum(1:n)          # depends only on n
+    result = scale * base    # depends on scale (and, transitively, n)
 end
 
-c  = Config(100, 2.0)
-c2 = remake(c; n=200)       # n=200, scale=2.0, result recomputed fresh
-c3 = remake(c; scale=3.0)   # n=100, scale=3.0, result recomputed fresh
-c4 = remake(c; result=0.0)  # n=100, scale=2.0, result pre-set to 0.0
+c  = Config(100, 2.0); c.result   # memoizes base + result
+c2 = remake(c; scale=3.0)  # n unchanged → `base` CARRIED over; `result` recomputed
+c3 = remake(c; n=200)      # n changed → both base & result recomputed
+c4 = remake(c; result=0.0) # result pre-set to 0.0 (explicit override wins)
 ```
 """
-function remake(obj; kwargs...)
-    T = typeof(obj)
-    fixed_names = fieldnames(T)[1:end-1]  # all fields except :cache
-    args = [get(kwargs, name, getfield(obj, name)) for name in fixed_names]
-    cache_kwargs = filter(p -> !(first(p) in fixed_names), kwargs)
-    T(args...; cache_kwargs...)
+remake(obj; kwargs...) = _remake(obj, values(kwargs))
+function _remake(obj::T, nt::NamedTuple{KW}) where {T,KW}
+    fixed = fieldnames(T)[1:end-1]               # all fields except :cache
+    args = Any[haskey(nt, n) ? nt[n] : getfield(obj, n) for n in fixed]
+    # Reuse the source's still-valid memoized properties; explicit cache
+    # pre-population kwargs (non-fixed-field) override any carried value.
+    carried = _carryover(obj, Val(KW))
+    explicit = Base.structdiff(nt, NamedTuple{fixed})
+    T(args...; carried..., explicit...)
 end
 
 # --- Error display for property computations ---
