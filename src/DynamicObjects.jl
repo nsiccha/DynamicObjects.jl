@@ -37,7 +37,7 @@ optionally disk-cached properties.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, file_version, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending
 
 import SHA, Serialization, Mmap, Treebars
 
@@ -363,8 +363,95 @@ compute_property(o, ::Val{:__hash__}) = persistent_hash((typeof(o), _hash_replac
 _hash_replace(x::Tuple) = map(_hash_replace, x)
 _hash_replace(x::NamedTuple) = map(_hash_replace, x)
 _hash_replace(x) = x
+
+# ── @versioned: identity/version split of the disk-cache path ───────────────
+# A `@versioned name::T` fixed field is the *version dimension*: excluded from
+# the object's cache IDENTITY and instead selecting a per-version subdir, so a
+# versioned object caches under `base/<identity>/<version>/…`. All versions of
+# one logical object share the identity dir (this is what lets "hold only the
+# most recent" prune stale siblings); a fresh version cache-misses cleanly.
+# Non-versioned types keep the byte-identical `base/<__hash__>/` layout via the
+# fast path below. The per-type `has_versioned_fields` / `_identity_hash_fields`
+# / `_version_hash_fields` overrides are emitted by @dynamicstruct ONLY when a
+# `@versioned` field is declared, so every existing struct is unaffected.
+has_versioned_fields(::Type) = false
+_identity_hash_fields(o) = o.__hash_fields__   # non-versioned: identity = all fixed fields
+_version_hash_fields(o) = ()                   # non-versioned: no version segment
+compute_property(o, ::Val{:__identity_hash__}) =
+    persistent_hash((typeof(o), _hash_replace(_identity_hash_fields(o))))
+compute_property(o, ::Val{:__version_tag__}) = begin
+    vhf = _version_hash_fields(o)
+    isempty(vhf) ? "" : persistent_hash(_hash_replace(vhf))
+end
 compute_property(o, ::Val{:__cache_base__}) = "cache"
-compute_property(o, ::Val{:__cache_path__}) = joinpath(o.__cache_base__, o.__hash__)
+compute_property(o, ::Val{:__cache_path__}) =
+    has_versioned_fields(typeof(o)) ?
+        joinpath(o.__cache_base__, o.__identity_hash__, o.__version_tag__) :
+        joinpath(o.__cache_base__, o.__hash__)
+
+# "Hold only the most recent" (the user-requested automatic convenience). A
+# versioned object caches under `base/<identity>/<version>/`; when it touches
+# that dir, SIBLING version dirs under the same identity are pruned, so only the
+# current version's entry survives on disk. This is a *targeted, version-keyed*
+# cleanup — NOT the general byte-budget LRU deleted in cc84ee6. Disk only:
+# in-memory caches on other live instances are untouched. Default-on for
+# versioned types; opt out per-instance with `T(…; __hold_recent_version__=false)`
+# (the overrideable-default idiom) or per-type by overriding this compute.
+# NOTE: if two versions of one object are alive AND both compute, they take
+# turns pruning each other — expected under "hold only the most recent".
+compute_property(o, ::Val{:__hold_recent_version__}) = has_versioned_fields(typeof(o))
+function _prune_stale_versions!(o)
+    getorcomputeproperty(o, :__hold_recent_version__) || return nothing
+    dir = o.__cache_path__            # base/<identity>/<version>
+    keep = basename(dir)
+    isempty(keep) && return nothing   # not actually versioned → nothing to prune
+    identity_dir = dirname(dir)       # base/<identity>
+    isdir(identity_dir) || return nothing
+    entries = try readdir(identity_dir) catch; return nothing end
+    length(entries) <= 1 && return nothing   # cheap guard: only the current version present
+    for e in entries
+        e == keep && continue
+        try
+            rm(joinpath(identity_dir, e); recursive = true, force = true)
+        catch
+            # best-effort: a concurrent writer may be creating/removing it
+        end
+    end
+    nothing
+end
+
+"""
+    file_version(path; by=:mtime) -> String
+
+Probe a file's current state, for use as a `@versioned` field's value. This is
+the "DO derives the version" half of the file-backed pattern: compute it AT THE
+CALL SITE (no per-access I/O) and pass it to the constructor / `remake` at the
+mutation boundary. `by` trades cost against precision:
+
+- `:mtime` — modification time (one `stat`, cheapest; coarse: misses a
+  content-preserving rewrite, and a `git checkout` bumps mtimes).
+- `:hash`  — a stable hash of the file bytes (reads the whole file; exact).
+- `:git`   — the file's git blob id (`git hash-object`; exact, cheap for tracked
+  files), falling back to `:hash` if git is unavailable.
+
+Returns `""` for a missing file, so a not-yet-created file has a stable version.
+"""
+function file_version(path; by::Symbol = :mtime)
+    isfile(path) || return ""
+    if by === :mtime
+        string(mtime(path))
+    elseif by === :hash
+        persistent_hash(read(path))
+    elseif by === :git
+        try
+            strip(read(`git hash-object $path`, String))
+        catch
+            persistent_hash(read(path))
+        end
+    else
+        error("file_version: unknown probe `by=$by` — use :mtime, :hash, or :git.")
+    end
+end
 # Progress tracking defaults IN (2026-07-09, decision 2f84ap): every DO that
 # doesn't declare `__status__` gets its own `:state` root, so `htmx_render`
 # never meets a `nothing` tree and no app has to remember the boilerplate.
@@ -1447,6 +1534,7 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
         if iscached(o, vname, indices...; kwargs...)
             cache_path = get_cache_path(o, name, indices...; kwargs...)
             mkpath(dirname(cache_path))
+            _prune_stale_versions!(o)   # @versioned "hold only the most recent" (no-op for non-versioned types)
             __strict__ = getorcomputeproperty(o, :__strict__)
             _cache_context = """Object type: $(nameof(typeof(o))) (objectid: $(objectid(o)), hash: $(hash(o)))
 Cache dict: ThreadsafeDict (parallel)
@@ -4404,7 +4492,10 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         metadata.doc[] = nothing
         !isnothing(locals) && push!(locals, name)
         !isnothing(locals) && push!(locals, :__status__)
-        @assert !isnothing(rhs) || length(macros) == 0
+        # A fixed field (no rhs) may carry ONLY `@versioned` (the cache version
+        # dimension); every other marker (@cached/@mmap/@fresh/@dynamic_progress)
+        # acts on a computed property and is a mistake on a field.
+        @assert !isnothing(rhs) || issubset(macros, (Symbol("@versioned"),)) "fixed field `$name` may not carry markers other than @versioned (got $(sort!(string.(collect(macros)))))"
         push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices, indexed, cache_version, doc))
     end
     # `properties` holds the per-declaration list (preserves order AND duplicate
@@ -4441,6 +4532,22 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     fixed_fields = [(name, info.lhs) for (name, info) in oproperties if isfixed(info)]
     fixed_names = [n for (n, _) in fixed_fields]
     fixed_lhs = [lhs for (_, lhs) in fixed_fields]
+    # ── @versioned fixed fields: the cache version dimension ─────────────────
+    # `@versioned name::T` tags a FIXED field as the version dimension. It is
+    # excluded from the identity hash and instead forms a per-version path
+    # segment (see `has_versioned_fields`/`__cache_path__`). It MUST be a fixed
+    # field — a computed property is absent from `__hash_fields__`, so tagging
+    # one would silently do nothing.
+    versioned_names = [name for (name, info) in oproperties if isfixed(info) && Symbol("@versioned") in info.macros]
+    for (name, info) in oproperties
+        (Symbol("@versioned") in info.macros && !isfixed(info)) && error("@versioned on property `$name`: applies only to a fixed field (`@versioned $name::T`), not a computed property. The version dimension must be a stored field so it participates in the cache identity — compute the probe (mtime / content-hash / git HEAD) at the call site and pass it in or `remake` it.")
+    end
+    identity_fixed_names = [n for n in fixed_names if !(n in versioned_names)]
+    versioned_defs = isempty(versioned_names) ? Any[] : Any[
+        :($DynamicObjects.has_versioned_fields(::Type{$type}) = true),
+        :($DynamicObjects._identity_hash_fields(__self__::$type) = $(Expr(:tuple, [:(getfield(__self__, $(QuoteNode(n)))) for n in identity_fixed_names]...))),
+        :($DynamicObjects._version_hash_fields(__self__::$type) = $(Expr(:tuple, [:(getfield(__self__, $(QuoteNode(n)))) for n in versioned_names]...))),
+    ]
     # ── Static dependency graph ──────────────────────────────────────────────
     # Populate each computed property's `dependson` set (empty until now — the
     # field was a placeholder). Walk a COPY of the RHS: `walk_rhs` mutates `:let`
@@ -4559,6 +4666,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             $DynamicObjects.is_generated_property(::$type, name::Symbol) = name in $generated_names
             $DynamicObjects.is_indexed_property(::$type, name::Symbol) = name in $indexed_names
             $DynamicObjects._hash_replace(__self__::$type) = __self__.__hash__
+            $(versioned_defs...)
             $([:(
                 $DynamicObjects._disk_cache(::$type, ::Val{$(QuoteNode(name))}) = $varname
             ) for (name, varname) in cached_names]...)
