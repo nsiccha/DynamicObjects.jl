@@ -4532,21 +4532,30 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     fixed_fields = [(name, info.lhs) for (name, info) in oproperties if isfixed(info)]
     fixed_names = [n for (n, _) in fixed_fields]
     fixed_lhs = [lhs for (_, lhs) in fixed_fields]
-    # ── @versioned fixed fields: the cache version dimension ─────────────────
-    # `@versioned name::T` tags a FIXED field as the version dimension. It is
-    # excluded from the identity hash and instead forms a per-version path
-    # segment (see `has_versioned_fields`/`__cache_path__`). It MUST be a fixed
-    # field — a computed property is absent from `__hash_fields__`, so tagging
-    # one would silently do nothing.
-    versioned_names = [name for (name, info) in oproperties if isfixed(info) && Symbol("@versioned") in info.macros]
+    # ── @versioned: the cache version dimension (fixed field OR computed prop) ─
+    # `@versioned x` tags `x` as the version dimension — excluded from the cache
+    # IDENTITY, forming a per-version path segment (see `has_versioned_fields` /
+    # `__cache_path__`). Two shapes share one contract (decision `b2tsvz`, opt B):
+    #   • a FIXED field  → read via `getfield`; excluded from the identity hash so
+    #     every version of one object shares an identity dir (what lets pruning work).
+    #   • a COMPUTED prop → read via `getorcomputeproperty` (the value DO derives,
+    #     e.g. `file_version(path)`); identity is UNCHANGED — a computed prop is
+    #     never in `__hash_fields__`, so there is nothing to exclude and the version
+    #     segment is purely additive. Acyclicity guarded once `dependson` is built.
+    versioned_names = [name for (name, info) in oproperties if Symbol("@versioned") in info.macros]
+    versioned_fixed = Set{Symbol}(name for (name, info) in oproperties if isfixed(info) && Symbol("@versioned") in info.macros)
+    # A computed `@versioned` prop cannot ALSO be disk-cached: computing its own
+    # value would need `__cache_path__` → `__version_tag__` → itself (a cycle).
     for (name, info) in oproperties
-        (Symbol("@versioned") in info.macros && !isfixed(info)) && error("@versioned on property `$name`: applies only to a fixed field (`@versioned $name::T`), not a computed property. The version dimension must be a stored field so it participates in the cache identity — compute the probe (mtime / content-hash / git HEAD) at the call site and pass it in or `remake` it.")
+        (Symbol("@versioned") in info.macros && !isfixed(info) &&
+         (Symbol("@cached") in info.macros || Symbol("@mmap") in info.macros)) &&
+            error("@versioned computed property `$name` may not also be @cached/@mmap: computing its value needs the cache path, which needs the version — a cycle. Make the version dimension a plain computed property.")
     end
-    identity_fixed_names = [n for n in fixed_names if !(n in versioned_names)]
+    identity_fixed_names = [n for n in fixed_names if !(n in versioned_fixed)]
     versioned_defs = isempty(versioned_names) ? Any[] : Any[
         :($DynamicObjects.has_versioned_fields(::Type{$type}) = true),
         :($DynamicObjects._identity_hash_fields(__self__::$type) = $(Expr(:tuple, [:(getfield(__self__, $(QuoteNode(n)))) for n in identity_fixed_names]...))),
-        :($DynamicObjects._version_hash_fields(__self__::$type) = $(Expr(:tuple, [:(getfield(__self__, $(QuoteNode(n)))) for n in versioned_names]...))),
+        :($DynamicObjects._version_hash_fields(__self__::$type) = $(Expr(:tuple, [(n in versioned_fixed ? :(getfield(__self__, $(QuoteNode(n)))) : :($DynamicObjects.getorcomputeproperty(__self__, $(QuoteNode(n))))) for n in versioned_names]...))),
     ]
     # ── Static dependency graph ──────────────────────────────────────────────
     # Populate each computed property's `dependson` set (empty until now — the
@@ -4561,6 +4570,32 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         _collect_self_deps!(info.dependson,
             walk_rhs(deepcopy(info.rhs); locals=copy(info.locals), properties=walk_props, lnn=info.lnn)) &&
             push!(opaque_props, name)
+    end
+    # ── @versioned computed props: acyclicity guard (decision `b2tsvz`) ───────
+    # A computed version dimension must be derivable WITHOUT a cache path: the path
+    # is `…/<identity>/<version_tag>`, and `__version_tag__` reads the version prop,
+    # so if that prop (transitively) reads a `@cached`/`@mmap` property the read
+    # needs `__cache_path__` → `__version_tag__` → the prop again (a cycle). The
+    # `dependson` graph is populated just above, so reject it at macro time with a
+    # precise message instead of a runtime stack overflow.
+    if any(n -> !(n in versioned_fixed), versioned_names)
+        _forbidden_ver_deps = union(
+            Set{Symbol}(name for (name, info) in oproperties
+                        if Symbol("@cached") in info.macros || Symbol("@mmap") in info.macros),
+            Set{Symbol}([:__cache_path__, :__version_tag__, :__identity_hash__]))
+        _ver_depmap = Dict{Symbol,Set{Symbol}}(name => info.dependson for (name, info) in properties)
+        for _vname in versioned_names
+            _vname in versioned_fixed && continue
+            _seen = Set{Symbol}()
+            _stack = collect(get(_ver_depmap, _vname, Set{Symbol}()))
+            while !isempty(_stack)
+                _d = pop!(_stack)
+                _d in _seen && continue
+                push!(_seen, _d)
+                _d in _forbidden_ver_deps && error("@versioned computed property `$_vname` (transitively) depends on `$_d`, whose value needs the cache path — computing the version would then need the version itself (a cycle). Derive the version dimension without reading any @cached/@mmap property or cache-path machinery.")
+                append!(_stack, get(_ver_depmap, _d, Set{Symbol}()))
+            end
+        end
     end
     # ── `remake` carry-over bake (decision yf4z8x) ───────────────────────────
     # A memoized bare property may be reused verbatim by `remake` when NONE of
