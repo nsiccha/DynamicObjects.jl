@@ -1,17 +1,20 @@
 # Regression: the `@versioned` marker (A2 of the file-backed feature).
 #
-# `@versioned name::T` tags a FIXED field as the cache VERSION dimension. DO
-# excludes it from the object's identity hash and instead uses it to select a
-# per-version path segment, so a versioned object caches under
-# `base/<identity>/<version>/…`. This bakes the hand-rolled content_version
-# pattern (see filebacked_content_version.jl) into a one-marker feature:
+# `@versioned x` tags `x` as the cache VERSION dimension. DO excludes it from the
+# object's identity hash and instead uses it to select a per-version path segment,
+# so a versioned object caches under `base/<identity>/<version>/…`. `x` may be a
+# FIXED field (probe passed in / `remake`d) OR — since b2tsvz, Option B — a
+# COMPUTED property DO derives itself (e.g. `file_version(path)`): additive to
+# identity, guarded against cache-path cycles. This bakes the hand-rolled
+# content_version pattern (see filebacked_content_version.jl) into a one marker:
 #   - all versions of one logical object share the identity dir;
 #   - a fresh version cache-misses cleanly;
 #   - "hold only the most recent" prunes stale sibling version dirs on write
 #     (default-on for versioned types; opt out with __hold_recent_version__=false);
 #   - non-versioned structs are byte-identical to before (fast path preserved).
-# The probe (mtime / content-hash / git HEAD) stays consumer-computed and is
-# passed in / `remake`d — no per-access I/O.
+# For a FIXED version the probe (mtime / content-hash / git HEAD) stays
+# consumer-computed and is passed in / `remake`d; a COMPUTED version has DO run
+# the probe, memoized once per object — no per-access I/O either way.
 #
 # Standalone: julia --project=<env-with-DO> test/versioned_marker.jl
 # In-suite:   add `include("versioned_marker.jl")` to runtests.jl.
@@ -34,6 +37,19 @@ end
     path::String
     @versioned content_version::String
     @cached payload() = string(path, ":", content_version)
+end
+
+# Computed @versioned (b2tsvz opt B): DO derives the version from the file's
+# content itself — identity stays the `path`, the version tracks the content hash.
+@dynamicstruct struct FileVersioned
+    path::String
+    @versioned content_ver = file_version(path; by = :hash)
+end
+
+@dynamicstruct struct FileVersionedDisk
+    path::String
+    @versioned content_ver = file_version(path; by = :hash)
+    @cached payload() = string("v=", content_ver)
 end
 
 @testset "@versioned marker" begin
@@ -68,18 +84,76 @@ end
         @test dirname(v2.__cache_path__) == dirname(v1.__cache_path__)
     end
 
-    @testset "@versioned on a computed property errors at expansion" begin
-        err = try
-            @eval @dynamicstruct struct BadVersioned
+    @testset "computed @versioned: DO derives the version (b2tsvz opt B)" begin
+        dir = mktempdir()
+        f = joinpath(dir, "data.bin")
+        write(f, "one")
+        a = FileVersioned(f)
+        @test has_versioned_fields(FileVersioned)
+        @test a.content_ver == file_version(f; by = :hash)     # DO computes the probe itself
+        id1, tag1 = a.__identity_hash__, a.__version_tag__
+        @test tag1 != ""                                       # computed prop drives a real version
+        @test basename(a.__cache_path__) == tag1
+        @test basename(dirname(a.__cache_path__)) == id1
+
+        write(f, "two")                                        # same path (identity), new content
+        b = FileVersioned(f)
+        @test b.__identity_hash__ == id1                       # identity EXCLUDES the computed version
+        @test b.__version_tag__ != tag1                        # version tracks the derived content hash
+        @test dirname(b.__cache_path__) == dirname(a.__cache_path__)  # share the identity dir
+        @test b.__cache_path__ != a.__cache_path__             # differ only in the version segment
+    end
+
+    @testset "computed @versioned: a @cached payload auto-invalidates on file change" begin
+        base = mktempdir()
+        dir = mktempdir()
+        f = joinpath(dir, "in.txt")
+        write(f, "alpha")
+        o1 = FileVersionedDisk(f; __cache_base__ = base)
+        @test o1.payload() == "v=" * file_version(f; by = :hash)
+        @test isfile(joinpath(o1.__cache_path__, "payload.sjl"))
+
+        write(f, "beta")                                       # content changes under the same path
+        o2 = FileVersionedDisk(f; __cache_base__ = base)
+        @test o2.__identity_hash__ == o1.__identity_hash__     # same identity
+        @test o2.__cache_path__ != o1.__cache_path__           # new version segment
+        @test o2.payload() == "v=" * file_version(f; by = :hash)  # fresh, not the stale "alpha" value
+    end
+
+    @testset "computed @versioned rejects a cache-path cycle (acyclicity guard)" begin
+        # (a) version derived from a @cached property → transitive cycle
+        e1 = try
+            @eval @dynamicstruct struct BadVerCachedDep
                 x::Int
-                @versioned bad() = 5
+                @cached expensive() = x * 2
+                @versioned v = expensive() + 1
             end
             nothing
-        catch e
-            e
-        end
-        @test err !== nothing
-        @test occursin("@versioned", sprint(showerror, err))
+        catch e; e end
+        @test e1 !== nothing
+        @test occursin("cycle", lowercase(sprint(showerror, e1)))
+
+        # (b) the version property itself marked @cached → self-cycle
+        e2 = try
+            @eval @dynamicstruct struct BadVerSelfCache
+                x::Int
+                @versioned @cached v() = x
+            end
+            nothing
+        catch e; e end
+        @test e2 !== nothing
+        @test occursin("@cached", sprint(showerror, e2))
+
+        # (c) version reads the cache-path machinery directly
+        e3 = try
+            @eval @dynamicstruct struct BadVerCachePath
+                x::Int
+                @versioned v = length(__cache_path__)
+            end
+            nothing
+        catch e; e end
+        @test e3 !== nothing
+        @test occursin("cycle", lowercase(sprint(showerror, e3)))
     end
 
     @testset "hold only the most recent — a new version prunes the old" begin

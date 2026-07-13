@@ -4583,7 +4583,11 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             Set{Symbol}(name for (name, info) in oproperties
                         if Symbol("@cached") in info.macros || Symbol("@mmap") in info.macros),
             Set{Symbol}([:__cache_path__, :__version_tag__, :__identity_hash__]))
-        _ver_depmap = Dict{Symbol,Set{Symbol}}(name => info.dependson for (name, info) in properties)
+        # Fixed fields carry `dependson === nothing` (only computed props get a
+        # populated Set above), so skip them — they're leaves in the dep walk and
+        # `get(…, Set())` below already treats a missing key as no-deps.
+        _ver_depmap = Dict{Symbol,Set{Symbol}}(name => info.dependson
+            for (name, info) in properties if info.dependson !== nothing)
         for _vname in versioned_names
             _vname in versioned_fixed && continue
             _seen = Set{Symbol}()
