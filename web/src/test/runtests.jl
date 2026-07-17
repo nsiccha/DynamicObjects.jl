@@ -1227,6 +1227,13 @@ _mmap_base = Ref("")
     wrapped = MmapOpaque(annotated)   # the wrap-on-read escape hatch
 end
 
+_mmap_heal_base = Ref("")
+_mmap_heal_counter = Ref(0)
+@dynamicstruct struct MmapHealing
+    __cache_base__ = _mmap_heal_base[]
+    @mmap payload::Vector{Float64} = (_mmap_heal_counter[] += 1; [1.0, 2.0, 3.0])
+end
+
 @testset "@mmap payload contract" begin
     _mmap_base[] = mktempdir()
     o = MmapPayloads()
@@ -1239,6 +1246,44 @@ end
     # Un-annotated array: self-describing DOMM load.
     @test o.unannotated isa Vector{Float64}
     @test o.unannotated == [5.0, 6.0, 7.0]
+
+    # A pre-existing header-only cache hit is already self-healing: the read
+    # path catches `_mmap_check_complete`, deletes the partial file, recomputes,
+    # and publishes a complete replacement. This distinguishes the reported
+    # cache-hit theory from the actual bug below (a NEW short write being
+    # published, then failing at the post-save reload outside that catch).
+    _mmap_heal_base[] = mktempdir()
+    _mmap_heal_counter[] = 0
+    h1 = MmapHealing()
+    @test h1.payload == [1.0, 2.0, 3.0]
+    heal_path = @cache_path h1.payload
+    header_offset = open(heal_path, "r") do io
+        _, _, _, offset = DynamicObjects._mmap_read_header(io)
+        offset
+    end
+    open(heal_path, "r+") do io
+        truncate(io, header_offset)
+    end
+    @test filesize(heal_path) == header_offset
+    h2 = MmapHealing()
+    @test h2.payload == [1.0, 2.0, 3.0]
+    @test _mmap_heal_counter[] == 2
+    @test filesize(heal_path) == header_offset + 3 * sizeof(Float64)
+
+    # A disk-full write can return normally while leaving only the header on
+    # macOS. The post-close validator must reject that temp before
+    # `_atomic_save` can rename it into the cache namespace.
+    partial_path = tempname()
+    write(partial_path, zeros(UInt8, header_offset))
+    partial_err = try
+        DynamicObjects._mmap_check_written_complete(
+            partial_path, header_offset, 3 * sizeof(Float64))
+        nothing
+    catch e
+        e
+    end
+    @test partial_err !== nothing
+    @test occursin("no partial cache entry will be published", sprint(showerror, partial_err))
 
     # A non-AbstractArray type an extension claims.
     @test o.tbl isa DataFrame
