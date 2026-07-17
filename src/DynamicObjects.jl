@@ -139,7 +139,7 @@ function save(::Val{:mmap}, path::AbstractString, x::AbstractArray)
     A = x isa Array ? x : Array(x)   # ensure dense column-major isbits payload
     isbitstype(eltype(A)) || error("@mmap: array eltype $(eltype(A)) is not isbits; only isbits arrays can be memory-mapped.")
     tag = _mmap_tag_of(eltype(A))
-    open(path, "w") do io
+    offset, len = open(path, "w") do io
         write(io, _MMAP_MAGIC...)
         write(io, _MMAP_VERSION)
         write(io, tag)
@@ -147,8 +147,15 @@ function save(::Val{:mmap}, path::AbstractString, x::AbstractArray)
         for d in size(A); write(io, Int64(d)); end
         pad = mod(-position(io), _MMAP_ALIGN)
         write(io, zeros(UInt8, pad))
+        offset = position(io)
         write(io, A)
+        (offset, sizeof(A))
     end
+    # `IOStream.write` may return normally after a short write on a full disk
+    # (observed on macOS). Validate after `close` has flushed the stream, before
+    # `_atomic_save` renames this temp file over the cache entry. On failure,
+    # `_atomic_save` removes the temp and leaves no header-only cache poison.
+    _mmap_check_written_complete(path, offset, len)
     A
 end
 # Reached when the property's VALUE is neither an `AbstractArray` nor a type some
@@ -211,6 +218,17 @@ function _mmap_check_complete(io::IO, path, offset::Int, len::Int)
     need = offset + len
     fsz >= need && return nothing
     error("@mmap: $path is truncated — need $need bytes (header offset $offset + payload $len) but the file holds $fsz. A partial cache file; it will be deleted and recomputed.")
+end
+
+# Validate a newly-written mmap file after the write stream has been closed.
+# This is distinct from `_mmap_check_complete`, which validates a cache hit:
+# here `path` is `_atomic_save`'s unique temp file, and throwing prevents the
+# subsequent atomic rename from publishing a partial cache entry.
+function _mmap_check_written_complete(path, offset::Int, len::Int)
+    fsz = filesize(path)
+    need = offset + len
+    fsz == need && return nothing
+    error("@mmap: incomplete write to $path — expected exactly $need bytes (header offset $offset + payload $len) but the file holds $fsz. The temporary file will be discarded; no partial cache entry will be published.")
 end
 
 # Annotated fast path: the property's `::T` array type is known → type-stable.
