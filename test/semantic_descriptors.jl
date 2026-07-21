@@ -1,4 +1,10 @@
-using Test, DynamicObjects
+using TestItemRunner
+
+@testmodule SemanticFixtures begin
+using DynamicObjects
+export SemanticQuality, draft, final, SemanticDescriptorFixture,
+    SemanticPendingFixture, ComputedVersionedSemanticDescriptorFixture,
+    BadSemanticInputName, LegacySemanticMeta
 
 @enum SemanticQuality draft final
 
@@ -58,7 +64,13 @@ DynamicObjects.meta(::Type{LegacySemanticMeta}) = [
         indexed=false, cache_version=nothing, doc=nothing),
 ]
 
-@testset "semantic property descriptors" begin
+end # @testmodule SemanticFixtures
+
+"""
+Documents the stable descriptor schema for fixed, computed, indexed, and
+legacy properties, including inferred and declared input domains.
+"""
+@testitem "semantic property descriptors" tags=[:semantic] setup=[SemanticFixtures] begin
     fixed = property_descriptor(SemanticDescriptorFixture, :enabled)
     @test fixed.role === :input
     @test fixed.output.materialization.tier === :field
@@ -151,7 +163,11 @@ DynamicObjects.meta(::Type{LegacySemanticMeta}) = [
     @test isempty(legacy.semantics.version_dependencies)
 end
 
-@testset "budgeted materialization recommendations" begin
+"""
+Checks budget-aware materialization recommendations while preserving an
+explicitly declared storage tier over automatic heuristics.
+"""
+@testitem "budgeted materialization recommendations" tags=[:semantic] setup=[SemanticFixtures] begin
     candidate = property_descriptor(SemanticDescriptorFixture, :candidate)
     mmap_plan = materialization_plan(candidate;
         memory_available_bytes=8 * 1024^2,
@@ -181,7 +197,11 @@ end
     @test declared.reason === :declared
 end
 
-@testset "materialization and Pending observability" begin
+"""
+Observes unmaterialized, pending, and ready states without forcing a property,
+then verifies that the same progress object remains visible through completion.
+"""
+@testitem "materialization and Pending observability" tags=[:semantic] setup=[SemanticFixtures] begin
     cache_base = mktempdir()
     o = SemanticDescriptorFixture(1, true, final, :fast;
         __cache_base__=cache_base)
@@ -228,7 +248,11 @@ end
     @test done.state === :ready
 end
 
-@testset "semantic metadata validation stays local to introspection" begin
+"""
+Invalid semantic metadata must fail during introspection while leaving normal
+property construction and execution unaffected.
+"""
+@testitem "semantic metadata validation stays local to introspection" tags=[:semantic] setup=[SemanticFixtures] begin
     err = try
         property_descriptor(BadSemanticInputName, :value)
         nothing

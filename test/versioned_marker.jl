@@ -12,6 +12,10 @@
 # original structure. Previously this file used `Test.@testset` and never ran in
 # CI (it wasn't `include`d) — folding it into a `@testitem` closes that gap.
 
+"""
+Exercises the complete @versioned cache identity contract: fixed and computed
+versions, remake invalidation, cycle rejection, pruning, and retention opt-out.
+"""
 @testitem "@versioned marker" tags=[:versioned] begin
     using DynamicObjects: remake, has_versioned_fields
 

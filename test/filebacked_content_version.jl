@@ -8,6 +8,10 @@
 # This works on the CURRENT `remake` (fresh object, empty cache) and pins that
 # contract.
 
+"""
+Pins the supported file-backed pattern: carry external content identity in a
+fixed field and use remake to invalidate cached reads at mutation boundaries.
+"""
 @testitem "file-backed content-version identity" tags=[:versioned] begin
     using DynamicObjects: remake
 
