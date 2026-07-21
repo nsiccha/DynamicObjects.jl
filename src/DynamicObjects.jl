@@ -6579,6 +6579,11 @@ _progress_mode(macros) =
     Symbol("@PROGRESS") in macros || Symbol("@progress") in macros || Symbol("@dynamic_progress") in macros ? :instrumented :
     Symbol("@fetch!") in macros ? :forwarded : :automatic
 
+_descriptor_version_dependencies(T::Type) = unique!(Symbol[
+    name for (name, entry) in meta(T)
+    if Symbol("@versioned") in get(entry, :macros, Set{Symbol}())
+])
+
 function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
     mod = parentmodule(T)
     metadata = _resolve_semantic_metadata(get(info, :semantic, nothing), mod)
@@ -6588,7 +6593,9 @@ function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
     fresh = Symbol("@fresh") in macros
     cached = Symbol("@cached") in macros
     mmap = Symbol("@mmap") in macros
-    versioned = Symbol("@versioned") in macros
+    declared_versioned = Symbol("@versioned") in macros
+    version_dependencies = _descriptor_version_dependencies(T)
+    versioned = has_versioned_fields(T) || !isempty(version_dependencies)
     computed = !fixed
     memoized = computed && !fresh
     pending = memoized
@@ -6614,10 +6621,16 @@ function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
     dependencies = dependencies === nothing ? Symbol[] : sort!(collect(dependencies))
     tier = _materialization_tier(Val(fixed), Val(fresh), Val(mmap), Val(cached))
     cache_version = get(info, :cache_version, nothing)
+    # `@versioned` is an object-wide cache-path dimension: a marker on one
+    # field/property invalidates every persisted output of T. Keep the local
+    # declaration fact separately so consumers can distinguish "defines the
+    # version" from "is governed by the version" without an annotation shim.
     semantics = (;
         fresh,
         memoized,
         versioned,
+        declared_versioned,
+        version_dependencies,
         cache_version,
         invalidation=(; content_version=versioned, cache_version),
         cached,

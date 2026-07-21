@@ -21,7 +21,7 @@ using Test, DynamicObjects
     ) @cached v"2" fit(dataset::Symbol, cohort::Symbol; scale::Int=1)::Vector{Float64} =
         fill(Float64(scale), dataset === :n1 ? 2 : 1)
 
-    @mmap matrix::Matrix{Float64} = reshape(collect(1.0:4.0), 2, 2)
+    @semantic (output=(mmap_eligible=true, immutable=true, portable=true),) @mmap @progress matrix::Matrix{Float64} = reshape(collect(1.0:4.0), 2, 2)
 
     @semantic (output=(estimated_bytes=64 * 1024^2, compute_seconds=3.0,
         expected_reuse=5, mmap_eligible=true, immutable=true, portable=true),) candidate::Vector{Float64} = [1.0, 2.0]
@@ -70,6 +70,10 @@ DynamicObjects.meta(::Type{LegacySemanticMeta}) = [
     @test fit.output.materialization.source === :declared
     @test fit.semantics.memoized
     @test fit.semantics.cached
+    @test fit.semantics.versioned
+    @test !fit.semantics.declared_versioned
+    @test fit.semantics.version_dependencies == [:revision]
+    @test fit.semantics.invalidation.content_version
     @test fit.semantics.pending
     @test fit.semantics.progress
     @test !fit.semantics.fresh
@@ -86,11 +90,20 @@ DynamicObjects.meta(::Type{LegacySemanticMeta}) = [
 
     version = property_descriptor(SemanticDescriptorFixture, :revision)
     @test version.semantics.versioned
+    @test version.semantics.declared_versioned
+    @test version.semantics.version_dependencies == [:revision]
     @test version.semantics.invalidation.content_version
 
     mapped = property_descriptor(SemanticDescriptorFixture, :matrix)
     @test mapped.output.materialization.tier === :mmap
     @test mapped.semantics.mmap
+    @test mapped.semantics.versioned
+    @test !mapped.semantics.declared_versioned
+    @test mapped.semantics.version_dependencies == [:revision]
+    @test mapped.semantics.invalidation ==
+        (content_version=true, cache_version=nothing)
+    @test mapped.semantics.progress_mode === :instrumented
+    @test mapped.output.materialization.hints.mmap_eligible
 
     fresh_descriptor = property_descriptor(SemanticDescriptorFixture, :preview)
     @test fresh_descriptor.semantics.fresh
@@ -106,6 +119,8 @@ DynamicObjects.meta(::Type{LegacySemanticMeta}) = [
     @test legacy.name === :legacy
     @test legacy.output.type === nothing
     @test legacy.output.materialization.tier === :memory
+    @test !legacy.semantics.versioned
+    @test isempty(legacy.semantics.version_dependencies)
 end
 
 @testset "budgeted materialization recommendations" begin
