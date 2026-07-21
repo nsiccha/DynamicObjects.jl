@@ -34,6 +34,19 @@ end
     slow(x::Int) = (take!(gate); x + 1)
 end
 
+@dynamicstruct struct ComputedVersionedSemanticDescriptorFixture
+    @versioned fixture_version = "synthetic_depot_v1"
+
+    @semantic (
+        inputs=(study=(domain=static_domain((:north, :south)),),),
+        output=(mmap_eligible=true, immutable=true, portable=true),
+    ) @mmap @progress prediction_grid(
+        study::Symbol,
+        model::Symbol,
+        dose::Float64=100.0,
+    )::Matrix{Float64} = fill(dose, 2, 2)
+end
+
 @dynamicstruct struct BadSemanticInputName
     @semantic (inputs=(missing=(domain=static_domain((1, 2)),),),) value(x::Int) = x
 end
@@ -104,6 +117,21 @@ DynamicObjects.meta(::Type{LegacySemanticMeta}) = [
         (content_version=true, cache_version=nothing)
     @test mapped.semantics.progress_mode === :instrumented
     @test mapped.output.materialization.hints.mmap_eligible
+
+    grid = property_descriptor(
+        ComputedVersionedSemanticDescriptorFixture, :prediction_grid)
+    @test grid.role === :operation
+    @test grid.indexed
+    @test grid.output.materialization.tier === :mmap
+    @test grid.output.materialization.hints.mmap_eligible
+    @test grid.semantics.mmap
+    @test grid.semantics.progress
+    @test grid.semantics.progress_mode === :instrumented
+    @test grid.semantics.versioned
+    @test !grid.semantics.declared_versioned
+    @test grid.semantics.version_dependencies == [:fixture_version]
+    @test grid.semantics.invalidation ==
+        (content_version=true, cache_version=nothing)
 
     fresh_descriptor = property_descriptor(SemanticDescriptorFixture, :preview)
     @test fresh_descriptor.semantics.fresh
