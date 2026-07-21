@@ -14,13 +14,16 @@ using DynamicObjects, Random
 
 export MultiLhs, CachedMultiLhs, ThreeValues, NamedDestr, RenameDestr,
     PrefixDestr, MixedDestr, Clearable, TwoFields, Basic,
-    WithDefault, Remakeable, Cached, VersionedCache, UnversionedCache,
+    WithDefault, Remakeable, RemountGraph, Cached, VersionedCache, UnversionedCache,
     VersionedIndexedCache, Idx, AllDefaults, CallVsBracket, Par, D1,
     LetScope, LambdaScope, SharedDep, AsyncApp, FailingProps,
     EntriesApp, ClearAllApp, FetchKwargs, HashLeaf, HashParent, HashNoDOs,
     BareRefMagic, BareRefOverride,
     _multi_lhs_counter, _multi_lhs_cached_path, _named_destr_counter,
     _prefix_destr_counter_x, _prefix_destr_counter_y, _clearable_path,
+    _remount_intrinsic_count, _remount_summary_count, _remount_slow_count,
+    _remount_child_count, _remount_indexed_child_count, _remount_cache_base,
+    _remount_started, _remount_release,
     _disk_cache_path, _version_cache_path, _idx_path,
     _call_vs_bracket_counter, _regression_path, _clearall_path
 
@@ -99,6 +102,48 @@ end
     x::Float64
     y::Float64
     sum_xy = x + y
+end
+
+_remount_intrinsic_count = Ref(0)
+_remount_summary_count = Ref(0)
+_remount_slow_count = Ref(0)
+_remount_child_count = Ref(0)
+_remount_indexed_child_count = Ref(0)
+_remount_cache_base = Ref("")
+_remount_started = Ref{Any}(nothing)
+_remount_release = Ref{Any}(nothing)
+
+@dynamicstruct struct RemountGraph
+    payload::String
+    @versioned content_version::String
+    __cache_base__ = _remount_cache_base[]
+    __req__ = error("request context is required")
+    __parent__ = nothing
+    __prefix__ = ""
+    fit_key = __req__.fit_key
+    intrinsic = (_remount_intrinsic_count[] += 1; Ref((payload, content_version)))
+    safe_index(operation) = (intrinsic, operation)
+    acceptance_summary(operation) = begin
+        _remount_summary_count[] += 1
+        (fit_key, operation)
+    end
+    @cached request_disk(operation) = (fit_key, operation)
+    @mmap mapped::Vector{Int} = [1, 2, 3]
+    @struct child = begin
+        current_fit_key = __parent__.fit_key
+        intrinsic_child = (_remount_child_count[] += 1; Ref(:child))
+        child_index(operation) = (intrinsic_child, operation)
+    end
+    @struct indexed_child(key) = begin
+        current_fit_key = __parent__.fit_key
+        intrinsic_child = (_remount_indexed_child_count[] += 1; Ref(key))
+    end
+    slow_intrinsic = begin
+        _remount_slow_count[] += 1
+        put!(_remount_started[], nothing)
+        take!(_remount_release[])
+        Ref(:finished)
+    end
 end
 
 _disk_cache_path = Ref("")
@@ -394,6 +439,131 @@ end
     @test r3.x == 1.0
     @test r3.y == 2.0
     @test r3.sum_xy == 99.0
+end
+
+@testitem "remount retains intrinsic cache identity and rebinds context" tags=[:core] setup=[DOImports, DOFixtures] begin
+    _remount_intrinsic_count[] = 0
+    _remount_summary_count[] = 0
+    _remount_slow_count[] = 0
+    _remount_child_count[] = 0
+    _remount_indexed_child_count[] = 0
+    _remount_cache_base[] = mktempdir()
+    _remount_started[] = Channel{Nothing}(1)
+    _remount_release[] = Channel{Nothing}(1)
+
+    source = RemountGraph("payload", "v1")
+    intrinsic = source.intrinsic
+    mapped = source.mapped
+    source_safe = source.safe_index
+    @test source_safe(:same) == (intrinsic, :same)
+    source_child = source.child
+    child_intrinsic = source_child.intrinsic_child
+    source_child_index = source_child.child_index
+    @test source_child_index(:same) == (child_intrinsic, :same)
+    source_indexed_child_ip = source.indexed_child
+    source_indexed_child = source_indexed_child_ip(:same)
+    indexed_child_intrinsic = source_indexed_child.intrinsic_child
+
+    request_a = (fit_key=:A,)
+    request_b = (fit_key=:B,)
+    a = remount(source; __req__=request_a, __parent__=:parent_a, __prefix__="/a")
+    b = remount(source; __req__=request_b, __parent__=:parent_b, __prefix__="/b")
+
+    @test a.fit_key === :A
+    @test b.fit_key === :B
+    @test a.__parent__ === :parent_a
+    @test b.__parent__ === :parent_b
+    @test a.__prefix__ == "/a"
+    @test b.__prefix__ == "/b"
+    @test a.acceptance_summary(:identical) == (:A, :identical)
+    @test b.acceptance_summary(:identical) == (:B, :identical)
+    @test _remount_summary_count[] == 2
+    @test a.request_disk(:identical) == (:A, :identical)
+    @test b.request_disk(:identical) == (:B, :identical)
+
+    # Settled scalar/mmap/version state is the retained graph's exact value.
+    @test a.intrinsic === intrinsic
+    @test b.intrinsic === intrinsic
+    @test _remount_intrinsic_count[] == 1
+    @test a.mapped === mapped
+    @test b.mapped === mapped
+    @test a.__version_tag__ == source.__version_tag__
+    @test b.__cache_path__ == source.__cache_path__
+
+    # Every mounted wrapper owns the current view. Safe indexed work shares its
+    # per-argument cache; request-derived indexed work has a local subcache.
+    a_safe = a.safe_index
+    b_safe = b.safe_index
+    @test a_safe.o === a
+    @test b_safe.o === b
+    @test a_safe.cache === source_safe.cache
+    @test b_safe.cache === source_safe.cache
+    @test a_safe(:same) === source_safe(:same)
+    @test a.acceptance_summary.o === a
+    @test b.acceptance_summary.o === b
+    @test a.acceptance_summary.cache !== b.acceptance_summary.cache
+
+    # Inline children cannot retain the source parent across mounts.
+    @test a.child.__parent__ === a
+    @test b.child.__parent__ === b
+    @test a.child.current_fit_key === :A
+    @test b.child.current_fit_key === :B
+    @test a.child.intrinsic_child === child_intrinsic
+    @test b.child.intrinsic_child === child_intrinsic
+    @test _remount_child_count[] == 1
+    @test a.child.child_index.o === a.child
+    @test b.child.child_index.o === b.child
+    @test a.child.child_index.cache === source_child_index.cache
+    @test b.child.child_index.cache === source_child_index.cache
+
+    # Settled indexed children get request-local wrapper/subcache identities but
+    # retain each child's intrinsic cache while rebinding its parent.
+    a_indexed_child_ip = a.indexed_child
+    b_indexed_child_ip = b.indexed_child
+    a_indexed_child = a_indexed_child_ip(:same)
+    b_indexed_child = b_indexed_child_ip(:same)
+    @test a_indexed_child_ip.o === a
+    @test b_indexed_child_ip.o === b
+    @test a_indexed_child_ip.cache !== source_indexed_child_ip.cache
+    @test b_indexed_child_ip.cache !== source_indexed_child_ip.cache
+    @test a_indexed_child.__parent__ === a
+    @test b_indexed_child.__parent__ === b
+    @test a_indexed_child.current_fit_key === :A
+    @test b_indexed_child.current_fit_key === :B
+    @test a_indexed_child.intrinsic_child === indexed_child_intrinsic
+    @test b_indexed_child.intrinsic_child === indexed_child_intrinsic
+    @test _remount_indexed_child_count[] == 1
+
+    # Remounting a view peels back to the retained source, never the prior
+    # request-local overlay.
+    c = remount(a; __req__=(fit_key=:C,), __parent__=:parent_c, __prefix__="/c")
+    @test c.acceptance_summary(:identical) == (:C, :identical)
+    @test c.intrinsic === intrinsic
+
+    # An intrinsic computation already in flight is not copied or restarted:
+    # the mounted view deduplicates onto the retained latch and value.
+    pending_source = fetchproperty(source, :slow_intrinsic) do rv, _
+        rv
+    end
+    @test pending_source isa Pending
+    take!(_remount_started[])
+    pending_view = remount(source; __req__=request_a, __parent__=:parent_a,
+                           __prefix__="/a")
+    pending_mounted = fetchproperty(pending_view, :slow_intrinsic) do rv, _
+        rv
+    end
+    @test pending_mounted isa Pending
+    put!(_remount_release[], nothing)
+    slow_source = fetch(pending_source)
+    @test fetch(pending_mounted) === slow_source
+    @test pending_view.slow_intrinsic === slow_source
+    @test _remount_slow_count[] == 1
+
+    # A shared-cache remount cannot change the retained identity dimensions.
+    @test_throws ErrorException remount(source; payload="other")
+    @test_throws ErrorException remount(source; content_version="v2")
+    @test_throws ErrorException remount(source; __cache_base__=mktempdir())
+    @test_throws ErrorException remount(source; unknown_context=1)
 end
 
 @testitem "Disk cache" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin

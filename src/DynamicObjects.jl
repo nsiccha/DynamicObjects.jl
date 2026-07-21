@@ -16,6 +16,7 @@ optionally disk-cached properties.
 - [`fresh`](@ref): Explicit uncached call into an `IndexableProperty`.
 - [`maybefresh`](@ref): Dispatch helper behind `@fresh`; uncached on IPs, plain call otherwise.
 - [`remake`](@ref): Create a new instance of a `@dynamicstruct` type with some fields changed.
+- [`remount`](@ref): Bind fresh request/context properties while retaining unrelated cache identity.
 - [`fetchindex`](@ref): Non-blocking access to `ThreadsafeDict`-backed properties with `(rv, status)` callback.
 - [`getstatus`](@ref): Read the status object for an in-flight computation.
 - [`@clear_cache!`](@ref): Clear the disk and in-memory cache for a property.
@@ -37,7 +38,7 @@ optionally disk-cached properties.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, file_version, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, remount, file_version, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending
 
 import SHA, Serialization, Mmap, Treebars
 
@@ -616,6 +617,7 @@ memoized values for non-indexed properties.
 struct PropertyCache{D<:AbstractDict{Symbol,Any}}
     cache::D
     PropertyCache(D, c::NamedTuple) = new{D{Symbol,Any}}(D{Symbol,Any}(pairs(c)))
+    PropertyCache(c::D) where {D<:AbstractDict{Symbol,Any}} = new{D}(c)
 end
 
 
@@ -731,6 +733,128 @@ struct ThreadsafeDict{K,V} <: AbstractThreadsafeDict{K,V}
     errors::Dict{K,Any}
     ThreadsafeDict{K,V}(c) where {K,V} = new{K,V}(ReentrantLock(), Dict{K,V}(c), Dict{K,Any}(), Dict{K,Threads.Condition}(), Dict{K,Any}())
     ThreadsafeDict() = new{Any,Any}(ReentrantLock(), Dict{Any,Any}(), Dict{Any,Any}(), Dict{Any,Threads.Condition}(), Dict{Any,Any}())
+end
+
+# A remounted object needs two cache namespaces under one lock: intrinsic keys
+# continue to address the retained object's dictionaries, while rebound keys and
+# every property derived from them address request-local dictionaries. Keeping the
+# four dictionaries (values/status/computing/errors) routed by the SAME key set is
+# what preserves compute-at-most-once/Pending identity for intrinsic work without
+# allowing an old request's value, latch, failure, or progress node to leak.
+struct MountedDict{K,V,S<:AbstractDict{K,V},L<:AbstractDict{K,V}} <: AbstractDict{K,V}
+    shared::S
+    overlay::L
+    local_names::Set{K}
+end
+
+@inline _mounted_dict(d::MountedDict, key) = key in d.local_names ? d.overlay : d.shared
+Base.getindex(d::MountedDict, key) = getindex(_mounted_dict(d, key), key)
+Base.get(d::MountedDict, key, default) = get(_mounted_dict(d, key), key, default)
+Base.haskey(d::MountedDict, key) = haskey(_mounted_dict(d, key), key)
+Base.setindex!(d::MountedDict, value, key) = setindex!(_mounted_dict(d, key), value, key)
+Base.delete!(d::MountedDict, key) = (delete!(_mounted_dict(d, key), key); d)
+Base.pop!(d::MountedDict, key) = pop!(_mounted_dict(d, key), key)
+Base.eltype(::Type{<:MountedDict{K,V}}) where {K,V} = Pair{K,V}
+Base.length(d::MountedDict) = length(d.overlay) + count(p -> !(first(p) in d.local_names), d.shared)
+
+function _iterate_mounted_shared(d::MountedDict, step)
+    while step !== nothing
+        pair, state = step
+        !(first(pair) in d.local_names) && return pair, (:shared, state)
+        step = iterate(d.shared, state)
+    end
+    nothing
+end
+function Base.iterate(d::MountedDict)
+    step = iterate(d.overlay)
+    step === nothing || return step[1], (:local, step[2])
+    _iterate_mounted_shared(d, iterate(d.shared))
+end
+function Base.iterate(d::MountedDict, state)
+    phase, inner = state
+    if phase === :local
+        step = iterate(d.overlay, inner)
+        step === nothing || return step[1], (:local, step[2])
+        return _iterate_mounted_shared(d, iterate(d.shared))
+    end
+    _iterate_mounted_shared(d, iterate(d.shared, inner))
+end
+
+"""
+    MountedThreadsafeDict
+
+Internal `AbstractThreadsafeDict` view used by [`remount`](@ref). Its fields
+deliberately match the abstract cache contract (`lock`, `cache`, `status`,
+`computing`, `errors`), so the ordinary get/compute/Pending machinery operates
+unchanged. Each field is a `MountedDict` over the retained and request-local
+dictionaries.
+"""
+struct MountedThreadsafeDict{S<:ThreadsafeDict{Symbol,Any},O} <: AbstractThreadsafeDict{Symbol,Any}
+    lock::ReentrantLock
+    cache::MountedDict{Symbol,Any}
+    status::MountedDict{Symbol,Any}
+    computing::MountedDict{Symbol,Threads.Condition}
+    errors::MountedDict{Symbol,Any}
+    shared::S
+    source::O
+    invalidated::Set{Symbol}
+    local_names::Set{Symbol}
+end
+
+# Private inner-constructor discriminator emitted by `@dynamicstruct`. A public
+# call can never collide with it, and ordinary constructors keep their existing
+# signature and overrideable-default behavior.
+struct _RemountToken end
+const _REMOUNT_TOKEN = _RemountToken()
+
+function MountedThreadsafeDict(shared::ThreadsafeDict{Symbol,Any}, source,
+                               local_names, invalidated, seed::NamedTuple)
+    names = Set{Symbol}(local_names)
+    union!(names, keys(seed))
+    local_cache = Dict{Symbol,Any}(pairs(seed))
+    local_status = Dict{Symbol,Any}()
+    local_computing = Dict{Symbol,Threads.Condition}()
+    local_errors = Dict{Symbol,Any}()
+    MountedThreadsafeDict(
+        shared.lock,
+        MountedDict(shared.cache, local_cache, names),
+        MountedDict(shared.status, local_status, names),
+        MountedDict(shared.computing, local_computing, names),
+        MountedDict(shared.errors, local_errors, names),
+        shared,
+        source,
+        Set{Symbol}(invalidated),
+        names,
+    )
+end
+
+# `setproperty!` on a mounted object is always a local shadow. Computed stores
+# bypass this method and write through `c.cache`, whose static routing set sends
+# only proven-invalidated keys local and intrinsic keys to the retained cache.
+function Base.setindex!(c::MountedThreadsafeDict, value, key::Symbol)
+    lock(c.lock) do
+        push!(c.local_names, key)
+        c.cache.overlay[key] = value
+        delete!(c.status.overlay, key)
+        delete!(c.computing.overlay, key)
+        delete!(c.errors.overlay, key)
+    end
+    value
+end
+
+Base.empty!(c::MountedThreadsafeDict) = begin
+    lock(c.lock) do
+        empty!(c.shared.cache); empty!(c.shared.status)
+        empty!(c.shared.computing); empty!(c.shared.errors)
+        empty!(c.cache.overlay); empty!(c.status.overlay)
+        empty!(c.computing.overlay); empty!(c.errors.overlay)
+    end
+    c
+end
+
+Base.show(io::IO, c::MountedThreadsafeDict) = lock(c.lock) do
+    print(io, "MountedThreadsafeDict(", length(c.cache), " cached, ",
+          length(c.computing), " running; ", length(c.local_names), " local keys)")
 end
 
 Base.length(c::AbstractThreadsafeDict) = lock(c.lock) do; length(c.cache); end
@@ -1171,10 +1295,35 @@ maybepop!(c::AbstractThreadsafeDict, key) = begin
 end
 
 # Subcache factory for indexed-property dicts — the cache is always a
-# `ThreadsafeDict`. The 4-arg form is keyed on `(ParentType, Val{name})` for
-# future per-property overrides; currently unused.
+# `ThreadsafeDict`. The owner-aware form lets a mounted wrapper rebuild nested
+# child views with the CURRENT parent while ordinary caches retain the historic
+# `(ParentType, Val{name})` override seam.
+subcache(pc::PropertyCache, owner, v::Val) = subcache(pc, typeof(owner), v)
 subcache(pc::PropertyCache, ::Type, ::Val) = subcache(pc)
 subcache(::PropertyCache{<:AbstractThreadsafeDict}) = ThreadsafeDict()
+function subcache(pc::PropertyCache{<:MountedThreadsafeDict}, owner, ::Val{name}) where {name}
+    mounted = pc.cache
+    source_ip = getproperty(mounted.source, name)
+    source_ip isa IndexableProperty || error(
+        "remount: intrinsic indexed property `$name` did not resolve to an IndexableProperty on the retained source")
+    if name in mounted.invalidated
+        local_cache = ThreadsafeDict()
+        if _nested_struct_type(typeof(owner), Val(name)) !== nothing
+            # Settled indexed children become mounted child views with the current
+            # parent. Their OWN intrinsic caches remain shared; an in-flight child
+            # constructor is deliberately not shared because it is still bound to
+            # the retained source parent.
+            lock(source_ip.cache.lock) do
+                for (key, value) in source_ip.cache.cache
+                    _is_dynamic_object(value) || continue
+                    local_cache.cache[key] = _remount_child(value, owner)
+                end
+            end
+        end
+        return local_cache
+    end
+    source_ip.cache
+end
 
 # --- PersistentSet ---
 
@@ -1549,7 +1698,7 @@ _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
     isnothing(__status__) && name != :__status__ && (__status__ = getorcomputeproperty(o, :__status__))
     _status_kw = is_generated_property(o, name) ? (; __status__) : (;)
     try
-        if iscached(o, vname, indices...; kwargs...)
+        if iscached(o, vname, indices...; kwargs...) && !_remount_invalidated(o, name)
             cache_path = get_cache_path(o, name, indices...; kwargs...)
             mkpath(dirname(cache_path))
             _prune_stale_versions!(o)   # @versioned "hold only the most recent" (no-op for non-versioned types)
@@ -1723,7 +1872,7 @@ else
         # call/ref syntax, e.g. `x() = ...` or `x[i] = ...`), return an
         # IndexableProperty wrapper instead of calling compute_property.
         if is_indexed_property(o, name)
-            return IndexableProperty(name, o, subcache(cache, typeof(o), Val(name)))
+            return IndexableProperty(name, o, subcache(cache, o, Val(name)))
         end
         # `s` is the substatus the spawn wrapper passed (or `nothing` when
         # `substatus_f` was nothing). Pass it as `__status__` so the body
@@ -3490,6 +3639,14 @@ IP call form consults this and routes to `fresh` (the uncached `_computeproperty
 instead of `memoize!`. Method-level, so Revise-safe; constant-foldable so the
 call form's branch is free at runtime."""
 _never_cache(o, ::Val) = false
+"""    _remount_opaque_properties(::Type{T})
+
+Names whose generated RHS reaches `__self__` in a way the static dependency
+collector cannot attribute to one property. Newly expanded types emit a tuple
+(possibly empty). `nothing` identifies an older expansion; [`remount`](@ref)
+then conservatively treats every computed property as request-derived.
+"""
+_remount_opaque_properties(::Type) = nothing
 """    _nested_struct_type(::Type{T}, ::Val{name})
 
 Return the type of the nested struct exposed under property `name` on `T`,
@@ -4675,6 +4832,12 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 )
             )
             __inst__
+        end),
+        :(function $type(::$DynamicObjects._RemountToken, __cache__::$PropertyCache, $(fixed_lhs...))
+            new(
+                $(fixed_names...),
+                __cache__
+            )
         end)
     ))
     # ── Magic-property deprecation: reject an OLD name DECLARED in a body ────
@@ -4735,6 +4898,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             $Base.setproperty!(__self__::$type, name::Symbol, value) = getfield(__self__, :cache)[name] = value
             $DynamicObjects.meta(::Type{$type}) = $properties
             $_carryover_expr
+            $DynamicObjects._remount_opaque_properties(::Type{$type}) = $(Tuple(sort!(collect(opaque_props))))
             $DynamicObjects.is_generated_property(::$type, name::Symbol) = name in $generated_names
             $DynamicObjects.is_indexed_property(::$type, name::Symbol) = name in $indexed_names
             $DynamicObjects._hash_replace(__self__::$type) = __self__.__hash__
@@ -5262,6 +5426,200 @@ function _remake(obj::T, nt::NamedTuple{KW}) where {T,KW}
     carried = _carryover(obj, Val(KW))
     explicit = Base.structdiff(nt, NamedTuple{fixed})
     T(args...; carried..., explicit...)
+end
+
+# --- immutable cache remounting ------------------------------------------------
+
+# These properties define the retained object's disk/materialization identity or
+# global cache policy. Rebinding one while sharing the intrinsic cache is a
+# contradiction; `remake` is the operation for constructing a new identity.
+const _REMOUNT_INTRINSIC_KEYS = (
+    :__hash_fields__, :__hash__, :__identity_hash__, :__version_tag__,
+    :__cache_base__, :__cache_path__, :__hold_recent_version__, :__strict__,
+)
+
+function _remount_source(obj)
+    hasfield(typeof(obj), :cache) || error("remount: $(typeof(obj)) is not a @dynamicstruct type")
+    pc = getfield(obj, :cache)
+    pc isa PropertyCache || error("remount: $(typeof(obj)) does not carry a DynamicObjects PropertyCache")
+    c = pc.cache
+    if c isa MountedThreadsafeDict
+        return c.source, c.shared
+    elseif c isa ThreadsafeDict{Symbol,Any}
+        return obj, c
+    end
+    error("remount: $(typeof(obj)) uses unsupported cache $(typeof(c)); remount requires the current threadsafe cache")
+end
+
+function _validate_remount_keys(source, changed)
+    T = typeof(source)
+    fixed = Set(fieldnames(T)[1:end-1])
+    changed_fixed = sort!(collect(intersect(Set(changed), fixed)))
+    isempty(changed_fixed) || error(
+        "remount: fixed field(s) $(join(changed_fixed, ", ")) define object identity; use remake for fixed-field changes")
+    intrinsic = sort!(collect(intersect(Set(changed), Set(_REMOUNT_INTRINSIC_KEYS))))
+    isempty(intrinsic) || error(
+        "remount: intrinsic cache/version property(s) $(join(intrinsic, ", ")) cannot be rebound while retaining cache identity; use remake")
+    unknown = sort!(Symbol[n for n in changed if !hasproperty(source, n)])
+    isempty(unknown) || error(
+        "remount: unknown context property/properties $(join(unknown, ", ")) on $(nameof(T))")
+    versioned = Set{Symbol}()
+    for (name, info) in meta(T)
+        Symbol("@versioned") in get(info, :macros, Set{Symbol}()) && push!(versioned, name)
+    end
+    changed_versioned = sort!(collect(intersect(Set(changed), versioned)))
+    isempty(changed_versioned) || error(
+        "remount: @versioned property/properties $(join(changed_versioned, ", ")) define persisted content identity; use remake")
+    nothing
+end
+
+# Return (invalidated values, local wrapper keys). `invalidated` is the sound
+# transitive closure rooted at explicit context overrides, fresh progress state,
+# opaque self-reaches, and nested children (which retain their parent object).
+# Indexed wrapper KEYS are always local so their `o` is the mounted object; an
+# indexed property's per-argument subcache is shared only when that property is
+# absent from `invalidated` (see the mounted `subcache` method above).
+function _remount_partition(source, shared::ThreadsafeDict{Symbol,Any}, changed,
+                            forced_local=())
+    T = typeof(source)
+    dependencies = Dict{Symbol,Set{Symbol}}()
+    computed = Set{Symbol}()
+    indexed = Set{Symbol}()
+    names = Set{Symbol}()
+    for (name, info) in meta(T)
+        push!(names, name)
+        get(info, :rhs, nothing) === nothing || push!(computed, name)
+        get(info, :indexed, false) && push!(indexed, name)
+        deps = get(info, :dependson, nothing)
+        deps === nothing || union!(get!(() -> Set{Symbol}(), dependencies, name), deps)
+    end
+
+    invalidated = union(Set{Symbol}(changed), Set{Symbol}(forced_local))
+    # Progress/status is request-scoped state even when the caller doesn't pass
+    # it explicitly. Keeping it local also prevents a mounted request from
+    # relabelling/reparenting the retained graph's progress tree on cache hits.
+    for name in (:__status__, :__substatus__)
+        hasproperty(source, name) && push!(invalidated, name)
+    end
+    # Every nested child retains `__parent__`; never share a child instance whose
+    # parent is the retained source object with a mounted view.
+    for name in names
+        _nested_struct_type(T, Val(name)) === nothing || push!(invalidated, name)
+    end
+    opaque = _remount_opaque_properties(T)
+    opaque === nothing ? union!(invalidated, computed) : union!(invalidated, opaque)
+
+    changed_graph = true
+    while changed_graph
+        changed_graph = false
+        for (name, deps) in dependencies
+            name in invalidated && continue
+            if !isdisjoint(deps, invalidated)
+                push!(invalidated, name)
+                changed_graph = true
+            end
+        end
+    end
+
+    local_names = copy(invalidated)
+    for name in indexed
+        value = get(shared, name, _missing_sentinel)
+        (value === _missing_sentinel || value isa IndexableProperty) && push!(local_names, name)
+    end
+    invalidated, local_names
+end
+
+_remount_invalidated(o, name::Symbol) = begin
+    hasfield(typeof(o), :cache) || return false
+    pc = getfield(o, :cache)
+    pc isa PropertyCache || return false
+    c = pc.cache
+    c isa MountedThreadsafeDict && name in c.invalidated
+end
+
+_is_dynamic_object(value) = hasfield(typeof(value), :cache) &&
+    getfield(value, :cache) isa PropertyCache
+
+# Bind the context DO itself understands structurally. `__req__` is identical
+# through a routed request and can be copied from the current parent; `__prefix__`
+# is route-relative, so mask the retained value and let the child's own generated
+# property recompute it from its new `__parent__`.
+function _remount_child(child, parent)
+    pairs = Pair{Symbol,Any}[]
+    hasproperty(child, :__parent__) && push!(pairs, :__parent__ => parent)
+    if hasproperty(child, :__req__) && hasproperty(parent, :__req__)
+        push!(pairs, :__req__ => getproperty(parent, :__req__))
+    end
+    context = (; pairs...)
+    forced = hasproperty(child, :__prefix__) ? (:__prefix__,) : ()
+    _remount_impl(child, context, forced)
+end
+
+function _seed_nested_remounts!(mounted, source, explicit)
+    T = typeof(source)
+    shared = _remount_source(source)[2]
+    seen = Set{Symbol}()
+    for (name, _) in meta(T)
+        name in seen && continue
+        push!(seen, name)
+        haskey(explicit, name) && continue
+        _nested_struct_type(T, Val(name)) === nothing && continue
+        value = get(shared, name, _missing_sentinel)
+        (value === _missing_sentinel || value isa Pending || value isa IndexableProperty ||
+         !_is_dynamic_object(value)) && continue
+        setproperty!(mounted, name, _remount_child(value, mounted))
+    end
+    mounted
+end
+
+"""
+    remount(obj; context...)
+
+Return an immutable, same-type view of `obj` with fresh context properties while
+retaining the cache identity of unrelated model work. This is the request/job
+counterpart to [`remake`](@ref): `remake` constructs a new value and copies only
+settled dependency-safe results, whereas `remount` keeps the retained cache's
+settled values, in-flight latches/[`Pending`](@ref) handles, mmap values, version
+identity, and indexed subcaches for every property proven independent of the
+rebound context.
+
+The keyword names are existing non-fixed properties such as `__parent__`,
+`__req__`, or `__prefix__`. They, every transitive dependent in `meta(T)`, every
+opaque self-dependent property, progress state, and nested child are routed to a
+fresh mount-local cache. Each mounted [`IndexableProperty`](@ref) wrapper is
+recreated with the mounted owner; its per-argument cache is shared only when the
+property is context-independent. Context-dependent `@cached`/`@mmap` properties
+bypass their intrinsic disk entry because the rebound context is intentionally
+not part of the retained disk identity.
+
+Fixed fields, `@versioned` properties, and cache/hash/path dunders are rejected:
+changing any of those means the object identity changed, so use `remake`.
+
+# Example
+```julia
+routed = ModelGraph(...)
+request_a = remount(routed; __req__=req_a, __parent__=parent_a, __prefix__="/a")
+request_b = remount(routed; __req__=req_b, __parent__=parent_b, __prefix__="/b")
+```
+"""
+function _remount_impl(obj, nt::NamedTuple, forced_local=())
+    source, shared = _remount_source(obj)
+    changed = keys(nt)
+    _validate_remount_keys(source, changed)
+    invalidated, local_names = _remount_partition(source, shared, changed, forced_local)
+    mounted = MountedThreadsafeDict(shared, source, local_names, invalidated, nt)
+    pc = PropertyCache(mounted)
+    T = typeof(source)
+    fixed = fieldnames(T)[1:end-1]
+    args = Any[getfield(source, name) for name in fixed]
+    applicable(T, _REMOUNT_TOKEN, pc, args...) || error(
+        "remount: $(nameof(T)) was expanded before remount support; re-expand its @dynamicstruct/@htmx definition")
+    view = T(_REMOUNT_TOKEN, pc, args...)
+    _seed_nested_remounts!(view, source, nt)
+end
+
+function remount(obj; kwargs...)
+    _remount_impl(obj, values(kwargs))
 end
 
 # --- Error display for property computations ---
