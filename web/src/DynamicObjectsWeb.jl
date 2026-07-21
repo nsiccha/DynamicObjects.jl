@@ -1,14 +1,12 @@
 module DynamicObjectsWeb
 
 using HTMXObjects
-using TestModules, Random
+import DynamicObjects
 # Load Treebars before importing RecordingRoutes — Treebars activates
 # HTMXObjectsTreebarsExt, which injects `RecordingRoutes` into the
 # HTMXObjects namespace and gives it a live polling_fetchindex progress UI.
 using Treebars
 using HTMXObjects: RecordingRoutes
-
-include("test/runtests.jl")
 
 # --- AppData: one DO global holding the on-disk gallery + recording inputs.
 @dynamicstruct struct DOAppData
@@ -81,7 +79,7 @@ const APPDATA = DOAppData()
     )
 
     @include structure = HTMXObjects.StructureRoutes(; root=AppContext)
-    @include tests     = TestRoutes(; __req__, test_module=@__MODULE__)
+    @include tests     = TestRoutes(; project=pkgdir(DynamicObjects))
 end
 
 function __init__()

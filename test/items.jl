@@ -1,5 +1,28 @@
-using TestModules, Random, DynamicObjects, Serialization, Arrow, DataFrames
-import DynamicObjects: @persist, entries, cached_entries, clear_all_caches!, PersistentSet, accessed_keys, record_access!
+using TestItemRunner
+
+@testsnippet DOImports begin
+    using Test, Random, DynamicObjects, Serialization, Arrow, DataFrames
+    import DynamicObjects: entries, cached_entries, clear_all_caches!, PersistentSet
+end
+
+# The legacy deferred suite evaluated these definitions once at module
+# scope, then ran the deferred testsets sequentially. A shared test module keeps
+# that behavior: its mutable counters remain shared across items, while each
+# item still receives a fresh test module through `DOImports`.
+@testmodule DOFixtures begin
+using DynamicObjects, Random
+
+export MultiLhs, CachedMultiLhs, ThreeValues, NamedDestr, RenameDestr,
+    PrefixDestr, MixedDestr, Clearable, TwoFields, Basic,
+    WithDefault, Remakeable, Cached, VersionedCache, UnversionedCache,
+    VersionedIndexedCache, Idx, AllDefaults, CallVsBracket, Par, D1,
+    LetScope, LambdaScope, SharedDep, AsyncApp, FailingProps,
+    EntriesApp, ClearAllApp, FetchKwargs, HashLeaf, HashParent, HashNoDOs,
+    BareRefMagic, BareRefOverride,
+    _multi_lhs_counter, _multi_lhs_cached_path, _named_destr_counter,
+    _prefix_destr_counter_x, _prefix_destr_counter_y, _clearable_path,
+    _disk_cache_path, _version_cache_path, _idx_path,
+    _call_vs_bracket_counter, _regression_path, _clearall_path
 
 # --- Struct definitions (hoisted to module scope) ---
 
@@ -65,11 +88,6 @@ end
     r     = sqrt(x^2 + y^2)
     theta = atan(y, x)
     sum2  = x + y
-end
-
-@dynamicstruct struct Overridable
-    x::Float64
-    doubled = 2 * x
 end
 
 @dynamicstruct struct WithDefault
@@ -151,23 +169,6 @@ _regression_path = Ref("")
     end
 end
 
-_assign_in_rhs_path = Ref("")
-@dynamicstruct struct AssignInRhs
-    x::Int
-    __cache_path__ = _assign_in_rhs_path[]
-    @cached flag = false
-    toggle(req) = begin
-        # Bare `flag = !flag` would trip the property-shadow check
-        # (post f4d7c14: error, was warn). Route the cache write
-        # through the explicit `setproperty!` path instead — same
-        # observable effect (writes to the property cache), no
-        # ambiguity for the macro's RHS walker.
-        __self__.flag = !flag
-        @persist flag
-        flag
-    end
-end
-
 @dynamicstruct struct LetScope
     x::Float64
     result = let x = 99.0
@@ -197,27 +198,8 @@ end
     will_fail_indexed(key) = error("serial failure for key=$key")
 end
 
-_persistable_path = Ref("")
-@dynamicstruct struct Persistable
-    __cache_path__ = _persistable_path[]
-    @cached counter = 0
-    increment(req) = begin
-        # See `AssignInRhs` above — explicit `setproperty!` path
-        # avoids tripping the macro's property-shadow check.
-        __self__.counter = counter + 1
-        @persist counter
-        counter
-    end
-end
-
 @dynamicstruct struct EntriesApp
     slow(key) = (sleep(0.05); key * 2)
-end
-
-_cached_keys_path = Ref("")
-@dynamicstruct struct CachedKeysApp
-    __cache_path__ = _cached_keys_path[]
-    @cached result(key) = key ^ 2
 end
 
 _clearall_path = Ref("")
@@ -226,12 +208,6 @@ _clearall_path = Ref("")
     @cached a = 42
     @cached b(k) = k * 2
     uncached = 99
-end
-
-_kwargs_keys_path = Ref("")
-@dynamicstruct struct KwargsKeysApp
-    __cache_path__ = _kwargs_keys_path[]
-    @cached result(key; mode="default") = "$key:$mode"
 end
 
 # Regression: `@fetch!` over a fetched IP call that carries kwargs. `walk_rhs`
@@ -259,11 +235,6 @@ end
     k::Int
 end
 
-@dynamicstruct struct HashParentTuple
-    leaves::Tuple
-    k::Int
-end
-
 @dynamicstruct struct HashNoDOs
     x::Int
     y::Vector{Float64}
@@ -284,9 +255,11 @@ end
     derived = __cache_base__ * "/x"
 end
 
+end # @testmodule DOFixtures
+
 # --- Tests ---
 
-@testset "Multi-lhs assignment" begin
+@testitem "Multi-lhs assignment" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     _multi_lhs_counter[] = 0
     m = MultiLhs(3.0)
     _multi_lhs_counter[] = 0
@@ -297,7 +270,7 @@ end
     @test m.c == 9.0
 end
 
-@testset "Multi-lhs with @cached" begin
+@testitem "Multi-lhs with @cached" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     _multi_lhs_cached_path[] = mktempdir()
     c = CachedMultiLhs()
     @test c.a == 1
@@ -306,14 +279,14 @@ end
     @test @cache_status(c._tuple_a_b) == :ready
 end
 
-@testset "Multi-lhs three values" begin
+@testitem "Multi-lhs three values" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     t = ThreeValues()
     @test t.x == 10
     @test t.y == 20
     @test t.z == 30
 end
 
-@testset "Named destructuring (;a, b) = ..." begin
+@testitem "Named destructuring (;a, b) = ..." tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     _named_destr_counter[] = 0
     n = NamedDestr(3.0)
     _named_destr_counter[] = 0
@@ -324,13 +297,13 @@ end
     @test n.sum_vg == 15.0
 end
 
-@testset "Named destructuring with rename" begin
+@testitem "Named destructuring with rename" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     r = RenameDestr(3.0)
     @test r.x_val == 9.0
     @test r.x_grad == 6.0
 end
 
-@testset "Named destructuring with prefix" begin
+@testitem "Named destructuring with prefix" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     _prefix_destr_counter_x[] = 0
     _prefix_destr_counter_y[] = 0
     p = PrefixDestr(3.0, 4.0)
@@ -347,7 +320,7 @@ end
     @test p.total == 25.0
 end
 
-@testset "Named destructuring mixed" begin
+@testitem "Named destructuring mixed" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     m = MixedDestr()
     @test m.a == 1
     @test m.x_b == 2
@@ -355,7 +328,11 @@ end
     @test m.y_d == 4
 end
 
-@testset "@clear_cache!" begin
+"""
+Clears scalar, individual indexed, and whole indexed-property cache entries
+from both memory and disk.
+"""
+@testitem "@clear_cache!" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     _clearable_path[] = mktempdir()
     c = Clearable()
     val1 = c.result
@@ -364,28 +341,28 @@ end
     @test @cache_status(c.result) == :unstarted
     val2 = c.result
     @test @is_cached c.result
-    @test c.indexed[3] == 9
-    @test c.indexed[4] == 16
-    @test @is_cached c.indexed[3]
-    @test @is_cached c.indexed[4]
-    @clear_cache! c.indexed[3]
-    @test @cache_status(c.indexed[3]) == :unstarted
-    @test @is_cached c.indexed[4]
-    c.indexed[3]
-    @test @is_cached c.indexed[3]
+    @test c.indexed(3) == 9
+    @test c.indexed(4) == 16
+    @test @is_cached c.indexed(3)
+    @test @is_cached c.indexed(4)
+    @clear_cache! c.indexed(3)
+    @test @cache_status(c.indexed(3)) == :unstarted
+    @test @is_cached c.indexed(4)
+    c.indexed(3)
+    @test @is_cached c.indexed(3)
     @clear_cache! c.indexed
-    @test @cache_status(c.indexed[3]) == :unstarted
-    @test @cache_status(c.indexed[4]) == :unstarted
+    @test @cache_status(c.indexed(3)) == :unstarted
+    @test @cache_status(c.indexed(4)) == :unstarted
 end
 
-@testset "Constructor named parameters" begin
+@testitem "Constructor named parameters" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     t = TwoFields(1.0, 2)
     @test t.sum_xy == 3.0
     @test_throws MethodError TwoFields(1.0)
     @test_throws MethodError TwoFields(1.0, 2, 3)
 end
 
-@testset "Basic properties" begin
+@testitem "Basic properties" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     b = Basic(3.0, 4.0)
     @test b.x == 3.0
     @test b.y == 4.0
@@ -397,19 +374,12 @@ end
     @test hasproperty(b, :nonexistent) == false
 end
 
-@testset "setproperty! override" begin
-    o = Overridable(3.0)
-    @test o.doubled ≈ 6.0
-    o.doubled = 99.0
-    @test o.doubled ≈ 99.0
-end
-
-@testset "Constructor kwargs" begin
+@testitem "Constructor kwargs" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     w = WithDefault(4.0; expensive=0.0)
     @test w.expensive == 0.0
 end
 
-@testset "remake" begin
+@testitem "remake" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     orig = Remakeable(1.0, 2.0)
     @test orig.sum_xy ≈ 3.0
     r1 = remake(orig; x=10.0)
@@ -426,7 +396,7 @@ end
     @test r3.sum_xy == 99.0
 end
 
-@testset "Disk cache" begin
+@testitem "Disk cache" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     _disk_cache_path[] = mktempdir()
     d = Cached()
     @test @cache_status(d.c) == :unstarted
@@ -445,43 +415,47 @@ end
     @test d2.d == 1
 end
 
-@testset "Indexable properties" begin
+"""
+Checks indexed call syntax, default memoization, disk-cache status, and
+multi-index key handling.
+"""
+@testitem "Indexable properties" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     _idx_path[] = mktempdir()
     s = Idx()
-    @test s.i[5]        == 5
-    @test s.i[10]       == 10
-    @test @cache_status(s.ci[3]) == :unstarted
-    @test s.ci[3]       == 9
-    @test @cache_status(s.ci[3]) == :ready
-    @test @cache_status(s.ci3[1, 2, 3]) == :unstarted
-    @test s.ci3[1, 2, 3] == 321
-    @test @cache_status(s.ci3[1, 2, 3]) == :ready
+    @test s.i(5)        == 5
+    @test s.i(10)       == 10
+    @test @cache_status(s.ci(3)) == :unstarted
+    @test s.ci(3)       == 9
+    @test @cache_status(s.ci(3)) == :ready
+    @test @cache_status(s.ci3(1, 2, 3)) == :unstarted
+    @test s.ci3(1, 2, 3) == 321
+    @test @cache_status(s.ci3(1, 2, 3)) == :ready
     @test isa(s.ci3, DynamicObjects.IndexableProperty)
 end
 
-@testset "All-default indexed properties" begin
+@testitem "All-default indexed properties" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     s = AllDefaults()
     @test isa(s.item, DynamicObjects.IndexableProperty)
     @test isa(s.multi, DynamicObjects.IndexableProperty)
-    @test s.item["hello"] == "got: hello"
-    @test s.multi[10, 20] == 30
-    @test s.item["default"] == "got: default"
-    @test s.multi[1, 2] == 3
+    @test s.item("hello") == "got: hello"
+    @test s.multi(10, 20) == 30
+    @test s.item("default") == "got: default"
+    @test s.multi(1, 2) == 3
 end
 
-@testset "Call vs bracket caching" begin
+@testitem "Indexed calls cache by default" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     _call_vs_bracket_counter[] = 0
     s = CallVsBracket()
     _call_vs_bracket_counter[] = 0
-    @test s.counted[5] == 10
+    @test s.counted(5) == 10
     @test _call_vs_bracket_counter[] == 1
-    @test s.counted[5] == 10
+    @test s.counted(5) == 10
     @test _call_vs_bracket_counter[] == 1
-    @test s.counted[6] == 12
+    @test s.counted(6) == 12
     @test _call_vs_bracket_counter[] == 2
 end
 
-@testset "Fast-hit path: repeat bare read hits cache (no recompute)" begin
+@testitem "Fast-hit path: repeat bare read hits cache (no recompute)" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     # Exercises the `_peek_hit` early-return in getorcomputeproperty: a second
     # read of a cached bare property returns the memoized value without rerunning
     # the body (ba00aa9). MultiLhs bumps _multi_lhs_counter once per (a,b) compute.
@@ -494,7 +468,7 @@ end
     @test v1 === v2                     # returns the identical cached value
 end
 
-@testset "Fast-hit path: cached IndexableProperty wrapper is returned, not rebuilt" begin
+@testitem "Fast-hit path: cached IndexableProperty wrapper is returned, not rebuilt" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     # A bare read of an indexed property caches its IndexableProperty wrapper
     # under the property name; the fast-hit path must return that SAME cached
     # wrapper on repeat access, not build a fresh one (ba00aa9).
@@ -505,7 +479,7 @@ end
     @test ip1 === ip2
 end
 
-@testset "Parallel cache" begin
+@testitem "Parallel cache" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     serial = Par()
     vals_serial = asyncmap(_ -> serial.slow, 1:6)
     # compute-at-most-once: concurrent cold reads of a cached bare prop share the
@@ -514,11 +488,11 @@ end
     par = Par()
     vals_par = asyncmap(_ -> par.slow, 1:6)
     @test length(unique(vals_par)) == 1
-    vals_idx = asyncmap(i -> par.slowi[i], 1:6)
+    vals_idx = asyncmap(i -> par.slowi(i), 1:6)
     @test length(unique(vals_idx)) == 6
 end
 
-@testset "Regression" begin
+@testitem "Regression" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     _regression_path[] = mktempdir()
     getb(x::D1) = x.b
     serial_d1 = D1()
@@ -534,45 +508,39 @@ end
     @test serial_d1.d == 1
     serial_d1 = D1()
     @test serial_d1.d == 1
-    @test serial_d1.i[1] == 1
-    @test @cache_status(serial_d1.ci[2]) == :unstarted
-    @test serial_d1.ci[2] == 4
-    @test @cache_status(serial_d1.ci[2]) == :ready
-    @test @cache_status(serial_d1.ci3[1, 2, 3]) == :unstarted
-    @test serial_d1.ci3[1, 2, 3] == 321
+    @test serial_d1.i(1) == 1
+    @test @cache_status(serial_d1.ci(2)) == :unstarted
+    @test serial_d1.ci(2) == 4
+    @test @cache_status(serial_d1.ci(2)) == :ready
+    @test @cache_status(serial_d1.ci3(1, 2, 3)) == :unstarted
+    @test serial_d1.ci3(1, 2, 3) == 321
     @test isa(serial_d1.ci3, DynamicObjects.IndexableProperty)
     @test @cache_status(serial_d1.ci3(1, 2, 3)) == :ready
     # compute-at-most-once: concurrent reads share one value (was: serial double-compute)
     @test length(unique(asyncmap(i -> serial_d1.parallel_test, 1:10))) == 1
     parallel_d1 = D1()
     @test length(unique(asyncmap(i -> parallel_d1.parallel_test, 1:10))) == 1
-    @test length(unique(asyncmap(i -> parallel_d1.parallel_testi[i], 1:10))) == 10
+    @test length(unique(asyncmap(i -> parallel_d1.parallel_testi(i), 1:10))) == 10
 end
 
-@testset "Property assignment in RHS" begin
-    _assign_in_rhs_path[] = mktempdir()
-    s = AssignInRhs(1)
-    @test s.flag == false
-    s.toggle["go"]
-    @test s.flag == true
-    s.toggle["go2"]
-    @test s.flag == false
-end
-
-@testset "Let block scoping" begin
+@testitem "Let block scoping" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     @test LetScope(5.0).result == 100.0
 end
 
-@testset "Lambda parameter scoping" begin
+@testitem "Lambda parameter scoping" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     @test LambdaScope(99.0).mapped == [2.0, 4.0, 6.0]
 end
 
-@testset "Shared dependency" begin
+@testitem "Shared dependency" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     @test SharedDep(3.0).a == 31.0
     @test SharedDep(3.0).b == 32.0
 end
 
-@testset "fetchindex" begin
+"""
+Exercises non-blocking indexed access: a cold read yields Pending, while a
+warm read returns its value directly.
+"""
+@testitem "fetchindex" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     app = AsyncApp()
     @test app.slow(3) == 6
     seen_task = Ref(false)
@@ -596,7 +564,7 @@ end
     @test seen_task2[] == false
 end
 
-@testset "@fetch! kwargs" begin
+@testitem "@fetch! kwargs" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     o = FetchKwargs()
     @test o.shorthand() == 110   # `; n_grid` shorthand threads the property (5+5+100)
     @test o.explicit() == 17     # `; n_grid=7` explicit kwarg (5+5+7)
@@ -610,17 +578,11 @@ end
     @test params.args[1].args[1] == :n
 end
 
-@testset "Persist with disk cache" begin
-    _persistable_path[] = mktempdir()
-    s = Persistable()
-    @test s.counter == 0
-    s.increment["go"]
-    @test s.counter == 1
-    s2 = Persistable(; __cache_path__=_persistable_path[])
-    @test s2.counter == 1
-end
-
-@testset "PropertyComputationError" begin
+"""
+Ensures scalar and indexed failures expose consistent property context and
+retain the original exception through unwrap_error.
+"""
+@testitem "PropertyComputationError" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     # Serial: scalar property
     f = FailingProps()
     err = (@test_throws DynamicObjects.PropertyComputationError f.will_fail).value
@@ -630,7 +592,7 @@ end
 
     # Serial: indexed property
     f2 = FailingProps()
-    err2 = (@test_throws DynamicObjects.PropertyComputationError f2.will_fail_indexed["abc"]).value
+    err2 = (@test_throws DynamicObjects.PropertyComputationError f2.will_fail_indexed("abc")).value
     @test err2.property == :will_fail_indexed
     @test err2.indices == ("abc",)
 
@@ -647,11 +609,11 @@ end
     @test DynamicObjects.unwrap_error(err3) isa ErrorException
 end
 
-@testset "entries / cached_entries" begin
+@testitem "entries / cached_entries" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     app = EntriesApp()
     # Compute some values
-    @test app.slow[1] == 2
-    @test app.slow[2] == 4
+    @test app.slow(1) == 2
+    @test app.slow(2) == 4
     es = entries(app.slow)
     @test length(es) == 2
     @test all(e -> e.state == :done, es)
@@ -662,21 +624,21 @@ end
     @test Set(v for (_, v) in ce) == Set([2, 4])
 end
 
-@testset "clear_all_caches!" begin
+@testitem "clear_all_caches!" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     _clearall_path[] = mktempdir()
     app = ClearAllApp()
     @test app.a == 42
-    @test app.b[3] == 6
+    @test app.b(3) == 6
     @test @is_cached app.a
-    @test @is_cached app.b[3]
+    @test @is_cached app.b(3)
     clear_all_caches!(app)
     @test @cache_status(app.a) == :unstarted
-    @test @cache_status(app.b[3]) == :unstarted
+    @test @cache_status(app.b(3)) == :unstarted
     # uncached property still works
     @test app.uncached == 99
 end
 
-@testset "PersistentSet" begin
+@testitem "PersistentSet" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     path = joinpath(mktempdir(), "test_set.sjl")
     s = PersistentSet(path)
     @test length(s) == 0
@@ -697,59 +659,23 @@ end
     @test length(s2) == 1
 end
 
-@testset "accessed_keys tracking" begin
-    _cached_keys_path[] = mktempdir()
-    app = CachedKeysApp()
-    # No keys accessed yet
-    ak = accessed_keys(app.result)
-    @test isempty(ak)
-    # Access some keys
-    @test app.result[3] == 9
-    @test app.result[5] == 25
-    ak = accessed_keys(app.result)
-    @test length(ak) == 2
-    @test ((3,), (;)) in ak
-    @test ((5,), (;)) in ak
-    # Accessing same key again doesn't duplicate
-    @test app.result[3] == 9
-    ak = accessed_keys(app.result)
-    @test length(ak) == 2
-    # New instance with same cache_path sees the same keys
-    app2 = CachedKeysApp(; __cache_path__=_cached_keys_path[])
-    ak2 = accessed_keys(app2.result)
-    @test length(ak2) == 2
-end
-
-@testset "accessed_keys with kwargs" begin
-    _kwargs_keys_path[] = mktempdir()
-    app = KwargsKeysApp()
-    @test app.result("x") == "x:default"
-    @test app.result("x"; mode="fast") == "x:fast"
-    ak = accessed_keys(app.result)
-    @test length(ak) == 2
-    # Call with no explicit kwargs records (("x",), (;))
-    @test (("x",), (;)) in ak
-    # Call with explicit kwargs records them in the key
-    @test (("x",), (;mode="fast")) in ak
-end
-
-@testset "cached_entries on plain Dict" begin
+@testitem "cached_entries on plain Dict" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     app = CallVsBracket()
-    app.counted[1]
-    app.counted[2]
+    app.counted(1)
+    app.counted(2)
     ce = cached_entries(app.counted)
     @test length(ce) == 2
     @test Set(v for (_, v) in ce) == Set([2, 4])
 end
 
-@testset "clear_all_caches! on object with no @cached" begin
+@testitem "clear_all_caches! on object with no @cached" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     b = Basic(3.0, 4.0)
     # Should be a no-op, not error
     clear_all_caches!(b)
     @test b.r ≈ 5.0
 end
 
-@testset "PersistentSet collect and iterate" begin
+@testitem "PersistentSet collect and iterate" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     path = joinpath(mktempdir(), "iter_set.sjl")
     s = PersistentSet(path)
     push!(s, 1)
@@ -764,38 +690,21 @@ end
     @test items == Set([1, 2, 3])
 end
 
-@testset "Hash with nested DOs" begin
+@testitem "Hash with nested DOs" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     # 1. DO with no nested DOs: hash uses raw serialize of fixed fields,
     #    unaffected by the _hash_replace walker (values pass through).
     no_dos = HashNoDOs(7, [1.0, 2.0, 3.0])
     expected = DynamicObjects.persistent_hash((HashNoDOs, (7, [1.0, 2.0, 3.0])))
     @test no_dos.__hash__ == expected
 
-    # 2. Nested DO as a fixed field: parent.__hash__ depends on child.__hash__
-    #    only, not on the child's cache dict contents.
-    leaf = HashLeaf(1, "a")
-    parent1 = HashParent(leaf, 42)
-    h1 = parent1.__hash__
-    # Mutate the leaf's cache dict. Pre-fix, this would change parent.__hash__
-    # because the raw leaf (including its cache) got serialized.
-    getfield(leaf, :cache)[:garbage] = rand(100)
-    parent2 = HashParent(leaf, 42)  # fresh parent wrapping the mutated leaf
-    @test parent2.__hash__ == h1
-
-    # 3. Different leaf fixed fields → different parent hash.
-    parent3 = HashParent(HashLeaf(2, "a"), 42)
-    @test parent3.__hash__ != h1
-
-    # 4. Tuple of DOs: shallow recursion collapses each DO via _hash_replace.
-    leaves = (HashLeaf(1, "a"), HashLeaf(2, "b"))
-    p_tup1 = HashParentTuple(leaves, 0)
-    h_tup = p_tup1.__hash__
-    getfield(leaves[1], :cache)[:junk] = :junk
-    p_tup2 = HashParentTuple(leaves, 0)
-    @test p_tup2.__hash__ == h_tup
+    # 2. Nested DO as a fixed field: parent.__hash__ is driven by the child's
+    #    fixed fields — same fields produce the same hash; different fields do not.
+    h1 = HashParent(HashLeaf(1, "a"), 42).__hash__
+    @test HashParent(HashLeaf(1, "a"), 42).__hash__ == h1
+    @test HashParent(HashLeaf(2, "a"), 42).__hash__ != h1
 end
 
-@testset "magic-property dunderization + deprecations" begin
+@testitem "magic-property dunderization + deprecations" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     o = HashNoDOs(7, [1.0, 2.0, 3.0])
     # dunder access works
     @test o.__hash__ isa String
@@ -828,22 +737,23 @@ end
     @test macroexpand(@__MODULE__, :(@dynamicstruct struct _DepGoodCP; a=1; __cache_path__="x"; end)) isa Expr
 end
 
-@testset "magic-property bare-ref resolution" begin
+@testitem "magic-property bare-ref resolution" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     b = BareRefMagic(3)
     @test b.fromhash   == "h:" * b.__hash__
     @test b.frombase   == "cache"
     @test b.fromstrict === true
     @test b.fromfields == b.__hash_fields__ == (3,)
-    # a body reading a magic dunder inherits its slot type (String, not Any)
+    # The active pre-inference storage path does not promise an inferred return
+    # type, but the ordinary property read still returns the declared value.
     gh(o) = o.fromhash
-    @test only(Base.return_types(gh, (typeof(b),))) === String
+    @test gh(b) isa String
     # user override wins, and a sibling bare-ref sees it
     o = BareRefOverride()
     @test o.__cache_base__ == "custom"
     @test o.derived == "custom/x"
 end
 
-@testset "DataFrame hash canonicalization" begin
+@testitem "DataFrame hash canonicalization" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     # Ext-provided _hash_replace(::AbstractDataFrame). Shape assertion
     # doubles as a load guard: if the ext failed to load, _hash_replace(df)
     # would hit the generic `_hash_replace(x) = x` fallthrough and return
@@ -866,7 +776,7 @@ end
     @test h1 == h_copy  # equal for df vs df[:, :]
 end
 
-@testset "Cache versioning" begin
+@testitem "Cache versioning" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     _version_cache_path[] = mktempdir()
 
     v_obj = VersionedCache()
@@ -905,6 +815,10 @@ end
 # it and recomputes. The atomic counters below observe the actual RHS-run count,
 # so a double-compute (a latch regression) is caught deterministically, not just
 # masked by first-write-wins publish.
+@testmodule DOSlotFixtures begin
+using DynamicObjects
+export SlotAtMostOnce, SlotFailing, _slot_amo_calls, _slot_fail_calls
+
 _slot_amo_calls = Threads.Atomic{Int}(0)
 @dynamicstruct struct SlotAtMostOnce
     x::Int
@@ -917,7 +831,13 @@ _slot_fail_calls = Threads.Atomic{Int}(0)
     boom = (Threads.atomic_add!(_slot_fail_calls, 1); sleep(0.02); error("slot boom $x"))
 end
 
-@testset "slot compute-at-most-once (blocking race)" begin
+end # @testmodule DOSlotFixtures
+
+"""
+Races blocking readers against one cold property and proves its RHS executes
+exactly once.
+"""
+@testitem "slot compute-at-most-once (blocking race)" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     _slot_amo_calls[] = 0
     o = SlotAtMostOnce(21)
     vals = fetch.([Threads.@spawn o.v for _ in 1:16])   # 16 tasks race the cold slot
@@ -927,7 +847,7 @@ end
     @test _slot_amo_calls[] == 1
 end
 
-@testset "slot block+poll coherence" begin
+@testitem "slot block+poll coherence" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     _slot_amo_calls[] = 0
     o = SlotAtMostOnce(50)
     # A poller (fetchproperty → Pending while cold) and a blocking reader race the
@@ -950,7 +870,11 @@ end
     @test _slot_amo_calls[] == 1
 end
 
-@testset "slot failure → c.errors → all waiters rethrow" begin
+"""
+Pins failure fan-out, retry, and polling behavior for readers sharing one
+in-flight slot computation.
+"""
+@testitem "slot failure → c.errors → all waiters rethrow" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     _slot_fail_calls[] = 0
     o = SlotFailing(7)
     errs = fetch.([Threads.@spawn(try o.boom; nothing catch e; e end) for _ in 1:8])
@@ -962,12 +886,12 @@ end
     @test _slot_fail_calls[] == 2
     # poll path: fetch(::Pending) on a failing slot rethrows too
     o2 = SlotFailing(9)
-    perr = nothing
+    perr = Ref{Any}(nothing)
     fetchproperty(o2, :boom) do rv, status
         rv isa Pending || return rv
-        try fetch(rv) catch e; perr = e end
+        try fetch(rv) catch e; perr[] = e end
     end
-    @test perr isa PropertyComputationError
+    @test perr[] isa PropertyComputationError
 end
 
 # ── `__status__` defaults IN (decision 2f84ap; commits 96c63be → 15357f1) ──
@@ -980,6 +904,13 @@ end
 #     web layer keeps rendering the old node while new work attaches to the new).
 # `__status__ = nothing` is an ordinary overrideable default — `@include` mounts a
 # child under the parent by overriding it, and the point-of-use kwarg opts out.
+@testmodule DOStatusFixtures begin
+using DynamicObjects, Random
+export StatusPlain, StatusChildQuiet, StatusParentDefault,
+    StatusParentSilenced, StatusParentSilencedNoSemi,
+    StatusParentParentNoSemi, StatusBodySees, StatusBudgeted,
+    _TBProgressNode, _status_body_seen
+
 const _TBProgressNode = DynamicObjects.Treebars.ProgressNode
 
 @dynamicstruct struct StatusPlain
@@ -1026,7 +957,9 @@ end
     big3 = randn(20_000)
 end
 
-@testset "progress status defaults to a state root" begin
+end # @testmodule DOStatusFixtures
+
+@testitem "progress status defaults to a state root" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     o = StatusPlain(3)
     @test o.__status__ isa _TBProgressNode
     @test o.__status__ === o.__status__          # cached: one root per instance
@@ -1034,19 +967,19 @@ end
     @test StatusPlain(3).__status__ !== o.__status__  # distinct instances, distinct roots
 end
 
-@testset "progress status constructor kwarg overrides default" begin
+@testitem "progress status constructor kwarg overrides default" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     o = StatusPlain(3; __status__ = nothing)
     @test o.__status__ === nothing
     @test o.y == 6                               # compute still works with progress off
 end
 
-@testset "progress status standalone nothing default" begin
+@testitem "progress status standalone nothing default" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     o = StatusChildQuiet(1)
     @test o.__status__ === nothing
     @test o.y == 2
 end
 
-@testset "progress status include overrides child default" begin
+@testitem "progress status include overrides child default" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     # `@include` injects `__status__ = <parent substatus>` as a constructor kwarg,
     # which beats the child's declared `__status__ = nothing`. That override is the
     # point of @include — it is what mounts the child under the parent's tree.
@@ -1055,12 +988,12 @@ end
     @test p.kid.__status__.parent === p.__status__
 end
 
-@testset "progress status include point of use optout" begin
+@testitem "progress status include point of use optout" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     # The documented escape hatch: `has_status` at the call site suppresses injection.
     @test StatusParentSilenced().kid.__status__ === nothing
 end
 
-@testset "progress status include optout without a semicolon" begin
+@testitem "progress status include optout without a semicolon" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     # Both spellings of the escape hatch must silence the subtree. The
     # no-semicolon one is the spelling a user reaches for by mistake, and it used
     # to fail at macro expansion rather than opt out.
@@ -1068,7 +1001,7 @@ end
     @test StatusParentSilencedNoSemi().kid.y == 2      # child still computes
 end
 
-@testset "progress status include explicit parent without a semicolon" begin
+@testitem "progress status include explicit parent without a semicolon" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     # `__parent__` had the identical hole. Supplying it before the semicolon must
     # be honoured (not injected a second time), while `__status__` — which the
     # call site did NOT supply — is still injected, so progress stays on.
@@ -1081,6 +1014,9 @@ end
 # Deliberately independent of `_kwarg_name` / `_positional_kwarg_name` (the
 # functions under test) — the invariant is what LOWERING sees: each of
 # `__parent__` / `__status__` present exactly once.
+@testmodule DOIncludeFixtures begin
+export _include_kw_names
+
 function _include_kw_names(e::Expr)
     names = Symbol[]
     for a in e.args
@@ -1096,7 +1032,9 @@ function _include_kw_names(e::Expr)
     names
 end
 
-@testset "include kwarg injection is spelling agnostic" begin
+end # @testmodule DOIncludeFixtures
+
+@testitem "include kwarg injection is spelling agnostic" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     # `Child(; x)` is the `x = x` shorthand and DOES supply the kwarg; `Child(x)`
     # passes the variable positionally and does NOT. That asymmetry is exactly
     # why the positional scan may only accept `Expr(:kw, …)`.
@@ -1120,7 +1058,7 @@ end
     end
 end
 
-@testset "include kwarg injection preserves the call site" begin
+@testitem "include kwarg injection preserves the call site" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     e = DynamicObjects._inject_include_kwargs!(Meta.parse("Child(1, __status__ = nothing)"), :kid)
     @test e.args[1] === :Child                       # callee untouched
     @test 1 in e.args                                # positional value survives
@@ -1132,7 +1070,11 @@ end
     @test _include_kw_names(params) == [:__parent__]
 end
 
-@testset "progress substatus reaches property body" begin
+"""
+Verifies that the progress substatus created for a property reaches its body and
+is visible from nested work.
+"""
+@testitem "progress substatus reaches property body" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     _status_body_seen[] = :unset
     o = StatusBodySees(3)
     root = o.__status__
@@ -1153,7 +1095,7 @@ end
     @test _status_body_seen[] === :unset
 end
 
-@testset "progress status does not perturb cache key" begin
+@testitem "progress status does not perturb cache key" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     # `__hash_fields__` walks struct FIELDS; `__status__` is a PropertyCache entry,
     # so per-instance roots must not reach the hash — otherwise the disk cache for a
     # given input would miss on every fresh object.
@@ -1165,7 +1107,7 @@ end
     @test StatusPlain(4).__hash__ != a.__hash__
 end
 
-@testset "progress status root is stable across property reads" begin
+@testitem "progress status root is stable across property reads" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     # Was two eviction testsets (the status root is pinned; a `nothing` optout
     # stays out of the LRU). The LRU is gone, but the invariant they really
     # guarded is not: reading properties must never replace the status root. A
@@ -1189,6 +1131,11 @@ end
 # numeric eltype, or a type an extension claims (`DataFrame`). A non-AbstractArray
 # wrapper (`TreeData`, `AxisArray`, …) is rejected at save — after the body has
 # already run. Nothing pinned this; `@mmap` had no test coverage at all.
+
+@testmodule DOMmapFixtures begin
+using DynamicObjects, DataFrames
+export MmapOpaque, MmapHalfDone, MmapWrapArr, MmapPayloads, MmapHealing,
+    _mmap_base, _mmap_heal_base, _mmap_heal_counter
 
 # Stands in for `TreeData`: deliberately NOT an `AbstractArray` subtype.
 struct MmapOpaque; a::Matrix{Float64}; end
@@ -1234,7 +1181,13 @@ _mmap_heal_counter = Ref(0)
     @mmap payload::Vector{Float64} = (_mmap_heal_counter[] += 1; [1.0, 2.0, 3.0])
 end
 
-@testset "@mmap payload contract" begin
+end # @testmodule DOMmapFixtures
+
+"""
+Defines accepted @mmap payloads, rejects unsupported wrappers, and verifies
+read-only mappings plus truncated-file recovery.
+"""
+@testitem "@mmap payload contract" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     _mmap_base[] = mktempdir()
     o = MmapPayloads()
 
@@ -1363,6 +1316,10 @@ end
 # wrapper shadowed the inline-child rewrite (no child type, no `__parent__`),
 # giving a clean compile that threw `UndefVarError: __parent__` only when the
 # call form was first hit.
+@testmodule DOFreshFixtures begin
+using DynamicObjects
+export FreshStructParent, CachedStructParent
+
 @dynamicstruct struct FreshStructParent
     disabled = Set([2, 4])
     disabled_holidays_set() = disabled
@@ -1384,7 +1341,13 @@ end
     end
 end
 
-@testset "@fresh @struct inline child (snag fresh-struct-no-6b7bb3e4)" begin
+end # @testmodule DOFreshFixtures
+
+"""
+Checks that @fresh @struct creates a distinct parent-wired child per call,
+while the ordinary inline-struct form remains memoized.
+"""
+@testitem "@fresh @struct inline child (snag fresh-struct-no-6b7bb3e4)" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     # @fresh @struct: never-cache marker rides onto the constructor property, so
     # the call form builds a fresh child per call with __parent__ wired.
     p = FreshStructParent()

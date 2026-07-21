@@ -5,54 +5,51 @@
 # so a versioned object caches under `base/<identity>/<version>/…`. `x` may be a
 # FIXED field (probe passed in / `remake`d) OR — since b2tsvz, Option B — a
 # COMPUTED property DO derives itself (e.g. `file_version(path)`): additive to
-# identity, guarded against cache-path cycles. This bakes the hand-rolled
-# content_version pattern (see filebacked_content_version.jl) into a one marker:
-#   - all versions of one logical object share the identity dir;
-#   - a fresh version cache-misses cleanly;
-#   - "hold only the most recent" prunes stale sibling version dirs on write
-#     (default-on for versioned types; opt out with __hold_recent_version__=false);
-#   - non-versioned structs are byte-identical to before (fast path preserved).
-# For a FIXED version the probe (mtime / content-hash / git HEAD) stays
-# consumer-computed and is passed in / `remake`d; a COMPUTED version has DO run
-# the probe, memoized once per object — no per-access I/O either way.
+# identity, guarded against cache-path cycles.
 #
-# Standalone: julia --project=<env-with-DO> test/versioned_marker.jl
-# In-suite:   add `include("versioned_marker.jl")` to runtests.jl.
-using Test, DynamicObjects
-using DynamicObjects: remake, has_versioned_fields
+# Fixtures are defined inside the item so the whole `@versioned` contract (fixed
+# + computed) lives in one selectable unit; the nested `@testset`s keep the
+# original structure. Previously this file used `Test.@testset` and never ran in
+# CI (it wasn't `include`d) — folding it into a `@testitem` closes that gap.
 
-@dynamicstruct struct PlainNoVer
-    a::Int
-    b::Int
-    s() = a + b
-end
+"""
+Exercises the complete @versioned cache identity contract: fixed and computed
+versions, remake invalidation, cycle rejection, pruning, and retention opt-out.
+"""
+@testitem "@versioned marker" tags=[:versioned] begin
+    using DynamicObjects: remake, has_versioned_fields
 
-@dynamicstruct struct Versioned
-    path::String
-    @versioned content_version::String
-    n() = length(path) + length(content_version)
-end
+    @dynamicstruct struct PlainNoVer
+        a::Int
+        b::Int
+        s() = a + b
+    end
 
-@dynamicstruct struct VersionedDisk
-    path::String
-    @versioned content_version::String
-    @cached payload() = string(path, ":", content_version)
-end
+    @dynamicstruct struct Versioned
+        path::String
+        @versioned content_version::String
+        n() = length(path) + length(content_version)
+    end
 
-# Computed @versioned (b2tsvz opt B): DO derives the version from the file's
-# content itself — identity stays the `path`, the version tracks the content hash.
-@dynamicstruct struct FileVersioned
-    path::String
-    @versioned content_ver = file_version(path; by = :hash)
-end
+    @dynamicstruct struct VersionedDisk
+        path::String
+        @versioned content_version::String
+        @cached payload() = string(path, ":", content_version)
+    end
 
-@dynamicstruct struct FileVersionedDisk
-    path::String
-    @versioned content_ver = file_version(path; by = :hash)
-    @cached payload() = string("v=", content_ver)
-end
+    # Computed @versioned (b2tsvz opt B): DO derives the version from the file's
+    # content itself — identity stays the `path`, the version tracks the content hash.
+    @dynamicstruct struct FileVersioned
+        path::String
+        @versioned content_ver = file_version(path; by = :hash)
+    end
 
-@testset "@versioned marker" begin
+    @dynamicstruct struct FileVersionedDisk
+        path::String
+        @versioned content_ver = file_version(path; by = :hash)
+        @cached payload() = string("v=", content_ver)
+    end
+
     @testset "non-versioned struct is byte-identical" begin
         p = PlainNoVer(1, 2)
         @test !has_versioned_fields(PlainNoVer)
