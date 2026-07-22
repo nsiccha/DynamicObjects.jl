@@ -5,8 +5,7 @@ using DynamicObjects
 export SemanticQuality, draft, final, SemanticDescriptorFixture,
     SemanticPendingFixture, ComputedVersionedSemanticDescriptorFixture,
     AutomaticSemanticContextFixture, GovernedMaterializationFixture,
-    GOVERNED_MATERIALIZATION_CALLS, GOVERNED_MMAP_CALLS,
-    GOVERNED_SERIAL_CALLS,
+    GOVERNED_MATERIALIZATION_CALLS,
     LegacySemanticMeta, DeduplicatedKeyFixture
 
 @enum SemanticQuality draft final
@@ -21,28 +20,16 @@ export SemanticQuality, draft, final, SemanticDescriptorFixture,
 end
 
 const GOVERNED_MATERIALIZATION_CALLS = Threads.Atomic{Int}(0)
-const GOVERNED_MMAP_CALLS = Threads.Atomic{Int}(0)
-const GOVERNED_SERIAL_CALLS = Threads.Atomic{Int}(0)
 
 @dynamicstruct struct GovernedMaterializationFixture
     @versioned revision::Int
     value::Int
     request = nothing
 
-    compute(scale::Int) = begin
+    @cached compute(scale::Int) = begin
         Threads.atomic_add!(GOVERNED_MATERIALIZATION_CALLS, 1)
         sleep(0.05)
         value * scale
-    end
-
-    large_array(scale::Int)::Vector{Float64} = begin
-        Threads.atomic_add!(GOVERNED_MMAP_CALLS, 1)
-        fill(Float64(value * scale), 1 + (1024 * 1024) ÷ sizeof(Float64))
-    end
-
-    large_text(scale::Int)::String = begin
-        Threads.atomic_add!(GOVERNED_SERIAL_CALLS, 1)
-        repeat(string(value * scale), 1 + 1024 * 1024)
     end
 end
 
@@ -191,7 +178,7 @@ legacy properties, including type-inferred input domains.
     legacy = property_descriptor(LegacySemanticMeta, :legacy)
     @test legacy.name === :legacy
     @test legacy.output.type === nothing
-    @test legacy.output.materialization.tier === :automatic
+    @test legacy.output.materialization.tier === :memory
     @test !legacy.semantics.versioned
     @test isempty(legacy.semantics.version_dependencies)
 end
@@ -240,8 +227,6 @@ directory. Identity/version and retention remain reflected in the lifecycle.
 """
 @testitem "governed materialization execution and GC" tags=[:semantic] setup=[SemanticFixtures] begin
     GOVERNED_MATERIALIZATION_CALLS[] = 0
-    GOVERNED_MMAP_CALLS[] = 0
-    GOVERNED_SERIAL_CALLS[] = 0
     cache_base = mktempdir()
     context = (;
         scope=:job,
@@ -275,36 +260,7 @@ directory. Identity/version and retention remain reflected in the lifecycle.
         @test ownership.active == 0
         @test ownership.reachable
         @test ownership.owned_paths == [abspath(path)]
-        @test !isfile(joinpath(path, "compute_3.sjl"))
-        @test property_descriptor(
-            GovernedMaterializationFixture, :compute).output.materialization.tier === :automatic
-
-        # No marker is needed for either disk format. The governed executor
-        # chooses mmap for a large isbits array and serialization for a large
-        # non-mmap value from their observed runtime values.
-        mapped = execute_materialization(context, object, :large_array, 2)
-        @test length(mapped) == 1 + (1024 * 1024) ÷ sizeof(Float64)
-        @test all(==(14.0), mapped)
-        mapped_path = DynamicObjects.get_cache_path(object, :large_array, 2)
-        @test isfile(mapped_path)
-        @test isfile(mapped_path * ".auto")
-        @test materialization_observation(
-            object, :large_array, 2).tier === :mmap
-
-        text = execute_materialization(context, object, :large_text, 2)
-        @test startswith(text, "14")
-        serialized_path = DynamicObjects.get_cache_path(object, :large_text, 2)
-        @test isfile(serialized_path)
-        @test isfile(serialized_path * ".auto")
-        @test materialization_observation(
-            object, :large_text, 2).tier === :serialized
-
-        clear_mem_caches!(object)
-        @test execute_materialization(
-            context, object, :large_array, 2) == mapped
-        @test execute_materialization(context, object, :large_text, 2) == text
-        @test GOVERNED_MMAP_CALLS[] == 1
-        @test GOVERNED_SERIAL_CALLS[] == 1
+        @test isfile(joinpath(path, "compute_3.sjl"))
 
         wrong_context = merge(context, (;key=(;mount="/study", job=:other)))
         @test release_materialization!(wrong_context, retained;
@@ -401,7 +357,7 @@ then verifies that the same progress object remains visible through completion.
     mmap_after = materialization_observation(o, :matrix)
     @test mmap_after.ready
     @test mmap_after.stored
-    @test mmap_after.tier === :mmap
+    @test mmap_after.tier === :memory
 
     @test o.preview(4) == 8
     fresh = materialization_observation(o, :preview, 4)
