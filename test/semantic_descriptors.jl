@@ -4,7 +4,8 @@ using TestItemRunner
 using DynamicObjects
 export SemanticQuality, draft, final, SemanticDescriptorFixture,
     SemanticPendingFixture, ComputedVersionedSemanticDescriptorFixture,
-    BadSemanticInputName, LegacySemanticMeta
+    BadSemanticInputName, LegacySemanticMeta,
+    DeduplicatedKeyFixture, SiblingAsSemanticInput
 
 @enum SemanticQuality draft final
 
@@ -55,6 +56,26 @@ end
 
 @dynamicstruct struct BadSemanticInputName
     @semantic (inputs=(missing=(domain=static_domain((1, 2)),),),) value(x::Int) = x
+end
+
+# The deduplicated shape do-use §6 documents: a key tuple shared by several
+# operations lives ONCE as fixed fields carrying the domains, and the
+# operations read them as bare siblings instead of restating `inputs=`.
+@dynamicstruct struct DeduplicatedKeyFixture
+    @semantic (inputs=(study=(domain=static_domain((:north, :south)),),),) study::Symbol
+    @semantic (inputs=(model=(domain=static_domain((:one_cmt, :two_cmt)),),),) model::Symbol
+    @semantic (inputs=(dose=(domain=static_domain((50.0, 100.0)),),),) dose::Float64
+
+    prediction_grid()::Matrix{Float64} = fill(dose, 2, 2)
+    summary_table()::Vector{Float64} = [dose, study === :north ? 1.0 : 2.0]
+    # `dependencies` is direct, not transitive: this reports `summary_table`,
+    # never the `study`/`dose` that `summary_table` itself reads.
+    headline()::Float64 = first(summary_table())
+end
+
+@dynamicstruct struct SiblingAsSemanticInput
+    study::Symbol
+    @semantic (inputs=(study=(domain=static_domain((:north, :south)),),),) grid() = study
 end
 
 struct LegacySemanticMeta end
@@ -262,4 +283,66 @@ property construction and execution unaffected.
     @test err !== nothing
     @test occursin("unknown property inputs", sprint(showerror, err))
     @test BadSemanticInputName().value(3) == 3
+end
+
+"""
+Pins the deduplicated-key contract documented in do-use §6: a shared key tuple
+is declared once as fixed fields carrying the option domains, and operations
+reach those domains through `dependencies` rather than restating `inputs=`.
+"""
+@testitem "deduplicated key tuple via fixed-field domains" tags=[:semantic] setup=[SemanticFixtures] begin
+    T = DeduplicatedKeyFixture
+
+    # A fixed field is its own single input, keyed by the field's own name.
+    for (name, values) in ((:study, [:north, :south]),
+                           (:model, [:one_cmt, :two_cmt]),
+                           (:dose, [50.0, 100.0]))
+        d = property_descriptor(T, name)
+        @test d.role === :input
+        @test d.fixed
+        @test length(d.inputs) == 1
+        @test d.inputs[1].name === name
+        @test d.inputs[1].kind === :field
+        @test d.inputs[1].required
+        @test d.inputs[1].domain.kind === :static
+        @test getproperty.(d.inputs[1].domain.options, :value) == values
+    end
+
+    # Operations restate nothing: no own inputs, siblings via `dependencies`.
+    grid = property_descriptor(T, :prediction_grid)
+    @test grid.role === :operation
+    @test isempty(grid.inputs)
+    @test grid.dependencies == [:dose]
+
+    summary = property_descriptor(T, :summary_table)
+    @test isempty(summary.inputs)
+    @test summary.dependencies == [:dose, :study]
+
+    # `dependencies` is DIRECT, not transitive.
+    headline = property_descriptor(T, :headline)
+    @test headline.dependencies == [:summary_table]
+
+    # The consumer recipe: resolve an operation's choices off its dependencies.
+    resolved = Dict{Symbol,Any}()
+    for dep in summary.dependencies
+        d = property_descriptor(T, dep)
+        d.fixed || continue
+        resolved[dep] = getproperty.(d.inputs[1].domain.options, :value)
+    end
+    @test resolved == Dict(:dose => [50.0, 100.0], :study => [:north, :south])
+
+    o = T(:north, :one_cmt, 100.0)
+    @test o.prediction_grid() == fill(100.0, 2, 2)
+    @test o.summary_table() == [100.0, 1.0]
+    @test o.headline() == 100.0
+
+    # A sibling is NOT addressable as an operation's own `@semantic` input.
+    err = try
+        property_descriptor(SiblingAsSemanticInput, :grid)
+        nothing
+    catch e
+        e
+    end
+    @test err !== nothing
+    @test occursin("unknown property inputs", sprint(showerror, err))
 end
