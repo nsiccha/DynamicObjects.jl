@@ -1,7 +1,7 @@
 name = "DynamicObjects"
 uuid = "23d02862-63fe-4c6e-8fdb-1d52cbbd39d5"
-authors = ["Nikolas Siccha <nikolassiccha@gmail.com> and contributors"]
 version = "0.4.3"
+authors = ["Nikolas Siccha <nikolassiccha@gmail.com> and contributors"]
 
 [deps]
 Mmap = "a63ad114-7e13-5084-954f-fe012c677804"
@@ -13,16 +13,19 @@ Treebars = "e1e568c4-3a56-40a4-95fa-9b9c6c16fccb"
 Arrow = "69666777-d1a9-59fb-9406-91d4454c9d45"
 DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
 
+[sources.TestModules]
+url = "https://github.com/nsiccha/TestModules.jl"
+
+[sources.Treebars]
+url = "https://github.com/nsiccha/Treebars.jl"
+
 [extensions]
 DataFramesArrowExt = ["Arrow", "DataFrames"]
-
-[sources]
-Treebars = {url = "https://github.com/nsiccha/Treebars.jl"}
-TestModules = {url = "https://github.com/nsiccha/TestModules.jl"}
 
 [compat]
 Arrow = "2"
 DataFrames = "1"
+SHA = "0.7"
 julia = "1.10"
 
 [extras]
