@@ -33,7 +33,7 @@ jobs:
       - uses: julia-actions/cache@v2
       - name: Install dependencies
         run: |
-          git clone https://github.com/nsiccha/Treebars.jl.git
+          git clone -b dev https://github.com/nsiccha/Treebars.jl.git
           julia --project=docs -e 'using Pkg; Pkg.develop([PackageSpec(path=pwd()), PackageSpec(path="Treebars.jl")]); Pkg.instantiate()'
       - name: Build and deploy
         env:
