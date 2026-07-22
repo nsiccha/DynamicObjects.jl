@@ -36,6 +36,10 @@ optionally disk-cached properties.
 - [`key_tracker`](@ref): Override to set the tracking strategy per object type / property.
 - [`record!`](@ref): Record an accessed key via a `KeyTracker`.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
+- [`property_descriptor`](@ref): Reflect semantic inputs, dependencies, and storage policy without execution.
+- [`execute_materialization`](@ref): Framework-only governed semantic execution (applications call operations normally).
+- [`release_materialization!`](@ref): Release a retained semantic root without racing active executions.
+- [`materialization_gc!`](@ref): Collect only unreachable, provider-released storage with proven ownership.
 """
 module DynamicObjects
 export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, remount, file_version, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending
@@ -6864,6 +6868,67 @@ function _semantic_input_overrides(metadata::NamedTuple)
     overrides
 end
 
+function _semantic_dependency_closure(T::Type, roots)
+    closure = Set{Symbol}()
+    seen = Set{Symbol}()
+    function visit(name::Symbol)
+        name in seen && return
+        push!(seen, name)
+        info = metafirst(T, name)
+        info === nothing && return
+        push!(closure, name)
+        dependencies = get(info, :dependson, nothing)
+        dependencies === nothing && return
+        for dependency in dependencies
+            dependency isa Symbol && visit(dependency)
+        end
+    end
+    for root in roots
+        root isa Symbol && visit(root)
+    end
+    # Declaration order is the schema/rendering order; `dependson` itself is a
+    # Set and therefore cannot provide a stable public order.
+    unique!(Symbol[name for (name, _) in meta(T) if name in closure])
+end
+
+function _semantic_fixed_dependencies(T::Type, roots)
+    Symbol[name for name in _semantic_dependency_closure(T, roots)
+        if isnothing(get(metafirst(T, name), :rhs, nothing))]
+end
+
+function _semantic_dependency_inputs(T::Type, dependencies)
+    inputs = NamedTuple[]
+    for name in _semantic_fixed_dependencies(T, dependencies)
+        descriptor = property_descriptor(T, name)
+        descriptor === nothing && continue
+        input = only(descriptor.inputs)
+        push!(inputs, merge(input, (;
+            kind=:context,
+            source=(;type=T, property=name),
+            scope=:object,
+        )))
+    end
+    inputs
+end
+
+function _merge_semantic_dependency_inputs(context_inputs, direct_inputs)
+    merged = NamedTuple[]
+    direct_by_name = Dict(input.name => input for input in direct_inputs)
+    for context in context_inputs
+        direct = get(direct_by_name, context.name, nothing)
+        if direct === nothing
+            push!(merged, context)
+            continue
+        end
+        context.type !== nothing && direct.type !== nothing && context.type != direct.type &&
+            error("semantic dependency input `$(context.name)` type $(context.type) conflicts with the property signature type $(direct.type)")
+        push!(merged, merge(context, direct, (;domain=context.domain)))
+    end
+    context_names = Set(input.name for input in context_inputs)
+    append!(merged, (input for input in direct_inputs if !(input.name in context_names)))
+    merged
+end
+
 function _apply_input_override(input::NamedTuple, overrides::NamedTuple)
     override = get(overrides, input.name, nothing)
     override === nothing && return input
@@ -6973,10 +7038,16 @@ function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
             NamedTuple[_descriptor_input(arg, :keyword) for arg in signature.kwargs],
         )
     end
-    inputs = _validate_dynamic_domains(T,
-        _apply_input_overrides(inferred_inputs, metadata))
     dependencies = get(info, :dependson, nothing)
     dependencies = dependencies === nothing ? Symbol[] : sort!(collect(dependencies))
+    dependency_closure = fixed ? Symbol[] :
+        _semantic_dependency_closure(T, dependencies)
+    context_inputs = fixed ? NamedTuple[] :
+        _semantic_dependency_inputs(T, dependencies)
+    declared_inputs = _apply_input_overrides(inferred_inputs, metadata)
+    effective_inputs = _merge_semantic_dependency_inputs(
+        context_inputs, declared_inputs)
+    inputs = _validate_dynamic_domains(T, effective_inputs)
     tier = _materialization_tier(Val(fixed), Val(fresh), Val(mmap), Val(cached))
     cache_version = get(info, :cache_version, nothing)
     # `@versioned` is an object-wide cache-path dimension: a marker on one
@@ -7011,6 +7082,7 @@ function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
         indexed,
         description=property_doc(info),
         dependencies,
+        dependency_closure,
         inputs,
         output=(; type=result_type, materialization),
         semantics,
@@ -7218,10 +7290,391 @@ function materialization_plan(descriptor::NamedTuple;
     _automatic_plan(:recompute, true, secret ? :secret_exceeds_memory_budget : :no_safe_storage_tier, resolved_hints)
 end
 
+# --- governed semantic materialization ---------------------------------------
+#
+# Applications do not construct a store. A semantic framework hands DO the root
+# it already retained plus a pure-data `(scope, key, retention)` context. DO
+# then executes through the ordinary property machinery, so the existing
+# ThreadsafeDict memoization, per-path disk locks, cache identity, @versioned
+# layout, atomic serialization, and mmap validation remain the only storage
+# implementation. This registry owns lifecycle metadata only; it is not a
+# second value cache.
+
+mutable struct _MaterializationOwner
+    id::String
+    registry_key::Tuple{UInt,Symbol,String}
+    root_type::Type
+    scope::Symbol
+    key_digest::String
+    identity::String
+    version::String
+    retention::Any
+    handle::WeakRef
+    active::Int
+    released::Bool
+    release_reason::Union{Nothing,Symbol}
+    last_access::Float64
+    owned_paths::Dict{String,String}
+    unowned_paths::Set{String}
+end
+
+const _MATERIALIZATION_OWNERS_LOCK = ReentrantLock()
+const _MATERIALIZATION_OWNERS = Dict{Tuple{UInt,Symbol,String},_MaterializationOwner}()
+const _MATERIALIZATION_PROCESS_TOKEN = Ref{Union{Nothing,String}}(nothing)
+const _MATERIALIZATION_MARKER = ".dynamicobjects-owner"
+
+function _materialization_process_token()
+    token = _MATERIALIZATION_PROCESS_TOKEN[]
+    token === nothing || return token
+    lock(_MATERIALIZATION_OWNERS_LOCK) do
+        token = _MATERIALIZATION_PROCESS_TOKEN[]
+        if token === nothing
+            token = persistent_hash((getpid(), time_ns(), objectid(current_task())))
+            _MATERIALIZATION_PROCESS_TOKEN[] = token
+        end
+        token
+    end
+end
+
+function _materialization_context(context::NamedTuple)
+    haskey(context, :scope) || error(
+        "materialization context must contain `scope`")
+    haskey(context, :key) || error(
+        "materialization context must contain `key`")
+    scope = context.scope
+    scope isa Symbol || error(
+        "materialization context `scope` must be a Symbol, got $(typeof(scope))")
+    retention = get(context, :retention, nothing)
+    if retention !== nothing
+        retention isa NamedTuple || error(
+            "materialization context `retention` must be `nothing` or a NamedTuple")
+        unknown = setdiff(Set(keys(retention)), Set((:max_entries, :ttl)))
+        isempty(unknown) || error(
+            "unknown materialization retention fields: $(join(sort!(string.(collect(unknown))), ", "))")
+        max_entries = get(retention, :max_entries, nothing)
+        ttl = get(retention, :ttl, nothing)
+        (max_entries === nothing || (max_entries isa Integer && max_entries > 0)) ||
+            error("materialization retention `max_entries` must be a positive integer or nothing")
+        (ttl === nothing || (ttl isa Real && ttl > 0)) ||
+            error("materialization retention `ttl` must be a positive number of seconds or nothing")
+        retention = (;max_entries, ttl)
+    end
+    key_digest = try
+        persistent_hash(context.key)
+    catch e
+        error("materialization context `key` must have a stable serializable identity: $(sprint(showerror, e))")
+    end
+    (;scope, key_digest, retention)
+end
+
+function _materialization_handle(root)
+    hasfield(typeof(root), :cache) || error(
+        "governed materialization root $(typeof(root)) is not a @dynamicstruct")
+    property_cache = getfield(root, :cache)
+    property_cache isa PropertyCache || error(
+        "governed materialization root $(typeof(root)) has no DynamicObjects PropertyCache")
+    cache = property_cache.cache
+    cache = cache isa MountedThreadsafeDict ? cache.shared : cache
+    # ThreadsafeDict itself is immutable, so WeakRef does not track its
+    # reachability reliably. Its mutable value Dict has the same lifetime and
+    # is retained by every mounted view of the shared cache.
+    cache isa ThreadsafeDict ? cache.cache : cache
+end
+
+function _materialization_identity(root)
+    try
+        (;
+            identity=string(root.__identity_hash__),
+            version=string(root.__version_tag__),
+            path=normpath(abspath(root.__cache_path__)),
+        )
+    catch e
+        error("governed materialization root $(typeof(root)) has no usable cache identity: $(sprint(showerror, e))")
+    end
+end
+
+_materialization_marker(path::AbstractString) =
+    joinpath(path, _MATERIALIZATION_MARKER)
+
+function _read_materialization_marker(marker)
+    isfile(marker) || return nothing
+    try
+        strip(read(marker, String))
+    catch
+        nothing
+    end
+end
+
+function _contest_materialization_marker!(marker, existing, claimant)
+    isdir(dirname(marker)) || return nothing
+    try
+        open(marker, "w") do io
+            println(io, "contested")
+            existing === nothing || println(io, existing)
+            println(io, claimant)
+        end
+    catch
+        # A marker that cannot be made explicitly contested is still unowned;
+        # cleanup requires an exact token match and therefore stays fail-closed.
+    end
+    nothing
+end
+
+function _claim_materialization_path!(owner::_MaterializationOwner, path)
+    path in owner.unowned_paths && return false
+    haskey(owner.owned_paths, path) && return true
+    if ispath(path)
+        marker = _materialization_marker(path)
+        existing = _read_materialization_marker(marker)
+        if existing == owner.id
+            owner.owned_paths[path] = marker
+            return true
+        end
+        existing === nothing ||
+            _contest_materialization_marker!(marker, existing, owner.id)
+        push!(owner.unowned_paths, path)
+        return false
+    end
+    marker = _materialization_marker(path)
+    mkpath(dirname(path))
+    try
+        # Claim the data directory itself atomically. Keeping the marker inside
+        # it matters for @versioned roots: stale-version pruning removes sibling
+        # directories, so an out-of-tree marker would be mistaken for a stale
+        # version and deleted before governance could prove ownership.
+        mkdir(path)
+    catch
+        existing = _read_materialization_marker(marker)
+        existing === nothing ||
+            _contest_materialization_marker!(marker, existing, owner.id)
+        push!(owner.unowned_paths, path)
+        return false
+    end
+    open(marker, "w") do io
+        write(io, owner.id)
+    end
+    owner.owned_paths[path] = marker
+    true
+end
+
+function _new_materialization_owner(root, normalized, handle, identity)
+    registry_key = (objectid(handle), normalized.scope, normalized.key_digest)
+    owner_id = persistent_hash((
+        _materialization_process_token(), registry_key,
+        typeof(root), identity.identity, identity.version,
+    ))
+    _MaterializationOwner(
+        owner_id, registry_key, typeof(root), normalized.scope,
+        normalized.key_digest, identity.identity, identity.version,
+        normalized.retention, WeakRef(handle), 0, false, nothing, time(),
+        Dict{String,String}(), Set{String}(),
+    )
+end
+
+function _materialization_owner_locked(root, context; create::Bool)
+    normalized = _materialization_context(context)
+    handle = _materialization_handle(root)
+    registry_key = (objectid(handle), normalized.scope, normalized.key_digest)
+    owner = get(_MATERIALIZATION_OWNERS, registry_key, nothing)
+    if owner === nothing
+        create || return nothing, normalized
+        identity = _materialization_identity(root)
+        owner = _new_materialization_owner(root, normalized, handle, identity)
+        _MATERIALIZATION_OWNERS[registry_key] = owner
+    else
+        owner.handle.value === handle || error(
+            "materialization ownership identity was reused after its root became unreachable; run `materialization_gc!()` and retry")
+        isequal(owner.retention, normalized.retention) || error(
+            "materialization retention changed for a live $(owner.scope) owner")
+    end
+    owner, normalized
+end
+
+function _cleanup_materialization_owner!(owner::_MaterializationOwner)
+    deleted = String[]
+    preserved = String[]
+    for (path, marker) in owner.owned_paths
+        if _read_materialization_marker(marker) != owner.id || islink(path)
+            push!(preserved, path)
+            continue
+        end
+        try
+            ispath(path) && rm(path; recursive=true, force=true)
+            push!(deleted, path)
+        catch
+            push!(preserved, path)
+        end
+    end
+    append!(preserved, owner.unowned_paths)
+    (;deleted, preserved)
+end
+
+function _materialization_gc_locked!()
+    collected = String[]
+    deleted = String[]
+    preserved = String[]
+    for (key, owner) in collect(_MATERIALIZATION_OWNERS)
+        owner.released || continue
+        owner.active == 0 || continue
+        owner.handle.value === nothing || continue
+        cleanup = _cleanup_materialization_owner!(owner)
+        append!(deleted, cleanup.deleted)
+        append!(preserved, cleanup.preserved)
+        push!(collected, owner.id)
+        delete!(_MATERIALIZATION_OWNERS, key)
+    end
+    (;collected, deleted_paths=deleted, preserved_paths=preserved)
+end
+
+"""
+    materialization_gc!()
+
+Collect storage owned by semantic roots that their provider has released and
+that are no longer reachable or executing. Framework lifecycle hooks call this
+opportunistically; applications do not need a cleanup loop. Cache directories
+that pre-date governance, are symlinks, or have conflicting ownership markers
+are preserved.
+"""
+materialization_gc!() = lock(_MATERIALIZATION_OWNERS_LOCK) do
+    _materialization_gc_locked!()
+end
+
+function _begin_materialization!(context, root)
+    lock(_MATERIALIZATION_OWNERS_LOCK) do
+        _materialization_gc_locked!()
+        owner, _ = _materialization_owner_locked(root, context; create=true)
+        identity = _materialization_identity(root)
+        (owner.identity == identity.identity && owner.version == identity.version) ||
+            error("materialization cache identity/version changed for a retained root")
+        _claim_materialization_path!(owner, identity.path)
+        owner.active += 1
+        owner.last_access = time()
+        owner
+    end
+end
+
+function _end_materialization!(owner::_MaterializationOwner)
+    lock(_MATERIALIZATION_OWNERS_LOCK) do
+        owner.active > 0 || error("materialization lease underflow")
+        owner.active -= 1
+        # `retention=nothing` is the HTMX fresh-request contract: there is no
+        # provider-held root and therefore no later eviction callback.
+        if owner.retention === nothing
+            owner.released = true
+            owner.release_reason = :request
+        end
+        _materialization_gc_locked!()
+    end
+    nothing
+end
+
+function _execute_materialization_target(target, name::Symbol, descriptor,
+        args, kwargs::NamedTuple)
+    if descriptor.indexed
+        return getproperty(target, name)(args...; kwargs...)
+    end
+    (isempty(args) && isempty(kwargs)) || error(
+        "non-indexed property `$name` does not accept operation arguments")
+    getproperty(target, name)
+end
+
+"""
+    execute_materialization(context, root, target, property, args...; kwargs...)
+    execute_materialization(context, object, property, args...; kwargs...)
+
+Execute a DynamicObjects property under framework-owned storage governance.
+`context` is the pure-data `(; scope, key, retention)` record supplied by a
+semantic host; ordinary applications call their operations normally and never
+construct a store. `root` is the retained application root and `target` is the
+mounted object that owns `property`.
+
+The executor adds an active lease around the existing DO property machinery;
+it does not introduce a second value cache or override declared `@fresh`,
+`@cached`, `@mmap`, identity, or `@versioned` policy.
+"""
+function execute_materialization(context::NamedTuple, root, target,
+        name::Symbol, args...; kwargs...)
+    descriptor = property_descriptor(typeof(target), name)
+    descriptor === nothing && error(
+        "$(typeof(target)) has no DynamicObjects property `$name`")
+    owner = _begin_materialization!(context, root)
+    try
+        _execute_materialization_target(target, name, descriptor, args,
+            (;kwargs...))
+    finally
+        _end_materialization!(owner)
+    end
+end
+
+execute_materialization(context::NamedTuple, object, name::Symbol,
+        args...; kwargs...) =
+    execute_materialization(context, object, object, name, args...; kwargs...)
+
+"""
+    release_materialization!(context, root; reason=:released)
+
+Mark a retained semantic root as released by its provider. Cleanup is deferred
+until active executions finish and the root's shared cache becomes unreachable.
+An unknown or mismatched owner is reported as `:unowned` and nothing is deleted.
+"""
+function release_materialization!(context::NamedTuple, root;
+        reason::Symbol=:released)
+    lock(_MATERIALIZATION_OWNERS_LOCK) do
+        owner, _ = _materialization_owner_locked(root, context; create=false)
+        owner === nothing && return (;
+            state=:unowned, released=false, reason, owner=nothing)
+        owner.released = true
+        owner.release_reason = reason
+        owner.last_access = time()
+        _materialization_gc_locked!()
+        (;
+            state=owner.active == 0 ? :deferred : :executing,
+            released=true,
+            reason,
+            owner=owner.id,
+        )
+    end
+end
+
+"""
+    materialization_ownership(context, root)
+
+Inspect framework storage ownership without computing a property. Returns
+`:unowned`, `:active`, or `:released`, including lease/reachability and the
+derived cache identity/version used for fail-closed cleanup.
+"""
+function materialization_ownership(context::NamedTuple, root)
+    lock(_MATERIALIZATION_OWNERS_LOCK) do
+        _materialization_gc_locked!()
+        owner, normalized = _materialization_owner_locked(
+            root, context; create=false)
+        owner === nothing && return (;
+            state=:unowned,
+            scope=normalized.scope,
+            key_digest=normalized.key_digest,
+        )
+        (;
+            state=owner.released ? :released : :active,
+            owner=owner.id,
+            scope=owner.scope,
+            key_digest=owner.key_digest,
+            identity=owner.identity,
+            version=owner.version,
+            retention=owner.retention,
+            active=owner.active,
+            reachable=owner.handle.value !== nothing,
+            owned_paths=sort!(collect(keys(owner.owned_paths))),
+            unowned_paths=sort!(collect(owner.unowned_paths)),
+            release_reason=owner.release_reason,
+        )
+    end
+end
+
 export print_structure, structure
 export tree_children_map, lint_index, lookup_type, callers_by_name, property_source_info, property_signature, property_doc, LintMessage
 export metafirst, metaall
 export option_descriptor, static_domain, dynamic_domain, property_descriptor, property_descriptors
 export materialization_observation, materialization_plan
+export execute_materialization, release_materialization!, materialization_ownership, materialization_gc!
 
 end
