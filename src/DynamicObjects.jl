@@ -55,6 +55,12 @@ get_path_lock!(d::DiskCacheLocks, path::String) = lock(d.lock) do
     get!(() -> ReentrantLock(), d.locks, path)
 end
 
+# Ordinary properties promoted by the governed executor share one process-local
+# per-path lock registry. Explicit @cached/@mmap properties keep their generated
+# per-property registries; this fallback exists so automatic storage does not
+# require a declaration-site marker merely to obtain safe write coordination.
+const _AUTOMATIC_MATERIALIZATION_DISK_LOCKS = DiskCacheLocks()
+
 persistent_hash(x) = begin
     b = IOBuffer()
     Serialization.serialize(b, x)
@@ -374,6 +380,10 @@ end
 # override for each `@mmap` property; everything else uses these defaults.
 _disk_format(o, ::Val) = Val(:serial)
 _disk_eltype(o, ::Val) = nothing
+
+_automatic_mmap_eligible(::Any) = false
+_automatic_mmap_eligible(value::AbstractArray) =
+    isbitstype(eltype(value)) && eltype(value) in _MMAP_ELTYPE_TAGS
 
 iscached(o, ::Val) = false
 cache_version(o, ::Val) = nothing
@@ -1567,10 +1577,14 @@ function clear_disk_caches!(obj)
     isdir(cp) || return nothing
     for (name, info) in m
         isfixed(info) && continue
-        Symbol("@cached") in info.macros || continue
         prefix = string(name)
         for f in readdir(cp)
-            if endswith(f, ".sjl") && (f == prefix * ".sjl" || startswith(f, prefix * "_"))
+            is_cache_file = endswith(f, ".sjl") ||
+                endswith(f, ".sjl" * _AUTOMATIC_MATERIALIZATION_SUFFIX)
+            if is_cache_file &&
+                    (f == prefix * ".sjl" ||
+                     f == prefix * ".sjl" * _AUTOMATIC_MATERIALIZATION_SUFFIX ||
+                     startswith(f, prefix * "_"))
                 rm(joinpath(cp, f))
             end
         end
@@ -2584,6 +2598,8 @@ clear_cache!(o, name::Symbol, indices...; kwargs...) = begin
         # Clear specific disk cache file
         path = get_cache_path(o, name, indices...; kwargs...)
         isfile(path) && rm(path)
+        metadata_path = _automatic_materialization_path(path)
+        isfile(metadata_path) && rm(metadata_path)
     end
     nothing
 end
@@ -6870,7 +6886,7 @@ _materialization_tier(::Val{false}, fresh, mmap, cached) =
 _computed_materialization_tier(::Val{true}, ::Val, ::Val) = :mmap
 _computed_materialization_tier(::Val{false}, ::Val{true}, ::Val) = :serialized
 _computed_materialization_tier(::Val{false}, ::Val{false}, ::Val{true}) = :recompute
-_computed_materialization_tier(::Val{false}, ::Val{false}, ::Val{false}) = :memory
+_computed_materialization_tier(::Val{false}, ::Val{false}, ::Val{false}) = :automatic
 
 _progress_mode(macros) =
     Symbol("@PROGRESS") in macros || Symbol("@progress") in macros || Symbol("@dynamic_progress") in macros ? :instrumented :
@@ -7029,14 +7045,47 @@ end
 
 _observed_bytes(value::AbstractString) = ncodeunits(value)
 _observed_bytes(value::AbstractArray{T}) where {T} =
-    isbitstype(T) ? length(value) * sizeof(T) : nothing
-_observed_bytes(value::T) where {T} = isbitstype(T) ? sizeof(T) : nothing
+    isbitstype(T) ? length(value) * sizeof(T) : try
+        Base.summarysize(value)
+    catch
+        nothing
+    end
+_observed_bytes(value::T) where {T} = isbitstype(T) ? sizeof(T) : try
+    Base.summarysize(value)
+catch
+    nothing
+end
+
+const _AUTOMATIC_MATERIALIZATION_SUFFIX = ".auto"
+const _AUTOMATIC_MATERIALIZATION_MIN_BYTES = 1024 * 1024
+const _AUTOMATIC_MATERIALIZATION_MIN_SECONDS = 1.0
+
+_automatic_materialization_path(cache_path::AbstractString) =
+    cache_path * _AUTOMATIC_MATERIALIZATION_SUFFIX
+
+function _automatic_materialization_metadata(cache_path::AbstractString)
+    metadata_path = _automatic_materialization_path(cache_path)
+    isfile(metadata_path) || return nothing
+    metadata = try
+        Serialization.deserialize(metadata_path)
+    catch
+        return nothing
+    end
+    metadata isa NamedTuple || return nothing
+    format = get(metadata, :format, nothing)
+    format in (:serial, :mmap) || return nothing
+    metadata
+end
 
 function _disk_observation(o, descriptor::NamedTuple, name::Symbol, args, kwargs::NamedTuple)
     semantics = descriptor.semantics
-    (semantics.cached || semantics.mmap) || return (;state=:none, path=nothing)
     path = get_cache_path(o, name, args...; kwargs...)
-    (;state=get_cache_status(path), path)
+    automatic = _automatic_materialization_metadata(path)
+    (semantics.cached || semantics.mmap || automatic !== nothing) ||
+        return (;state=:none, path=nothing, format=nothing)
+    format = automatic === nothing ?
+        (semantics.mmap ? :mmap : :serial) : automatic.format
+    (;state=get_cache_status(path), path, format)
 end
 
 _observation_state(memory, disk, fresh) =
@@ -7067,7 +7116,9 @@ function materialization_observation(o, name::Symbol, args...; kwargs...)
         pending=memory.state === :pending,
         failed=memory.state === :failed,
         stored=disk.state === :ready,
-        tier=memory.state === :ready ? :memory : descriptor.output.materialization.tier,
+        tier=disk.state === :ready ?
+            (disk.format === :mmap ? :mmap : :serialized) :
+            memory.state === :ready ? :memory : descriptor.output.materialization.tier,
         memory_state=memory.state,
         disk_state=disk.state,
         path=disk.path,
@@ -7366,6 +7417,158 @@ function _execute_materialization_target(target, name::Symbol, descriptor,
     getproperty(target, name)
 end
 
+function _materialization_path_within(root::AbstractString, path::AbstractString)
+    relative = relpath(normpath(abspath(path)), normpath(abspath(root)))
+    relative == "." && return true
+    isabspath(relative) && return false
+    parts = splitpath(relative)
+    isempty(parts) || first(parts) != ".."
+end
+
+function _automatic_materialization_allowed(owner::_MaterializationOwner,
+        target, name::Symbol, descriptor, path::AbstractString)
+    owner.retention === nothing && return false
+    descriptor.fixed && return false
+    descriptor.output.materialization.tier === :automatic || return false
+    _remount_invalidated(target, name) && return false
+    any(owner.owned_paths) do (root, marker)
+        _read_materialization_marker(marker) == owner.id &&
+            _materialization_path_within(root, path)
+    end
+end
+
+function _automatic_materialization_slot(target, name::Symbol, descriptor,
+        args, kwargs::NamedTuple)
+    if descriptor.indexed
+        property = getproperty(target, name)
+        property isa IndexableProperty || return nothing
+        return property.cache, (args, kwargs)
+    end
+    hasfield(typeof(target), :cache) || return nothing
+    property_cache = getfield(target, :cache)
+    property_cache isa PropertyCache || return nothing
+    property_cache.cache, name
+end
+
+function _set_automatic_materialization_cache!(target, name, descriptor,
+        args, kwargs, value)
+    slot = _automatic_materialization_slot(
+        target, name, descriptor, args, kwargs)
+    slot === nothing && return false
+    cache, key = slot
+    cache[key] = value
+    true
+end
+
+function _clear_automatic_materialization_cache!(target, name, descriptor,
+        args, kwargs)
+    slot = _automatic_materialization_slot(
+        target, name, descriptor, args, kwargs)
+    slot === nothing && return false
+    cache, key = slot
+    maybepop!(cache, key)
+    true
+end
+
+function _drop_automatic_materialization!(cache_path)
+    rm(cache_path; force=true)
+    rm(_automatic_materialization_path(cache_path); force=true)
+    nothing
+end
+
+function _load_automatic_materialization!(owner, target, name, descriptor,
+        args, kwargs::NamedTuple)
+    cache_path = get_cache_path(target, name, args...; kwargs...)
+    _automatic_materialization_allowed(
+        owner, target, name, descriptor, cache_path) || return nothing
+    path_lock = get_path_lock!(
+        _AUTOMATIC_MATERIALIZATION_DISK_LOCKS, cache_path)
+    lock(path_lock) do
+        metadata = _automatic_materialization_metadata(cache_path)
+        metadata === nothing && return nothing
+        get_cache_status(cache_path) === :ready || return nothing
+        value = try
+            load(Val(metadata.format), cache_path, nothing)
+        catch e
+            _drop_automatic_materialization!(cache_path)
+            @debug "Automatic materialization cache read failed; recomputing" cache_path exception=e
+            return nothing
+        end
+        _set_automatic_materialization_cache!(
+            target, name, descriptor, args, kwargs, value) || return nothing
+        (;tier=metadata.format === :mmap ? :mmap : :serialized, value)
+    end
+end
+
+function _automatic_materialization_choice(value, elapsed_seconds)
+    value isa Union{Pending,Task,Channel} &&
+        return (;tier=:memory, format=nothing, estimated_bytes=nothing)
+    estimated_bytes = _observed_bytes(value)
+    large = estimated_bytes !== nothing &&
+        estimated_bytes >= _AUTOMATIC_MATERIALIZATION_MIN_BYTES
+    expensive = elapsed_seconds >= _AUTOMATIC_MATERIALIZATION_MIN_SECONDS
+    (large || expensive) ||
+        return (;tier=:memory, format=nothing, estimated_bytes)
+    format = _automatic_mmap_eligible(value) ? :mmap : :serial
+    (;tier=format === :mmap ? :mmap : :serialized, format, estimated_bytes)
+end
+
+function _persist_automatic_materialization!(owner, target, name, descriptor,
+        args, kwargs::NamedTuple, value, elapsed_seconds)
+    cache_path = get_cache_path(target, name, args...; kwargs...)
+    _automatic_materialization_allowed(
+        owner, target, name, descriptor, cache_path) || return value
+    choice = _automatic_materialization_choice(value, elapsed_seconds)
+    choice.format === nothing && return value
+    path_lock = get_path_lock!(
+        _AUTOMATIC_MATERIALIZATION_DISK_LOCKS, cache_path)
+    lock(path_lock) do
+        existing = _automatic_materialization_metadata(cache_path)
+        if existing !== nothing && get_cache_status(cache_path) === :ready
+            stored = try
+                load(Val(existing.format), cache_path, nothing)
+            catch
+                _drop_automatic_materialization!(cache_path)
+                nothing
+            end
+            if stored !== nothing
+                if existing.format === :mmap
+                    _set_automatic_materialization_cache!(
+                        target, name, descriptor, args, kwargs, stored)
+                    return stored
+                end
+                _clear_automatic_materialization_cache!(
+                    target, name, descriptor, args, kwargs)
+                return value
+            end
+        end
+
+        metadata_path = _automatic_materialization_path(cache_path)
+        try
+            mkpath(dirname(cache_path))
+            _atomic_save(Val(choice.format), cache_path, value)
+            metadata = (;
+                format=choice.format,
+                estimated_bytes=choice.estimated_bytes,
+                compute_seconds=elapsed_seconds,
+            )
+            _atomic_save(Val(:serial), metadata_path, metadata)
+            if choice.format === :mmap
+                stored = load(Val(:mmap), cache_path, nothing)
+                _set_automatic_materialization_cache!(
+                    target, name, descriptor, args, kwargs, stored)
+                return stored
+            end
+            _clear_automatic_materialization_cache!(
+                target, name, descriptor, args, kwargs)
+        catch e
+            _drop_automatic_materialization!(cache_path)
+            @debug "Automatic materialization persistence failed; keeping the computed value in memory" cache_path exception=e
+        end
+        value
+    end
+end
+
 """
     execute_materialization(context, root, target, property, args...; kwargs...)
     execute_materialization(context, object, property, args...; kwargs...)
@@ -7376,9 +7579,12 @@ semantic host; ordinary applications call their operations normally and never
 construct a store. `root` is the retained application root and `target` is the
 mounted object that owns `property`.
 
-The executor adds an active lease around the existing DO property machinery;
-it does not introduce a second value cache or override declared `@fresh`,
-`@cached`, `@mmap`, identity, or `@versioned` policy.
+The executor adds an active lease around the existing DO property machinery.
+For an ordinary property on a retained root it observes the actual result and
+automatically keeps small/cheap values in memory, serializes large or expensive
+values, and memory-maps supported large values. Fresh request roots recompute
+across requests. Existing `@fresh`, `@cached`, and `@mmap` declarations remain
+compatibility overrides; applications do not need them for governed execution.
 """
 function execute_materialization(context::NamedTuple, root, target,
         name::Symbol, args...; kwargs...)
@@ -7387,8 +7593,21 @@ function execute_materialization(context::NamedTuple, root, target,
         "$(typeof(target)) has no DynamicObjects property `$name`")
     owner = _begin_materialization!(context, root)
     try
-        _execute_materialization_target(target, name, descriptor, args,
-            (;kwargs...))
+        property_kwargs = (;kwargs...)
+        automatic = _load_automatic_materialization!(
+            owner, target, name, descriptor, args, property_kwargs)
+        started = time_ns()
+        value = _execute_materialization_target(
+            target, name, descriptor, args, property_kwargs)
+        if automatic !== nothing
+            automatic.tier === :serialized &&
+                _clear_automatic_materialization_cache!(
+                    target, name, descriptor, args, property_kwargs)
+            return value
+        end
+        elapsed_seconds = (time_ns() - started) / 1.0e9
+        _persist_automatic_materialization!(owner, target, name, descriptor,
+            args, property_kwargs, value, elapsed_seconds)
     finally
         _end_materialization!(owner)
     end
