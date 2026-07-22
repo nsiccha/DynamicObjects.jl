@@ -2,6 +2,11 @@ module DataFramesArrowExt
 
 using DynamicObjects, Arrow, DataFrames
 
+# The governed executor may select mmap from the observed runtime value without
+# an @mmap declaration. Loading this extension is itself the capability signal:
+# DataFrames have a registered Arrow-backed mmap format below.
+DynamicObjects._automatic_mmap_eligible(::AbstractDataFrame) = true
+
 # Arrow-backed `@mmap` for a `DataFrame` property. Slots under the existing
 # `:mmap` disk-format token by value-type dispatch — no new marker, no macro
 # change. A property declared `@mmap tbl::DataFrame = …` emits
