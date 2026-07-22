@@ -1384,6 +1384,10 @@ read-only mappings plus truncated-file recovery.
         _, _, _, offset = DynamicObjects._mmap_read_header(io)
         offset
     end
+    # Windows forbids truncating a file while its mmap is live. Drop the only
+    # owning object and force finalization before simulating the partial file.
+    h1 = nothing
+    GC.gc(true)
     open(heal_path, "r+") do io
         truncate(io, header_offset)
     end
