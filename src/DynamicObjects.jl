@@ -3745,7 +3745,7 @@ _extract_member(extract_from, source) = :($extract_from[$source])
 _replace_lnn(::LineNumberNode, lnn) = lnn
 _replace_lnn(x, _) = x
 
-# Property-macro accumulator: doc / cache_version / semantic / macros are the
+# Property-macro accumulator: doc / cache_version / macros are the
 # pieces of state the body-args parser threads through the
 # `while Meta.isexpr(arg, :macrocall)` peeling loop. Bundling them into a
 # small mutable struct lets per-macro logic live in dispatched methods of
@@ -3754,7 +3754,6 @@ _replace_lnn(x, _) = x
 mutable struct _PropertyMacroState
     doc::Any
     cache_version::Any
-    semantic::Any
     macros::Set{Symbol}
 end
 
@@ -3801,17 +3800,11 @@ function _apply_property_macro!(state::_PropertyMacroState, ::Val{Symbol("@mmap"
     arg.args[end]
 end
 
-# `@semantic metadata <prop>` is an optional, execution-neutral annotation for
-# descriptor facts that cannot be inferred from the property declaration (for
-# example a dependency-driven option domain).  Keep the expression unevaluated
-# in `meta`; `property_descriptor` resolves it in the defining module only when
-# introspection is requested.  Requiring a single metadata expression keeps the
-# marker unambiguous and lets old `meta` entries degrade via `semantic=nothing`.
-function _apply_property_macro!(state::_PropertyMacroState, ::Val{Symbol("@semantic")}, arg)
-    length(arg.args) == 4 || error("@semantic expects one metadata expression followed by a property declaration, e.g. `@semantic (inputs=(choice=(domain=static_domain((:a, :b)),),),) result(choice) = ...`.")
-    state.semantic = arg.args[end-1]
-    arg.args[end]
-end
+# Semantic descriptors are inferred from the ordinary property graph.  Reject
+# the former metadata macro explicitly so stale consumers get a useful error
+# instead of silently carrying an inert marker.
+_apply_property_macro!(::_PropertyMacroState, ::Val{Symbol("@semantic")}, _) =
+    error("@semantic was removed: DynamicObjects now reflects ordinary fields, property signatures, inferred dependencies, result annotations, Bool/Enum types, and cache markers directly")
 _parse_cache_version(v::VersionNumber) = v
 function _parse_cache_version(ver_expr::Expr)
     Meta.isexpr(ver_expr, :macrocall) && ver_expr.args[1] == Symbol("@v_str") ||
@@ -3876,12 +3869,12 @@ function _emit_positional_element!(oproperties, docs, a::Expr, i, source_sym, ln
     inner_leaves = _collect_leaves(a)
     inner_name = Symbol("_tuple_", join(inner_leaves, "_"))
     inner_locals = Set{Symbol}(inner_leaves); push!(inner_locals, inner_name)
-    push!(oproperties, inner_name => (;lhs=inner_name, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=inner_locals, indices=tuple(), indexed=false, cache_version=nothing, result_type=nothing, semantic=nothing, doc=nothing))
+    push!(oproperties, inner_name => (;lhs=inner_name, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=inner_locals, indices=tuple(), indexed=false, cache_version=nothing, result_type=nothing, doc=nothing))
     push!(docs, (inner_name => (nothing, true)))
     _emit_positional_destructure!(oproperties, docs, a.args, inner_name, lnn)
 end
 function _push_positional_leaf!(oproperties, docs, leaf::Symbol, i, source_sym, lnn)
-    push!(oproperties, leaf => (;lhs=leaf, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([leaf]), indices=tuple(), indexed=false, cache_version=nothing, result_type=nothing, semantic=nothing, doc=nothing))
+    push!(oproperties, leaf => (;lhs=leaf, macros=Set{Symbol}(), rhs=:($source_sym[$i]), lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([leaf]), indices=tuple(), indexed=false, cache_version=nothing, result_type=nothing, doc=nothing))
     push!(docs, (leaf => (nothing, true)))
 end
 # One element of a named-destructure LHS: either a bare Symbol leaf or a
@@ -4521,8 +4514,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         # place — `macros` is the same Set the outer loop uses, so we read
         # it back implicitly; the other two are scalars copied back after
         # the loop.
-        semantic = nothing
-        macro_state = _PropertyMacroState(doc, cache_version, semantic, macros)
+        macro_state = _PropertyMacroState(doc, cache_version, macros)
         while Meta.isexpr(arg, :macrocall)
             # `_resolve_macro_name` collapses `GlobalRef(Core, :@doc)` (the
             # form Julia's docstring lowering surfaces) to bare `:@doc`.
@@ -4531,7 +4523,6 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         end
         doc = macro_state.doc
         cache_version = macro_state.cache_version
-        semantic = macro_state.semantic
         # Inline-method form: `f(__self__, ...) = body` (with optional `where`
         # clauses and qualified `Module.f` names). Bypasses property tooling —
         # no compute_property, no getproperty entry — but the body still gets
@@ -4568,7 +4559,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 all_leaves = _collect_leaves(arg)
                 group_name = Symbol("_tuple_", join(all_leaves, "_"))
                 group_locals = Set{Symbol}(all_leaves); push!(group_locals, group_name)
-                push!(oproperties, group_name => (;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, cache_version, result_type=nothing, semantic, doc))
+                push!(oproperties, group_name => (;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, cache_version, result_type=nothing, doc))
                 push!(docs, (group_name => (doc, true)))
                 _emit_positional_destructure!(oproperties, docs, raw_args, group_name, lnn)
                 metadata.doc[] = nothing
@@ -4602,14 +4593,14 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 group_name = Symbol("_tuple_", join(prop_names, "_"))
                 group_locals = Set{Symbol}(prop_names)
                 push!(group_locals, group_name)
-                push!(oproperties, group_name=>(;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, cache_version, result_type=nothing, semantic, doc))
+                push!(oproperties, group_name=>(;lhs=group_name, macros, rhs, lnn, dependson=Set{Symbol}(), locals=group_locals, indices=tuple(), indexed=false, cache_version, result_type=nothing, doc))
                 push!(docs, (group_name=>(doc, true)))
                 group_name
             end
             metadata.doc[] = nothing
             for (prop_name, source) in members
                 extract_rhs = _extract_member(extract_from, source)
-                push!(oproperties, prop_name=>(;lhs=prop_name, macros=Set{Symbol}(), rhs=extract_rhs, lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([prop_name]), indices=tuple(), indexed=false, cache_version=nothing, result_type=nothing, semantic=nothing, doc=nothing))
+                push!(oproperties, prop_name=>(;lhs=prop_name, macros=Set{Symbol}(), rhs=extract_rhs, lnn, dependson=Set{Symbol}(), locals=Set{Symbol}([prop_name]), indices=tuple(), indexed=false, cache_version=nothing, result_type=nothing, doc=nothing))
                 push!(docs, (prop_name=>(nothing, true)))
             end
             continue
@@ -4690,7 +4681,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         # dimension); every other marker (@cached/@mmap/@fresh/@dynamic_progress)
         # acts on a computed property and is a mistake on a field.
         @assert !isnothing(rhs) || issubset(macros, (Symbol("@versioned"),)) "fixed field `$name` may not carry markers other than @versioned (got $(sort!(string.(collect(macros)))))"
-        push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices, indexed, cache_version, result_type=ext_type, semantic, doc))
+        push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices, indexed, cache_version, result_type=ext_type, doc))
     end
     # `properties` holds the per-declaration list (preserves order AND duplicate
     # names — e.g. a future `@get foo()` + `@include foo(x::String)` pair). It's
@@ -5250,7 +5241,6 @@ _parse_macro_opt(a) = error("@dynamicstruct: unsupported option `$a` — use a d
     @dynamicstruct [docstring] struct Name
         field                     # fixed field (constructor argument)
         prop = expr               # lazily computed property
-        @semantic metadata prop = expr  # optional descriptor-only hints
         @cached prop = expr       # lazily computed + disk-cached property
         prop(idx) = expr          # indexable property (cached per args; `@fresh` to bypass)
         prop(args...; kw...) = expr  # indexable property (cached per args; `@fresh` to bypass)
@@ -6757,18 +6747,13 @@ end
 _lhs_type_expr(::Any) = nothing
 _lhs_type_expr(lhs::Expr) = Meta.isexpr(lhs, :(::)) ? lhs.args[end] : nothing
 
-"""
-    option_descriptor(value; label=string(value), group=nothing,
-                      help=nothing, disabled=false)
-
-Return the pure-data record used for one member of a semantic option domain.
-"""
-option_descriptor(value; label=string(value), group=nothing, help=nothing, disabled=false) = (;
+_option_descriptor(value; label=string(value), group=nothing,
+                   help=nothing, disabled=false) = (;
     value, label, group, help, disabled,
 )
-function option_descriptor(option::NamedTuple)
+function _option_descriptor(option::NamedTuple)
     haskey(option, :value) || error("an option descriptor requires a `value` field")
-    defaults = option_descriptor(option.value)
+    defaults = _option_descriptor(option.value)
     merge(defaults, option)
 end
 
@@ -6782,14 +6767,8 @@ _unrestricted_domain() = (;
     allow_custom=true,
 )
 
-"""
-    static_domain(values; multiple=false, allow_custom=false)
-
-Describe a finite option domain. Values may be raw values or NamedTuples with a
-required `value` and optional `label`, `group`, `help`, and `disabled` fields.
-"""
-static_domain(values; multiple=false, allow_custom=false) = let opts =
-    NamedTuple[option_descriptor(v) for v in values]
+_static_domain(values; multiple=false, allow_custom=false) = let opts =
+    NamedTuple[_option_descriptor(v) for v in values]
     (;
         kind=:static,
         options=opts,
@@ -6801,72 +6780,17 @@ static_domain(values; multiple=false, allow_custom=false) = let opts =
     )
 end
 
-"""
-    dynamic_domain(provider::Symbol; dependencies=(), cardinality=nothing,
-                   multiple=false, allow_custom=false)
-
-Describe an option domain produced by another DynamicObjects property.
-`dependencies` declares the graph inputs whose values are passed to or
-otherwise invalidate that provider. The provider therefore inherits ordinary
-DO memoization, version, pending, and progress semantics.
-"""
-function dynamic_domain(provider::Symbol; dependencies=(), cardinality=nothing,
-                        multiple=false, allow_custom=false)
-    deps = unique!(Symbol[dep for dep in dependencies])
-    (;
-        kind=:dynamic,
-        options=NamedTuple[],
-        provider,
-        dependencies=deps,
-        cardinality,
-        multiple,
-        allow_custom,
-    )
+function _inferred_domain(input_type)
+    input_type === Bool && return _static_domain((false, true))
+    input_type isa Type && input_type <: Enum && return _static_domain(instances(input_type))
+    _unrestricted_domain()
 end
-
-_inferred_domain(::Nothing) = _unrestricted_domain()
-_inferred_domain(::Type{Bool}) = static_domain((false, true))
-_inferred_domain(::Type{T}) where {T<:Enum} = static_domain(instances(T))
-_inferred_domain(::Type) = _unrestricted_domain()
-
-function _normalize_domain(domain::NamedTuple)
-    kind = get(domain, :kind, nothing)
-    kind === :unrestricted && return merge(_unrestricted_domain(), domain)
-    kind === :static && return static_domain(get(domain, :options, ());
-        multiple=get(domain, :multiple, false),
-        allow_custom=get(domain, :allow_custom, false))
-    kind === :dynamic && return dynamic_domain(get(domain, :provider, nothing);
-        dependencies=get(domain, :dependencies, ()),
-        cardinality=get(domain, :cardinality, nothing),
-        multiple=get(domain, :multiple, false),
-        allow_custom=get(domain, :allow_custom, false))
-    error("semantic domain kind must be :unrestricted, :static, or :dynamic; got $kind")
-end
-_normalize_domain(domain) = error("semantic domain must be a NamedTuple from `static_domain` or `dynamic_domain`; got $(typeof(domain))")
 
 _descriptor_input(arg::NamedTuple, kind::Symbol) = (;
     arg...,
     kind,
     domain=_inferred_domain(arg.type),
 )
-
-_resolve_semantic_metadata(::Nothing, ::Module) = (;)
-_resolve_semantic_metadata(metadata::Expr, mod::Module) =
-    _resolve_semantic_metadata(Core.eval(mod, metadata), mod)
-function _resolve_semantic_metadata(metadata::NamedTuple, ::Module)
-    allowed = (:inputs, :output)
-    unknown = setdiff(collect(keys(metadata)), collect(allowed))
-    isempty(unknown) || error("unknown @semantic metadata fields: $(join(unknown, ", ")); supported fields are `inputs` and `output`")
-    metadata
-end
-_resolve_semantic_metadata(metadata, ::Module) =
-    error("@semantic metadata must evaluate to a NamedTuple, got $(typeof(metadata))")
-
-function _semantic_input_overrides(metadata::NamedTuple)
-    overrides = get(metadata, :inputs, (;))
-    overrides isa NamedTuple || error("@semantic `inputs` must be a NamedTuple keyed by input name")
-    overrides
-end
 
 function _semantic_dependency_closure(T::Type, roots)
     closure = Set{Symbol}()
@@ -6929,63 +6853,6 @@ function _merge_semantic_dependency_inputs(context_inputs, direct_inputs)
     merged
 end
 
-function _apply_input_override(input::NamedTuple, overrides::NamedTuple)
-    override = get(overrides, input.name, nothing)
-    override === nothing && return input
-    override isa NamedTuple || error("@semantic override for input `$(input.name)` must be a NamedTuple")
-    # A domain record may be supplied directly, or wrapped as `(domain=...,)`
-    # to leave room for future input-level semantic fields.
-    if haskey(override, :kind)
-        override = (;domain=override)
-    else
-        unknown = setdiff(collect(keys(override)), [:domain])
-        isempty(unknown) || error("unknown @semantic fields for input `$(input.name)`: $(join(unknown, ", "))")
-    end
-    haskey(override, :domain) || return input
-    merge(input, (;domain=_normalize_domain(override.domain)))
-end
-
-function _apply_input_overrides(inputs, metadata::NamedTuple)
-    overrides = _semantic_input_overrides(metadata)
-    known = Set(input.name for input in inputs)
-    unknown = setdiff(Set(keys(overrides)), known)
-    isempty(unknown) || error("@semantic names unknown property inputs: $(join(sort!(string.(collect(unknown))), ", "))")
-    NamedTuple[_apply_input_override(input, overrides) for input in inputs]
-end
-
-function _validate_dynamic_domains(T::Type, inputs)
-    input_names = Set(input.name for input in inputs)
-    property_names = Set(first(pair) for pair in meta(T))
-    known_dependencies = union(input_names, property_names)
-    for input in inputs
-        domain = input.domain
-        domain.kind === :dynamic || continue
-        domain.provider in property_names ||
-            error("dynamic domain provider `$(domain.provider)` is not a property of $(nameof(T))")
-        unknown = setdiff(Set(domain.dependencies), known_dependencies)
-        isempty(unknown) || error("dynamic domain for input `$(input.name)` names unknown dependencies: $(join(sort!(string.(collect(unknown))), ", "))")
-    end
-    inputs
-end
-
-const _MATERIALIZATION_HINT_DEFAULTS = (;
-    estimated_bytes=nothing,
-    compute_seconds=nothing,
-    expected_reuse=nothing,
-    mmap_eligible=false,
-    immutable=nothing,
-    portable=nothing,
-    secret=false,
-)
-
-function _materialization_hints(metadata::NamedTuple)
-    hints = get(metadata, :output, (;))
-    hints isa NamedTuple || error("@semantic `output` must be a NamedTuple of materialization hints")
-    unknown = setdiff(collect(keys(hints)), collect(keys(_MATERIALIZATION_HINT_DEFAULTS)))
-    isempty(unknown) || error("unknown @semantic output hints: $(join(unknown, ", "))")
-    merge(_MATERIALIZATION_HINT_DEFAULTS, hints)
-end
-
 _descriptor_role(::Val{true}, ::Val) = :input
 _descriptor_role(::Val{false}, ::Val{true}) = :operation
 _descriptor_role(::Val{false}, ::Val{false}) = :output
@@ -7009,7 +6876,6 @@ _descriptor_version_dependencies(T::Type) = unique!(Symbol[
 
 function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
     mod = parentmodule(T)
-    metadata = _resolve_semantic_metadata(get(info, :semantic, nothing), mod)
     fixed = isnothing(get(info, :rhs, nothing))
     indexed = get(info, :indexed, !isempty(get(info, :indices, ())))
     macros = get(info, :macros, Set{Symbol}())
@@ -7040,14 +6906,9 @@ function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
     end
     dependencies = get(info, :dependson, nothing)
     dependencies = dependencies === nothing ? Symbol[] : sort!(collect(dependencies))
-    dependency_closure = fixed ? Symbol[] :
-        _semantic_dependency_closure(T, dependencies)
     context_inputs = fixed ? NamedTuple[] :
         _semantic_dependency_inputs(T, dependencies)
-    declared_inputs = _apply_input_overrides(inferred_inputs, metadata)
-    effective_inputs = _merge_semantic_dependency_inputs(
-        context_inputs, declared_inputs)
-    inputs = _validate_dynamic_domains(T, effective_inputs)
+    inputs = _merge_semantic_dependency_inputs(context_inputs, inferred_inputs)
     tier = _materialization_tier(Val(fixed), Val(fresh), Val(mmap), Val(cached))
     cache_version = get(info, :cache_version, nothing)
     # `@versioned` is an object-wide cache-path dimension: a marker on one
@@ -7068,13 +6929,7 @@ function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
         progress,
         progress_mode=_progress_mode(macros),
     )
-    materialization = (;
-        tier,
-        source=(fixed || fresh || cached || mmap) ? :declared : :default,
-        automatic=false,
-        budgeted=false,
-        hints=_materialization_hints(metadata),
-    )
+    materialization = (;tier)
     (;
         name=prop,
         role=_descriptor_role(Val(fixed), Val(indexed)),
@@ -7082,7 +6937,6 @@ function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
         indexed,
         description=property_doc(info),
         dependencies,
-        dependency_closure,
         inputs,
         output=(; type=result_type, materialization),
         semantics,
@@ -7215,79 +7069,6 @@ function materialization_observation(o, name::Symbol, args...; kwargs...)
         value_type,
         estimated_bytes=memory.has_value ? _observed_bytes(memory.value) : nothing,
     )
-end
-
-_hint_or(hints::NamedTuple, name::Symbol, supplied) =
-    supplied === nothing ? get(hints, name, nothing) : supplied
-_fits_budget(bytes, budget) = bytes !== nothing && budget !== nothing && bytes <= budget
-
-_automatic_plan(tier, budgeted, reason, hints) = (;
-    tier,
-    source=:automatic,
-    automatic=true,
-    budgeted,
-    reason,
-    hints,
-)
-
-"""
-    materialization_plan(descriptor; budgets and evidence...)
-
-Return a conservative, pure recommendation across `:recompute`, `:memory`,
-`:serialized`, and `:mmap`. Declared `@fresh`/`@cached`/`@mmap` policy always
-wins. Automatic disk recommendations require an explicit disk budget plus
-portability/reuse evidence; mmap additionally requires eligibility,
-immutability, and a size threshold. This function does not materialize, evict,
-or mutate anything.
-"""
-function materialization_plan(descriptor::NamedTuple;
-        estimated_bytes=nothing,
-        compute_seconds=nothing,
-        expected_reuse=nothing,
-        memory_available_bytes=nothing,
-        disk_available_bytes=nothing,
-        mmap_eligible=nothing,
-        immutable=nothing,
-        portable=nothing,
-        secret=nothing,
-        cheap_compute_seconds=0.05,
-        mmap_min_bytes=16 * 1024^2,
-        serialized_min_compute_seconds=1.0)
-    declared = descriptor.output.materialization
-    declared.source === :declared && return merge(declared, (;reason=:declared))
-    hints = declared.hints
-    estimated_bytes = _hint_or(hints, :estimated_bytes, estimated_bytes)
-    compute_seconds = _hint_or(hints, :compute_seconds, compute_seconds)
-    expected_reuse = _hint_or(hints, :expected_reuse, expected_reuse)
-    mmap_eligible = _hint_or(hints, :mmap_eligible, mmap_eligible)
-    immutable = _hint_or(hints, :immutable, immutable)
-    portable = _hint_or(hints, :portable, portable)
-    secret = something(_hint_or(hints, :secret, secret), false)
-    resolved_hints = (;
-        estimated_bytes, compute_seconds, expected_reuse,
-        mmap_eligible, immutable, portable, secret,
-    )
-    budgeted = memory_available_bytes !== nothing || disk_available_bytes !== nothing
-    budgeted || return _automatic_plan(:memory, false, :budgets_not_supplied, resolved_hints)
-    if compute_seconds !== nothing && compute_seconds <= cheap_compute_seconds &&
-            (expected_reuse === nothing || expected_reuse <= 1)
-        return _automatic_plan(:recompute, true, :cheap_single_use, resolved_hints)
-    end
-    disk_fits = _fits_budget(estimated_bytes, disk_available_bytes)
-    if !secret && disk_fits && mmap_eligible === true && immutable === true &&
-            portable === true && estimated_bytes >= mmap_min_bytes
-        return _automatic_plan(:mmap, true, :large_reusable_mmap_output, resolved_hints)
-    end
-    if !secret && disk_fits && portable === true &&
-            compute_seconds !== nothing && compute_seconds >= serialized_min_compute_seconds &&
-            expected_reuse !== nothing && expected_reuse >= 2
-        return _automatic_plan(:serialized, true, :expensive_reusable_portable_output, resolved_hints)
-    end
-    _fits_budget(estimated_bytes, memory_available_bytes) &&
-        return _automatic_plan(:memory, true, :fits_memory_budget, resolved_hints)
-    estimated_bytes === nothing &&
-        return _automatic_plan(:recompute, true, :unknown_size, resolved_hints)
-    _automatic_plan(:recompute, true, secret ? :secret_exceeds_memory_budget : :no_safe_storage_tier, resolved_hints)
 end
 
 # --- governed semantic materialization ---------------------------------------
@@ -7673,8 +7454,8 @@ end
 export print_structure, structure
 export tree_children_map, lint_index, lookup_type, callers_by_name, property_source_info, property_signature, property_doc, LintMessage
 export metafirst, metaall
-export option_descriptor, static_domain, dynamic_domain, property_descriptor, property_descriptors
-export materialization_observation, materialization_plan
+export property_descriptor, property_descriptors
+export materialization_observation
 export execute_materialization, release_materialization!, materialization_ownership, materialization_gc!
 
 end

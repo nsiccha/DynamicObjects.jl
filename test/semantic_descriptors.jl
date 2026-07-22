@@ -6,13 +6,12 @@ export SemanticQuality, draft, final, SemanticDescriptorFixture,
     SemanticPendingFixture, ComputedVersionedSemanticDescriptorFixture,
     AutomaticSemanticContextFixture, GovernedMaterializationFixture,
     GOVERNED_MATERIALIZATION_CALLS,
-    BadSemanticInputName, LegacySemanticMeta,
-    DeduplicatedKeyFixture, SiblingAsSemanticInput
+    LegacySemanticMeta, DeduplicatedKeyFixture
 
 @enum SemanticQuality draft final
 
 @dynamicstruct struct AutomaticSemanticContextFixture
-    @semantic (inputs=(study=(domain=static_domain((:alpha, :beta)),),),) study::Symbol
+    study::Symbol
     confirmed::Bool
 
     prepared = (study, confirmed)
@@ -38,25 +37,12 @@ end
     @versioned revision::Int
     enabled::Bool
     quality::SemanticQuality
-    @semantic (inputs=(mode=(domain=static_domain((
-        (value=:fast, label="Fast"),
-        (value=:careful, label="Careful", help="Use the full solver"),
-    )),),),) mode::Symbol
+    mode::Symbol
 
-    dataset_options(cohort::Symbol) = cohort === :north ? [:n1, :n2] : [:s1]
-
-    @semantic (
-        inputs=(dataset=(domain=dynamic_domain(:dataset_options;
-            dependencies=(:cohort,)),),),
-        output=(estimated_bytes=32 * 1024^2, compute_seconds=4.0,
-            expected_reuse=3, portable=true),
-    ) @cached v"2" fit(dataset::Symbol, cohort::Symbol; scale::Int=1)::Vector{Float64} =
+    @cached v"2" fit(dataset::Symbol, cohort::Symbol; scale::Int=1)::Vector{Float64} =
         fill(Float64(scale), dataset === :n1 ? 2 : 1)
 
-    @semantic (output=(mmap_eligible=true, immutable=true, portable=true),) @mmap @progress matrix::Matrix{Float64} = reshape(collect(1.0:4.0), 2, 2)
-
-    @semantic (output=(estimated_bytes=64 * 1024^2, compute_seconds=3.0,
-        expected_reuse=5, mmap_eligible=true, immutable=true, portable=true),) candidate::Vector{Float64} = [1.0, 2.0]
+    @mmap @progress matrix::Matrix{Float64} = reshape(collect(1.0:4.0), 2, 2)
 
     @fresh preview(x::Int) = 2x
 end
@@ -69,38 +55,25 @@ end
 @dynamicstruct struct ComputedVersionedSemanticDescriptorFixture
     @versioned fixture_version = "synthetic_depot_v1"
 
-    @semantic (
-        inputs=(study=(domain=static_domain((:north, :south)),),),
-        output=(mmap_eligible=true, immutable=true, portable=true),
-    ) @mmap @progress prediction_grid(
+    @mmap @progress prediction_grid(
         study::Symbol,
         model::Symbol,
         dose::Float64=100.0,
     )::Matrix{Float64} = fill(dose, 2, 2)
 end
 
-@dynamicstruct struct BadSemanticInputName
-    @semantic (inputs=(missing=(domain=static_domain((1, 2)),),),) value(x::Int) = x
-end
-
-# The deduplicated shape do-use §6 documents: a key tuple shared by several
-# operations lives ONCE as fixed fields carrying the domains, and the
-# operations read them as bare siblings instead of restating `inputs=`.
+# A key tuple shared by several operations lives once as fixed fields; the
+# operations read them as bare siblings.
 @dynamicstruct struct DeduplicatedKeyFixture
-    @semantic (inputs=(study=(domain=static_domain((:north, :south)),),),) study::Symbol
-    @semantic (inputs=(model=(domain=static_domain((:one_cmt, :two_cmt)),),),) model::Symbol
-    @semantic (inputs=(dose=(domain=static_domain((50.0, 100.0)),),),) dose::Float64
+    study::Symbol
+    model::Symbol
+    dose::Float64
 
     prediction_grid()::Matrix{Float64} = fill(dose, 2, 2)
     summary_table()::Vector{Float64} = [dose, study === :north ? 1.0 : 2.0]
     # `dependencies` is direct, not transitive: this reports `summary_table`,
     # never the `study`/`dose` that `summary_table` itself reads.
     headline()::Float64 = first(summary_table())
-end
-
-@dynamicstruct struct SiblingAsSemanticInput
-    study::Symbol
-    @semantic (inputs=(study=(domain=static_domain((:north, :south)),),),) grid() = study
 end
 
 struct LegacySemanticMeta end
@@ -114,7 +87,7 @@ end # @testmodule SemanticFixtures
 
 """
 Documents the stable descriptor schema for fixed, computed, indexed, and
-legacy properties, including inferred and declared input domains.
+legacy properties, including type-inferred input domains.
 """
 @testitem "semantic property descriptors" tags=[:semantic] setup=[SemanticFixtures] begin
     fixed = property_descriptor(SemanticDescriptorFixture, :enabled)
@@ -127,18 +100,15 @@ legacy properties, including inferred and declared input domains.
     @test getproperty.(enum_input.inputs[1].domain.options, :value) ==
         [draft, final]
 
-    static_input = property_descriptor(SemanticDescriptorFixture, :mode)
-    @test static_input.inputs[1].domain.kind === :static
-    @test getproperty.(static_input.inputs[1].domain.options, :label) ==
-        ["Fast", "Careful"]
-    @test static_input.inputs[1].domain.options[2].help == "Use the full solver"
+    unrestricted = property_descriptor(SemanticDescriptorFixture, :mode)
+    @test unrestricted.inputs[1].domain.kind === :unrestricted
+    @test isempty(unrestricted.inputs[1].domain.options)
 
     fit = property_descriptor(SemanticDescriptorFixture, :fit)
     @test fit.role === :operation
     @test fit.indexed
     @test fit.output.type == Vector{Float64}
     @test fit.output.materialization.tier === :serialized
-    @test fit.output.materialization.source === :declared
     @test fit.semantics.memoized
     @test fit.semantics.cached
     @test fit.semantics.versioned
@@ -151,13 +121,8 @@ legacy properties, including inferred and declared input domains.
     @test fit.semantics.cache_version == v"2"
     @test fit.semantics.invalidation.cache_version == v"2"
     dataset = only(filter(input -> input.name === :dataset, fit.inputs))
-    @test dataset.domain.kind === :dynamic
-    @test dataset.domain.provider === :dataset_options
-    @test dataset.domain.dependencies == [:cohort]
+    @test dataset.domain.kind === :unrestricted
     @test only(filter(input -> input.name === :scale, fit.inputs)).kind === :keyword
-    provider = property_descriptor(SemanticDescriptorFixture, dataset.domain.provider)
-    @test provider.role === :operation
-    @test provider.semantics.pending
 
     version = property_descriptor(SemanticDescriptorFixture, :revision)
     @test version.semantics.versioned
@@ -174,14 +139,12 @@ legacy properties, including inferred and declared input domains.
     @test mapped.semantics.invalidation ==
         (content_version=true, cache_version=nothing)
     @test mapped.semantics.progress_mode === :instrumented
-    @test mapped.output.materialization.hints.mmap_eligible
 
     grid = property_descriptor(
         ComputedVersionedSemanticDescriptorFixture, :prediction_grid)
     @test grid.role === :operation
     @test grid.indexed
     @test grid.output.materialization.tier === :mmap
-    @test grid.output.materialization.hints.mmap_eligible
     @test grid.semantics.mmap
     @test grid.semantics.progress
     @test grid.semantics.progress_mode === :instrumented
@@ -221,10 +184,9 @@ dependent operation signatures or metadata.
 
     fit = property_descriptor(AutomaticSemanticContextFixture, :fit)
     @test fit.dependencies == [:prepared]
-    @test fit.dependency_closure == [:study, :confirmed, :prepared]
     @test getproperty.(fit.inputs, :name) == [:study, :confirmed, :draws]
     @test getproperty.(fit.inputs[1:2], :kind) == [:context, :context]
-    @test getproperty.(fit.inputs[1].domain.options, :value) == [:alpha, :beta]
+    @test fit.inputs[1].domain.kind === :unrestricted
     @test getproperty.(fit.inputs[2].domain.options, :value) == [false, true]
     @test fit.inputs[1].source == (;
         type=AutomaticSemanticContextFixture,
@@ -299,7 +261,9 @@ directory. Identity/version and retention remain reflected in the lifecycle.
         @test materialization_ownership(context, object).release_reason === :lru
 
         marker = joinpath(path, ".dynamicobjects-owner")
-        (path, WeakRef(getfield(retained, :cache).cache.cache), marker)
+        handle = WeakRef(getfield(retained, :cache).cache.cache)
+        retained = object = nothing
+        (path, handle, marker)
     end
 
     GC.gc(); GC.gc()
@@ -340,7 +304,9 @@ directory. Identity/version and retention remain reflected in the lifecycle.
         @test ownership.unowned_paths == [abspath(path)]
         @test release_materialization!(unowned_context, object;
             reason=:ttl).state === :deferred
-        (path, user_file, WeakRef(getfield(object, :cache).cache.cache))
+        handle = WeakRef(getfield(object, :cache).cache.cache)
+        object = nothing
+        (path, user_file, handle)
     end
 
     GC.gc(); GC.gc()
@@ -349,40 +315,6 @@ directory. Identity/version and retention remain reflected in the lifecycle.
     @test abspath(unowned_path) in preserved.preserved_paths
     @test isfile(unowned_file)
     @test read(unowned_file, String) == "keep"
-end
-
-"""
-Checks budget-aware materialization recommendations while preserving an
-explicitly declared storage tier over automatic heuristics.
-"""
-@testitem "budgeted materialization recommendations" tags=[:semantic] setup=[SemanticFixtures] begin
-    candidate = property_descriptor(SemanticDescriptorFixture, :candidate)
-    mmap_plan = materialization_plan(candidate;
-        memory_available_bytes=8 * 1024^2,
-        disk_available_bytes=128 * 1024^2)
-    @test mmap_plan.tier === :mmap
-    @test mmap_plan.automatic
-    @test mmap_plan.budgeted
-
-    @test materialization_plan(candidate).tier === :memory
-    @test materialization_plan(candidate;
-        estimated_bytes=512,
-        memory_available_bytes=1024,
-        disk_available_bytes=0,
-        mmap_eligible=false).tier === :memory
-    @test materialization_plan(candidate;
-        estimated_bytes=2048,
-        compute_seconds=0.01,
-        expected_reuse=1,
-        memory_available_bytes=1024,
-        disk_available_bytes=0).tier === :recompute
-
-    declared = materialization_plan(
-        property_descriptor(SemanticDescriptorFixture, :matrix);
-        memory_available_bytes=0, disk_available_bytes=0)
-    @test declared.tier === :mmap
-    @test !declared.automatic
-    @test declared.reason === :declared
 end
 
 """
@@ -436,34 +368,32 @@ then verifies that the same progress object remains visible through completion.
     @test done.state === :ready
 end
 
-"""
-Invalid semantic metadata must fail during introspection while leaving normal
-property construction and execution unaffected.
-"""
-@testitem "semantic metadata validation stays local to introspection" tags=[:semantic] setup=[SemanticFixtures] begin
+@testitem "@semantic metadata is removed" tags=[:semantic] begin
+    using DynamicObjects
     err = try
-        property_descriptor(BadSemanticInputName, :value)
+        macroexpand(@__MODULE__, :(
+            @dynamicstruct struct RemovedSemanticFixture
+                @semantic (inputs=(;),) value(x::Int) = x
+            end
+        ))
         nothing
     catch e
         e
     end
     @test err !== nothing
-    @test occursin("unknown property inputs", sprint(showerror, err))
-    @test BadSemanticInputName().value(3) == 3
+    @test occursin("@semantic was removed", sprint(showerror, err))
 end
 
 """
 Pins the zero-configuration deduplicated-key contract: a shared key tuple is
-declared once as fixed fields carrying the option domains, and dependent
-operations receive effective context inputs without restating `inputs=`.
+declared once as fixed fields, and dependent operations receive effective
+context inputs without extra metadata.
 """
-@testitem "deduplicated key tuple via fixed-field domains" tags=[:semantic] setup=[SemanticFixtures] begin
+@testitem "deduplicated key tuple via fixed fields" tags=[:semantic] setup=[SemanticFixtures] begin
     T = DeduplicatedKeyFixture
 
     # A fixed field is its own single input, keyed by the field's own name.
-    for (name, values) in ((:study, [:north, :south]),
-                           (:model, [:one_cmt, :two_cmt]),
-                           (:dose, [50.0, 100.0]))
+    for name in (:study, :model, :dose)
         d = property_descriptor(T, name)
         @test d.role === :input
         @test d.fixed
@@ -471,8 +401,7 @@ operations receive effective context inputs without restating `inputs=`.
         @test d.inputs[1].name === name
         @test d.inputs[1].kind === :field
         @test d.inputs[1].required
-        @test d.inputs[1].domain.kind === :static
-        @test getproperty.(d.inputs[1].domain.options, :value) == values
+        @test d.inputs[1].domain.kind === :unrestricted
     end
 
     # Operations restate nothing. Their signatures stay empty while descriptors
@@ -480,41 +409,22 @@ operations receive effective context inputs without restating `inputs=`.
     grid = property_descriptor(T, :prediction_grid)
     @test grid.role === :operation
     @test grid.dependencies == [:dose]
-    @test grid.dependency_closure == [:dose]
     @test getproperty.(grid.inputs, :name) == [:dose]
     @test only(grid.inputs).kind === :context
 
     summary = property_descriptor(T, :summary_table)
     @test summary.dependencies == [:dose, :study]
-    @test summary.dependency_closure == [:study, :dose]
     @test getproperty.(summary.inputs, :name) == [:study, :dose]
     @test all(input -> input.kind === :context, summary.inputs)
 
-    # `dependencies` stays direct; `dependency_closure` is transitive and the
-    # effective inputs have already been expanded from it.
+    # `dependencies` stays direct while effective context inputs have already
+    # been expanded transitively.
     headline = property_descriptor(T, :headline)
     @test headline.dependencies == [:summary_table]
-    @test headline.dependency_closure == [:study, :dose, :summary_table]
     @test getproperty.(headline.inputs, :name) == [:study, :dose]
-
-    # Consumers read the effective inputs directly; no graph walk or fragment
-    # registry is required merely to reconstruct the shared choices.
-    resolved = Dict(input.name =>
-        getproperty.(input.domain.options, :value) for input in summary.inputs)
-    @test resolved == Dict(:dose => [50.0, 100.0], :study => [:north, :south])
 
     o = T(:north, :one_cmt, 100.0)
     @test o.prediction_grid() == fill(100.0, 2, 2)
     @test o.summary_table() == [100.0, 1.0]
     @test o.headline() == 100.0
-
-    # A sibling is NOT addressable as an operation's own `@semantic` input.
-    err = try
-        property_descriptor(SiblingAsSemanticInput, :grid)
-        nothing
-    catch e
-        e
-    end
-    @test err !== nothing
-    @test occursin("unknown property inputs", sprint(showerror, err))
 end
