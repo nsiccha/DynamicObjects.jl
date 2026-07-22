@@ -1,10 +1,4 @@
 using Documenter, DocumenterVitepress, DynamicObjects
-import HTMXObjects
-
-# Sync the canonical htmxo-embed.ts (+ companion CSS) from HTMXObjects'
-# assets into the docs theme dir before DocumenterVitepress runs. The
-# theme's index.ts imports it via `import { setupHtmxoEmbed } from './htmxo-embed'`.
-HTMXObjects.vitepress_theme_install(joinpath(@__DIR__, "src", ".vitepress", "theme"))
 
 makedocs(
     sitename = "DynamicObjects.jl",
@@ -12,7 +6,7 @@ makedocs(
     format   = DocumenterVitepress.MarkdownVitepress(
         repo = "github.com/nsiccha/DynamicObjects.jl",
         devurl = "dev",
-        devbranch = "dev",
+        devbranch = "pre-inference",
     ),
     pages = [
         "Home"    => "index.md",
@@ -35,6 +29,6 @@ end
 
 DocumenterVitepress.deploydocs(
     repo = "github.com/nsiccha/DynamicObjects.jl",
-    devbranch = "dev",
+    devbranch = "pre-inference",
     push_preview = true,
 )

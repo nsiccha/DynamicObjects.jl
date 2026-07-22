@@ -1,7 +1,7 @@
 name: Run tests
 on:
   push:
-    branches: [master, main, dev]
+    branches: [main, dev, pre-inference]
   pull_request:
     # `edited` fires on title/body edits, NOT on new commits — pushing a fix to
     # a PR must re-run the suite, which is what `synchronize` reports.
@@ -33,6 +33,6 @@ jobs:
       - name: Develop unregistered dependencies
         run: |
           git clone https://github.com/nsiccha/Treebars.jl.git
-          julia --project=. -e 'using Pkg; project = read("Project.toml", String); try Pkg.develop(path="Treebars.jl"); Pkg.resolve() finally write("Project.toml", project) end'
+          julia --project=. -e 'using Pkg; Pkg.develop([PackageSpec(path="Treebars.jl")]); Pkg.instantiate()'
       - name: Run tests
         run: julia --project=. --color=yes -e 'using Pkg; Pkg.test(; coverage=true)'
