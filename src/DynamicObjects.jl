@@ -3804,7 +3804,7 @@ end
 # the former metadata macro explicitly so stale consumers get a useful error
 # instead of silently carrying an inert marker.
 _apply_property_macro!(::_PropertyMacroState, ::Val{Symbol("@semantic")}, _) =
-    error("@semantic was removed: DynamicObjects now reflects ordinary fields, property signatures, inferred dependencies, result annotations, Bool/Enum types, and cache markers directly")
+    error("@semantic was removed: DynamicObjects now reflects ordinary fields, property signatures, `<input>_options` properties, inferred dependencies, result annotations, Bool/Enum types, and cache markers directly")
 _parse_cache_version(v::VersionNumber) = v
 function _parse_cache_version(ver_expr::Expr)
     Meta.isexpr(ver_expr, :macrocall) && ver_expr.args[1] == Symbol("@v_str") ||
@@ -6747,13 +6747,20 @@ end
 _lhs_type_expr(::Any) = nothing
 _lhs_type_expr(lhs::Expr) = Meta.isexpr(lhs, :(::)) ? lhs.args[end] : nothing
 
-_option_descriptor(value; label=string(value), group=nothing,
-                   help=nothing, disabled=false) = (;
+"""
+    option_descriptor(value; label=string(value), group=nothing,
+                      help=nothing, disabled=false)
+
+Return the pure-data record used for one option returned by an ordinary
+`<input>_options` property.
+"""
+option_descriptor(value; label=string(value), group=nothing,
+                  help=nothing, disabled=false) = (;
     value, label, group, help, disabled,
 )
-function _option_descriptor(option::NamedTuple)
+function option_descriptor(option::NamedTuple)
     haskey(option, :value) || error("an option descriptor requires a `value` field")
-    defaults = _option_descriptor(option.value)
+    defaults = option_descriptor(option.value)
     merge(defaults, option)
 end
 
@@ -6767,8 +6774,15 @@ _unrestricted_domain() = (;
     allow_custom=true,
 )
 
-_static_domain(values; multiple=false, allow_custom=false) = let opts =
-    NamedTuple[_option_descriptor(v) for v in values]
+"""
+    static_domain(values; multiple=false, allow_custom=false)
+
+Normalize raw values or option records returned by an ordinary options
+property. Application declarations do not call this; descriptor consumers use
+it after evaluating the inferred provider.
+"""
+static_domain(values; multiple=false, allow_custom=false) = let opts =
+    NamedTuple[option_descriptor(v) for v in values]
     (;
         kind=:static,
         options=opts,
@@ -6780,16 +6794,38 @@ _static_domain(values; multiple=false, allow_custom=false) = let opts =
     )
 end
 
-function _inferred_domain(input_type)
-    input_type === Bool && return _static_domain((false, true))
-    input_type isa Type && input_type <: Enum && return _static_domain(instances(input_type))
+function _provider_domain(provider::Symbol, dependencies)
+    (;
+        kind=:dynamic,
+        options=NamedTuple[],
+        provider,
+        dependencies=unique!(Symbol[dependencies...]),
+        cardinality=nothing,
+        multiple=false,
+        allow_custom=false,
+    )
+end
+
+function _inferred_domain(T::Type, name::Symbol, input_type)
+    provider = Symbol(name, :_options)
+    provider_info = metafirst(T, provider)
+    if provider_info !== nothing
+        signature = property_signature(provider_info, parentmodule(T))
+        dependencies = Symbol[
+            input.name for input in (signature.positional..., signature.kwargs...)
+            if input.name !== :__verb__
+        ]
+        return _provider_domain(provider, dependencies)
+    end
+    input_type === Bool && return static_domain((false, true))
+    input_type isa Type && input_type <: Enum && return static_domain(instances(input_type))
     _unrestricted_domain()
 end
 
-_descriptor_input(arg::NamedTuple, kind::Symbol) = (;
+_descriptor_input(T::Type, arg::NamedTuple, kind::Symbol) = (;
     arg...,
     kind,
-    domain=_inferred_domain(arg.type),
+    domain=_inferred_domain(T, arg.name, arg.type),
 )
 
 function _semantic_dependency_closure(T::Type, roots)
@@ -6892,7 +6928,7 @@ function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
     result_type = _resolve_arg_type(_descriptor_result_type_expr(info), mod)
     signature = property_signature(info, mod)
     inferred_inputs = if fixed
-        NamedTuple[_descriptor_input((;
+        NamedTuple[_descriptor_input(T, (;
             name=prop,
             type=result_type,
             required=true,
@@ -6900,8 +6936,8 @@ function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
         ), :field)]
     else
         vcat(
-            NamedTuple[_descriptor_input(arg, :positional) for arg in signature.positional],
-            NamedTuple[_descriptor_input(arg, :keyword) for arg in signature.kwargs],
+            NamedTuple[_descriptor_input(T, arg, :positional) for arg in signature.positional],
+            NamedTuple[_descriptor_input(T, arg, :keyword) for arg in signature.kwargs],
         )
     end
     dependencies = get(info, :dependson, nothing)
@@ -7454,7 +7490,7 @@ end
 export print_structure, structure
 export tree_children_map, lint_index, lookup_type, callers_by_name, property_source_info, property_signature, property_doc, LintMessage
 export metafirst, metaall
-export property_descriptor, property_descriptors
+export option_descriptor, static_domain, property_descriptor, property_descriptors
 export materialization_observation
 export execute_materialization, release_materialization!, materialization_ownership, materialization_gc!
 
