@@ -11,7 +11,6 @@ export SemanticQuality, draft, final, SemanticDescriptorFixture,
 @enum SemanticQuality draft final
 
 @dynamicstruct struct AutomaticSemanticContextFixture
-    study_options = (:alpha, :beta)
     study::Symbol
     confirmed::Bool
 
@@ -38,13 +37,7 @@ end
     @versioned revision::Int
     enabled::Bool
     quality::SemanticQuality
-    mode_options = (
-        (value=:fast, label="Fast"),
-        (value=:careful, label="Careful", help="Use the full solver"),
-    )
     mode::Symbol
-
-    dataset_options(cohort::Symbol) = cohort === :north ? [:n1, :n2] : [:s1]
 
     @cached v"2" fit(dataset::Symbol, cohort::Symbol; scale::Int=1)::Vector{Float64} =
         fill(Float64(scale), dataset === :n1 ? 2 : 1)
@@ -61,7 +54,6 @@ end
 
 @dynamicstruct struct ComputedVersionedSemanticDescriptorFixture
     @versioned fixture_version = "synthetic_depot_v1"
-    study_options = (:north, :south)
 
     @mmap @progress prediction_grid(
         study::Symbol,
@@ -73,9 +65,6 @@ end
 # A key tuple shared by several operations lives once as fixed fields; the
 # operations read them as bare siblings.
 @dynamicstruct struct DeduplicatedKeyFixture
-    study_options = (:north, :south)
-    model_options = (:one_cmt, :two_cmt)
-    dose_options = (50.0, 100.0)
     study::Symbol
     model::Symbol
     dose::Float64
@@ -111,12 +100,16 @@ legacy properties, including type-inferred input domains.
     @test getproperty.(enum_input.inputs[1].domain.options, :value) ==
         [draft, final]
 
-    inferred_options = property_descriptor(SemanticDescriptorFixture, :mode)
-    @test inferred_options.inputs[1].domain.kind === :dynamic
-    @test inferred_options.inputs[1].domain.provider === :mode_options
-    @test isempty(inferred_options.inputs[1].domain.dependencies)
-    option_values = SemanticDescriptorFixture(1, true, final, :fast).mode_options
-    normalized = static_domain(option_values)
+    unrestricted = property_descriptor(SemanticDescriptorFixture, :mode)
+    @test unrestricted.inputs[1].domain.kind === :unrestricted
+    @test isempty(unrestricted.inputs[1].domain.options)
+
+    # Framework consumers can normalize already-known option data without
+    # imposing an application naming or annotation convention.
+    normalized = static_domain((
+        (value=:fast, label="Fast"),
+        (value=:careful, label="Careful", help="Use the full solver"),
+    ))
     @test getproperty.(normalized.options, :label) == ["Fast", "Careful"]
     @test normalized.options[2].help == "Use the full solver"
 
@@ -137,13 +130,8 @@ legacy properties, including type-inferred input domains.
     @test fit.semantics.cache_version == v"2"
     @test fit.semantics.invalidation.cache_version == v"2"
     dataset = only(filter(input -> input.name === :dataset, fit.inputs))
-    @test dataset.domain.kind === :dynamic
-    @test dataset.domain.provider === :dataset_options
-    @test dataset.domain.dependencies == [:cohort]
+    @test dataset.domain.kind === :unrestricted
     @test only(filter(input -> input.name === :scale, fit.inputs)).kind === :keyword
-    provider = property_descriptor(SemanticDescriptorFixture, dataset.domain.provider)
-    @test provider.role === :operation
-    @test provider.semantics.pending
 
     version = property_descriptor(SemanticDescriptorFixture, :revision)
     @test version.semantics.versioned
@@ -167,8 +155,7 @@ legacy properties, including type-inferred input domains.
     @test grid.indexed
     @test grid.output.materialization.tier === :mmap
     @test grid.inputs[1].name === :study
-    @test grid.inputs[1].domain.provider === :study_options
-    @test isempty(grid.inputs[1].domain.dependencies)
+    @test grid.inputs[1].domain.kind === :unrestricted
     @test grid.semantics.mmap
     @test grid.semantics.progress
     @test grid.semantics.progress_mode === :instrumented
@@ -185,8 +172,7 @@ legacy properties, including type-inferred input domains.
     @test fresh_descriptor.output.materialization.tier === :recompute
 
     names = getproperty.(property_descriptors(SemanticDescriptorFixture), :name)
-    @test names[1:3] == [:revision, :enabled, :quality]
-    @test :mode in names
+    @test names[1:4] == [:revision, :enabled, :quality, :mode]
     @test :fit in names
 
     legacy = property_descriptor(LegacySemanticMeta, :legacy)
@@ -211,9 +197,7 @@ dependent operation signatures or metadata.
     @test fit.dependencies == [:prepared]
     @test getproperty.(fit.inputs, :name) == [:study, :confirmed, :draws]
     @test getproperty.(fit.inputs[1:2], :kind) == [:context, :context]
-    @test fit.inputs[1].domain.kind === :dynamic
-    @test fit.inputs[1].domain.provider === :study_options
-    @test isempty(fit.inputs[1].domain.dependencies)
+    @test fit.inputs[1].domain.kind === :unrestricted
     @test getproperty.(fit.inputs[2].domain.options, :value) == [false, true]
     @test fit.inputs[1].source == (;
         type=AutomaticSemanticContextFixture,
@@ -428,9 +412,7 @@ context inputs without extra metadata.
         @test d.inputs[1].name === name
         @test d.inputs[1].kind === :field
         @test d.inputs[1].required
-        @test d.inputs[1].domain.kind === :dynamic
-        @test d.inputs[1].domain.provider === Symbol(name, :_options)
-        @test isempty(d.inputs[1].domain.dependencies)
+        @test d.inputs[1].domain.kind === :unrestricted
     end
 
     # Operations restate nothing. Their signatures stay empty while descriptors
@@ -453,10 +435,6 @@ context inputs without extra metadata.
     @test getproperty.(headline.inputs, :name) == [:study, :dose]
 
     o = T(:north, :one_cmt, 100.0)
-    resolved = Dict(input.name => getproperty.(
-        static_domain(getproperty(o, input.domain.provider)).options, :value)
-        for input in summary.inputs)
-    @test resolved == Dict(:dose => [50.0, 100.0], :study => [:north, :south])
     @test o.prediction_grid() == fill(100.0, 2, 2)
     @test o.summary_table() == [100.0, 1.0]
     @test o.headline() == 100.0
