@@ -40,11 +40,20 @@ end
 
 # The kwarg names of the `compute_property` method emitted for `T`'s property
 # `name` — the signature the fix is about, read straight off the method table.
+#
+# `unwrap_unionall` because `methods` is GLOBAL: a parametric `@dynamicstruct`
+# anywhere in the suite emits `compute_property(o::Foo{T}, ::Val{:x}) where T`,
+# whose `sig` is a `UnionAll` with no `.parameters` at all. Reaching for that
+# field directly threw `type UnionAll has no field parameters` for every call
+# here as soon as `test/parametric_structs.jl` shared a worker with this file —
+# a failure that depends on test scheduling, not on anything this file declares.
+_cp_sig_params(m) = Base.unwrap_unionall(m.sig).parameters
+
 function cp_kwarg_names(T, name::Symbol)
     ms = [
         m for m in methods(DynamicObjects.compute_property)
-        if length(m.sig.parameters) >= 3 &&
-            m.sig.parameters[2] === T && m.sig.parameters[3] === Val{name}
+        if length(_cp_sig_params(m)) >= 3 &&
+            _cp_sig_params(m)[2] === T && _cp_sig_params(m)[3] === Val{name}
     ]
     Base.kwarg_decl(only(ms))
 end
