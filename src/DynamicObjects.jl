@@ -569,10 +569,35 @@ _report_disk_load!(::Nothing, _, _) = nothing
 # !isnothing(doc)` rule: undocumented properties add no labelled noise to the
 # tree, documented ones do.
 #
-# `transient` is consumed here (default true → substatus auto-detaches on finalize);
-# it does not reach the property body. Pass transient=false to keep finished substatuses
-# pinned to the parent tree (e.g. for historical "N finished" pill display).
-function _default_substatus(status::Treebars.ProgressNode, o, name, args...; transient=true, kwargs...)
+# ── The parent: Treebars' AMBIENT node, falling back to `status` ─────────────
+#
+# This one line is what makes progress nesting implied. `status` is the DEFAULT
+# parent the caller had — for the two cache factories (`memoize!` /
+# `_bare_substatus_f`) that is always `o.__status__`, the object's ROOT, because
+# a cache has no idea who asked. Parenting there is why correct nesting used to
+# need `@fetch!` on every call site: the author had to hand the caller's node
+# down explicitly, and a body that reached a property through an ordinary
+# function could not hand it down at all.
+#
+# `Treebars.current_progress()` is that caller — the node whose compute we are
+# lexically inside, bound by `_with_substatus!` below for the whole dynamic
+# extent of the body. So the substatus is born in the right place, at ANY call
+# depth and through ANY number of foreign frames, with nothing threaded through
+# the body. `nothing` (no tree running, or a read from top level) falls back to
+# `status`, reproducing the old parenting exactly.
+#
+# `o.__status__ === nothing` never reaches here — the generic `_default_substatus`
+# returns `nothing` — so an object with progress disabled stays silent even when
+# read from inside a live tree.
+#
+# `transient` now defaults to FALSE, which is the other half of the same change.
+# It existed to un-parent a node from the object root once `_attach_fetched!` had
+# re-homed it under the real caller (Treebars detaches transient nodes from their
+# parent on finalize, keeping failed ones pinned). Ambient parenting puts the node
+# under the real caller to begin with, so detaching on success would now delete
+# the very nesting we just built — a finished tree would render empty. Callers
+# that still want the old re-homing behaviour pass `transient=true` explicitly.
+function _default_substatus(status::Treebars.ProgressNode, o, name, args...; transient=false, kwargs...)
     # Gate the label PER CALL SIGNATURE: `_is_property_documented` dispatches on
     # `args...` (one method emitted per declaration — `true` if documented,
     # `false` if not), so a property with multiple signatures resolves its OWN
@@ -585,7 +610,8 @@ function _default_substatus(status::Treebars.ProgressNode, o, name, args...; tra
     # fix rolls in as each struct is re-expanded.)
     desc = _is_property_documented(o, Val(name), args...; kwargs...) ?
         something(_property_description(o, Val(name), args...; kwargs...), "") : ""
-    Treebars.initialize_progress!(status; description=desc, transient)
+    parent = something(Treebars.current_progress(), status)
+    Treebars.initialize_progress!(parent; description=desc, transient)
 end
 
 # Lifecycle hooks — give DO's ThreadsafeDict-spawned substatuses the with_progress
@@ -594,6 +620,19 @@ end
 # so they stay visible until retry_failed clears them).
 _finalize_substatus!(s::Treebars.ProgressNode) = Treebars.finalize_progress!(s)
 _fail_substatus!(s::Treebars.ProgressNode, e) = Treebars.fail_progress!(s, e)
+
+# Run `f(s)` with `s` bound as Treebars' ambient node, so every property/IP the
+# body reaches parents under `s` (see `_default_substatus`). This is the producer
+# half of the implied-progress contract, and it is deliberately applied at the
+# CACHE layer rather than in the emitted body: the cache is the one place every
+# evaluation passes through, including the `Threads.@spawn`ed poller path. That
+# spawn crosses a task boundary — and Treebars' ambient node is task-local on
+# 1.10 — but `s` is passed to the spawned task explicitly, so re-binding it here
+# re-establishes the ambient inside the new task. DO therefore does not inherit
+# Treebars' consumer-spawn limitation on its own compute path.
+_with_substatus!(f, s) = f(s)
+_with_substatus!(f, s::Treebars.ProgressNode) =
+    Treebars.with_current_progress(s) do; f(s); end
 
 # Disk-load reporting — set the substatus message to a human-readable
 # "from disk: <size>" so big-file loads show up in the tree instead of
@@ -984,7 +1023,7 @@ const _missing_sentinel = _Missing()
 function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condition, f, s)
     local v
     try
-        v = f(s)
+        v = _with_substatus!(f, s)
     catch e
         lock(c.lock) do
             get(c.computing, key, nothing) === cnd && delete!(c.computing, key)
@@ -2407,6 +2446,44 @@ function _progress_self_rewrite_kwarg(a::Expr)
     return _progress_self_rewrite(a)
 end
 
+# ── Implied progress: which declarations keep their own marker ────────────────
+#
+# True iff the author wrote any progress-family marker on this declaration, in
+# which case that marker owns the body and the implied wrap stands down. A
+# function rather than a `const` tuple on purpose: a tuple's arity is part of its
+# type, so growing this list under a live Revise session would be a hard
+# `invalid redefinition of constant` (`dev` §11).
+_is_progress_marked(macros) = any(m -> m in macros,
+    (Symbol("@progress"), Symbol("@PROGRESS"), Symbol("@fetch!"), Symbol("@dynamic_progress")))
+
+# The body as a block `Treebars.@progress` can safely lower.
+#
+# Two hazards, both of which only a DEFAULT wrap is wide enough to hit:
+#
+# 1. A BARE STRING in statement position is read by Treebars as a phase LABEL —
+#    the documented "a bare `"label"` is silently swallowed as a docstring"
+#    trap. A property whose body IS a string (`item(x="default") = "got: $x"`,
+#    `__cache_base__ = "custom"`) would then return a `ProgressNode` instead of
+#    its value. Wrapping each such statement in `identity` leaves the value
+#    bit-identical while making it a call Treebars has no interest in.
+# 2. A NON-BLOCK body must be block-wrapped, or a bare comprehension/generator
+#    reaches `Treebars.@progress` as a comprehension — lowered to a per-element
+#    counter, and an outright macro-expansion error on a filtered or multi-dim
+#    one.
+#
+# An already-`:block` body is rebuilt in place rather than nested in a fresh
+# block (`1ce8892`): re-wrapping buries an inline `@progress "phase"` marker one
+# level deep, and Treebars requires a marker to be a DIRECT statement of the
+# enclosing block.
+_progress_safe_stmt(x) = x
+_progress_safe_stmt(x::String) = Expr(:call, GlobalRef(Base, :identity), x)
+_progress_safe_stmt(x::Expr) =
+    Meta.isexpr(x, :string) ? Expr(:call, GlobalRef(Base, :identity), x) : x
+
+_progress_body_block(rhs) = Meta.isexpr(rhs, :block) ?
+    Expr(:block, Any[_progress_safe_stmt(a) for a in rhs.args]...) :
+    Expr(:block, _progress_safe_stmt(rhs))
+
 """
     noprogress(f, args...; kwargs...)
 
@@ -2472,7 +2549,9 @@ maybeprogress!(progress, ip::IndexableProperty{name}, indices...; kwargs...) whe
     # `_default_substatus` (gated on the property's docstring).
     s = _default_substatus(progress, o, name, indices...; kwargs...)
     try
-        rv = _computeproperty(o, name, indices...; __status__=s, kwargs...)
+        rv = _with_substatus!(s) do _
+            _computeproperty(o, name, indices...; __status__=s, kwargs...)
+        end
         _finalize_substatus!(s)
         rv
     catch e
@@ -5429,19 +5508,11 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 # calls (NOT a nested `@fetch! __progress__ …`) avoid the `fecc238`
                 # outside-in dangling-`__progress__` footgun.
                 if Symbol("@progress") in info.macros
-                    # Pass the rewritten body to Treebars.@progress. If it is already a
-                    # block, pass it DIRECTLY — wrapping a block inside another block
-                    # buries inline `@progress "phase"` markers one level deep, and Tb
-                    # requires a phase marker to be a DIRECT statement of the enclosing
-                    # @progress block (else: "phase marker must be a direct statement of
-                    # an enclosing @progress block"). Only a bare-expr body needs a fresh
-                    # block wrapper.
-                    _rewritten = _progress_self_rewrite(walked_rhs)
                     walked_rhs = Expr(:macrocall,
                         GlobalRef(Treebars, Symbol("@progress")),
                         something(info.lnn, LineNumberNode(0, :unknown)),
                         :__status__,
-                        Meta.isexpr(_rewritten, :block) ? _rewritten : Expr(:block, _rewritten))
+                        _progress_body_block(_progress_self_rewrite(walked_rhs)))
                 end
                 # `@PROGRESS`-marked: the "throw everything at @progress" form. Exactly
                 # like `@progress` above, but rewrites the body with `_fetch_rewrite`
@@ -5454,12 +5525,46 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 # path as `@progress`, and inline `@progress`/`@phases` markers in the body
                 # still work (Tb expands the wrap first).
                 if Symbol("@PROGRESS") in info.macros
-                    _rewritten_all = _fetch_rewrite(:__progress__, walked_rhs)
                     walked_rhs = Expr(:macrocall,
                         GlobalRef(Treebars, Symbol("@progress")),
                         something(info.lnn, LineNumberNode(0, :unknown)),
                         :__status__,
-                        Meta.isexpr(_rewritten_all, :block) ? _rewritten_all : Expr(:block, _rewritten_all))
+                        _progress_body_block(_fetch_rewrite(:__progress__, walked_rhs)))
+                end
+                # UNMARKED — the default, and so the shape almost every property
+                # in the ecosystem takes. Progress is IMPLIED, and the nesting
+                # comes from the CACHE layer, not from rewriting this body: the
+                # substatus `_bare_substatus_f` / `memoize!` build for this
+                # evaluation is parented at Treebars' AMBIENT node and made
+                # ambient for the duration of the compute, so any property or IP
+                # reached from here — at any call depth, through any number of
+                # foreign functions — nests underneath automatically. The
+                # property's DOCSTRING stays the only user-facing progress
+                # metadata (it drives `_is_property_documented` → label vs.
+                # inlined-away, emitted just above).
+                #
+                # The wrap emitted here is therefore NOT what threads the
+                # nesting; it exists so that an inline `@progress "phase"` marker
+                # — the one remaining escape hatch — works in ANY body without a
+                # marker on the LHS. It is a label-less bare wrapper, which the
+                # renderer inlines away, so it adds no row.
+                #
+                # The four markers stay as overrides — `@progress` (self-accesses
+                # only), `@PROGRESS` / `@fetch!` (everything, via the poller's
+                # spawning path), `@dynamic_progress` (foreign calls too) — so
+                # nothing that relies on them changes.
+                #
+                # Two shapes are excluded. `__status__` gets no `__status__`
+                # kwarg at all (see `cp_kwargs` above), and `__substatus__` is the
+                # factory that BUILDS the node this wrap would parent under —
+                # wrapping either is circular.
+                if !_is_progress_marked(info.macros) &&
+                   name !== :__status__ && name !== :__substatus__
+                    walked_rhs = Expr(:macrocall,
+                        GlobalRef(Treebars, Symbol("@progress")),
+                        something(info.lnn, LineNumberNode(0, :unknown)),
+                        :__status__,
+                        _progress_body_block(walked_rhs))
                 end
                 block = Expr(:block,
                     _lnn, Expr(:(=), _call(:compute_property, cp_kwargs...), Expr(:block, _lnn, walked_rhs)),
