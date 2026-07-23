@@ -573,10 +573,10 @@ _fail_substatus!(::Nothing, e) = nothing
 #
 # `Treebars.current_progress()` (Treebars `aac3f34`, decision `13jb58i`) is a
 # dynamically-scoped "node currently being computed" that any frame can read at
-# any call depth. That turns nesting into two runtime rules and no macro:
-#
-#   1. a new substatus parents at the ambient node (`_progress_parent`), and
-#   2. a property body runs with its own substatus ambient (`_run_progress_body`).
+# any call depth. That turns nesting into runtime rules and no macro — see the
+# "Ambient (annotation-free) progress" block below for the edge-discovery half
+# (`with_ambient_progress` / `_attach_ambient!`); `_progress_parent` here is the
+# node-CREATION half.
 #
 # The markers still work and are still useful as *instrumentation* (they also
 # memoize, and relabel in-memory hits `(cached)`); they are no longer load-bearing
@@ -585,20 +585,19 @@ _fail_substatus!(::Nothing, e) = nothing
 # Parent for a newly created substatus: the node whose body we are running inside,
 # falling back to the object root when there is none. `nothing` (progress disabled)
 # flows through unchanged — `_default_substatus`'s generic method no-ops on it.
+#
+# Creating the node in its final place — rather than under the root and then
+# adding the ambient edge — is what keeps the ROOT's child set proportional to
+# the top-level reads instead of to every property evaluation in the object
+# graph. `_attach_ambient!` still adds the edge on the paths where no node is
+# created (warm hit, `:wait` / `:pending` / `:error` losers): there the node
+# belongs to whoever computed it, under THEIR caller, and the current reader
+# needs a second edge to it. `Treebars.add_child!` is a `ThreadsafeSet` push, so
+# the two halves overlapping on the compute path is an idempotent no-op.
 _progress_parent(o) = begin
     ambient = Treebars.current_progress()
     isnothing(ambient) ? o.__status__ : ambient
 end
-
-# Run a property/IP body with `s` installed as the ambient node, so every DO access
-# it reaches — at any call depth, through arbitrary foreign frames — nests under `s`.
-#
-# A body with NO node of its own (`nothing`: progress disabled, a dunder, or a
-# property `_bare_substatus_f` skips) deliberately leaves the ambient binding
-# untouched rather than clearing it: its accesses then attribute to the CALLER's
-# node, which is the right parent for work that has no node to own it.
-_run_progress_body(f, s) = Treebars.with_current_progress(f, s)
-_run_progress_body(f, ::Nothing) = f()
 
 # Disk-load reporting hook — the generic method is a no-op; the
 # `::Treebars.ProgressNode` specialization below sets the substatus message to
@@ -660,6 +659,92 @@ function _format_size(n::Integer)
     n < 1024^2          && return string(round(n / 1024,        digits=1), " KB")
     n < 1024^3          && return string(round(n / 1024^2,      digits=1), " MB")
     string(round(n / 1024^3, digits=1), " GB")
+end
+
+# ── Ambient (annotation-free) progress ───────────────────────────────────────
+#
+# `@fetch!` / `@progress` make a nested computation visible by threading the
+# CALLER's node lexically and calling `Treebars.add_child!(caller, callee)`. The
+# node itself was never the missing piece — every generated property already
+# builds its own substatus (`_bare_substatus_f` / `memoize!`'s `substatus_f`)
+# and registers it in `c.status`. Only the tree EDGE needed an annotation.
+#
+# So the edge is discovered at RUNTIME instead: while a property body runs, its
+# own node is the *ambient* node (set in `_run_cache_compute!`, the one place
+# every body executes); every ordinary property/IP read performed underneath it
+# mounts its node under that ambient node (in `get!`, the one place every node
+# is created or found). Nesting therefore follows actual execution, needing no
+# call-site annotation and no macro-time dependency enumeration.
+#
+# ⚠️ This is deliberately NOT the auto-progress stack that was reverted in
+# 2026-05 (see the DO primer, "Rules & invariants"). That one wrapped bodies
+# implicitly at MACRO time, keyed the wrap on the docstring, emitted a
+# `_dependencies` pre-enumeration, and stored the node in a persistent
+# `__status__::Treebars.ProgressNode` STRUCT FIELD — which moved struct shape
+# (fatal under Julia 1.10 + Revise) and put presentation metadata in charge of
+# execution semantics. Here: nothing is emitted, no body is rewritten, no
+# struct shape changes, and the docstring keeps its existing role — it labels a
+# node that is built either way (`_default_substatus`), it does not decide
+# whether one exists.
+#
+# The dynamic scope itself is TREEBARS' (`Treebars.current_progress` /
+# `with_current_progress`), not a second one of our own. That is load-bearing,
+# not tidiness: two ambient stacks would be mutually invisible, so a
+# `progress_map` body reading a property, or a property body calling an
+# ambient-instrumented function, would each look up the wrong key and silently
+# lose the edge — the precise failure this mechanism exists to prevent. It also
+# keeps the version shim (`Base.ScopedValues` on 1.11+, task-local storage on
+# 1.10) in the one package that owns it. We deliberately export nothing here:
+# Treebars already exports `with_ambient_progress`, and a same-named DO export
+# would make `using DynamicObjects, Treebars` ambiguous.
+#
+# Task-local (on 1.10), not global: concurrent requests each get their own
+# stack, and a `Threads.@spawn`ed compute starts with an empty TLS and installs
+# its own node (which is what we want — the spawned body is the callee). A body
+# that spawns its OWN tasks and reads properties inside them does not inherit
+# the ambient node; those reads stay unattached, exactly as they are today
+# without a hand-threaded `__progress__`. On 1.11+ Treebars' shim switches to
+# `ScopedValues`, which fixes that inheritance with no change here.
+
+"""
+    ambient_progress()
+
+The progress node ordinary property/indexed-property reads currently attach to,
+or `nothing` outside any instrumented computation.
+
+An alias for `Treebars.current_progress()` — DynamicObjects reads the ambient
+node, it does not own it.
+"""
+ambient_progress() = Treebars.current_progress()
+
+"""
+    with_ambient_progress(f, s)
+
+Run `f()` with `s` installed as the ambient progress node, restoring the
+previous node afterwards. `s === nothing` (a property with no substatus — a
+dunder, an indexed wrapper, or progress switched off) leaves the current
+ambient node in place, so such a property stays transparent and its callees
+attach to its own caller.
+
+Distinct from `Treebars.with_ambient_progress`, which CREATES a child node from
+a description; here the node already exists (the property's own substatus) and
+only needs binding, so this delegates to `Treebars.with_current_progress`.
+"""
+with_ambient_progress(f, ::Nothing) = f()
+with_ambient_progress(f, s) = Treebars.with_current_progress(f, s)
+
+# Mount `s` under the ambient node, mirroring `_attach_fetched!` on the explicit
+# `@fetch!` path — including the "(cached)" relabel for a documented in-memory
+# hit. Both `add_child!` (a `ThreadsafeSet` push) and `_mark_cached!` (an
+# `endswith` guard) are idempotent, so an explicitly threaded `@fetch!` inside a
+# `@progress` body — where the threaded node and the ambient node are the same
+# node — attaches once, not twice.
+function _attach_ambient!(ambient, s, hit::Bool)
+    ambient isa Treebars.ProgressNode || return nothing
+    hit && s isa Treebars.ProgressNode && !isempty(s.impl.description) &&
+        _mark_cached!(s)
+    Treebars.add_child!(ambient, s)
+    nothing
 end
 
 """
@@ -959,6 +1044,13 @@ end
 # `c.lock` would deadlock. So we fast-path first, then build `s` outside the lock and
 # re-take it to arbitrate; if we lose the arbitration we discard `s` via finalize.
 Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substatus=nothing, retry_failed=true) = begin
+    # This is the one place a property/IP progress node is created or found, so
+    # it is where an ordinary read mounts itself under the caller's node —
+    # `ambient_progress()` is the caller's node whenever we are running inside
+    # another property's body. Reading it costs one task-local lookup; when it is
+    # `nothing` (no instrumented computation in progress — the common case)
+    # `_attach_ambient!` is a typed no-op and every path below is unchanged.
+    ambient = ambient_progress()
     # Fast path: a ready value returns immediately, no substatus cost. (`_missing_sentinel`
     # distinguishes "absent" from a legitimately-cached `nothing`.)
     hit = lock(c.lock) do
@@ -966,7 +1058,13 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
         v !== _missing_sentinel && (_on_hit!(c, key); return v)
         _missing_sentinel
     end
-    hit === _missing_sentinel || return hit
+    if hit !== _missing_sentinel
+        # In-memory hit: the node from the ORIGINAL compute is still in `c.status`
+        # with its finished subtree; mount it and let `_attach_ambient!` apply the
+        # same "(cached)" relabel the explicit `@fetch!` path applies.
+        isnothing(ambient) || _attach_ambient!(ambient, _peek_status(c, key), true)
+        return hit
+    end
     # Build the substatus OUTSIDE the lock — factories recurse into DO props on the SAME
     # lock, so building under it would deadlock.
     s = isnothing(substatus) ? nothing : substatus()
@@ -994,22 +1092,32 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
         return sync ? (:inline, cnd) : (:spawn, cnd)
     end
     kind = action[1]
-    kind === :value && (!isnothing(s) && _finalize_substatus!(s); return action[2])
+    # Every branch below mounts the EFFECTIVE node under the ambient one, and does
+    # so BEFORE it blocks, computes or spawns — a node attached only after the work
+    # finished would never be seen running, which is the whole point of the tree.
+    # On the four non-computing branches the winner owns the status, so the node to
+    # mount is `c.status[key]`, never the `s` we built and are about to discard.
+    kind === :value && (isnothing(ambient) || _attach_ambient!(ambient, _peek_status(c, key), true);
+                        !isnothing(s) && _finalize_substatus!(s); return action[2])
     if kind === :error
+        isnothing(ambient) || _attach_ambient!(ambient, _peek_status(c, key), false)
         !isnothing(s) && _finalize_substatus!(s)
         throw(action[2])
     end
     if kind === :wait
         # Blocking waiter: block on the in-flight computer's latch, then read value/error.
         # We built `s` but aren't the computer; finalize it (the winner owns the status).
+        isnothing(ambient) || _attach_ambient!(ambient, _peek_status(c, key), false)
         !isnothing(s) && _finalize_substatus!(s)
         return _await_cache_value!(c, key, action[2]::Threads.Condition, f; fetch, substatus, retry_failed)
     end
     if kind === :pending
         # Poller, compute already in flight elsewhere — hand back a cheap Pending, no spawn.
+        isnothing(ambient) || _attach_ambient!(ambient, _peek_status(c, key), false)
         !isnothing(s) && _finalize_substatus!(s)
         return fetch(Pending(c, key, nothing))
     end
+    isnothing(ambient) || _attach_ambient!(ambient, s, false)
     if kind === :inline
         # Blocking first-arriver: compute on THIS thread (no spawn), publish, return value.
         return _run_cache_compute!(c, key, action[2]::Threads.Condition, f, s)
@@ -1020,6 +1128,12 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     cnd = action[2]::Threads.Condition
     Threads.@spawn try; _run_cache_compute!(c, key, cnd, f, s); catch; end  # error already recorded
     return fetch(Pending(c, key, nothing))
+end
+
+# Read the winning computer's node without racing the cache lock. Used only on
+# the ambient-attach paths, so it costs nothing when no progress is in flight.
+_peek_status(c::AbstractThreadsafeDict, key) = lock(c.lock) do
+    get(c.status, key, nothing)
 end
 
 # Singleton sentinel so a single `get` lookup distinguishes "key absent" from
@@ -1037,19 +1151,12 @@ const _missing_sentinel = _Missing()
 function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condition, f, s)
     local v
     try
-        # THE ambient-nesting install point: every memoized property/IP body in DO
-        # runs through here (bare property, IP `memoize!`, and the `fetch*` polling
-        # forms alike), so binding `s` as the ambient node once here gives every DO
-        # access the body reaches — at any call depth — the right parent, with no
-        # macro at the property and none at the consumer.
-        #
-        # This is also what carries nesting across DO's own `:spawn` path: Julia
-        # 1.10 task-local storage is not inherited by a child task, but `s` was
-        # built in the CALLING task (against the caller's ambient node) and is
-        # re-installed here, inside whichever task actually runs the body.
-        v = _run_progress_body(s) do
-            f(s)
-        end
+        # Every property/IP body runs through here — inline on the caller's task
+        # and inside the fire-and-forget spawn alike — so this is the one place
+        # that installs the body's own node as the ambient one. Ordinary reads in
+        # the body then mount themselves under `s` (see `get!`), which is what
+        # makes the tree build itself without a single call-site annotation.
+        v = with_ambient_progress(() -> f(s), s)
     catch e
         lock(c.lock) do
             get(c.computing, key, nothing) === cnd && delete!(c.computing, key)
@@ -1916,6 +2023,13 @@ function _peek_hit(c::AbstractThreadsafeDict, name::Symbol)
 end
 _peek_hit(c::AbstractDict, name::Symbol) = get(c, name, _missing_sentinel)
 
+# Bare-property counterpart to `_peek_status`, unwrapping the `PropertyCache`.
+# A `Dict`-backed (`:serial`) cache carries no status at all, hence the fallback.
+_peek_bare_status(pc::PropertyCache, name::Symbol) =
+    _peek_bare_status(getfield(pc, :cache), name)
+_peek_bare_status(c::AbstractThreadsafeDict, name::Symbol) = _peek_status(c, name)
+_peek_bare_status(::AbstractDict, ::Symbol) = nothing
+
 getorcomputeproperty(o, name, indices...; kwargs...) = if hasfield(typeof(o), name)
     @assert length(indices) == length(kwargs) == 0
     getfield(o, name)
@@ -1938,7 +2052,17 @@ else
     # directly is behaviourally identical to routing through `get!`. Only misses
     # pay the closures.
     hit = _peek_hit(cache, name)
-    hit === _missing_sentinel || return hit
+    if hit !== _missing_sentinel
+        # This path deliberately skips `get!`, so it has to do `get!`'s ambient
+        # attach itself — otherwise a warm property read inside another body would
+        # silently drop out of the tree the first time it is re-read, and the
+        # subtree it already computed would disappear along with it. Only pays the
+        # lookup when a computation is actually being instrumented.
+        ambient = ambient_progress()
+        isnothing(ambient) ||
+            _attach_ambient!(ambient, _peek_bare_status(cache, name), true)
+        return hit
+    end
     substatus_f = _bare_substatus_f(o, name)
     get!(cache, name; substatus=substatus_f) do s
         # When called with no indices on an indexed property (declared with
