@@ -3859,6 +3859,21 @@ end
 _apply_property_macro!(state::_PropertyMacroState, ::Val{name}, arg) where {name} =
     (push!(state.macros, name); arg.args[end])
 
+# DO's own markers that act on a right-hand side: each one changes how a
+# property's BODY is computed, cached or stored, so on a declaration with no
+# body it is silently inert — a mistake DO is in a position to name (see the
+# rhs-less check in `dynamicstruct`). Deliberately NOT a whitelist of the
+# allowed markers: a marker DO does not recognise belongs to a downstream
+# consumer (`@include`, `@get`, …), is captured-but-inert by design, and is
+# meaningful on an rhs-less declaration — `@include mount(key::Symbol)`
+# declares a call form whose implementation the consumer mounts.
+# `@versioned` is DO's own but IS meaningful without an rhs (it declares a
+# fixed field to be a cache-version dimension), so it is absent here.
+const _RHS_ACTING_MARKERS = Set([
+    Symbol("@cached"), Symbol("@mmap"), Symbol("@fresh"),
+    Symbol("@dynamic_progress"), Symbol("@struct"), Symbol("@options"),
+])
+
 # `@doc "str" <def>` — silently consume (don't push to macros) and capture
 # the docstring. `length(arg.args) >= 4` matches Julia's lowered shape
 # (`(:macrocall, :@doc, LNN, "str", <def>)`); shorter forms fall back to
@@ -4760,7 +4775,13 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         if Meta.isexpr(arg, (:ref, :call))
             arg, indices... = arg.args
             indexed = true
-            union!(locals, extractnames(indices))
+            # `locals` is `nothing` until the `:(=)` branch above creates it, and
+            # an indexed declaration may legitimately have NO rhs — `foo(i)` on
+            # its own, which is what an indexed `@include` leaves behind once its
+            # (inert here) marker is peeled. There is no body to walk, so there
+            # is nothing to shadow. Same guard the `foo(i)::T` path below already
+            # carries; without it this unioned into `nothing`.
+            !isnothing(locals) && union!(locals, extractnames(indices))
         end
         name, ext_type = if Meta.isexpr(arg, :(::))
             arg.args[1], arg.args[2]
@@ -4823,10 +4844,16 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         metadata.doc[] = nothing
         !isnothing(locals) && push!(locals, name)
         !isnothing(locals) && push!(locals, :__status__)
-        # A fixed field (no rhs) may carry ONLY `@versioned` (the cache version
-        # dimension); every other marker (@cached/@mmap/@fresh/@dynamic_progress)
-        # acts on a computed property and is a mistake on a field.
-        @assert !isnothing(rhs) || issubset(macros, (Symbol("@versioned"),)) "fixed field `$name` may not carry markers other than @versioned (got $(sort!(string.(collect(macros)))))"
+        # No rhs → no body for a marker to act on. Reject DO's OWN rhs-acting
+        # markers, which would be silently inert (`_RHS_ACTING_MARKERS`), and
+        # let every other marker through: an unrecognised marker belongs to a
+        # downstream consumer and `@include mount(key::Symbol)` — a call form
+        # implemented elsewhere — is a legitimate declaration, not a field with
+        # a stray marker.
+        if isnothing(rhs)
+            inert = intersect(macros, _RHS_ACTING_MARKERS)
+            isempty(inert) || error("@dynamicstruct $type: `$name` has no right-hand side, so $(join(sort!(string.(collect(inert))), ", ")) has nothing to act on — the marker would be silently ignored. Give `$name` a body, or drop the marker.")
+        end
         push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices, indexed, cache_version, result_type=ext_type, doc))
     end
     # `properties` holds the per-declaration list (preserves order AND duplicate
@@ -6775,7 +6802,9 @@ function property_source_info(T::Type, prop::Symbol)
     signature = isempty(info.indices) ? string(info.lhs) :
                 string(info.lhs, "(", join(info.indices, ", "), ")")
     macros = isempty(info.macros) ? "" : join(string.(info.macros), " ") * " "
-    dependson = isempty(info.dependson) ? Symbol[] : sort!(collect(info.dependson))
+    # `nothing` (not an empty Set) for a declaration with no rhs — there was no
+    # body to walk. Renders the same as "depends on nothing".
+    dependson = isnothing(info.dependson) ? Symbol[] : sort!(collect(info.dependson))
     (; rhs_string, signature, macros, dependson)
 end
 
