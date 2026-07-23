@@ -41,13 +41,16 @@ end
 # Does `m` carry the `compute_property` signature emitted for `T`'s property `name`?
 #
 # `m.sig` is a `UnionAll`, not a `Tuple` DataType, for every method a PARAMETRIC
-# `@dynamicstruct` emits (they carry a `where` clause). Reading `.parameters` off a
-# `UnionAll` throws `type UnionAll has no field parameters` — and `methods()` is
-# GLOBAL, so this predicate sees every parametric struct any other test file in the
-# same process has defined. That is why the file passes in isolation and errored
-# only in the full suite, once `test/parametric_structs.jl` had loaded. Unwrap
-# first; a parametric signature's `parameters[2]` is then a typevar-carrying type
-# that simply fails `=== T`, which is the match behaviour we want.
+# `@dynamicstruct` emits — `compute_property(o::Foo{T}, ::Val{:x}) where T` — and a
+# `UnionAll` has no `.parameters` field at all, so reading it threw `type UnionAll
+# has no field parameters`. `methods()` is GLOBAL, so this predicate sees every
+# parametric struct any other test file in the same process has defined: the failure
+# depended on test scheduling, not on anything this file declares, which is why the
+# file passed 30/30 in isolation and errored 5/9 in the full suite once
+# `test/parametric_structs.jl` shared a worker with it.
+#
+# Unwrap first. A parametric signature's `parameters[2]` is then a typevar-carrying
+# type that simply fails `=== T`, which is the non-match we want.
 _cp_sig_matches(m, T, name::Symbol) = begin
     sig = Base.unwrap_unionall(m.sig)
     sig isa DataType && length(sig.parameters) >= 3 &&

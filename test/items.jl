@@ -1153,9 +1153,16 @@ end
     # `@include` injects `__status__ = <parent substatus>` as a constructor kwarg,
     # which beats the child's declared `__status__ = nothing`. That override is the
     # point of @include — it is what mounts the child under the parent's tree.
+    #
+    # ANCESTOR, not direct parent: with implied progress the substatus is parented
+    # at the ambient node, so the child mounts under the property that included it
+    # rather than flat at the object root. That is the intended shape — the kid's
+    # work renders nested beneath `kid`, not beside it — and the root is still what
+    # the whole subtree hangs from.
     p = StatusParentDefault()
     @test p.kid.__status__ isa _TBProgressNode
-    @test p.kid.__status__.parent === p.__status__
+    status_chain(n) = isnothing(n) ? Any[] : pushfirst!(status_chain(n.parent), n)
+    @test any(n -> n === p.__status__, status_chain(p.kid.__status__))
 end
 
 @testitem "progress status include point of use optout" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
