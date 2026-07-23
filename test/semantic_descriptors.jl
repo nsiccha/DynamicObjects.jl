@@ -5,7 +5,9 @@ using DynamicObjects
 export SemanticQuality, draft, final, SemanticDescriptorFixture,
     SemanticPendingFixture, ComputedVersionedSemanticDescriptorFixture,
     AutomaticSemanticContextFixture, GovernedMaterializationFixture,
-    GOVERNED_MATERIALIZATION_CALLS,
+    GOVERNED_MATERIALIZATION_CACHE_BASE,
+    GOVERNED_MATERIALIZATION_CALLS, GOVERNED_MMAP_CALLS,
+    GOVERNED_SERIAL_CALLS,
     LegacySemanticMeta, DeduplicatedKeyFixture
 
 @enum SemanticQuality draft final
@@ -20,16 +22,31 @@ export SemanticQuality, draft, final, SemanticDescriptorFixture,
 end
 
 const GOVERNED_MATERIALIZATION_CALLS = Threads.Atomic{Int}(0)
+const GOVERNED_MMAP_CALLS = Threads.Atomic{Int}(0)
+const GOVERNED_SERIAL_CALLS = Threads.Atomic{Int}(0)
+const GOVERNED_MATERIALIZATION_CACHE_BASE = Ref("cache")
 
 @dynamicstruct struct GovernedMaterializationFixture
     @versioned revision::Int
     value::Int
     request = nothing
+    __cache_base__ = GOVERNED_MATERIALIZATION_CACHE_BASE[]
+    __hold_recent_version__ = false
 
-    @cached compute(scale::Int) = begin
+    compute(scale::Int) = begin
         Threads.atomic_add!(GOVERNED_MATERIALIZATION_CALLS, 1)
         sleep(0.05)
         value * scale
+    end
+
+    large_array(scale::Int)::Vector{Float64} = begin
+        Threads.atomic_add!(GOVERNED_MMAP_CALLS, 1)
+        fill(Float64(value * scale), 1 + (1024 * 1024) ÷ sizeof(Float64))
+    end
+
+    large_text(scale::Int)::String = begin
+        Threads.atomic_add!(GOVERNED_SERIAL_CALLS, 1)
+        repeat(string(value * scale), 1 + 1024 * 1024)
     end
 end
 
@@ -178,7 +195,7 @@ legacy properties, including type-inferred input domains.
     legacy = property_descriptor(LegacySemanticMeta, :legacy)
     @test legacy.name === :legacy
     @test legacy.output.type === nothing
-    @test legacy.output.materialization.tier === :memory
+    @test legacy.output.materialization.tier === :automatic
     @test !legacy.semantics.versioned
     @test isempty(legacy.semantics.version_dependencies)
 end
@@ -227,7 +244,10 @@ directory. Identity/version and retention remain reflected in the lifecycle.
 """
 @testitem "governed materialization execution and GC" tags=[:semantic] setup=[SemanticFixtures] begin
     GOVERNED_MATERIALIZATION_CALLS[] = 0
+    GOVERNED_MMAP_CALLS[] = 0
+    GOVERNED_SERIAL_CALLS[] = 0
     cache_base = mktempdir()
+    GOVERNED_MATERIALIZATION_CACHE_BASE[] = cache_base
     context = (;
         scope=:job,
         key=(;mount="/study", job=:one),
@@ -235,9 +255,7 @@ directory. Identity/version and retention remain reflected in the lifecycle.
     )
 
     owned_path, owned_handle, owned_marker = let
-        retained = GovernedMaterializationFixture(1, 7;
-            __cache_base__=cache_base,
-            __hold_recent_version__=false)
+        retained = GovernedMaterializationFixture(1, 7)
         object = remount(retained; request=:current_request)
         path = object.__cache_path__
         @test !ispath(path)
@@ -260,7 +278,44 @@ directory. Identity/version and retention remain reflected in the lifecycle.
         @test ownership.active == 0
         @test ownership.reachable
         @test ownership.owned_paths == [abspath(path)]
-        @test isfile(joinpath(path, "compute_3.sjl"))
+        @test !isfile(joinpath(path, "compute_3.sjl"))
+        @test property_descriptor(
+            GovernedMaterializationFixture,
+            :compute).output.materialization.tier === :automatic
+        # Duration is the non-compilation portion of first-hit wall time. A
+        # trivial scalar must not become a disk entry just because Julia had to
+        # compile its property method on first use.
+        @test !isfile(DynamicObjects.get_cache_path(object, :compute, 3))
+        @test DynamicObjects._effective_compute_seconds(
+            41_500_000_000, 41_450_000_000) ≈ 0.05
+        @test DynamicObjects._effective_compute_seconds(1, 2) == 0.0
+
+        # No marker is needed for either disk format. The governed executor
+        # chooses mmap for a large isbits array and serialization for a large
+        # non-mmap value from their observed runtime values.
+        mapped = execute_materialization(context, object, :large_array, 2)
+        @test length(mapped) == 1 + (1024 * 1024) ÷ sizeof(Float64)
+        @test all(==(14.0), mapped)
+        mapped_path = DynamicObjects.get_cache_path(object, :large_array, 2)
+        @test isfile(mapped_path)
+        @test isfile(mapped_path * ".auto")
+        @test materialization_observation(
+            object, :large_array, 2).tier === :mmap
+
+        text = execute_materialization(context, object, :large_text, 2)
+        @test startswith(text, "14")
+        serialized_path = DynamicObjects.get_cache_path(object, :large_text, 2)
+        @test isfile(serialized_path)
+        @test isfile(serialized_path * ".auto")
+        @test materialization_observation(
+            object, :large_text, 2).tier === :serialized
+
+        clear_mem_caches!(object)
+        @test execute_materialization(
+            context, object, :large_array, 2) == mapped
+        @test execute_materialization(context, object, :large_text, 2) == text
+        @test GOVERNED_MMAP_CALLS[] == 1
+        @test GOVERNED_SERIAL_CALLS[] == 1
 
         wrong_context = merge(context, (;key=(;mount="/study", job=:other)))
         @test release_materialization!(wrong_context, retained;
@@ -286,10 +341,8 @@ directory. Identity/version and retention remain reflected in the lifecycle.
 
     # A new @versioned value gets a distinct governed path under the same
     # logical identity. Nothing is configured beyond the ordinary DO field.
-    v1 = GovernedMaterializationFixture(1, 9;
-        __cache_base__=cache_base, __hold_recent_version__=false)
-    v2 = GovernedMaterializationFixture(2, 9;
-        __cache_base__=cache_base, __hold_recent_version__=false)
+    v1 = GovernedMaterializationFixture(1, 9)
+    v2 = GovernedMaterializationFixture(2, 9)
     @test v1.__identity_hash__ == v2.__identity_hash__
     @test v1.__version_tag__ != v2.__version_tag__
     @test v1.__cache_path__ != v2.__cache_path__
@@ -302,8 +355,7 @@ directory. Identity/version and retention remain reflected in the lifecycle.
         retention=(;max_entries=1, ttl=60.0),
     )
     unowned_path, unowned_file, unowned_handle = let
-        object = GovernedMaterializationFixture(3, 11;
-            __cache_base__=cache_base, __hold_recent_version__=false)
+        object = GovernedMaterializationFixture(3, 11)
         path = object.__cache_path__
         mkpath(path)
         user_file = joinpath(path, "user-owned.txt")
@@ -357,7 +409,7 @@ then verifies that the same progress object remains visible through completion.
     mmap_after = materialization_observation(o, :matrix)
     @test mmap_after.ready
     @test mmap_after.stored
-    @test mmap_after.tier === :memory
+    @test mmap_after.tier === :mmap
 
     @test o.preview(4) == 8
     fresh = materialization_observation(o, :preview, 4)
