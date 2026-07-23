@@ -1554,3 +1554,135 @@ while the ordinary inline-struct form remains memoized.
     @test cached_err !== nothing
     @test occursin("@cached", sprint(showerror, cached_err))
 end
+
+# ── Ambient (annotation-free) progress ───────────────────────────────────────
+# An ordinary property/IP read performed inside another property's body mounts
+# its progress node under the caller's node, exactly as an explicit `@fetch!`
+# would — no `@progress`, no `@fetch!`, no threaded `__progress__` anywhere in
+# these fixtures. The docstrings only LABEL the nodes; a node is built either
+# way (`_default_substatus`), which is what keeps this distinct from the
+# docstring-triggered auto-progress stack that was reverted in 2026-05.
+@testmodule DOAmbientFixtures begin
+using DynamicObjects
+export AmbientLeaf, AmbientMid, AmbientTop, AmbientTwice, AmbientBoom,
+    ambient_descendants
+
+@dynamicstruct struct AmbientLeaf
+    n::Int
+    "Leaf work"
+    leafval() = 2n
+end
+
+@dynamicstruct struct AmbientMid
+    n::Int
+    @include leaf = AmbientLeaf(n)
+    "Mid work"
+    midval() = leaf.leafval() + 1
+end
+
+@dynamicstruct struct AmbientTop
+    n::Int
+    @include mid = AmbientMid(n)
+    "Top work"
+    topval() = mid.midval() + 100
+end
+
+# Two siblings reading the SAME nested IP on the SAME instance: the first
+# computes it, the second takes an in-memory hit and must still mount the
+# original node with its subtree intact.
+@dynamicstruct struct AmbientTwice
+    @include t = AmbientTop(5)
+    "First consumer"
+    first_use() = t.topval()
+    "Second consumer"
+    second_use() = t.topval()
+end
+
+@dynamicstruct struct AmbientBoom
+    "Boom leaf"
+    boomleaf() = error("nested boom")
+    "Boom top"
+    boomtop() = boomleaf()
+end
+
+function ambient_descendants(node, acc=String[])
+    for child in node.children
+        push!(acc, child.impl.description)
+        ambient_descendants(child, acc)
+    end
+    acc
+end
+end # @testmodule DOAmbientFixtures
+
+@testitem "ambient progress — nesting without annotations" tags=[:core] setup=[DOAmbientFixtures] begin
+    using DynamicObjects
+    const TBNode = DynamicObjects.Treebars.ProgressNode
+
+    # Outside any computation there is nothing to attach to.
+    @test ambient_progress() === nothing
+
+    o = AmbientTop(3)
+    @test o.topval() == 2 * 3 + 1 + 100
+    top = DynamicObjects.getstatus(o.topval)
+    @test top isa TBNode
+    @test top.impl.description == "Top work"
+    desc = ambient_descendants(top)
+    # Three levels deep, discovered purely from execution nesting.
+    @test "Mid work" in desc
+    @test "Leaf work" in desc
+
+    # The body sees itself as the ambient node while it runs, and the ambient
+    # node is restored afterwards.
+    @test ambient_progress() === nothing
+end
+
+@testitem "ambient progress — cache hit keeps the subtree" tags=[:core] setup=[DOAmbientFixtures] begin
+    using DynamicObjects
+
+    x = AmbientTwice()
+    @test x.first_use() == x.second_use()
+
+    second = ambient_descendants(DynamicObjects.getstatus(x.second_use))
+    # The hit mounts the ORIGINAL node, relabelled in place — not a childless
+    # "(cached)" stub, which is the collapsed-subtree bug this guards.
+    @test "Top work (cached)" in second
+    @test "Mid work" in second
+    @test "Leaf work" in second
+end
+
+@testitem "ambient progress — nested failure stays visible" tags=[:core] setup=[DOAmbientFixtures] begin
+    using DynamicObjects
+
+    b = AmbientBoom()
+    @test_throws DynamicObjects.PropertyComputationError b.boomtop()
+    node = DynamicObjects.getstatus(b.boomtop)
+    # A failed node is pinned rather than detached, so the tree still shows
+    # WHICH nested step failed.
+    @test "Boom leaf" in ambient_descendants(node)
+end
+
+@testitem "ambient progress — with_ambient_progress scoping" tags=[:core] setup=[DOAmbientFixtures] begin
+    using DynamicObjects
+    const TBNode = DynamicObjects.Treebars.ProgressNode
+
+    root = DynamicObjects.Treebars.initialize_progress!(:state; description="root")
+    @test ambient_progress() === nothing
+    inner = with_ambient_progress(root) do
+        ambient_progress()
+    end
+    @test inner === root
+    @test ambient_progress() === nothing
+
+    # `nothing` is transparent: a property with no substatus must not orphan its
+    # callees, so the current ambient node stays in place.
+    kept = with_ambient_progress(root) do
+        with_ambient_progress(nothing) do
+            ambient_progress()
+        end
+    end
+    @test kept === root
+
+    # Restored even when the body throws.
+    @test_throws ErrorException with_ambient_progress(() -> error("x"), root)
+    @test ambient_progress() === nothing
+end
