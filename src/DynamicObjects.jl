@@ -7534,7 +7534,7 @@ function _load_automatic_materialization!(owner, target, name, descriptor,
             load(Val(metadata.format), cache_path, nothing)
         catch e
             _drop_automatic_materialization!(cache_path)
-            @debug "Automatic materialization cache read failed; recomputing" cache_path exception=e
+            @warn "Automatic materialization cache read failed; deleting it and recomputing" cache_path exception=e
             return nothing
         end
         _set_automatic_materialization_cache!(
@@ -7570,8 +7570,9 @@ function _persist_automatic_materialization!(owner, target, name, descriptor,
         if existing !== nothing && get_cache_status(cache_path) === :ready
             stored = try
                 load(Val(existing.format), cache_path, nothing)
-            catch
+            catch e
                 _drop_automatic_materialization!(cache_path)
+                @warn "Automatic materialization cache read failed; deleting it and recomputing" cache_path exception=e
                 nothing
             end
             if stored !== nothing
@@ -7606,7 +7607,7 @@ function _persist_automatic_materialization!(owner, target, name, descriptor,
                 target, name, descriptor, args, kwargs)
         catch e
             _drop_automatic_materialization!(cache_path)
-            @debug "Automatic materialization persistence failed; keeping the computed value in memory" cache_path exception=e
+            @warn "Automatic materialization persistence failed; keeping the computed value in memory" cache_path exception=e
         end
         value
     end
