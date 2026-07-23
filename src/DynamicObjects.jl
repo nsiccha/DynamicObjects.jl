@@ -42,7 +42,7 @@ optionally disk-cached properties.
 - [`materialization_gc!`](@ref): Collect only unreachable, provider-released storage with proven ownership.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, remount, file_version, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, ambient_progress, with_ambient_progress, remake, remount, file_version, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending
 
 import SHA, Serialization, Mmap, Treebars
 
@@ -611,6 +611,84 @@ function _format_size(n::Integer)
     string(round(n / 1024^3, digits=1), " GB")
 end
 
+# ── Ambient (annotation-free) progress ───────────────────────────────────────
+#
+# `@fetch!` / `@progress` make a nested computation visible by threading the
+# CALLER's node lexically and calling `Treebars.add_child!(caller, callee)`. The
+# node itself was never the missing piece — every generated property already
+# builds its own substatus (`_bare_substatus_f` / `memoize!`'s `substatus_f`)
+# and registers it in `c.status`. Only the tree EDGE needed an annotation.
+#
+# So the edge is discovered at RUNTIME instead: while a property body runs, its
+# own node is the *ambient* node (set in `_run_cache_compute!`, the one place
+# every body executes); every ordinary property/IP read performed underneath it
+# mounts its node under that ambient node (in `get!`, the one place every node
+# is created or found). Nesting therefore follows actual execution, needing no
+# call-site annotation and no macro-time dependency enumeration.
+#
+# ⚠️ This is deliberately NOT the auto-progress stack that was reverted in
+# 2026-05 (see the DO primer, "Rules & invariants"). That one wrapped bodies
+# implicitly at MACRO time, keyed the wrap on the docstring, emitted a
+# `_dependencies` pre-enumeration, and stored the node in a persistent
+# `__status__::Treebars.ProgressNode` STRUCT FIELD — which moved struct shape
+# (fatal under Julia 1.10 + Revise) and put presentation metadata in charge of
+# execution semantics. Here: nothing is emitted, no body is rewritten, no
+# struct shape changes, and the docstring keeps its existing role — it labels a
+# node that is built either way (`_default_substatus`), it does not decide
+# whether one exists.
+#
+# Task-local, not global: concurrent requests each get their own stack, and a
+# `Threads.@spawn`ed compute starts with an empty TLS and installs its own node
+# (which is what we want — the spawned body is the callee). A body that spawns
+# its OWN tasks and reads properties inside them does not inherit the ambient
+# node; those reads stay unattached, exactly as they are today without a
+# hand-threaded `__progress__`.
+const _AMBIENT_PROGRESS_KEY = :__DynamicObjects_ambient_progress__
+
+"""
+    ambient_progress()
+
+The progress node ordinary property/indexed-property reads currently attach to,
+or `nothing` outside any instrumented computation. Set for the duration of a
+property body by [`with_ambient_progress`](@ref).
+"""
+ambient_progress() = get(task_local_storage(), _AMBIENT_PROGRESS_KEY, nothing)
+
+"""
+    with_ambient_progress(f, s)
+
+Run `f()` with `s` installed as the ambient progress node, restoring the
+previous node afterwards. `s === nothing` (a property with no substatus — a
+dunder, an indexed wrapper, or progress switched off) leaves the current
+ambient node in place, so such a property stays transparent and its callees
+attach to its own caller.
+"""
+with_ambient_progress(f, ::Nothing) = f()
+function with_ambient_progress(f, s)
+    tls = task_local_storage()
+    prev = get(tls, _AMBIENT_PROGRESS_KEY, nothing)
+    tls[_AMBIENT_PROGRESS_KEY] = s
+    try
+        f()
+    finally
+        tls[_AMBIENT_PROGRESS_KEY] = prev
+    end
+end
+
+# Mount `s` under the ambient node, mirroring `_attach_fetched!` on the explicit
+# `@fetch!` path — including the "(cached)" relabel for a documented in-memory
+# hit. Both `add_child!` (a `ThreadsafeSet` push) and `_mark_cached!` (an
+# `endswith` guard) are idempotent, so an explicitly threaded `@fetch!` inside a
+# `@progress` body — where the threaded node and the ambient node are the same
+# node — attaches once, not twice.
+function _attach_ambient!(ambient, s, hit::Bool)
+    ambient isa Treebars.ProgressNode || return nothing
+    hit && s isa Treebars.ProgressNode && !isempty(s.impl.description) &&
+        _mark_cached!(s)
+    Treebars.add_child!(ambient, s)
+    nothing
+end
+
 """
     PropertyCache{D}(cache)
 
@@ -906,6 +984,13 @@ end
 # `c.lock` would deadlock. So we fast-path first, then build `s` outside the lock and
 # re-take it to arbitrate; if we lose the arbitration we discard `s` via finalize.
 Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substatus=nothing, retry_failed=true) = begin
+    # This is the one place a property/IP progress node is created or found, so
+    # it is where an ordinary read mounts itself under the caller's node —
+    # `ambient_progress()` is the caller's node whenever we are running inside
+    # another property's body. Reading it costs one task-local lookup; when it is
+    # `nothing` (no instrumented computation in progress — the common case)
+    # `_attach_ambient!` is a typed no-op and every path below is unchanged.
+    ambient = ambient_progress()
     # Fast path: a ready value returns immediately, no substatus cost. (`_missing_sentinel`
     # distinguishes "absent" from a legitimately-cached `nothing`.)
     hit = lock(c.lock) do
@@ -913,7 +998,13 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
         v !== _missing_sentinel && (_on_hit!(c, key); return v)
         _missing_sentinel
     end
-    hit === _missing_sentinel || return hit
+    if hit !== _missing_sentinel
+        # In-memory hit: the node from the ORIGINAL compute is still in `c.status`
+        # with its finished subtree; mount it and let `_attach_ambient!` apply the
+        # same "(cached)" relabel the explicit `@fetch!` path applies.
+        isnothing(ambient) || _attach_ambient!(ambient, _peek_status(c, key), true)
+        return hit
+    end
     # Build the substatus OUTSIDE the lock — factories recurse into DO props on the SAME
     # lock, so building under it would deadlock.
     s = isnothing(substatus) ? nothing : substatus()
@@ -941,22 +1032,32 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
         return sync ? (:inline, cnd) : (:spawn, cnd)
     end
     kind = action[1]
-    kind === :value && (!isnothing(s) && _finalize_substatus!(s); return action[2])
+    # Every branch below mounts the EFFECTIVE node under the ambient one, and does
+    # so BEFORE it blocks, computes or spawns — a node attached only after the work
+    # finished would never be seen running, which is the whole point of the tree.
+    # On the four non-computing branches the winner owns the status, so the node to
+    # mount is `c.status[key]`, never the `s` we built and are about to discard.
+    kind === :value && (isnothing(ambient) || _attach_ambient!(ambient, _peek_status(c, key), true);
+                        !isnothing(s) && _finalize_substatus!(s); return action[2])
     if kind === :error
+        isnothing(ambient) || _attach_ambient!(ambient, _peek_status(c, key), false)
         !isnothing(s) && _finalize_substatus!(s)
         throw(action[2])
     end
     if kind === :wait
         # Blocking waiter: block on the in-flight computer's latch, then read value/error.
         # We built `s` but aren't the computer; finalize it (the winner owns the status).
+        isnothing(ambient) || _attach_ambient!(ambient, _peek_status(c, key), false)
         !isnothing(s) && _finalize_substatus!(s)
         return _await_cache_value!(c, key, action[2]::Threads.Condition, f; fetch, substatus, retry_failed)
     end
     if kind === :pending
         # Poller, compute already in flight elsewhere — hand back a cheap Pending, no spawn.
+        isnothing(ambient) || _attach_ambient!(ambient, _peek_status(c, key), false)
         !isnothing(s) && _finalize_substatus!(s)
         return fetch(Pending(c, key, nothing))
     end
+    isnothing(ambient) || _attach_ambient!(ambient, s, false)
     if kind === :inline
         # Blocking first-arriver: compute on THIS thread (no spawn), publish, return value.
         return _run_cache_compute!(c, key, action[2]::Threads.Condition, f, s)
@@ -967,6 +1068,12 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     cnd = action[2]::Threads.Condition
     Threads.@spawn try; _run_cache_compute!(c, key, cnd, f, s); catch; end  # error already recorded
     return fetch(Pending(c, key, nothing))
+end
+
+# Read the winning computer's node without racing the cache lock. Used only on
+# the ambient-attach paths, so it costs nothing when no progress is in flight.
+_peek_status(c::AbstractThreadsafeDict, key) = lock(c.lock) do
+    get(c.status, key, nothing)
 end
 
 # Singleton sentinel so a single `get` lookup distinguishes "key absent" from
@@ -984,7 +1091,12 @@ const _missing_sentinel = _Missing()
 function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condition, f, s)
     local v
     try
-        v = f(s)
+        # Every property/IP body runs through here — inline on the caller's task
+        # and inside the fire-and-forget spawn alike — so this is the one place
+        # that installs the body's own node as the ambient one. Ordinary reads in
+        # the body then mount themselves under `s` (see `get!`), which is what
+        # makes the tree build itself without a single call-site annotation.
+        v = with_ambient_progress(() -> f(s), s)
     catch e
         lock(c.lock) do
             get(c.computing, key, nothing) === cnd && delete!(c.computing, key)
@@ -1847,6 +1959,13 @@ function _peek_hit(c::AbstractThreadsafeDict, name::Symbol)
 end
 _peek_hit(c::AbstractDict, name::Symbol) = get(c, name, _missing_sentinel)
 
+# Bare-property counterpart to `_peek_status`, unwrapping the `PropertyCache`.
+# A `Dict`-backed (`:serial`) cache carries no status at all, hence the fallback.
+_peek_bare_status(pc::PropertyCache, name::Symbol) =
+    _peek_bare_status(getfield(pc, :cache), name)
+_peek_bare_status(c::AbstractThreadsafeDict, name::Symbol) = _peek_status(c, name)
+_peek_bare_status(::AbstractDict, ::Symbol) = nothing
+
 getorcomputeproperty(o, name, indices...; kwargs...) = if hasfield(typeof(o), name)
     @assert length(indices) == length(kwargs) == 0
     getfield(o, name)
@@ -1869,7 +1988,17 @@ else
     # directly is behaviourally identical to routing through `get!`. Only misses
     # pay the closures.
     hit = _peek_hit(cache, name)
-    hit === _missing_sentinel || return hit
+    if hit !== _missing_sentinel
+        # This path deliberately skips `get!`, so it has to do `get!`'s ambient
+        # attach itself — otherwise a warm property read inside another body would
+        # silently drop out of the tree the first time it is re-read, and the
+        # subtree it already computed would disappear along with it. Only pays the
+        # lookup when a computation is actually being instrumented.
+        ambient = ambient_progress()
+        isnothing(ambient) ||
+            _attach_ambient!(ambient, _peek_bare_status(cache, name), true)
+        return hit
+    end
     substatus_f = _bare_substatus_f(o, name)
     get!(cache, name; substatus=substatus_f) do s
         # When called with no indices on an indexed property (declared with
