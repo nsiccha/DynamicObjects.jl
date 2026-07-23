@@ -7739,11 +7739,784 @@ function materialization_ownership(context::NamedTuple, root)
     end
 end
 
+# --- tracked primitives -------------------------------------------------------
+#
+# A changeable value needs no annotation at its declaration site. It is an
+# ordinary property whose VALUE is one of the types below, each of which owns
+# its lock, its version and its observer list. A Base-style mutation or an
+# observed filesystem change bumps the version; [`sync!`](@ref) turns a version
+# change into cache invalidation for the transitive closure of properties that
+# read it.
+#
+# Why version-and-sync rather than pushing invalidation from the mutation site.
+# A tracked value does not know which objects hold it — the same
+# `ThreadSafeDict` is reachable from a store and from every node that
+# destructured it — and a filesystem change has no mutation site at all. One
+# integer compared per tracked value at a request boundary treats an external
+# change and a local `setindex!` identically, costs nothing on the property
+# hot path, and needs no bookkeeping at read time. `on_change!` is there for a
+# host that also wants a push signal.
+#
+# This is DO's first in-place invalidation: `remake`/`remount` build a NEW
+# object and carry over the entries a field change provably cannot affect.
+# `sync!` is the mirror image — the object stays, and the entries a tracked
+# value provably CAN affect are dropped.
+
+mutable struct _TrackedState
+    lock::ReentrantLock
+    version::UInt64
+    observers::Vector{Any}
+end
+_TrackedState() = _TrackedState(ReentrantLock(), UInt64(1), Any[])
+
+# Bump under the lock, notify outside it: an observer that reads the value it
+# was notified about must not deadlock against the writer, and one that throws
+# must not leave the version unbumped — the change already happened.
+function _bump!(state::_TrackedState)
+    version, observers = lock(state.lock) do
+        state.version += UInt64(1)
+        state.version, copy(state.observers)
+    end
+    for observer in observers
+        try
+            observer()
+        catch err
+            @warn "tracked-value observer threw; the change already happened" exception=(err, catch_backtrace())
+        end
+    end
+    version
+end
+
+"""    tracked_version(x) -> Union{UInt64,Nothing}
+
+Observable version of `x`, or `nothing` for a value that is not tracked.
+
+Monotone: any Base-style mutation of a tracked container, or any observed
+change to a tracked path, produces a strictly greater number. Equal versions
+mean "nothing has changed that this value can see"; they carry no other
+information, and the number itself is not comparable across values.
+
+For [`TrackedFile`](@ref) / [`TrackedDirectory`](@ref) this call POLLS the
+filesystem, which is what makes an external change observable without a
+watcher. For the in-memory containers it is a lock and a field read.
+
+The `nothing` fallback is what makes tracking extensible: [`sync!`](@ref)
+treats anything answering non-`nothing` as tracked, so another package can
+opt its own type in by adding a method.
+"""
+tracked_version(::Any) = nothing
+
+"""    on_change!(f, tracked) -> f
+
+Register a zero-argument `f` to run after `tracked` changes.
+
+Called outside the value's lock, so `f` may read the value it was notified
+about. A throwing `f` is logged and skipped — the change has already
+happened, and one bad observer must not take down the writer. Observers are
+never removed; register them once, at wiring time.
+
+The push counterpart to [`sync!`](@ref)'s poll. Neither is required for the
+other: a host may poll, may observe, or may do both.
+"""
+function on_change!(f, tracked)
+    state = _tracked_state(tracked)
+    lock(state.lock) do
+        push!(state.observers, f)
+    end
+    f
+end
+
+"""    notify_change!(tracked) -> UInt64
+
+Bump `tracked`'s version and run its observers, returning the new version.
+
+Called for you by every mutating Base method. Call it directly only after
+changing something the container cannot see for itself — mutating a value
+already stored in it, for instance.
+"""
+notify_change!(tracked) = _bump!(_tracked_state(tracked))
+
+"""
+    ThreadSafeDict{K,V}(pairs...)
+
+A `Dict` that is safe to share between tasks and reports a version.
+
+Every operation takes the dict's own lock, and every mutation that actually
+changes something bumps [`tracked_version`](@ref) — a `delete!` of an absent
+key and a `get!` that hits do not, so a version change always means the
+contents differ.
+
+`get!(f, dict, key)` holds the lock across `f`, which is what makes
+check-and-insert atomic: two tasks racing to create the same entry both
+observe the same winner, and the loser can detect that it lost by identity.
+Keep `f` short — it is running under the lock.
+
+`keys`, `values` and iteration return a snapshot taken under the lock, so a
+sweep never observes a torn view and never blocks a writer for its duration.
+The snapshot is a plain `Vector`, not a lazy view.
+"""
+struct ThreadSafeDict{K,V} <: AbstractDict{K,V}
+    state::_TrackedState
+    entries::Dict{K,V}
+    ThreadSafeDict{K,V}(entries) where {K,V} = new{K,V}(_TrackedState(), Dict{K,V}(entries))
+    ThreadSafeDict{K,V}() where {K,V} = new{K,V}(_TrackedState(), Dict{K,V}())
+end
+ThreadSafeDict{K,V}(pairs::Pair...) where {K,V} = ThreadSafeDict{K,V}(pairs)
+ThreadSafeDict() = ThreadSafeDict{Any,Any}()
+function ThreadSafeDict(pairs::Pair...)
+    entries = Dict(pairs...)
+    ThreadSafeDict{keytype(entries),valtype(entries)}(entries)
+end
+
+"""
+    ProviderRoots()
+
+The retained roots a provider is holding, keyed by id.
+
+A `ThreadSafeDict{String,Any}` in every respect, plus the one fact that makes
+a root a root: who retained it. `retain!` records the provider, `release!`
+drops everything one provider holds, and `delete!` releases a single id.
+Entries are held STRONGLY — that is the point of a root — so an id that is
+never released is a leak, exactly as intended.
+
+DO attaches no policy: which objects deserve retaining, when they are
+released, and what a provider means are the application's.
+"""
+struct ProviderRoots <: AbstractDict{String,Any}
+    state::_TrackedState
+    entries::Dict{String,Any}
+    providers::Dict{String,Symbol}
+    ProviderRoots() = new(_TrackedState(), Dict{String,Any}(), Dict{String,Symbol}())
+end
+
+"""
+    TrackedFile(path; read=Base.read, version=:mtime)
+
+One file, observed rather than re-read.
+
+`read(file)` returns `read(path)`'s result, memoized until the file changes;
+pass `read=TOML.parsefile` (or any `path -> value`) to track parsed content
+instead of bytes. `version` selects the change probe — `:mtime` (cheap,
+coarse), `:hash` (exact, reads the file) or `:git` — and is passed straight to
+[`file_version`](@ref).
+
+A missing file is not an error: it stamps as `""`, so a path that does not
+exist yet has a stable version and starts producing changes the moment it
+appears. `read` on a missing file throws, as `Base.read` would.
+
+There is no watcher. The probe runs when someone asks for the version or the
+content, which is what "poll on access" means here.
+"""
+mutable struct TrackedFile
+    state::_TrackedState
+    path::String
+    reader::Any
+    probe::Symbol
+    stamp::String
+    value::Any
+    has_value::Bool
+end
+function TrackedFile(path::AbstractString; read=Base.read, version::Symbol=:mtime)
+    version in (:mtime, :hash, :git) ||
+        error("TrackedFile: unknown version probe `$version` — use :mtime, :hash or :git.")
+    TrackedFile(_TrackedState(), String(path), read, version, "", nothing, false)
+end
+
+"""
+    TrackedDirectory(path; match=Returns(true), key=path -> Symbol(basename(path)),
+                     read=identity, version=:mtime)
+
+The files of one directory, as an `AbstractDict` that observes both
+membership and content.
+
+Directory membership and every matched file's version are ONE observed
+version: a file appearing, disappearing or changing all move
+[`tracked_version`](@ref) by the same mechanism, so a consumer cannot see a
+listing that disagrees with the contents.
+
+`match` filters absolute paths, `key` names each file (the key is derived from
+the path, so a file cannot disagree with itself about what it is called), and
+`read` turns a path into the value — the default `identity` yields the path,
+so a directory of things you will open yourself needs no reader. Values are
+memoized per file and dropped only for files that actually changed.
+
+A missing directory is empty, not an error, and starts producing entries when
+it appears. Keys iterate in sorted path order, so a sweep is reproducible.
+"""
+mutable struct TrackedDirectory <: AbstractDict{Any,Any}
+    state::_TrackedState
+    path::String
+    match::Any
+    key::Any
+    reader::Any
+    probe::Symbol
+    stamps::Dict{String,String}
+    order::Vector{Any}
+    paths::Dict{Any,String}
+    values::Dict{Any,Any}
+end
+function TrackedDirectory(path::AbstractString;
+        match=Returns(true), key=path -> Symbol(basename(path)),
+        read=identity, version::Symbol=:mtime)
+    version in (:mtime, :hash, :git) ||
+        error("TrackedDirectory: unknown version probe `$version` — use :mtime, :hash or :git.")
+    TrackedDirectory(_TrackedState(), String(path), match, key, read, version,
+        Dict{String,String}(), Any[], Dict{Any,String}(), Dict{Any,Any}())
+end
+
+const TrackedValue = Union{ThreadSafeDict,ProviderRoots,TrackedFile,TrackedDirectory}
+
+_tracked_state(t::TrackedValue) = t.state
+
+# Poll the outside world. In-memory containers already know when they changed.
+_poll!(::Union{ThreadSafeDict,ProviderRoots}) = nothing
+
+function _poll!(f::TrackedFile)
+    stamp = file_version(f.path; by=f.probe)
+    changed = lock(f.state.lock) do
+        stamp == f.stamp && return false
+        f.stamp = stamp
+        f.value = nothing
+        f.has_value = false
+        true
+    end
+    changed && _bump!(f.state)
+    nothing
+end
+
+function _poll!(d::TrackedDirectory)
+    entries = isdir(d.path) ? sort!(readdir(d.path; join=true)) : String[]
+    matched = filter(d.match, entries)
+    stamps = Dict{String,String}(path => file_version(path; by=d.probe) for path in matched)
+    changed = lock(d.state.lock) do
+        stamps == d.stamps && return false
+        # Keep the memoized value of every file that did not change; drop only
+        # the ones that did, and the ones that are gone.
+        for (key, path) in d.paths
+            get(stamps, path, nothing) == get(d.stamps, path, nothing) || delete!(d.values, key)
+        end
+        d.stamps = stamps
+        d.order = Any[d.key(path) for path in matched]
+        keep = Set{Any}(d.order)
+        d.paths = Dict{Any,String}(d.key(path) => path for path in matched)
+        for key in collect(keys(d.values))
+            key in keep || delete!(d.values, key)
+        end
+        true
+    end
+    changed && _bump!(d.state)
+    nothing
+end
+
+tracked_version(t::TrackedValue) = (_poll!(t); lock(t.state.lock) do; t.state.version; end)
+
+"""    tracked_path(tracked) -> String
+
+The filesystem path a [`TrackedFile`](@ref) or [`TrackedDirectory`](@ref)
+observes. Fixed for the lifetime of the value: a different path is a different
+tracked value, not a mutation of this one.
+"""
+tracked_path(t::Union{TrackedFile,TrackedDirectory}) = t.path
+
+# --- ThreadSafeDict / ProviderRoots Base interface ---------------------------
+#
+# One lock per operation; snapshots for anything that sweeps. `_entries` and
+# `_state` let the two containers share every method.
+
+_entries(d::ThreadSafeDict) = d.entries
+_entries(r::ProviderRoots) = r.entries
+const _LockedDict = Union{ThreadSafeDict,ProviderRoots}
+
+Base.length(d::_LockedDict) = lock(d.state.lock) do; length(_entries(d)); end
+Base.isempty(d::_LockedDict) = lock(d.state.lock) do; isempty(_entries(d)); end
+Base.haskey(d::_LockedDict, key) = lock(d.state.lock) do; haskey(_entries(d), key); end
+Base.getindex(d::_LockedDict, key) = lock(d.state.lock) do; _entries(d)[key]; end
+Base.get(d::_LockedDict, key, default) = lock(d.state.lock) do; get(_entries(d), key, default); end
+Base.get(f::Function, d::_LockedDict, key) = lock(d.state.lock) do; get(f, _entries(d), key); end
+Base.keys(d::_LockedDict) = lock(d.state.lock) do; collect(keys(_entries(d))); end
+Base.values(d::_LockedDict) = lock(d.state.lock) do; collect(values(_entries(d))); end
+_snapshot(d::_LockedDict) = lock(d.state.lock) do; collect(pairs(_entries(d))); end
+
+function Base.setindex!(d::_LockedDict, value, key)
+    changed = lock(d.state.lock) do
+        entries = _entries(d)
+        # An identical re-assignment is not a change: a version bump would
+        # invalidate every dependent for nothing.
+        haskey(entries, key) && entries[key] === value && return false
+        entries[key] = value
+        d isa ProviderRoots && get!(d.providers, key, :default)
+        true
+    end
+    changed && _bump!(d.state)
+    d
+end
+
+# The lock is held across `f` — that is what makes check-and-insert atomic.
+function Base.get!(f::Function, d::_LockedDict, key)
+    inserted = false
+    value = lock(d.state.lock) do
+        entries = _entries(d)
+        haskey(entries, key) && return entries[key]
+        inserted = true
+        v = f()
+        entries[key] = v
+        d isa ProviderRoots && get!(d.providers, key, :default)
+        v
+    end
+    inserted && _bump!(d.state)
+    value
+end
+Base.get!(d::_LockedDict, key, default) = get!(() -> default, d, key)
+
+function Base.delete!(d::_LockedDict, key)
+    deleted = lock(d.state.lock) do
+        entries = _entries(d)
+        haskey(entries, key) || return false
+        delete!(entries, key)
+        d isa ProviderRoots && delete!(d.providers, key)
+        true
+    end
+    deleted && _bump!(d.state)
+    d
+end
+
+function Base.pop!(d::_LockedDict, key, default)
+    found = Ref(false)
+    value = lock(d.state.lock) do
+        entries = _entries(d)
+        haskey(entries, key) || return default
+        found[] = true
+        v = pop!(entries, key)
+        d isa ProviderRoots && delete!(d.providers, key)
+        v
+    end
+    found[] && _bump!(d.state)
+    value
+end
+function Base.pop!(d::_LockedDict, key)
+    sentinel = Ref{Any}()
+    value = pop!(d, key, sentinel)
+    value === sentinel && throw(KeyError(key))
+    value
+end
+
+function Base.empty!(d::_LockedDict)
+    emptied = lock(d.state.lock) do
+        entries = _entries(d)
+        isempty(entries) && return false
+        empty!(entries)
+        d isa ProviderRoots && empty!(d.providers)
+        true
+    end
+    emptied && _bump!(d.state)
+    d
+end
+
+# Iteration walks a snapshot taken once, so a concurrent mutation can neither
+# tear the sweep nor be blocked by it. The snapshot travels in the state.
+function Base.iterate(d::_LockedDict)
+    snapshot = _snapshot(d)
+    result = iterate(snapshot)
+    result === nothing && return nothing
+    item, state = result
+    item, (snapshot, state)
+end
+function Base.iterate(::_LockedDict, state::Tuple{Vector,Any})
+    snapshot, inner = state
+    result = iterate(snapshot, inner)
+    result === nothing && return nothing
+    item, next = result
+    item, (snapshot, next)
+end
+
+Base.show(io::IO, d::ThreadSafeDict{K,V}) where {K,V} =
+    print(io, "ThreadSafeDict{", K, ",", V, "}(", length(d), " entries, v", tracked_version(d), ")")
+Base.show(io::IO, ::MIME"text/plain", d::ThreadSafeDict) = show(io, d)
+Base.show(io::IO, r::ProviderRoots) =
+    print(io, "ProviderRoots(", length(r), " retained, v", tracked_version(r), ")")
+Base.show(io::IO, ::MIME"text/plain", r::ProviderRoots) = show(io, r)
+
+"""    retain!(roots::ProviderRoots, id::AbstractString, root; provider::Symbol=:default) -> root
+
+Retain `root` under `id` on behalf of `provider`.
+
+Replacing an existing id re-retains it under the new provider. The returned
+value is `root`, so a retain reads as part of the expression that produced it.
+"""
+function retain!(roots::ProviderRoots, id::AbstractString, root; provider::Symbol=:default)
+    key = String(id)
+    changed = lock(roots.state.lock) do
+        same = get(roots.entries, key, nothing) === root &&
+               get(roots.providers, key, nothing) === provider
+        same && return false
+        roots.entries[key] = root
+        roots.providers[key] = provider
+        true
+    end
+    changed && _bump!(roots.state)
+    root
+end
+
+"""    release!(roots::ProviderRoots; provider::Symbol) -> Vector{String}
+
+Release every root `provider` retained, returning the ids dropped (sorted).
+
+One bump for the whole release, not one per id: a provider going away is a
+single change to everyone downstream.
+"""
+function release!(roots::ProviderRoots; provider::Symbol)
+    released = lock(roots.state.lock) do
+        ids = sort!([id for (id, owner) in roots.providers if owner === provider])
+        for id in ids
+            delete!(roots.entries, id)
+            delete!(roots.providers, id)
+        end
+        ids
+    end
+    isempty(released) || _bump!(roots.state)
+    released
+end
+
+"""    provider_of(roots::ProviderRoots, id) -> Union{Symbol,Nothing}
+
+Which provider retained `id`, or `nothing` if nobody has.
+"""
+provider_of(roots::ProviderRoots, id) =
+    lock(roots.state.lock) do; get(roots.providers, String(id), nothing); end
+
+"""    retained_providers(roots::ProviderRoots) -> Vector{Symbol}
+
+Every provider currently holding at least one root, sorted.
+"""
+retained_providers(roots::ProviderRoots) =
+    lock(roots.state.lock) do; sort!(unique(values(roots.providers))); end
+
+# --- TrackedFile / TrackedDirectory Base interface ----------------------------
+
+"""    read(file::TrackedFile)
+
+The file's content through its reader, memoized until the file changes.
+
+Polls first, so a change made since the last read is picked up here rather
+than at some later boundary.
+"""
+function Base.read(f::TrackedFile)
+    _poll!(f)
+    lock(f.state.lock) do
+        f.has_value && return f.value
+        # Under the lock: two tasks must not both run the reader and disagree
+        # about which result is the memoized one.
+        f.value = f.reader(f.path)
+        f.has_value = true
+        f.value
+    end
+end
+Base.stat(f::TrackedFile) = stat(f.path)
+Base.isfile(f::TrackedFile) = isfile(f.path)
+Base.ispath(f::TrackedFile) = ispath(f.path)
+Base.show(io::IO, f::TrackedFile) =
+    print(io, "TrackedFile(", repr(f.path), "; version=", repr(f.probe), ")")
+Base.show(io::IO, ::MIME"text/plain", f::TrackedFile) = show(io, f)
+
+Base.length(d::TrackedDirectory) = (_poll!(d); lock(d.state.lock) do; length(d.order); end)
+Base.isempty(d::TrackedDirectory) = length(d) == 0
+Base.keys(d::TrackedDirectory) = (_poll!(d); lock(d.state.lock) do
+    # `identity.` narrows the element type, so `collect(keys(dir))` yields the
+    # `Vector{Symbol}` the key function actually produced rather than `Any`.
+    identity.(d.order)
+end)
+Base.haskey(d::TrackedDirectory, key) = (_poll!(d); lock(d.state.lock) do; haskey(d.paths, key); end)
+Base.stat(d::TrackedDirectory) = stat(d.path)
+Base.isdir(d::TrackedDirectory) = isdir(d.path)
+
+function Base.getindex(d::TrackedDirectory, key)
+    _poll!(d)
+    lock(d.state.lock) do
+        haskey(d.values, key) && return d.values[key]
+        haskey(d.paths, key) || throw(KeyError(key))
+        d.values[key] = d.reader(d.paths[key])
+    end
+end
+Base.get(d::TrackedDirectory, key, default) = haskey(d, key) ? d[key] : default
+Base.values(d::TrackedDirectory) = [d[key] for key in keys(d)]
+
+"""    tracked_paths(dir::TrackedDirectory) -> Dict
+
+Each key's path, for a consumer that needs the file rather than its content.
+"""
+tracked_paths(d::TrackedDirectory) = (_poll!(d); lock(d.state.lock) do; copy(d.paths); end)
+
+# Sorted-key snapshot, then read per key — so a file appearing mid-sweep does
+# not change what this sweep yields.
+function Base.iterate(d::TrackedDirectory)
+    snapshot = keys(d)
+    isempty(snapshot) && return nothing
+    (snapshot[1] => d[snapshot[1]]), (snapshot, 2)
+end
+function Base.iterate(d::TrackedDirectory, state::Tuple{Vector,Int})
+    snapshot, i = state
+    i > length(snapshot) && return nothing
+    (snapshot[i] => d[snapshot[i]]), (snapshot, i + 1)
+end
+
+Base.show(io::IO, d::TrackedDirectory) =
+    print(io, "TrackedDirectory(", repr(d.path), "; version=", repr(d.probe), ")")
+Base.show(io::IO, ::MIME"text/plain", d::TrackedDirectory) = show(io, d)
+
+# --- downstream invalidation --------------------------------------------------
+
+# Transitive dependents, inverted from `meta(T)`'s `dependson` and memoized
+# per type — the graph is a property of the type, not of any object.
+const _DEPENDENTS_LOCK = ReentrantLock()
+const _DEPENDENTS = Dict{Type,Dict{Symbol,Vector{Symbol}}}()
+
+function _dependents_map(T::Type)
+    lock(_DEPENDENTS_LOCK) do
+        get!(_DEPENDENTS, T) do
+            direct = Dict{Symbol,Set{Symbol}}()
+            for (name, info) in meta(T)
+                deps = get(info, :dependson, nothing)
+                deps === nothing && continue
+                for dep in deps
+                    push!(get!(() -> Set{Symbol}(), direct, dep), name)
+                end
+            end
+            transitive = Dict{Symbol,Vector{Symbol}}()
+            for source in keys(direct)
+                seen = Set{Symbol}()
+                stack = Symbol[source]
+                while !isempty(stack)
+                    current = pop!(stack)
+                    for dependent in get(direct, current, ())
+                        dependent in seen && continue
+                        push!(seen, dependent)
+                        push!(stack, dependent)
+                    end
+                end
+                transitive[source] = sort!(collect(seen))
+            end
+            transitive
+        end
+    end
+end
+
+"""    dependents(T::Type, name::Symbol) -> Vector{Symbol}
+
+Every property of `T` whose value can change when `name`'s does, transitively.
+
+The inverse of the `dependson` walk the macro already runs, so it is exact for
+ordinary sibling reads and knows nothing about a value obtained some other way
+(through a global, or off an object DO did not build). Sorted, and excludes
+`name` itself.
+"""
+dependents(T::Type, name::Symbol) = get(_dependents_map(T), name, Symbol[])
+
+_property_cache(o) = getfield(o, :cache).cache
+
+"""    invalidate!(o, name::Symbol; self=false) -> Vector{Symbol}
+
+Drop the cached values of every property of `o` that depends on `name`,
+returning the names actually dropped (sorted).
+
+`self=true` drops `name`'s own cached value too. The default is `false`
+because the case this exists for is a tracked value that mutated IN PLACE:
+the property still holds the same container, and only what was derived from
+it is stale.
+
+Indexed properties are not reached — their per-argument caches live in an
+`IndexableProperty`, not in the object's `PropertyCache`.
+"""
+function invalidate!(o, name::Symbol; self::Bool=false)
+    cache = _property_cache(o)
+    targets = dependents(typeof(o), name)
+    self && (targets = sort!(vcat(targets, name)))
+    dropped = Symbol[]
+    for target in targets
+        haskey(cache, target) || continue
+        delete!(cache, target)
+        push!(dropped, target)
+    end
+    if !isempty(dropped)
+        _cache_generation(o)[] += UInt64(1)
+        # A dropped property's next value is a different incarnation — new
+        # child objects, each with its own version — so any [`sync!`](@ref)
+        # stamp taken from the old one is meaningless. Forget it, and the next
+        # sync re-baselines instead of reporting a change that already
+        # happened.
+        stamps = _tracked_stamps(o)
+        for name in dropped
+            delete!(stamps, name)
+        end
+    end
+    dropped
+end
+
+# Per-object record of the version each tracked value had when we last looked.
+#
+# Anchored on a MUTABLE object reachable from `o`'s cache, because a DO object
+# is an immutable struct and therefore cannot be weakly referenced or
+# finalized — `WeakKeyDict` rejects it outright. The anchor is per-object,
+# lives exactly as long as the cache does, and takes the stamps with it when
+# it dies. Keying on the cache also gives the right answer for `remake`: a new
+# object gets a new cache, hence new stamps, hence recomputes rather than
+# inheriting a stale "already seen this version".
+const _TRACKED_STAMPS_LOCK = ReentrantLock()
+const _TRACKED_STAMPS = WeakKeyDict{Any,Dict{Symbol,UInt64}}()
+const _CACHE_GENERATIONS = WeakKeyDict{Any,Base.RefValue{UInt64}}()
+
+_stamp_anchor(cache::AbstractThreadsafeDict) = cache.lock
+_stamp_anchor(cache::AbstractDict) = cache
+
+_tracked_stamps(o) = lock(_TRACKED_STAMPS_LOCK) do
+    get!(() -> Dict{Symbol,UInt64}(), _TRACKED_STAMPS, _stamp_anchor(_property_cache(o)))
+end
+
+_cache_generation(o) = lock(_TRACKED_STAMPS_LOCK) do
+    get!(() -> Ref(UInt64(1)), _CACHE_GENERATIONS, _stamp_anchor(_property_cache(o)))
+end
+
+"""    object_version(o) -> UInt64
+
+How many times anything has been invalidated on `o`, as a monotone number.
+
+The aggregate a holder watches: an object is stale to whoever derived from it
+exactly when this moves, and [`invalidate!`](@ref) is the only thing that
+moves it. That makes a DO object observable on the same terms as a tracked
+value — [`sync!`](@ref) compares it per holder, so an object shared by several
+parents reports the change to each of them once, whenever each looks.
+
+Only about this object's own cache; a change inside a child moves the child's
+number, and this one only if something here was dropped as a result.
+"""
+object_version(o) = _cache_generation(o)[]
+
+# A DO object is exactly one that carries a `PropertyCache` — cheaper to ask
+# than `hasmethod(meta, …)`, and it is the field `sync!` needs anyway.
+_type_is_dynamic(T::Type) = hasfield(T, :cache) && fieldtype(T, :cache) <: PropertyCache
+_is_dynamic(x) = _type_is_dynamic(typeof(x))
+
+# Worth descending into a container? Only if its elements could be DO objects.
+# A concrete non-DO eltype (`Vector{Float64}`, `Vector{String}`) is skipped
+# without touching an element.
+_may_hold_dynamic(::Type{T}) where {T} = !isconcretetype(T) || _type_is_dynamic(T)
+
+# Sync everything below `value` and fold the children's [`object_version`](@ref)
+# into one number, or `nothing` when there is nothing dynamic down there.
+# Returning a VERSION rather than "did it drop" is what makes a shared child
+# correct: the drop happens once, but each holder compares against its own
+# stamp and so learns about it exactly once, whenever it next looks.
+function _below_version(value, visited)
+    _is_dynamic(value) || return nothing
+    _sync!(value, visited)
+    object_version(value)
+end
+function _below_version(value::Union{AbstractArray,Tuple}, visited)
+    _may_hold_dynamic(eltype(value)) || return nothing
+    folded = nothing
+    for element in value
+        below = _below_version(element, visited)
+        below === nothing && continue
+        folded = hash(below, folded === nothing ? UInt64(0) : folded)
+    end
+    folded
+end
+function _below_version(value::AbstractDict, visited)
+    value isa TrackedValue && return nothing
+    _may_hold_dynamic(valtype(value)) || return nothing
+    _below_version(collect(values(value)), visited)
+end
+
+"""    sync!(o) -> Vector{Symbol}
+
+Bring `o`'s cache up to date with its tracked values, returning the property
+names dropped from `o` (sorted).
+
+For every already-computed property of `o` whose value answers
+[`tracked_version`](@ref), compare that version with the one seen last time.
+Where it moved — a `setindex!` on a `ThreadSafeDict`, a file rewritten under a
+[`TrackedFile`](@ref), a file added to a [`TrackedDirectory`](@ref) — drop the
+transitive dependents of that property. The tracked value itself is kept: it
+is the same container, and it is the thing that observed the change.
+
+Child objects are synced by the same rule, one level of indirection out. A
+property holding a DO object (or an array, tuple or dict of them) is synced
+first, and if anything dropped inside it, that property counts as changed and
+`o`'s dependents of it are dropped. So a file appearing under a nested store
+invalidates the store's derived properties, which invalidates whatever the
+root derived from the store, with no annotation anywhere and no knowledge of
+what the objects mean. A child that reports no drops changes nothing in its
+parent — nothing there was stale.
+
+Each object is synced once per call even when several parents hold it, and the
+result is reused, so a shared store gives every holder the same answer.
+Reference cycles (`__parent__` back-references, which are not followed) and
+diamonds terminate.
+
+Call it where a host decides what to serve — once per request or per render.
+It computes nothing: only already-cached properties are examined, so the walk
+covers the live object graph rather than the possible one, and its cost is a
+version probe per tracked value.
+
+The first call on an object records versions without dropping anything: there
+is no "before" to compare against.
+"""
+sync!(o) = _sync!(o, IdDict{Any,Vector{Symbol}}())
+
+function _sync!(o, visited)
+    cache = _property_cache(o)
+    anchor = _stamp_anchor(cache)
+    # Also the cycle guard: an object still being synced reports no drops, so
+    # a `__parent__`-style loop terminates instead of recursing forever.
+    haskey(visited, anchor) && return visited[anchor]
+    visited[anchor] = Symbol[]
+    dropped = Set{Symbol}()
+    # Fixed fields as well as cached properties: a child object arrives through
+    # the constructor as often as it is computed (`Dataset(; store, key)`), and
+    # a field is just as able to hold a tracked value. A field can never be
+    # dropped — it is immutable — but what was derived FROM it can.
+    names = sort!(collect(union(
+        Symbol[field for field in fieldnames(typeof(o)) if field !== :cache],
+        keys(cache),
+    )))
+    lock(_TRACKED_STAMPS_LOCK) do
+        stamps = _tracked_stamps(o)
+        for name in names
+            value = try
+                getproperty(o, name)
+            catch
+                # A property cached as an error, or one whose access needs
+                # arguments: it holds nothing we can probe.
+                continue
+            end
+            version = tracked_version(value)
+            if version === nothing
+                # Not a tracked value: it may still HOLD one, one level out.
+                # `__parent__`/`__self__` are back-references — following them
+                # would sync the whole application from any node.
+                (name === :__parent__ || name === :__self__) && continue
+                version = _below_version(value, visited)
+                version === nothing && continue
+            end
+            previous = get(stamps, name, nothing)
+            stamps[name] = version
+            (previous === nothing || previous == version) && continue
+            union!(dropped, invalidate!(o, name))
+        end
+    end
+    result = sort!(collect(dropped))
+    visited[anchor] = result
+    result
+end
+
 export print_structure, structure
 export tree_children_map, lint_index, lookup_type, callers_by_name, property_source_info, property_signature, property_doc, LintMessage
 export metafirst, metaall
 export static_domain, property_descriptor, property_descriptors, type_descriptor,
     option_declarations, has_option_declaration, property_options
+export ThreadSafeDict, ProviderRoots, TrackedFile, TrackedDirectory
+export tracked_version, tracked_path, on_change!, notify_change!
+export retain!, release!, provider_of, retained_providers, tracked_paths
+export dependents, invalidate!, sync!, object_version
 export materialization_observation
 export execute_materialization, release_materialization!, materialization_ownership, materialization_gc!
 
