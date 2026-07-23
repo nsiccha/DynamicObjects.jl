@@ -559,6 +559,47 @@ _finalize_substatus!(::Nothing) = nothing
 _fail_substatus!(s, e) = nothing
 _fail_substatus!(::Nothing, e) = nothing
 
+# ── Automatic nesting via Treebars' ambient current-node ───────────────────
+#
+# Progress nesting used to be opt-in plumbing. A new substatus always hung under
+# the OBJECT ROOT (`o.__status__`), because an ordinary sibling read inside a
+# property body lowers to a plain `getproperty` with nothing to attach to — so
+# `b` read from `a`'s body mounted NEXT TO `a` instead of under it, and a correct
+# tree required the author to remember one of `@progress` / `@PROGRESS` /
+# `@fetch!` / `@dynamic_progress` on the caller. Every one of those threads a
+# LEXICAL `__progress__`, so nesting was also lost through any intermediate frame
+# a macro could not see: if `a` calls a plain helper `h` and `h` touches `o.b`,
+# `b` still landed on the root.
+#
+# `Treebars.current_progress()` (Treebars `aac3f34`, decision `13jb58i`) is a
+# dynamically-scoped "node currently being computed" that any frame can read at
+# any call depth. That turns nesting into two runtime rules and no macro:
+#
+#   1. a new substatus parents at the ambient node (`_progress_parent`), and
+#   2. a property body runs with its own substatus ambient (`_run_progress_body`).
+#
+# The markers still work and are still useful as *instrumentation* (they also
+# memoize, and relabel in-memory hits `(cached)`); they are no longer load-bearing
+# for correctness.
+
+# Parent for a newly created substatus: the node whose body we are running inside,
+# falling back to the object root when there is none. `nothing` (progress disabled)
+# flows through unchanged — `_default_substatus`'s generic method no-ops on it.
+_progress_parent(o) = begin
+    ambient = Treebars.current_progress()
+    isnothing(ambient) ? o.__status__ : ambient
+end
+
+# Run a property/IP body with `s` installed as the ambient node, so every DO access
+# it reaches — at any call depth, through arbitrary foreign frames — nests under `s`.
+#
+# A body with NO node of its own (`nothing`: progress disabled, a dunder, or a
+# property `_bare_substatus_f` skips) deliberately leaves the ambient binding
+# untouched rather than clearing it: its accesses then attribute to the CALLER's
+# node, which is the right parent for work that has no node to own it.
+_run_progress_body(f, s) = Treebars.with_current_progress(f, s)
+_run_progress_body(f, ::Nothing) = f()
+
 # Disk-load reporting hook — the generic method is a no-op; the
 # `::Treebars.ProgressNode` specialization below sets the substatus message to
 # "from disk: <size>". Called from `_computeproperty` just before
@@ -888,7 +929,9 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
     (;o, cache) = ip
     substatus_f = if name != :__substatus__ && name != :__status__
         () -> begin
-            root = o.__status__
+            # Ambient node when one is active (this IP was reached from another
+            # property's body → nest under it), else the object root.
+            root = _progress_parent(o)
             compute_property(o, Val(:__substatus__), name, indices...; __status__=root, kwargs...)
         end
     else
@@ -994,7 +1037,19 @@ const _missing_sentinel = _Missing()
 function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condition, f, s)
     local v
     try
-        v = f(s)
+        # THE ambient-nesting install point: every memoized property/IP body in DO
+        # runs through here (bare property, IP `memoize!`, and the `fetch*` polling
+        # forms alike), so binding `s` as the ambient node once here gives every DO
+        # access the body reaches — at any call depth — the right parent, with no
+        # macro at the property and none at the consumer.
+        #
+        # This is also what carries nesting across DO's own `:spawn` path: Julia
+        # 1.10 task-local storage is not inherited by a child task, but `s` was
+        # built in the CALLING task (against the caller's ambient node) and is
+        # re-installed here, inside whichever task actually runs the body.
+        v = _run_progress_body(s) do
+            f(s)
+        end
     catch e
         lock(c.lock) do
             get(c.computing, key, nothing) === cnd && delete!(c.computing, key)
@@ -1903,7 +1958,9 @@ _bare_substatus_f(o, name) =
        !(startswith(string(name), "__") && endswith(string(name), "__")) &&
        is_generated_property(o, name) && !is_indexed_property(o, name)
         () -> begin
-            root = o.__status__
+            # Ambient node when one is active (this property was reached from
+            # another property's body → nest under it), else the object root.
+            root = _progress_parent(o)
             compute_property(o, Val(:__substatus__), name; __status__=root)
         end
     else
