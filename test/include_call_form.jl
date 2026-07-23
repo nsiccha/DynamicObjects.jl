@@ -73,6 +73,30 @@ o = IncludeSelfNamedRoot("/x")
 @test DynamicObjects._self_named_index(o, Val(:dataset))
 end
 
+@testitem "_unwrap_short_form_body is total" begin
+using DynamicObjects
+unwrap = DynamicObjects._unwrap_short_form_body
+
+# The parser's wrapping around a short-form method body: one statement out.
+@test unwrap(Meta.parse("f(x) = g(x)").args[2]) == :(g(x))
+@test unwrap(Meta.parse("item(key::Symbol) = Leaf(key)").args[2]) == :(Leaf(key))
+
+# A REAL body comes back as the same block — never a sentinel. HTMXObjects
+# delegates here and converts a multi-statement `@include revise = begin … end`
+# into an inline sub-router by testing `Meta.isexpr(out, :block)`; returning
+# `nothing` fell through that check, dropped the declaration, and took
+# HTMXObjects/src/routes/shared_ops_routes.jl:21 down at load time.
+body = Meta.parse("kid = begin\n    a = 1\n    Leaf(a)\nend").args[2]
+@test unwrap(body) === body
+@test Meta.isexpr(unwrap(body), :block)
+
+# Anything it cannot unwrap passes straight through.
+@test unwrap(:x) === :x
+@test unwrap(:(Leaf(1))) == :(Leaf(1))
+@test unwrap(1) === 1
+@test unwrap(Meta.parse("f(x) = begin end").args[2]) == Meta.parse("f(x) = begin end").args[2]
+end
+
 @testitem "a genuine block body is still rejected under @dynamicstruct" setup=[IncludeCallFormFixtures] begin
 using DynamicObjects
 

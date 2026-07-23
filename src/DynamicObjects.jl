@@ -3812,6 +3812,11 @@ function nested_object_type(T::Type, name::Symbol)
     child = _walk_nested_type(T, name)
     child isa Type && _type_is_dynamic(child) ? child : nothing
 end
+# Every Symbol appearing in a type annotation — `value::Vector{T}` mentions `T`.
+# Used to decide whether a struct's type parameters are solvable from its fields.
+_type_symbols(_) = Set{Symbol}()
+_type_symbols(x::Symbol) = Set{Symbol}((x,))
+_type_symbols(x::Expr) = mapreduce(_type_symbols, union, x.args; init=Set{Symbol}())
 extractnames(x::Vector) = mapreduce(extractnames, union, x; init=Set())
 extractnames(x::Symbol) = Set((x,))
 extractnames(x::Expr) = if Meta.isexpr(x, :(::))
@@ -4155,18 +4160,28 @@ function _inject_include_kwargs!(call_expr, prop_name)
     call_expr
 end
 
-# `f(args…) = rhs` is a SHORT-FORM METHOD DEFINITION, and Julia wraps its rhs in
-# a `:block` however the source read: `@include item(key) = Leaf(key)` arrives
-# with exactly the same `:block` head as `@include kid = begin … end`. The LHS
-# shape alone cannot tell them apart — the block's payload can. One statement
-# (LineNumberNodes aside) means the parser wrapped it; several mean the user
-# wrote a body. Returns the unwrapped single statement, or `nothing` for a real
-# body.
+"""    _unwrap_short_form_body(rhs)
+
+Undo the `:block` the parser wraps a short-form method body in.
+
+`f(args…) = rhs` is a SHORT-FORM METHOD DEFINITION, and Julia wraps its rhs in a
+`:block` however the source read — so `@include item(key) = Leaf(key)` arrives
+with exactly the same head as `@include kid = begin … end`. LHS shape alone
+cannot tell them apart; the block's payload can. One statement (LineNumberNodes
+aside) is the parser's wrapping and unwraps to the bare expression; several are a
+body the author wrote.
+
+**Total: anything this cannot unwrap comes back unchanged**, so a caller tests
+the RESULT (`Meta.isexpr(out, :block)` still means "a real body") rather than a
+sentinel. HTMXObjects delegates here so both sides of one declaration agree by
+construction; a sentinel return would silently fall through every `isexpr` check
+on that side and drop the declaration on the floor.
+"""
 _unwrap_short_form_body(rhs) = rhs
 function _unwrap_short_form_body(rhs::Expr)
     Meta.isexpr(rhs, :block) || return rhs
     statements = [a for a in rhs.args if !(a isa LineNumberNode)]
-    length(statements) == 1 ? only(statements) : nothing
+    length(statements) == 1 ? only(statements) : rhs
 end
 
 function _process_include_externals!(body)
@@ -4197,12 +4212,8 @@ function _process_include_externals!(body)
         # below rejects the CALL form with the block form's error message — which
         # is what made every call-form indexed `@include` unreachable: no
         # `_analysis_nested_type`, so nothing downstream could recover the child
-        # type. `nothing` back means the block really is a body; leave it wrapped
-        # and let the check speak.
-        if Meta.isexpr(lhs, :call)
-            unwrapped = _unwrap_short_form_body(rhs)
-            isnothing(unwrapped) || (rhs = unwrapped)
-        end
+        # type. A real body comes back as the same block and the check speaks.
+        Meta.isexpr(lhs, :call) && (rhs = _unwrap_short_form_body(rhs))
         # `@include name = begin … end` (inline sub-router) is an HTMXObjects
         # construct: under `@htmx`, `_convert_include_to_struct!` replaces the
         # block form with a `prop = struct …` inline child BEFORE `dynamicstruct`
@@ -4310,7 +4321,24 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     mut, head, body = expr.args
     type = head
     Meta.isexpr(type, :(<:)) && (type = type.args[1])
+    # Type parameters, kept whole (`T<:Real` stays bounded) alongside their bare
+    # names. `head` still carries the curly AND the supertype, so the emitted
+    # `:struct` keeps both — only the derived pieces below need the split.
+    type_params = Meta.isexpr(type, :curly) ? collect(type.args[2:end]) : Any[]
     Meta.isexpr(type, :(curly)) && (type = type.args[1])
+    param_names = map(type_params) do p
+        Meta.isexpr(p, (:(<:), :(>:))) ? p.args[1] :
+        Meta.isexpr(p, :comparison) ? p.args[3] : p
+    end
+    parametric = !isempty(type_params)
+    # `Foo` alone is the UnionAll, so `::Type{Foo}` matches neither `Foo{:a}` nor
+    # anything else a user holds. Every per-type method below dispatches on the
+    # covariant form instead. Left exact for a non-parametric type, where the two
+    # are equivalent but the exact one is more specific.
+    type_dispatch = parametric ? Expr(:(<:), type) : type
+    # `Foo{K}` for a signature/`new`, `Foo` when there is nothing to apply.
+    _curly(f) = parametric ? Expr(:curly, f, param_names...) : f
+    _where(sig) = parametric ? Expr(:where, sig, type_params...) : sig
     @assert body.head == :block
     # --- Rewrite `@struct prop[(idx...)] = begin body end` into the equivalent
     # `prop[(idx...)] = struct <auto-named> body end` so the Form 1 path picks
@@ -4974,7 +5002,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     end
     identity_fixed_names = [n for n in fixed_names if !(n in versioned_fixed)]
     versioned_defs = isempty(versioned_names) ? Any[] : Any[
-        :($DynamicObjects.has_versioned_fields(::Type{$type}) = true),
+        :($DynamicObjects.has_versioned_fields(::Type{$type_dispatch}) = true),
         :($DynamicObjects._identity_hash_fields(__self__::$type) = $(Expr(:tuple, [:(getfield(__self__, $(QuoteNode(n)))) for n in identity_fixed_names]...))),
         :($DynamicObjects._version_hash_fields(__self__::$type) = $(Expr(:tuple, [(n in versioned_fixed ? :(getfield(__self__, $(QuoteNode(n)))) : :($DynamicObjects.getorcomputeproperty(__self__, $(QuoteNode(n))))) for n in versioned_names]...))),
     ]
@@ -5014,7 +5042,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         ))
     end
     option_declaration_defs = isempty(option_declaration_records) ? Any[] : Any[
-        :($DynamicObjects.option_declarations(::Type{$type}) = $option_declaration_records),
+        :($DynamicObjects.option_declarations(::Type{$type_dispatch}) = $option_declaration_records),
     ]
     # ── @versioned computed props: acyclicity guard (decision `b2tsvz`) ───────
     # A computed version dimension must be derivable WITHOUT a cache path: the path
@@ -5075,26 +5103,48 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     _carryover_expr = isempty(_carry_calls) ?
         :($DynamicObjects._carryover(__obj__::$type, ::Val) = (;)) :
         :($DynamicObjects._carryover(__obj__::$type, ::Val{__KW__}) where {__KW__} = merge($(_carry_calls...)))
+    # An inner constructor whose signature does not mention the type parameters
+    # cannot use a bare `new` — Julia rejects the definition outright ("too few
+    # type parameters specified in new{...}"), which is why a parametric
+    # `@dynamicstruct` never expanded. Bind the parameters on the signature
+    # (`Foo{K}(…) where {K}`) and apply them to `new`; both collapse to today's
+    # exact expressions when there are none.
+    _new = _curly(:new)
+    _ctor1 = :(function $(_curly(type))($(fixed_lhs...); cache_type=nothing, kwargs...)
+        isnothing(cache_type) || error("`cache_type` was removed (2026-07-07, decision 2canrl); the cache is always threadsafe now — drop this kwarg.")
+        __inst__ = $_new(
+            $(fixed_names...),
+            $PropertyCache(
+                $ThreadsafeDict,
+                (;kwargs...)
+            )
+        )
+        __inst__
+    end)
+    _ctor2 = :(function $(_curly(type))(::$DynamicObjects._RemountToken, __cache__::$PropertyCache, $(fixed_lhs...))
+        $_new(
+            $(fixed_names...),
+            __cache__
+        )
+    end)
+    _ctor1.args[1] = _where(_ctor1.args[1])
+    _ctor2.args[1] = _where(_ctor2.args[1])
     struct_expr = Expr(:struct, mut, head, Expr(:block,
-        fixed_lhs..., :(cache::$PropertyCache),
-        :(function $type($(fixed_lhs...); cache_type=nothing, kwargs...)
-            isnothing(cache_type) || error("`cache_type` was removed (2026-07-07, decision 2canrl); the cache is always threadsafe now — drop this kwarg.")
-            __inst__ = new(
-                $(fixed_names...),
-                $PropertyCache(
-                    $ThreadsafeDict,
-                    (;kwargs...)
-                )
-            )
-            __inst__
-        end),
-        :(function $type(::$DynamicObjects._RemountToken, __cache__::$PropertyCache, $(fixed_lhs...))
-            new(
-                $(fixed_names...),
-                __cache__
-            )
-        end)
+        fixed_lhs..., :(cache::$PropertyCache), _ctor1, _ctor2
     ))
+    # `struct Wrapped{T}; value::T; end` normally gets BOTH `Wrapped{Int}(1)` and
+    # the inferring `Wrapped(1)`; declaring any inner constructor replaces both.
+    # Re-emit the inferring one — but only when every parameter actually occurs
+    # in a field's declared type, since `Wrapped(v) where {T}` is otherwise a
+    # static parameter Julia has no way to solve.
+    _annotated = mapreduce(union, fixed_lhs; init=Set{Symbol}()) do lhs
+        Meta.isexpr(lhs, :(::)) ? _type_symbols(lhs.args[2]) : Set{Symbol}()
+    end
+    _outer_ctor = parametric && all(in(_annotated), param_names) ? Any[
+        Expr(:(=),
+            _where(Expr(:call, type, Expr(:parameters, :(kwargs...)), fixed_lhs...)),
+            Expr(:call, _curly(type), Expr(:parameters, :(kwargs...)), fixed_names...))
+    ] : Any[]
     # ── Magic-property deprecation: reject an OLD name DECLARED in a body ────
     # (2026-07-07, decision 2canrl). Declaring an old data-side name would
     # silently become a plain user property (no disk-cache/content-addressing
@@ -5141,7 +5191,8 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     #      hoisted inline child structs.
     push!(result.args, Expr(:block,
         struct_expr,
-        :($Base.Docs.getdoc(::Type{$type}) = begin
+        _outer_ctor...,
+        :($Base.Docs.getdoc(::Type{$type_dispatch}) = begin
             __b = $Base.Docs.Binding(parentmodule($type), nameof($type))
             __m = get($Base.Docs.meta(__b.mod), __b, nothing)
             (__m === nothing || isempty(__m.docs)) ? $docstring : nothing
@@ -5151,10 +5202,10 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             $Base.hasproperty(__self__::$type, name::Symbol) = name in $(Tuple(prop_names))
             $Base.getproperty(__self__::$type, name::Symbol) = $getorcomputeproperty(__self__, name)
             $Base.setproperty!(__self__::$type, name::Symbol, value) = getfield(__self__, :cache)[name] = value
-            $DynamicObjects.meta(::Type{$type}) = $properties
+            $DynamicObjects.meta(::Type{$type_dispatch}) = $properties
             $(option_declaration_defs...)
             $_carryover_expr
-            $DynamicObjects._remount_opaque_properties(::Type{$type}) = $(Tuple(sort!(collect(opaque_props))))
+            $DynamicObjects._remount_opaque_properties(::Type{$type_dispatch}) = $(Tuple(sort!(collect(opaque_props))))
             $DynamicObjects.is_generated_property(::$type, name::Symbol) = name in $generated_names
             $DynamicObjects.is_indexed_property(::$type, name::Symbol) = name in $indexed_names
             $DynamicObjects._hash_replace(__self__::$type) = __self__.__hash__
@@ -5172,17 +5223,17 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 $DynamicObjects._check_mmap_annotation($(QuoteNode(type)), $(QuoteNode(name)), $(mmap_eltypes[name]))
             ) for name in mmap_names if !isnothing(mmap_eltypes[name])]...)
             $([:(
-                $DynamicObjects._nested_struct_type(::Type{$type}, ::Val{$(QuoteNode(prop_name))}) = $gen_name
+                $DynamicObjects._nested_struct_type(::Type{$type_dispatch}, ::Val{$(QuoteNode(prop_name))}) = $gen_name
             ) for (prop_name, gen_name) in inline_child_pairs]...)
             $([:(
-                $DynamicObjects._analysis_nested_type(::Type{$type}, ::Val{$(QuoteNode(prop_name))}) = $gen_name
+                $DynamicObjects._analysis_nested_type(::Type{$type_dispatch}, ::Val{$(QuoteNode(prop_name))}) = $gen_name
             ) for (prop_name, gen_name) in analysis_child_pairs]...)
             # Per-T `_type_description` override — delegates to a runtime
             # resolver that reads the user-attached docstring (if any). Lets
             # `@include`-emitted `_property_description` overrides bubble
             # `T`'s docstring up as the progress label when `T(args)` is
             # constructed via an IP.
-            $DynamicObjects._type_description(::Type{$type}, args...; kwargs...) =
+            $DynamicObjects._type_description(::Type{$type_dispatch}, args...; kwargs...) =
                 $DynamicObjects._resolve_type_description($type, args, (; kwargs...))
             $Base.show(io::IO, __self__::$type) = begin
                 print(io, $(string(type)), "(")
@@ -5274,11 +5325,16 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                         idx
                     end
                 end
-                _call(f, extras...) = fixcall(Expr(:call,
+                # `__self__::Foo{Kind} … where {Kind}` rather than `__self__::Foo`
+                # — dispatch-equivalent, but it BINDS the type parameters, so a
+                # property body may read them the way it reads a sibling
+                # (`tagged = string(base, "-", Kind)`). Identity when the struct
+                # has no parameters.
+                _call(f, extras...) = _where(fixcall(Expr(:call,
                     Expr(:., DynamicObjects, QuoteNode(f)),
-                    :(__self__::$type), :(::Val{$(Meta.quot(name))}),
+                    :(__self__::$(_curly(type))), :(::Val{$(Meta.quot(name))}),
                     walked_indices..., Expr(:parameters, extras...),
-                ))
+                )))
                 iscached_val = Symbol("@cached") in info.macros || Symbol("@mmap") in info.macros
                 # Per-signature documentation flag + (when documented) the
                 # doc-derived label override.
@@ -5412,10 +5468,10 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 )
                 if !isnothing(info.cache_version)
                     # Don't use _call — cache_version is per-property, not per-index
-                    cv_method = Expr(:call,
+                    cv_method = _where(Expr(:call,
                         Expr(:., DynamicObjects, QuoteNode(:cache_version)),
-                        :(__self__::$type), :(::Val{$(Meta.quot(name))}),
-                    )
+                        :(__self__::$(_curly(type))), :(::Val{$(Meta.quot(name))}),
+                    ))
                     cv_expr = (_lnn, Expr(:(=), cv_method, Expr(:block, _lnn, info.cache_version)))
                     push!(block.args, cv_expr...)
                 end
