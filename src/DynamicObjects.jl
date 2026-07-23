@@ -3589,12 +3589,13 @@ default in that case.
 """
 _type_description(::Type, args...; kwargs...) = nothing
 
-# Runtime: read the user-registered docstring for `T` (if any), strip it,
-# format with the construction args. Returns `nothing` when no doc is set —
-# the auto-generated property-list fallback installed at line ~2556 lives
-# in `Base.Docs.getdoc(::Type{T})`, NOT in `Base.Docs.meta`, so this only
-# fires when the user explicitly attached a docstring via `"…"` syntax.
-function _resolve_type_description(::Type{T}, args, kwargs) where {T}
+# Runtime: read the user-registered docstring for `T` (if any) and strip it.
+# Returns `nothing` when no doc is set — the auto-generated property-list
+# fallback installed at line ~2556 lives in `Base.Docs.getdoc(::Type{T})`, NOT
+# in `Base.Docs.meta`, so this only fires when the user explicitly attached a
+# docstring via `"…"` syntax. Shared by `_resolve_type_description` (which
+# formats it with construction args) and the public `type_descriptor`.
+function _type_docstring(::Type{T}) where {T}
     binding  = Base.Docs.Binding(parentmodule(T), nameof(T))
     docs_meta = Base.Docs.meta(binding.mod)
     multidoc = get(docs_meta, binding, nothing)
@@ -3602,7 +3603,12 @@ function _resolve_type_description(::Type{T}, args, kwargs) where {T}
     raw = first(values(multidoc.docs))
     txt = raw isa Base.Docs.DocStr ? join(raw.text, "") : string(raw)
     label = strip(txt)
-    isempty(label) && return nothing
+    isempty(label) ? nothing : label
+end
+
+function _resolve_type_description(::Type{T}, args, kwargs) where {T}
+    label = _type_docstring(T)
+    label === nothing && return nothing
     argstr = join(args, ",")
     kwstr  = isempty(kwargs) ? "" : "; " * join(("$k=$v" for (k, v) in pairs(kwargs)), ",")
     "$label($argstr$kwstr)"
@@ -3669,6 +3675,54 @@ HTMXObjects' route walker does not (so typed primitives like
 `port::Int = 8080` don't crash route registration on `meta(::Type{Int})`).
 """
 _analysis_nested_type(::Type, ::Val) = nothing
+
+"""    option_declarations(::Type{T}) -> Vector{Pair{Symbol,NamedTuple}}
+
+Every `@options <parameter> = <domain expression>` declaration in `T`'s body, in
+declaration order (duplicates preserved, first wins where a single answer is
+needed — same convention as [`meta`](@ref)).
+
+`@options` declares *which values a parameter may take*. It is the one thing the
+structural descriptors cannot infer: a finite domain is proved by the type only
+for `Bool` and `Enum`, and a domain that depends on another input cannot be
+proved at all. The declaration is recorded, never run — DynamicObjects does not
+evaluate the expression, so it is free to name application functions and data
+DO knows nothing about.
+
+Each entry's NamedTuple carries:
+
+- `parameter::Symbol` — the input this domain governs. It is matched by *name*
+  against every input of `T`: a fixed field, a positional or keyword argument of
+  an indexed property, or a fixed field promoted into an operation's `:context`
+  inputs. One declaration therefore covers every operation that takes that name.
+- `expression` — the declared expression, verbatim and unevaluated.
+- `expression_string::String` — `string(expression)`, for display.
+- `dependencies::Vector{Symbol}` — the sibling properties/fields the expression
+  reads, collected by the same scope-aware walk that populates `dependson`.
+- `static::Bool` — `isempty(dependencies)`: `true` when the domain is fixed for
+  the type, `false` when it is context-dependent and a consumer must re-evaluate
+  it whenever one of `dependencies` changes.
+- `source::Symbol` — which declaration form produced this record (`:options`).
+- `lnn` — the declaration's `LineNumberNode`, or `nothing`.
+
+The same records reach consumers through the descriptor graph: an input governed
+by a declaration reports `domain.kind === :declared` with the record under
+`domain.declaration` (see [`property_descriptor`](@ref)). Reading them here is
+for whole-type inspection — e.g. a declaration whose parameter no attached input
+happens to carry.
+"""
+option_declarations(::Type) = Pair{Symbol,NamedTuple}[]
+
+# First declaration per parameter name, for descriptor attachment.
+function _option_declaration_map(T::Type)
+    declarations = option_declarations(T)
+    isempty(declarations) && return nothing
+    map = Dict{Symbol,NamedTuple}()
+    for (parameter, declaration) in declarations
+        get!(map, parameter, declaration)
+    end
+    map
+end
 
 # Union of both hooks for analyzer + render code paths. `_nested_struct_type`
 # wins if both are defined for the same property (shouldn't normally happen).
@@ -3805,6 +3859,17 @@ end
 # instead of silently carrying an inert marker.
 _apply_property_macro!(::_PropertyMacroState, ::Val{Symbol("@semantic")}, _) =
     error("@semantic was removed: DynamicObjects now reflects ordinary fields, property signatures, inferred dependencies, result annotations, Bool/Enum types, and cache markers directly")
+
+# `@options <parameter> = <domain expression>` — an option-domain declaration,
+# not a property. Captured here and consumed by the body loop, which routes it
+# into `option_declarations(T)` instead of emitting a property. Takes no
+# argument of its own, so anything but the bare 3-arg form is a mistake.
+function _apply_property_macro!(state::_PropertyMacroState, ::Val{Symbol("@options")}, arg)
+    length(arg.args) == 3 ||
+        error("@options takes no arguments: write `@options <parameter> = <domain expression>`, got `$arg`")
+    push!(state.macros, Symbol("@options"))
+    arg.args[end]
+end
 _parse_cache_version(v::VersionNumber) = v
 function _parse_cache_version(ver_expr::Expr)
     Meta.isexpr(ver_expr, :macrocall) && ver_expr.args[1] == Symbol("@v_str") ||
@@ -4493,6 +4558,10 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     docs = []
     oproperties = Pair[]
     inline_methods = Any[]
+    # `@options <parameter> = <domain expression>` declarations, in body order.
+    # Held as `(; parameter, expression, lnn)` until the property list is
+    # complete, because the dependency walk needs the full set of sibling names.
+    option_decls = Any[]
     # `@mmap` properties: name => eltype-annotation-expr (or `nothing` when
     # un-annotated). Drives the per-property `_disk_format`/`_disk_eltype`
     # emission below.
@@ -4523,6 +4592,20 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         end
         doc = macro_state.doc
         cache_version = macro_state.cache_version
+        # `@options` declares a parameter's domain, not a property: it never
+        # emits a `compute_property` (the parameter it names is declared
+        # elsewhere — as a field or as an argument — and would collide), and its
+        # RHS is never evaluated. Divert it before property classification.
+        if Symbol("@options") in macros
+            extra = setdiff(macros, (Symbol("@options"),))
+            isempty(extra) ||
+                error("@dynamicstruct $type: `@options` cannot combine with $(join(sort!(string.(collect(extra))), ", ")).")
+            (Meta.isexpr(arg, :(=)) && arg.args[1] isa Symbol) ||
+                error("@dynamicstruct $type: `@options` must read `@options <parameter> = <domain expression>`, got `$arg`.")
+            push!(option_decls, (; parameter=arg.args[1], expression=arg.args[2], lnn))
+            metadata.doc[] = nothing
+            continue
+        end
         # Inline-method form: `f(__self__, ...) = body` (with optional `where`
         # clauses and qualified `Module.f` names). Bypasses property tooling —
         # no compute_property, no getproperty entry — but the body still gets
@@ -4756,6 +4839,32 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             walk_rhs(deepcopy(info.rhs); locals=copy(info.locals), properties=walk_props, lnn=info.lnn)) &&
             push!(opaque_props, name)
     end
+    # ── `@options` domain declarations ───────────────────────────────────────
+    # Same dependency machinery as a property RHS, and for the same reason: a
+    # domain that reads a sibling is context-dependent, and a consumer has to
+    # know *which* sibling to re-evaluate it against. The walk runs on a COPY
+    # and its rewritten result is discarded — only the collected names are
+    # kept. The declared expression itself is emitted verbatim: DO records
+    # domains, it does not evaluate them.
+    option_declaration_records = Pair{Symbol,NamedTuple}[]
+    for decl in option_decls
+        deps = Set{Symbol}()
+        _collect_self_deps!(deps, walk_rhs(deepcopy(decl.expression);
+            locals=Set{Symbol}(), properties=walk_props, lnn=decl.lnn))
+        dependencies = sort!(collect(deps))
+        push!(option_declaration_records, decl.parameter => (;
+            parameter=decl.parameter,
+            expression=decl.expression,
+            expression_string=string(decl.expression),
+            dependencies,
+            static=isempty(dependencies),
+            source=:options,
+            lnn=decl.lnn,
+        ))
+    end
+    option_declaration_defs = isempty(option_declaration_records) ? Any[] : Any[
+        :($DynamicObjects.option_declarations(::Type{$type}) = $option_declaration_records),
+    ]
     # ── @versioned computed props: acyclicity guard (decision `b2tsvz`) ───────
     # A computed version dimension must be derivable WITHOUT a cache path: the path
     # is `…/<identity>/<version_tag>`, and `__version_tag__` reads the version prop,
@@ -4892,6 +5001,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             $Base.getproperty(__self__::$type, name::Symbol) = $getorcomputeproperty(__self__, name)
             $Base.setproperty!(__self__::$type, name::Symbol, value) = getfield(__self__, :cache)[name] = value
             $DynamicObjects.meta(::Type{$type}) = $properties
+            $(option_declaration_defs...)
             $_carryover_expr
             $DynamicObjects._remount_opaque_properties(::Type{$type}) = $(Tuple(sort!(collect(opaque_props))))
             $DynamicObjects.is_generated_property(::$type, name::Symbol) = name in $generated_names
@@ -6629,7 +6739,7 @@ Two entry points:
   declaration. Always returns a (possibly empty) `(; positional, kwargs)`.
 
 Both yield `(; positional, kwargs)`, where every entry is a NamedTuple
-`(; name, type, required, default)`:
+`(; name, type, required, default, vararg)`:
 
 - `name::Union{Symbol,Nothing}` — the argument name (`nothing` for an anonymous
   `::T` positional).
@@ -6642,9 +6752,14 @@ Both yield `(; positional, kwargs)`, where every entry is a NamedTuple
   `nothing` (and meaningless) when `required === true`. A literal `nothing`
   default is told apart from "no default" only by `required === false`.
 
+- `vararg::Bool` — `true` for a splat (`x...` / `x::T...`), which is otherwise
+  indistinguishable from a plain optional arg: both report `required=false`.
+  Consumers that build a call template need the difference (an open-ended
+  `path...` segment is not a single optional `path`).
+
 A non-indexed property (no call signature) yields empty `positional` and
-`kwargs`. A vararg (`x...`) is unwrapped to its inner name/type with
-`required=false`; the splat is not otherwise marked.
+`kwargs`. A vararg is unwrapped to its inner name/type with `required=false`
+and `vararg=true`.
 
 Layering — intentionally verb-agnostic: this returns *every* positional arg,
 including any framework-injected leading arg (e.g. HTMXObjects' injected
@@ -6694,6 +6809,7 @@ end
 function _parse_signature_arg(node, mod)
     required = true
     default = nothing
+    vararg = false
     if Meta.isexpr(node, :kw)            # `x = d` / `x::T = d`
         required = false
         default = node.args[2]
@@ -6701,6 +6817,7 @@ function _parse_signature_arg(node, mod)
     end
     if Meta.isexpr(node, :...)           # `x...` — 0+ args, so not required
         required = false
+        vararg = true
         node = node.args[1]
     end
     typeexpr = nothing
@@ -6714,7 +6831,7 @@ function _parse_signature_arg(node, mod)
     end
     (; name = nm isa Symbol ? nm : nothing,
        type = _resolve_arg_type(typeexpr, mod),
-       required, default)
+       required, default, vararg)
 end
 
 # Resolve a type-annotation expression against the struct's defining module.
@@ -6765,6 +6882,7 @@ _unrestricted_domain() = (;
     cardinality=nothing,
     multiple=false,
     allow_custom=true,
+    declaration=nothing,
 )
 
 """
@@ -6784,8 +6902,25 @@ static_domain(values; multiple=false, allow_custom=false) = let opts =
         cardinality=length(opts),
         multiple,
         allow_custom,
+        declaration=nothing,
     )
 end
+
+# Domain of an input governed by an `@options` declaration. `options` stays
+# empty and `cardinality` `nothing` on purpose: DO records the declared
+# expression, it never evaluates it, so it cannot know the values. The consumer
+# evaluates `declaration.expression` — once for a `static` domain, and again
+# per change of `dependencies` for a context-dependent one.
+_declared_domain(declaration::NamedTuple) = (;
+    kind=:declared,
+    options=NamedTuple[],
+    provider=nothing,
+    dependencies=declaration.dependencies,
+    cardinality=nothing,
+    multiple=false,
+    allow_custom=false,
+    declaration,
+)
 
 function _inferred_domain(input_type)
     input_type === Bool && return static_domain((false, true))
@@ -6793,10 +6928,18 @@ function _inferred_domain(input_type)
     _unrestricted_domain()
 end
 
-_descriptor_input(arg::NamedTuple, kind::Symbol) = (;
+# A declaration wins over the type-inferred domain: `Bool`/`Enum` prove a domain,
+# but an author who declared one for that name meant it.
+_input_domain(arg::NamedTuple, ::Nothing) = _inferred_domain(arg.type)
+_input_domain(arg::NamedTuple, declarations::AbstractDict) =
+    let declaration = arg.name === nothing ? nothing : get(declarations, arg.name, nothing)
+        declaration === nothing ? _inferred_domain(arg.type) : _declared_domain(declaration)
+    end
+
+_descriptor_input(arg::NamedTuple, kind::Symbol, declarations=nothing) = (;
     arg...,
     kind,
-    domain=_inferred_domain(arg.type),
+    domain=_input_domain(arg, declarations),
 )
 
 function _semantic_dependency_closure(T::Type, roots)
@@ -6898,17 +7041,19 @@ function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
     progress = computed
     result_type = _resolve_arg_type(_descriptor_result_type_expr(info), mod)
     signature = property_signature(info, mod)
+    declarations = _option_declaration_map(T)
     inferred_inputs = if fixed
         NamedTuple[_descriptor_input((;
             name=prop,
             type=result_type,
             required=true,
             default=nothing,
-        ), :field)]
+            vararg=false,
+        ), :field, declarations)]
     else
         vcat(
-            NamedTuple[_descriptor_input(arg, :positional) for arg in signature.positional],
-            NamedTuple[_descriptor_input(arg, :keyword) for arg in signature.kwargs],
+            NamedTuple[_descriptor_input(arg, :positional, declarations) for arg in signature.positional],
+            NamedTuple[_descriptor_input(arg, :keyword, declarations) for arg in signature.kwargs],
         )
     end
     dependencies = get(info, :dependson, nothing)
@@ -6957,6 +7102,16 @@ Return a backward-safe, pure-data descriptor for one DynamicObjects property,
 or `nothing` when the type or property has no DO metadata. The result describes
 inputs/output, lifecycle semantics, option domains, and declared
 materialization without reading or computing an object property.
+
+Each entry of `inputs` carries a `domain`, of one of three `kind`s:
+
+- `:static` — a finite domain the *type* proves (`Bool`, or an `Enum`), with the
+  values in `options`.
+- `:declared` — an [`@options`](@ref option_declarations) declaration governs
+  this parameter name. `domain.declaration` is the record (declared expression,
+  its `dependencies`, and `static`); `options` is empty because DO records the
+  expression and never evaluates it.
+- `:unrestricted` — no domain is known; the type is the only constraint.
 """
 function property_descriptor(T::Type, prop::Symbol)
     applicable(meta, T) || return nothing
@@ -6974,6 +7129,29 @@ function property_descriptors(T::Type)
     applicable(meta, T) || return NamedTuple[]
     NamedTuple[property_descriptor(T, name, info) for (name, info) in meta(T)]
 end
+
+"""
+    type_descriptor(T::Type)
+
+Type-level counterpart to [`property_descriptor`](@ref): what a reflection
+consumer needs about the node as a whole, so "what is this thing called" has
+exactly one answer rather than one per consumer.
+
+Returns `(; type, name, description, options)`.
+
+- `description` is `T`'s own user-attached docstring, stripped, or `nothing`
+  when none was attached. The auto-generated property-list docstring
+  `@dynamicstruct` installs as a `?T` fallback is deliberately *not* reported:
+  it is reference text, not a label.
+- `options` is [`option_declarations`](@ref)`(T)` — including any declaration
+  whose parameter no input of `T` happens to carry.
+"""
+type_descriptor(T::Type) = (;
+    type=T,
+    name=nameof(T),
+    description=_type_docstring(T),
+    options=option_declarations(T),
+)
 
 # Snapshot cache state without calling `getproperty`, `memoize!`, or a property
 # body. `has_value` distinguishes a cached `nothing` from an absent entry.
@@ -7461,7 +7639,8 @@ end
 export print_structure, structure
 export tree_children_map, lint_index, lookup_type, callers_by_name, property_source_info, property_signature, property_doc, LintMessage
 export metafirst, metaall
-export static_domain, property_descriptor, property_descriptors
+export static_domain, property_descriptor, property_descriptors, type_descriptor,
+    option_declarations
 export materialization_observation
 export execute_materialization, release_materialization!, materialization_ownership, materialization_gc!
 
