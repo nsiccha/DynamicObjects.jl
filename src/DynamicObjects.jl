@@ -55,6 +55,12 @@ get_path_lock!(d::DiskCacheLocks, path::String) = lock(d.lock) do
     get!(() -> ReentrantLock(), d.locks, path)
 end
 
+# Ordinary properties promoted by the governed executor share one process-local
+# per-path lock registry. Explicit @cached/@mmap properties keep their generated
+# per-property registries; this fallback exists so automatic storage does not
+# require a declaration-site marker merely to obtain safe write coordination.
+const _AUTOMATIC_MATERIALIZATION_DISK_LOCKS = DiskCacheLocks()
+
 persistent_hash(x) = begin
     b = IOBuffer()
     Serialization.serialize(b, x)
@@ -374,6 +380,10 @@ end
 # override for each `@mmap` property; everything else uses these defaults.
 _disk_format(o, ::Val) = Val(:serial)
 _disk_eltype(o, ::Val) = nothing
+
+_automatic_mmap_eligible(::Any) = false
+_automatic_mmap_eligible(value::AbstractArray) =
+    isbitstype(eltype(value)) && eltype(value) in _MMAP_ELTYPE_TAGS
 
 iscached(o, ::Val) = false
 cache_version(o, ::Val) = nothing
@@ -1567,10 +1577,14 @@ function clear_disk_caches!(obj)
     isdir(cp) || return nothing
     for (name, info) in m
         isfixed(info) && continue
-        Symbol("@cached") in info.macros || continue
         prefix = string(name)
         for f in readdir(cp)
-            if endswith(f, ".sjl") && (f == prefix * ".sjl" || startswith(f, prefix * "_"))
+            is_cache_file = endswith(f, ".sjl") ||
+                endswith(f, ".sjl" * _AUTOMATIC_MATERIALIZATION_SUFFIX)
+            if is_cache_file &&
+                    (f == prefix * ".sjl" ||
+                     f == prefix * ".sjl" * _AUTOMATIC_MATERIALIZATION_SUFFIX ||
+                     startswith(f, prefix * "_"))
                 rm(joinpath(cp, f))
             end
         end
@@ -2584,6 +2598,8 @@ clear_cache!(o, name::Symbol, indices...; kwargs...) = begin
         # Clear specific disk cache file
         path = get_cache_path(o, name, indices...; kwargs...)
         isfile(path) && rm(path)
+        metadata_path = _automatic_materialization_path(path)
+        isfile(metadata_path) && rm(metadata_path)
     end
     nothing
 end
@@ -3589,12 +3605,13 @@ default in that case.
 """
 _type_description(::Type, args...; kwargs...) = nothing
 
-# Runtime: read the user-registered docstring for `T` (if any), strip it,
-# format with the construction args. Returns `nothing` when no doc is set —
-# the auto-generated property-list fallback installed at line ~2556 lives
-# in `Base.Docs.getdoc(::Type{T})`, NOT in `Base.Docs.meta`, so this only
-# fires when the user explicitly attached a docstring via `"…"` syntax.
-function _resolve_type_description(::Type{T}, args, kwargs) where {T}
+# Runtime: read the user-registered docstring for `T` (if any) and strip it.
+# Returns `nothing` when no doc is set — the auto-generated property-list
+# fallback installed at line ~2556 lives in `Base.Docs.getdoc(::Type{T})`, NOT
+# in `Base.Docs.meta`, so this only fires when the user explicitly attached a
+# docstring via `"…"` syntax. Shared by `_resolve_type_description` (which
+# formats it with construction args) and the public `type_descriptor`.
+function _type_docstring(::Type{T}) where {T}
     binding  = Base.Docs.Binding(parentmodule(T), nameof(T))
     docs_meta = Base.Docs.meta(binding.mod)
     multidoc = get(docs_meta, binding, nothing)
@@ -3602,7 +3619,12 @@ function _resolve_type_description(::Type{T}, args, kwargs) where {T}
     raw = first(values(multidoc.docs))
     txt = raw isa Base.Docs.DocStr ? join(raw.text, "") : string(raw)
     label = strip(txt)
-    isempty(label) && return nothing
+    isempty(label) ? nothing : label
+end
+
+function _resolve_type_description(::Type{T}, args, kwargs) where {T}
+    label = _type_docstring(T)
+    label === nothing && return nothing
     argstr = join(args, ",")
     kwstr  = isempty(kwargs) ? "" : "; " * join(("$k=$v" for (k, v) in pairs(kwargs)), ",")
     "$label($argstr$kwstr)"
@@ -3669,6 +3691,98 @@ HTMXObjects' route walker does not (so typed primitives like
 `port::Int = 8080` don't crash route registration on `meta(::Type{Int})`).
 """
 _analysis_nested_type(::Type, ::Val) = nothing
+
+"""    option_declarations(::Type{T}) -> Vector{Pair{Symbol,NamedTuple}}
+
+Every `@options(<parameter>) = <domain expression>` declaration in `T`'s body,
+in declaration order. A parameter may be declared only once: duplicate
+declarations are rejected where the `@dynamicstruct` is defined so reflection
+and the generated `__options__(::Val{parameter})` method can never disagree.
+
+`@options` declares *which values a parameter may take*. It is the one thing the
+structural descriptors cannot infer: a finite domain is proved by the type only
+for `Bool` and `Enum`, and a domain that depends on another input cannot be
+proved at all. Both spellings are accepted — `@options(x) = …` (the marker binds
+its parenthesized argument, so it sits on the assignment's LHS) and
+`@options x = …`.
+
+A declaration lowers to the dunder indexed property `__options__(::Val{x})`, so
+the domain is an ordinary lazily computed DO value. Nothing is evaluated at
+macro-expansion time and nothing is evaluated by reflection: the expression runs
+only when a consumer asks for the value, via [`property_options`](@ref). That is
+what lets a domain be written in terms of application functions and data DO
+knows nothing about, and it is why the value memoizes and invalidates like every
+other property.
+
+This function reports the *declarations*. Each entry's NamedTuple carries:
+
+- `parameter::Symbol` — the input this domain governs. It is matched by *name*
+  against every input of `T`: a fixed field, a positional or keyword argument of
+  an indexed property, or a fixed field promoted into an operation's `:context`
+  inputs. One declaration therefore covers every operation that takes that name.
+- `expression` — the declared expression, verbatim and unevaluated.
+- `expression_string::String` — `string(expression)`, for display.
+- `dependencies::Vector{Symbol}` — the sibling properties/fields the expression
+  reads, from the same `dependson` walk every property RHS gets.
+- `static::Bool` — `isempty(dependencies)`: `true` when the domain is fixed for
+  the type, `false` when it is context-dependent and a consumer must re-read it
+  whenever one of `dependencies` changes.
+- `source::Symbol` — which declaration form produced this record (`:options`).
+- `lnn` — the declaration's `LineNumberNode`, or `nothing`.
+
+The same records reach consumers through the descriptor graph: an input governed
+by a declaration reports `domain.kind === :declared` with the record under
+`domain.declaration` (see [`property_descriptor`](@ref)). Reading them here is
+for whole-type inspection — e.g. a declaration whose parameter no attached input
+happens to carry.
+"""
+option_declarations(::Type) = Pair{Symbol,NamedTuple}[]
+
+# First declaration per parameter name, for descriptor attachment.
+function _option_declaration_map(T::Type)
+    declarations = option_declarations(T)
+    isempty(declarations) && return nothing
+    map = Dict{Symbol,NamedTuple}()
+    for (parameter, declaration) in declarations
+        get!(map, parameter, declaration)
+    end
+    map
+end
+
+"""
+    has_option_declaration(T::Type, parameter::Symbol) -> Bool
+
+Whether `T` declares an `@options` domain for `parameter`. The cheap check a
+consumer makes before [`property_options`](@ref) — it reads declarations only
+and never touches an object.
+"""
+function has_option_declaration(T::Type, parameter::Symbol)
+    declarations = _option_declaration_map(T)
+    declarations !== nothing && haskey(declarations, parameter)
+end
+
+"""
+    property_options(o, parameter::Symbol)
+
+The declared domain for `parameter` **on this object** — the value of the
+`@options` expression, computed against `o` and memoized like any other
+property. Returns `nothing` when no declaration governs `parameter`.
+
+This is the evaluating half of the option contract, and it needs an object for
+the same reason a dependent domain exists at all: `@options(model) =
+models_for(study)` is only answerable once `study` is fixed, and `study` is
+fixed by `o`. Reflection ([`option_declarations`](@ref),
+[`property_descriptor`](@ref)) reports the declaration without running it; this
+runs it.
+
+A domain is any value supporting `in` — a vector of nodes, a range, an
+interval, a type. What a consumer does with it (membership check, control
+choice, rejecting a submission made against a stale domain) is the consumer's;
+DO neither interprets the value nor caches a rendering of it.
+"""
+property_options(o, parameter::Symbol) =
+    has_option_declaration(typeof(o), parameter) ?
+        getproperty(o, :__options__)(Val(parameter)) : nothing
 
 # Union of both hooks for analyzer + render code paths. `_nested_struct_type`
 # wins if both are defined for the same property (shouldn't normally happen).
@@ -3805,6 +3919,17 @@ end
 # instead of silently carrying an inert marker.
 _apply_property_macro!(::_PropertyMacroState, ::Val{Symbol("@semantic")}, _) =
     error("@semantic was removed: DynamicObjects now reflects ordinary fields, property signatures, inferred dependencies, result annotations, Bool/Enum types, and cache markers directly")
+
+# `@options <parameter> = <domain expression>` — an option-domain declaration,
+# not a property. Captured here and consumed by the body loop, which routes it
+# into `option_declarations(T)` instead of emitting a property. Takes no
+# argument of its own, so anything but the bare 3-arg form is a mistake.
+function _apply_property_macro!(state::_PropertyMacroState, ::Val{Symbol("@options")}, arg)
+    length(arg.args) == 3 ||
+        error("@options takes no arguments: write `@options <parameter> = <domain expression>`, got `$arg`")
+    push!(state.macros, Symbol("@options"))
+    arg.args[end]
+end
 _parse_cache_version(v::VersionNumber) = v
 function _parse_cache_version(ver_expr::Expr)
     Meta.isexpr(ver_expr, :macrocall) && ver_expr.args[1] == Symbol("@v_str") ||
@@ -4493,6 +4618,10 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     docs = []
     oproperties = Pair[]
     inline_methods = Any[]
+    # `@options <parameter> = <domain expression>` declarations, in body order.
+    # Held as `(; parameter, expression, lnn)` until the property list is
+    # complete, because the dependency walk needs the full set of sibling names.
+    option_decls = Any[]
     # `@mmap` properties: name => eltype-annotation-expr (or `nothing` when
     # un-annotated). Drives the per-property `_disk_format`/`_disk_eltype`
     # emission below.
@@ -4515,6 +4644,18 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         # it back implicitly; the other two are scalars copied back after
         # the loop.
         macro_state = _PropertyMacroState(doc, cache_version, macros)
+        # `@options(x) = domain` — a PARENTHESIZED macrocall binds only its own
+        # arguments, so the marker lands on the LHS of the assignment instead of
+        # wrapping it. Normalize to the wrapping form the peel loop expects, so
+        # both `@options(x) = …` and `@options x = …` take one path.
+        if Meta.isexpr(arg, :(=)) && Meta.isexpr(arg.args[1], :macrocall) &&
+                _resolve_macro_name(arg.args[1].args[1]) === Symbol("@options")
+            inner = arg.args[1]
+            length(inner.args) == 3 ||
+                error("@options names exactly one parameter: `@options(<parameter>) = <domain expression>`, got `$arg`")
+            arg = Expr(:macrocall, inner.args[1], inner.args[2],
+                Expr(:(=), inner.args[end], arg.args[2]))
+        end
         while Meta.isexpr(arg, :macrocall)
             # `_resolve_macro_name` collapses `GlobalRef(Core, :@doc)` (the
             # form Julia's docstring lowering surfaces) to bare `:@doc`.
@@ -4523,6 +4664,30 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         end
         doc = macro_state.doc
         cache_version = macro_state.cache_version
+        # `@options(<parameter>) = <domain>` declares which values an input may
+        # take — the one fact the structural descriptors cannot infer. It does
+        # NOT declare a property named `<parameter>` (that name is already a
+        # field or an argument, and would collide); it lowers to the dunder
+        # indexed property `__options__(::Val{parameter})`, so a domain is an
+        # ordinary lazily computed DO value: never evaluated unless a consumer
+        # asks for it, memoized and invalidated like anything else, and its
+        # dependencies fall out of the same walk every other RHS gets. The
+        # rewrite happens here and then falls through to ordinary property
+        # classification — no separate emission path.
+        if Symbol("@options") in macros
+            extra = setdiff(macros, (Symbol("@options"),))
+            isempty(extra) ||
+                error("@dynamicstruct $type: `@options` cannot combine with $(join(sort!(string.(collect(extra))), ", ")).")
+            (Meta.isexpr(arg, :(=)) && arg.args[1] isa Symbol) ||
+                error("@dynamicstruct $type: `@options` must read `@options(<parameter>) = <domain expression>`, got `$arg`.")
+            parameter, domain = arg.args
+            any(decl -> decl.parameter === parameter, option_decls) &&
+                error("@dynamicstruct $type: duplicate `@options` declaration for `$parameter`; each parameter may declare one domain.")
+            push!(option_decls, (; parameter, expression=domain, lnn))
+            arg = Expr(:(=),
+                Expr(:call, :__options__, Expr(:(::), Expr(:curly, Val, QuoteNode(parameter)))),
+                domain)
+        end
         # Inline-method form: `f(__self__, ...) = body` (with optional `where`
         # clauses and qualified `Module.f` names). Bypasses property tooling —
         # no compute_property, no getproperty entry — but the body still gets
@@ -4756,6 +4921,30 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             walk_rhs(deepcopy(info.rhs); locals=copy(info.locals), properties=walk_props, lnn=info.lnn)) &&
             push!(opaque_props, name)
     end
+    # ── `@options` domain declarations ───────────────────────────────────────
+    # Each declaration became an ordinary `__options__(::Val{parameter})`
+    # property above, so its `dependson` was just populated by the pass above —
+    # a domain that reads a sibling is context-dependent, and that is exactly
+    # what `dependson` records. Declaration order is body order in both lists.
+    option_infos = [info for (name, info) in properties
+        if name === :__options__ && Symbol("@options") in info.macros]
+    @assert length(option_infos) == length(option_decls)
+    option_declaration_records = Pair{Symbol,NamedTuple}[]
+    for (decl, info) in zip(option_decls, option_infos)
+        dependencies = sort!(collect(info.dependson))
+        push!(option_declaration_records, decl.parameter => (;
+            parameter=decl.parameter,
+            expression=decl.expression,
+            expression_string=string(decl.expression),
+            dependencies,
+            static=isempty(dependencies),
+            source=:options,
+            lnn=decl.lnn,
+        ))
+    end
+    option_declaration_defs = isempty(option_declaration_records) ? Any[] : Any[
+        :($DynamicObjects.option_declarations(::Type{$type}) = $option_declaration_records),
+    ]
     # ── @versioned computed props: acyclicity guard (decision `b2tsvz`) ───────
     # A computed version dimension must be derivable WITHOUT a cache path: the path
     # is `…/<identity>/<version_tag>`, and `__version_tag__` reads the version prop,
@@ -4892,6 +5081,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             $Base.getproperty(__self__::$type, name::Symbol) = $getorcomputeproperty(__self__, name)
             $Base.setproperty!(__self__::$type, name::Symbol, value) = getfield(__self__, :cache)[name] = value
             $DynamicObjects.meta(::Type{$type}) = $properties
+            $(option_declaration_defs...)
             $_carryover_expr
             $DynamicObjects._remount_opaque_properties(::Type{$type}) = $(Tuple(sort!(collect(opaque_props))))
             $DynamicObjects.is_generated_property(::$type, name::Symbol) = name in $generated_names
@@ -6629,7 +6819,7 @@ Two entry points:
   declaration. Always returns a (possibly empty) `(; positional, kwargs)`.
 
 Both yield `(; positional, kwargs)`, where every entry is a NamedTuple
-`(; name, type, required, default)`:
+`(; name, type, required, default, vararg)`:
 
 - `name::Union{Symbol,Nothing}` — the argument name (`nothing` for an anonymous
   `::T` positional).
@@ -6642,9 +6832,14 @@ Both yield `(; positional, kwargs)`, where every entry is a NamedTuple
   `nothing` (and meaningless) when `required === true`. A literal `nothing`
   default is told apart from "no default" only by `required === false`.
 
+- `vararg::Bool` — `true` for a splat (`x...` / `x::T...`), which is otherwise
+  indistinguishable from a plain optional arg: both report `required=false`.
+  Consumers that build a call template need the difference (an open-ended
+  `path...` segment is not a single optional `path`).
+
 A non-indexed property (no call signature) yields empty `positional` and
-`kwargs`. A vararg (`x...`) is unwrapped to its inner name/type with
-`required=false`; the splat is not otherwise marked.
+`kwargs`. A vararg is unwrapped to its inner name/type with `required=false`
+and `vararg=true`.
 
 Layering — intentionally verb-agnostic: this returns *every* positional arg,
 including any framework-injected leading arg (e.g. HTMXObjects' injected
@@ -6694,6 +6889,7 @@ end
 function _parse_signature_arg(node, mod)
     required = true
     default = nothing
+    vararg = false
     if Meta.isexpr(node, :kw)            # `x = d` / `x::T = d`
         required = false
         default = node.args[2]
@@ -6701,6 +6897,7 @@ function _parse_signature_arg(node, mod)
     end
     if Meta.isexpr(node, :...)           # `x...` — 0+ args, so not required
         required = false
+        vararg = true
         node = node.args[1]
     end
     typeexpr = nothing
@@ -6714,7 +6911,7 @@ function _parse_signature_arg(node, mod)
     end
     (; name = nm isa Symbol ? nm : nothing,
        type = _resolve_arg_type(typeexpr, mod),
-       required, default)
+       required, default, vararg)
 end
 
 # Resolve a type-annotation expression against the struct's defining module.
@@ -6765,6 +6962,7 @@ _unrestricted_domain() = (;
     cardinality=nothing,
     multiple=false,
     allow_custom=true,
+    declaration=nothing,
 )
 
 """
@@ -6784,8 +6982,25 @@ static_domain(values; multiple=false, allow_custom=false) = let opts =
         cardinality=length(opts),
         multiple,
         allow_custom,
+        declaration=nothing,
     )
 end
+
+# Domain of an input governed by an `@options` declaration. `options` stays
+# empty and `cardinality` `nothing` on purpose: DO records the declared
+# expression, it never evaluates it during reflection, so it cannot know the
+# values. The consumer calls `property_options(object, parameter)` when it needs
+# the value and re-reads after a declared dependency changes.
+_declared_domain(declaration::NamedTuple) = (;
+    kind=:declared,
+    options=NamedTuple[],
+    provider=nothing,
+    dependencies=declaration.dependencies,
+    cardinality=nothing,
+    multiple=false,
+    allow_custom=false,
+    declaration,
+)
 
 function _inferred_domain(input_type)
     input_type === Bool && return static_domain((false, true))
@@ -6793,10 +7008,18 @@ function _inferred_domain(input_type)
     _unrestricted_domain()
 end
 
-_descriptor_input(arg::NamedTuple, kind::Symbol) = (;
+# A declaration wins over the type-inferred domain: `Bool`/`Enum` prove a domain,
+# but an author who declared one for that name meant it.
+_input_domain(arg::NamedTuple, ::Nothing) = _inferred_domain(arg.type)
+_input_domain(arg::NamedTuple, declarations::AbstractDict) =
+    let declaration = arg.name === nothing ? nothing : get(declarations, arg.name, nothing)
+        declaration === nothing ? _inferred_domain(arg.type) : _declared_domain(declaration)
+    end
+
+_descriptor_input(arg::NamedTuple, kind::Symbol, declarations=nothing) = (;
     arg...,
     kind,
-    domain=_inferred_domain(arg.type),
+    domain=_input_domain(arg, declarations),
 )
 
 function _semantic_dependency_closure(T::Type, roots)
@@ -6870,7 +7093,7 @@ _materialization_tier(::Val{false}, fresh, mmap, cached) =
 _computed_materialization_tier(::Val{true}, ::Val, ::Val) = :mmap
 _computed_materialization_tier(::Val{false}, ::Val{true}, ::Val) = :serialized
 _computed_materialization_tier(::Val{false}, ::Val{false}, ::Val{true}) = :recompute
-_computed_materialization_tier(::Val{false}, ::Val{false}, ::Val{false}) = :memory
+_computed_materialization_tier(::Val{false}, ::Val{false}, ::Val{false}) = :automatic
 
 _progress_mode(macros) =
     Symbol("@PROGRESS") in macros || Symbol("@progress") in macros || Symbol("@dynamic_progress") in macros ? :instrumented :
@@ -6898,17 +7121,19 @@ function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
     progress = computed
     result_type = _resolve_arg_type(_descriptor_result_type_expr(info), mod)
     signature = property_signature(info, mod)
+    declarations = _option_declaration_map(T)
     inferred_inputs = if fixed
         NamedTuple[_descriptor_input((;
             name=prop,
             type=result_type,
             required=true,
             default=nothing,
-        ), :field)]
+            vararg=false,
+        ), :field, declarations)]
     else
         vcat(
-            NamedTuple[_descriptor_input(arg, :positional) for arg in signature.positional],
-            NamedTuple[_descriptor_input(arg, :keyword) for arg in signature.kwargs],
+            NamedTuple[_descriptor_input(arg, :positional, declarations) for arg in signature.positional],
+            NamedTuple[_descriptor_input(arg, :keyword, declarations) for arg in signature.kwargs],
         )
     end
     dependencies = get(info, :dependson, nothing)
@@ -6937,6 +7162,12 @@ function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
         progress_mode=_progress_mode(macros),
     )
     materialization = (;tier)
+    # The domain of the property's OWN value. A fixed field also reports it on
+    # its single `:field` input, but the shape that needs this is the
+    # overrideable default (`n_chain::Integer = 8`): it is a parameter a
+    # consumer sets, yet it is a computed property with no signature, so it has
+    # no `inputs` entry to hang a domain on.
+    domain = _input_domain((; name=prop, type=result_type), declarations)
     (;
         name=prop,
         role=_descriptor_role(Val(fixed), Val(indexed)),
@@ -6944,6 +7175,7 @@ function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
         indexed,
         description=property_doc(info),
         dependencies,
+        domain,
         inputs,
         output=(; type=result_type, materialization),
         semantics,
@@ -6957,6 +7189,22 @@ Return a backward-safe, pure-data descriptor for one DynamicObjects property,
 or `nothing` when the type or property has no DO metadata. The result describes
 inputs/output, lifecycle semantics, option domains, and declared
 materialization without reading or computing an object property.
+
+The descriptor's own `domain` is the domain of the property's *value*, and each
+entry of `inputs` carries the domain of that argument. Read the top-level one
+for a parameter a consumer sets — a fixed field, or an overrideable default like
+`n_chain::Integer = 8`, which is a computed property with no signature and
+therefore no `inputs` entry to hang a domain on. Every domain has one of three
+`kind`s:
+
+- `:static` — a finite domain the *type* proves (`Bool`, or an `Enum`), with the
+  values in `options`.
+- `:declared` — an [`@options`](@ref option_declarations) declaration governs
+  this parameter name. `domain.declaration` is the record (declared expression,
+  its `dependencies`, and `static`); `options` is empty because reflection
+  reports the declaration without running it. Call
+  [`property_options`](@ref)`(o, name)` for the domain's actual value.
+- `:unrestricted` — no domain is known; the type is the only constraint.
 """
 function property_descriptor(T::Type, prop::Symbol)
     applicable(meta, T) || return nothing
@@ -6974,6 +7222,29 @@ function property_descriptors(T::Type)
     applicable(meta, T) || return NamedTuple[]
     NamedTuple[property_descriptor(T, name, info) for (name, info) in meta(T)]
 end
+
+"""
+    type_descriptor(T::Type)
+
+Type-level counterpart to [`property_descriptor`](@ref): what a reflection
+consumer needs about the node as a whole, so "what is this thing called" has
+exactly one answer rather than one per consumer.
+
+Returns `(; type, name, description, options)`.
+
+- `description` is `T`'s own user-attached docstring, stripped, or `nothing`
+  when none was attached. The auto-generated property-list docstring
+  `@dynamicstruct` installs as a `?T` fallback is deliberately *not* reported:
+  it is reference text, not a label.
+- `options` is [`option_declarations`](@ref)`(T)` — including any declaration
+  whose parameter no input of `T` happens to carry.
+"""
+type_descriptor(T::Type) = (;
+    type=T,
+    name=nameof(T),
+    description=_type_docstring(T),
+    options=option_declarations(T),
+)
 
 # Snapshot cache state without calling `getproperty`, `memoize!`, or a property
 # body. `has_value` distinguishes a cached `nothing` from an absent entry.
@@ -7029,14 +7300,56 @@ end
 
 _observed_bytes(value::AbstractString) = ncodeunits(value)
 _observed_bytes(value::AbstractArray{T}) where {T} =
-    isbitstype(T) ? length(value) * sizeof(T) : nothing
-_observed_bytes(value::T) where {T} = isbitstype(T) ? sizeof(T) : nothing
+    isbitstype(T) ? length(value) * sizeof(T) : try
+        Base.summarysize(value)
+    catch
+        nothing
+    end
+_observed_bytes(value::T) where {T} = isbitstype(T) ? sizeof(T) : try
+    Base.summarysize(value)
+catch
+    nothing
+end
+
+const _AUTOMATIC_MATERIALIZATION_SUFFIX = ".auto"
+const _AUTOMATIC_MATERIALIZATION_MIN_BYTES = 1024 * 1024
+const _AUTOMATIC_MATERIALIZATION_MIN_SECONDS = 1.0
+
+_automatic_materialization_path(cache_path::AbstractString) =
+    cache_path * _AUTOMATIC_MATERIALIZATION_SUFFIX
+
+function _effective_compute_seconds(wall_ns::Integer, compile_ns::Integer)
+    # Julia's cumulative compile counter is process-global. Concurrent
+    # compilation can therefore make `compile_ns` exceed this call's wall time;
+    # clamp at zero so that ambiguity is conservative (keep memory) rather than
+    # a false disk-promotion signal.
+    noncompile_ns = wall_ns > compile_ns ? wall_ns - compile_ns : zero(wall_ns)
+    Float64(noncompile_ns) / 1.0e9
+end
+
+function _automatic_materialization_metadata(cache_path::AbstractString)
+    metadata_path = _automatic_materialization_path(cache_path)
+    isfile(metadata_path) || return nothing
+    metadata = try
+        Serialization.deserialize(metadata_path)
+    catch
+        return nothing
+    end
+    metadata isa NamedTuple || return nothing
+    format = get(metadata, :format, nothing)
+    format in (:serial, :mmap) || return nothing
+    metadata
+end
 
 function _disk_observation(o, descriptor::NamedTuple, name::Symbol, args, kwargs::NamedTuple)
     semantics = descriptor.semantics
-    (semantics.cached || semantics.mmap) || return (;state=:none, path=nothing)
     path = get_cache_path(o, name, args...; kwargs...)
-    (;state=get_cache_status(path), path)
+    automatic = _automatic_materialization_metadata(path)
+    (semantics.cached || semantics.mmap || automatic !== nothing) ||
+        return (;state=:none, path=nothing, format=nothing)
+    format = automatic === nothing ?
+        (semantics.mmap ? :mmap : :serial) : automatic.format
+    (;state=get_cache_status(path), path, format)
 end
 
 _observation_state(memory, disk, fresh) =
@@ -7067,7 +7380,9 @@ function materialization_observation(o, name::Symbol, args...; kwargs...)
         pending=memory.state === :pending,
         failed=memory.state === :failed,
         stored=disk.state === :ready,
-        tier=memory.state === :ready ? :memory : descriptor.output.materialization.tier,
+        tier=disk.state === :ready ?
+            (disk.format === :mmap ? :mmap : :serialized) :
+            memory.state === :ready ? :memory : descriptor.output.materialization.tier,
         memory_state=memory.state,
         disk_state=disk.state,
         path=disk.path,
@@ -7366,6 +7681,193 @@ function _execute_materialization_target(target, name::Symbol, descriptor,
     getproperty(target, name)
 end
 
+function _timed_materialization_target(target, name::Symbol, descriptor,
+        args, kwargs::NamedTuple)
+    # This is the same compiler counter Base.@time uses. Its enable/disable
+    # operations nest, so concurrent/nested governed executions do not turn
+    # collection off underneath one another.
+    Base.cumulative_compile_timing(true)
+    compile_started = first(Base.cumulative_compile_time_ns())
+    wall_started = time_ns()
+    try
+        value = _execute_materialization_target(
+            target, name, descriptor, args, kwargs)
+        wall_ns = time_ns() - wall_started
+        compile_ns =
+            first(Base.cumulative_compile_time_ns()) - compile_started
+        (;
+            value,
+            elapsed_seconds=_effective_compute_seconds(wall_ns, compile_ns),
+        )
+    finally
+        Base.cumulative_compile_timing(false)
+    end
+end
+
+function _materialization_path_within(root::AbstractString, path::AbstractString)
+    relative = relpath(normpath(abspath(path)), normpath(abspath(root)))
+    relative == "." && return true
+    isabspath(relative) && return false
+    parts = splitpath(relative)
+    isempty(parts) || first(parts) != ".."
+end
+
+function _automatic_materialization_allowed(owner::_MaterializationOwner,
+        target, name::Symbol, descriptor, path::AbstractString)
+    owner.retention === nothing && return false
+    descriptor.fixed && return false
+    descriptor.output.materialization.tier === :automatic || return false
+    _remount_invalidated(target, name) && return false
+    any(owner.owned_paths) do (root, marker)
+        _read_materialization_marker(marker) == owner.id &&
+            _materialization_path_within(root, path)
+    end
+end
+
+function _automatic_materialization_slot(target, name::Symbol, descriptor,
+        args, kwargs::NamedTuple)
+    if descriptor.indexed
+        property = getproperty(target, name)
+        property isa IndexableProperty || return nothing
+        return property.cache, (args, kwargs)
+    end
+    hasfield(typeof(target), :cache) || return nothing
+    property_cache = getfield(target, :cache)
+    property_cache isa PropertyCache || return nothing
+    property_cache.cache, name
+end
+
+function _set_automatic_materialization_cache!(target, name, descriptor,
+        args, kwargs, value)
+    slot = _automatic_materialization_slot(
+        target, name, descriptor, args, kwargs)
+    slot === nothing && return false
+    cache, key = slot
+    if cache isa AbstractThreadsafeDict
+        # Computed stores publish directly into the wrapped dictionary rather
+        # than through `setindex!`: mounted caches use the same distinction to
+        # preserve shared-vs-request-local routing, and plain ThreadsafeDicts do
+        # not expose a public `setindex!` mutation path.
+        lock(cache.lock) do
+            cache.cache[key] = value
+            _on_store!(cache, key)
+        end
+    else
+        cache[key] = value
+    end
+    true
+end
+
+function _clear_automatic_materialization_cache!(target, name, descriptor,
+        args, kwargs)
+    slot = _automatic_materialization_slot(
+        target, name, descriptor, args, kwargs)
+    slot === nothing && return false
+    cache, key = slot
+    maybepop!(cache, key)
+    true
+end
+
+function _drop_automatic_materialization!(cache_path)
+    rm(cache_path; force=true)
+    rm(_automatic_materialization_path(cache_path); force=true)
+    nothing
+end
+
+function _load_automatic_materialization!(owner, target, name, descriptor,
+        args, kwargs::NamedTuple)
+    cache_path = get_cache_path(target, name, args...; kwargs...)
+    _automatic_materialization_allowed(
+        owner, target, name, descriptor, cache_path) || return nothing
+    path_lock = get_path_lock!(
+        _AUTOMATIC_MATERIALIZATION_DISK_LOCKS, cache_path)
+    lock(path_lock) do
+        metadata = _automatic_materialization_metadata(cache_path)
+        metadata === nothing && return nothing
+        get_cache_status(cache_path) === :ready || return nothing
+        value = try
+            load(Val(metadata.format), cache_path, nothing)
+        catch e
+            _drop_automatic_materialization!(cache_path)
+            @warn "Automatic materialization cache read failed; deleting it and recomputing" cache_path exception=e
+            return nothing
+        end
+        _set_automatic_materialization_cache!(
+            target, name, descriptor, args, kwargs, value) || return nothing
+        (;tier=metadata.format === :mmap ? :mmap : :serialized, value)
+    end
+end
+
+function _automatic_materialization_choice(value, elapsed_seconds)
+    value isa Union{Pending,Task,Channel} &&
+        return (;tier=:memory, format=nothing, estimated_bytes=nothing)
+    estimated_bytes = _observed_bytes(value)
+    large = estimated_bytes !== nothing &&
+        estimated_bytes >= _AUTOMATIC_MATERIALIZATION_MIN_BYTES
+    expensive = elapsed_seconds >= _AUTOMATIC_MATERIALIZATION_MIN_SECONDS
+    (large || expensive) ||
+        return (;tier=:memory, format=nothing, estimated_bytes)
+    format = _automatic_mmap_eligible(value) ? :mmap : :serial
+    (;tier=format === :mmap ? :mmap : :serialized, format, estimated_bytes)
+end
+
+function _persist_automatic_materialization!(owner, target, name, descriptor,
+        args, kwargs::NamedTuple, value, elapsed_seconds)
+    cache_path = get_cache_path(target, name, args...; kwargs...)
+    _automatic_materialization_allowed(
+        owner, target, name, descriptor, cache_path) || return value
+    choice = _automatic_materialization_choice(value, elapsed_seconds)
+    choice.format === nothing && return value
+    path_lock = get_path_lock!(
+        _AUTOMATIC_MATERIALIZATION_DISK_LOCKS, cache_path)
+    lock(path_lock) do
+        existing = _automatic_materialization_metadata(cache_path)
+        if existing !== nothing && get_cache_status(cache_path) === :ready
+            stored = try
+                load(Val(existing.format), cache_path, nothing)
+            catch e
+                _drop_automatic_materialization!(cache_path)
+                @warn "Automatic materialization cache read failed; deleting it and recomputing" cache_path exception=e
+                nothing
+            end
+            if stored !== nothing
+                if existing.format === :mmap
+                    _set_automatic_materialization_cache!(
+                        target, name, descriptor, args, kwargs, stored)
+                    return stored
+                end
+                _clear_automatic_materialization_cache!(
+                    target, name, descriptor, args, kwargs)
+                return value
+            end
+        end
+
+        metadata_path = _automatic_materialization_path(cache_path)
+        try
+            mkpath(dirname(cache_path))
+            _atomic_save(Val(choice.format), cache_path, value)
+            metadata = (;
+                format=choice.format,
+                estimated_bytes=choice.estimated_bytes,
+                compute_seconds=elapsed_seconds,
+            )
+            _atomic_save(Val(:serial), metadata_path, metadata)
+            if choice.format === :mmap
+                stored = load(Val(:mmap), cache_path, nothing)
+                _set_automatic_materialization_cache!(
+                    target, name, descriptor, args, kwargs, stored)
+                return stored
+            end
+            _clear_automatic_materialization_cache!(
+                target, name, descriptor, args, kwargs)
+        catch e
+            _drop_automatic_materialization!(cache_path)
+            @warn "Automatic materialization persistence failed; keeping the computed value in memory" cache_path exception=e
+        end
+        value
+    end
+end
+
 """
     execute_materialization(context, root, target, property, args...; kwargs...)
     execute_materialization(context, object, property, args...; kwargs...)
@@ -7376,9 +7878,12 @@ semantic host; ordinary applications call their operations normally and never
 construct a store. `root` is the retained application root and `target` is the
 mounted object that owns `property`.
 
-The executor adds an active lease around the existing DO property machinery;
-it does not introduce a second value cache or override declared `@fresh`,
-`@cached`, `@mmap`, identity, or `@versioned` policy.
+The executor adds an active lease around the existing DO property machinery.
+For an ordinary property on a retained root it observes the actual result and
+automatically keeps small/cheap values in memory, serializes large or expensive
+values, and memory-maps supported large values. Fresh request roots recompute
+across requests. Existing `@fresh`, `@cached`, and `@mmap` declarations remain
+compatibility overrides; applications do not need them for governed execution.
 """
 function execute_materialization(context::NamedTuple, root, target,
         name::Symbol, args...; kwargs...)
@@ -7387,8 +7892,21 @@ function execute_materialization(context::NamedTuple, root, target,
         "$(typeof(target)) has no DynamicObjects property `$name`")
     owner = _begin_materialization!(context, root)
     try
-        _execute_materialization_target(target, name, descriptor, args,
-            (;kwargs...))
+        property_kwargs = (;kwargs...)
+        automatic = _load_automatic_materialization!(
+            owner, target, name, descriptor, args, property_kwargs)
+        if automatic !== nothing
+            value = _execute_materialization_target(
+                target, name, descriptor, args, property_kwargs)
+            automatic.tier === :serialized &&
+                _clear_automatic_materialization_cache!(
+                    target, name, descriptor, args, property_kwargs)
+            return value
+        end
+        timed = _timed_materialization_target(
+            target, name, descriptor, args, property_kwargs)
+        _persist_automatic_materialization!(owner, target, name, descriptor,
+            args, property_kwargs, timed.value, timed.elapsed_seconds)
     finally
         _end_materialization!(owner)
     end
@@ -7461,7 +7979,8 @@ end
 export print_structure, structure
 export tree_children_map, lint_index, lookup_type, callers_by_name, property_source_info, property_signature, property_doc, LintMessage
 export metafirst, metaall
-export static_domain, property_descriptor, property_descriptors
+export static_domain, property_descriptor, property_descriptors, type_descriptor,
+    option_declarations, has_option_declaration, property_options
 export materialization_observation
 export execute_materialization, release_materialization!, materialization_ownership, materialization_gc!
 
