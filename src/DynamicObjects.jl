@@ -1771,7 +1771,7 @@ $_cache_context""")
                     end
                     if isnothing(rv) || resumes(o, vname, indices...; kwargs...)
                         @debug "Generating $cache_path...\n$_cache_context"
-                        rv = compute_property(o, vname, indices...; _status_kw..., (name=>rv, )..., kwargs...)
+                        rv = compute_property(o, vname, indices...; _status_kw..., _resume_kw(o, vname, rv)..., kwargs...)
                         _atomic_save(_disk_format(o, vname), cache_path, rv)
                         if _disk_format(o, vname) == Val(:mmap)
                             rv = load(Val(:mmap), cache_path, _disk_eltype(o, vname))
@@ -3649,6 +3649,25 @@ IP call form consults this and routes to `fresh` (the uncached `_computeproperty
 instead of `memoize!`. Method-level, so Revise-safe; constant-foldable so the
 call form's branch is free at runtime."""
 _never_cache(o, ::Val) = false
+"""    _self_named_index(o, ::Val{name})
+
+Per-type override: `true` when one of property `name`'s own index args is also
+called `name` — `dataset(dataset::Dataset) = …`. An indexed property normally
+gets a kwarg named after itself, defaulting to `__self__.name`, which is how a
+body reaches its own `IndexableProperty` (recursion) and how a `@cached` body
+receives the partially-loaded disk value to resume from. When an index arg
+already binds that name, the kwarg would be a duplicate argument name — a
+`syntax:` error at expansion — so it is not emitted, and the resume value has
+nowhere to go (the positional shadows it in the body regardless). This trait
+tells [`_computeproperty`](@ref) to stop passing it. Default `false`;
+constant-foldable."""
+_self_named_index(o, ::Val) = false
+# The resume kwarg: the loaded (possibly partial, possibly `nothing`) disk value
+# handed back to the body under the property's own name, so a `resumes`-enabled
+# computation can continue from it. Empty when the property has no such kwarg to
+# receive it — passing it anyway is an unsupported-keyword MethodError.
+_resume_kw(o, ::Val{name}, rv) where {name} =
+    _self_named_index(o, Val(name)) ? NamedTuple() : NamedTuple{(name,)}((rv,))
 """    _remount_opaque_properties(::Type{T})
 
 Names whose generated RHS reaches `__self__` in a way the static dependency
@@ -3773,6 +3792,25 @@ function _walk_nested_type(T, name::Symbol)
     t = _nested_struct_type(T, Val(name))
     t !== nothing && return t
     _analysis_nested_type(T, Val(name))
+end
+"""    nested_object_type(::Type{T}, name::Symbol)
+
+The **DynamicObject** type reachable under property `name` of `T`, whichever
+form declared it — an inline `@struct` child, an `@include`d external in either
+the bare (`kid = Child(…)`) or the call (`item(key) = Child(key)`) form, or a
+`prop::Child = …` annotation — and `nothing` when the property is not backed by
+one.
+
+This is the guarded reading of [`_walk_nested_type`](@ref), which answers with
+whatever type was registered and so returns `Int` for `port::Int = 8080`. That
+trap is why `_nested_struct_type` and `_analysis_nested_type` were kept apart in
+the first place; a consumer that wants "the child type, however it was declared"
+should ask here rather than pick a hook and inherit one hook's blind spot. A
+route walker can follow this without wedging on `meta(Int)`.
+"""
+function nested_object_type(T::Type, name::Symbol)
+    child = _walk_nested_type(T, name)
+    child isa Type && _type_is_dynamic(child) ? child : nothing
 end
 extractnames(x::Vector) = mapreduce(extractnames, union, x; init=Set())
 extractnames(x::Symbol) = Set((x,))
@@ -4117,6 +4155,20 @@ function _inject_include_kwargs!(call_expr, prop_name)
     call_expr
 end
 
+# `f(args…) = rhs` is a SHORT-FORM METHOD DEFINITION, and Julia wraps its rhs in
+# a `:block` however the source read: `@include item(key) = Leaf(key)` arrives
+# with exactly the same `:block` head as `@include kid = begin … end`. The LHS
+# shape alone cannot tell them apart — the block's payload can. One statement
+# (LineNumberNodes aside) means the parser wrapped it; several mean the user
+# wrote a body. Returns the unwrapped single statement, or `nothing` for a real
+# body.
+_unwrap_short_form_body(rhs) = rhs
+function _unwrap_short_form_body(rhs::Expr)
+    Meta.isexpr(rhs, :block) || return rhs
+    statements = [a for a in rhs.args if !(a isa LineNumberNode)]
+    length(statements) == 1 ? only(statements) : nothing
+end
+
 function _process_include_externals!(body)
     # Returned: (prop_name, type_expr) for each `@include`'d external. Used
     # to emit `_analysis_nested_type` so `analyze_structure` walks the
@@ -4140,6 +4192,17 @@ function _process_include_externals!(body)
         Meta.isexpr(inner, :(=)) || continue
         lhs = inner.args[1]
         rhs = inner.args[2]
+        # Call-form LHS (`@include item(key) = Leaf(key)`): Julia has wrapped the
+        # rhs in a short-form-method `:block`. Unwrap it, or the `:block` check
+        # below rejects the CALL form with the block form's error message — which
+        # is what made every call-form indexed `@include` unreachable: no
+        # `_analysis_nested_type`, so nothing downstream could recover the child
+        # type. `nothing` back means the block really is a body; leave it wrapped
+        # and let the check speak.
+        if Meta.isexpr(lhs, :call)
+            unwrapped = _unwrap_short_form_body(rhs)
+            isnothing(unwrapped) || (rhs = unwrapped)
+        end
         # `@include name = begin … end` (inline sub-router) is an HTMXObjects
         # construct: under `@htmx`, `_convert_include_to_struct!` replaces the
         # block form with a `prop = struct …` inline child BEFORE `dynamicstruct`
@@ -5167,7 +5230,20 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                     _wrapper_desc = isempty(_wrappers) ? "another macro" : join(_wrappers, ", ")
                     error("@struct on property `$name`: `@struct` must be outermost (only `@doc` and `@fresh` may wrap it), but here it is wrapped by $_wrapper_desc. A wrapping marker shadows the inline-child rewrite, so the child type and its injected `__parent__` are never emitted and the property would throw `UndefVarError: __parent__` when its call form is first hit (a clean compile that breaks only live). Write `@struct $name(…) = begin … end` (optionally `@fresh @struct $name(…) = …` for a fresh child per call). Disk-cache markers `@cached`/`@mmap` on an inline child are not supported — disk-cache a plain computed property instead.")
                 end
-                cp_kwargs = [Expr(:kw, name, length(info.indices) > 0 ? :(__self__.$name) : nothing)]
+                # An index arg may legitimately be named after the property it
+                # indexes — `dataset(dataset::Dataset) = DatasetWorkspace(dataset)`
+                # reads as "the workspace FOR this dataset". The self-named kwarg
+                # below would then be a second argument called `dataset` in the
+                # same signature, which Julia rejects outright ("function argument
+                # name not unique"). Suppress it: the index arg is in `locals`, so
+                # the body's bare `dataset` already resolves to the positional and
+                # the kwarg was unreachable anyway. `_self_named_index` tells
+                # `_computeproperty` not to pass the resume value it can no longer
+                # receive.
+                self_named_index = name in extractnames(collect(info.indices))
+                cp_kwargs = Any[]
+                self_named_index || push!(cp_kwargs,
+                    Expr(:kw, name, length(info.indices) > 0 ? :(__self__.$name) : nothing))
                 name != :__status__ && push!(cp_kwargs, Expr(:kw, :__status__, :nothing))
                 # Build method definitions with Expr directly (not :() syntax)
                 # so the parser doesn't insert DynamicObjects.jl LNNs into
@@ -5354,6 +5430,15 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                     )
                     nc_expr = (_lnn, Expr(:(=), nc_method, Expr(:block, _lnn, true)))
                     push!(block.args, nc_expr...)
+                end
+                # See the suppression above: this property has no kwarg named
+                # after itself, so the disk-cache resume value must not be passed.
+                if self_named_index
+                    sni_method = Expr(:call,
+                        Expr(:., DynamicObjects, QuoteNode(:_self_named_index)),
+                        :(__self__::$type), :(::Val{$(Meta.quot(name))}),
+                    )
+                    push!(block.args, _lnn, Expr(:(=), sni_method, Expr(:block, _lnn, true)))
                 end
                 push!(block.args, isdoc_expr...)
                 !isnothing(desc_expr) && push!(block.args, desc_expr...)
@@ -8391,8 +8476,13 @@ number, and this one only if something here was dropped as a result.
 object_version(o) = _cache_generation(o)[]
 
 # A DO object is exactly one that carries a `PropertyCache` — cheaper to ask
-# than `hasmethod(meta, …)`, and it is the field `sync!` needs anyway.
-_type_is_dynamic(T::Type) = hasfield(T, :cache) && fieldtype(T, :cache) <: PropertyCache
+# than `hasmethod(meta, …)`, and it is the field `sync!` needs anyway. Unwrap
+# first: `nested_object_type` may be handed a parametric type as the bare
+# `Child` UnionAll, which `hasfield` will not take.
+_type_is_dynamic(T::Type) = begin
+    body = Base.unwrap_unionall(T)
+    body isa DataType && hasfield(body, :cache) && fieldtype(body, :cache) <: PropertyCache
+end
 _is_dynamic(x) = _type_is_dynamic(typeof(x))
 
 # Worth descending into a container? Only if its elements could be DO objects.
@@ -8511,6 +8601,7 @@ end
 export print_structure, structure
 export tree_children_map, lint_index, lookup_type, callers_by_name, property_source_info, property_signature, property_doc, LintMessage
 export metafirst, metaall
+export nested_object_type
 export static_domain, property_descriptor, property_descriptors, type_descriptor,
     option_declarations, has_option_declaration, property_options
 export ThreadSafeDict, ProviderRoots, TrackedFile, TrackedDirectory
