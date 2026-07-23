@@ -3678,18 +3678,26 @@ _analysis_nested_type(::Type, ::Val) = nothing
 
 """    option_declarations(::Type{T}) -> Vector{Pair{Symbol,NamedTuple}}
 
-Every `@options <parameter> = <domain expression>` declaration in `T`'s body, in
-declaration order (duplicates preserved, first wins where a single answer is
+Every `@options(<parameter>) = <domain expression>` declaration in `T`'s body,
+in declaration order (duplicates preserved, first wins where a single answer is
 needed — same convention as [`meta`](@ref)).
 
 `@options` declares *which values a parameter may take*. It is the one thing the
 structural descriptors cannot infer: a finite domain is proved by the type only
 for `Bool` and `Enum`, and a domain that depends on another input cannot be
-proved at all. The declaration is recorded, never run — DynamicObjects does not
-evaluate the expression, so it is free to name application functions and data
-DO knows nothing about.
+proved at all. Both spellings are accepted — `@options(x) = …` (the marker binds
+its parenthesized argument, so it sits on the assignment's LHS) and
+`@options x = …`.
 
-Each entry's NamedTuple carries:
+A declaration lowers to the dunder indexed property `__options__(::Val{x})`, so
+the domain is an ordinary lazily computed DO value. Nothing is evaluated at
+macro-expansion time and nothing is evaluated by reflection: the expression runs
+only when a consumer asks for the value, via [`property_options`](@ref). That is
+what lets a domain be written in terms of application functions and data DO
+knows nothing about, and it is why the value memoizes and invalidates like every
+other property.
+
+This function reports the *declarations*. Each entry's NamedTuple carries:
 
 - `parameter::Symbol` — the input this domain governs. It is matched by *name*
   against every input of `T`: a fixed field, a positional or keyword argument of
@@ -3698,10 +3706,10 @@ Each entry's NamedTuple carries:
 - `expression` — the declared expression, verbatim and unevaluated.
 - `expression_string::String` — `string(expression)`, for display.
 - `dependencies::Vector{Symbol}` — the sibling properties/fields the expression
-  reads, collected by the same scope-aware walk that populates `dependson`.
+  reads, from the same `dependson` walk every property RHS gets.
 - `static::Bool` — `isempty(dependencies)`: `true` when the domain is fixed for
-  the type, `false` when it is context-dependent and a consumer must re-evaluate
-  it whenever one of `dependencies` changes.
+  the type, `false` when it is context-dependent and a consumer must re-read it
+  whenever one of `dependencies` changes.
 - `source::Symbol` — which declaration form produced this record (`:options`).
 - `lnn` — the declaration's `LineNumberNode`, or `nothing`.
 
@@ -3723,6 +3731,41 @@ function _option_declaration_map(T::Type)
     end
     map
 end
+
+"""
+    has_option_declaration(T::Type, parameter::Symbol) -> Bool
+
+Whether `T` declares an `@options` domain for `parameter`. The cheap check a
+consumer makes before [`property_options`](@ref) — it reads declarations only
+and never touches an object.
+"""
+function has_option_declaration(T::Type, parameter::Symbol)
+    declarations = _option_declaration_map(T)
+    declarations !== nothing && haskey(declarations, parameter)
+end
+
+"""
+    property_options(o, parameter::Symbol)
+
+The declared domain for `parameter` **on this object** — the value of the
+`@options` expression, computed against `o` and memoized like any other
+property. Returns `nothing` when no declaration governs `parameter`.
+
+This is the evaluating half of the option contract, and it needs an object for
+the same reason a dependent domain exists at all: `@options(model) =
+models_for(study)` is only answerable once `study` is fixed, and `study` is
+fixed by `o`. Reflection ([`option_declarations`](@ref),
+[`property_descriptor`](@ref)) reports the declaration without running it; this
+runs it.
+
+A domain is any value supporting `in` — a vector of nodes, a range, an
+interval, a type. What a consumer does with it (membership check, control
+choice, rejecting a submission made against a stale domain) is the consumer's;
+DO neither interprets the value nor caches a rendering of it.
+"""
+property_options(o, parameter::Symbol) =
+    has_option_declaration(typeof(o), parameter) ?
+        getproperty(o, :__options__)(Val(parameter)) : nothing
 
 # Union of both hooks for analyzer + render code paths. `_nested_struct_type`
 # wins if both are defined for the same property (shouldn't normally happen).
@@ -4584,6 +4627,18 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         # it back implicitly; the other two are scalars copied back after
         # the loop.
         macro_state = _PropertyMacroState(doc, cache_version, macros)
+        # `@options(x) = domain` — a PARENTHESIZED macrocall binds only its own
+        # arguments, so the marker lands on the LHS of the assignment instead of
+        # wrapping it. Normalize to the wrapping form the peel loop expects, so
+        # both `@options(x) = …` and `@options x = …` take one path.
+        if Meta.isexpr(arg, :(=)) && Meta.isexpr(arg.args[1], :macrocall) &&
+                _resolve_macro_name(arg.args[1].args[1]) === Symbol("@options")
+            inner = arg.args[1]
+            length(inner.args) == 3 ||
+                error("@options names exactly one parameter: `@options(<parameter>) = <domain expression>`, got `$arg`")
+            arg = Expr(:macrocall, inner.args[1], inner.args[2],
+                Expr(:(=), inner.args[end], arg.args[2]))
+        end
         while Meta.isexpr(arg, :macrocall)
             # `_resolve_macro_name` collapses `GlobalRef(Core, :@doc)` (the
             # form Julia's docstring lowering surfaces) to bare `:@doc`.
@@ -4592,19 +4647,27 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         end
         doc = macro_state.doc
         cache_version = macro_state.cache_version
-        # `@options` declares a parameter's domain, not a property: it never
-        # emits a `compute_property` (the parameter it names is declared
-        # elsewhere — as a field or as an argument — and would collide), and its
-        # RHS is never evaluated. Divert it before property classification.
+        # `@options(<parameter>) = <domain>` declares which values an input may
+        # take — the one fact the structural descriptors cannot infer. It does
+        # NOT declare a property named `<parameter>` (that name is already a
+        # field or an argument, and would collide); it lowers to the dunder
+        # indexed property `__options__(::Val{parameter})`, so a domain is an
+        # ordinary lazily computed DO value: never evaluated unless a consumer
+        # asks for it, memoized and invalidated like anything else, and its
+        # dependencies fall out of the same walk every other RHS gets. The
+        # rewrite happens here and then falls through to ordinary property
+        # classification — no separate emission path.
         if Symbol("@options") in macros
             extra = setdiff(macros, (Symbol("@options"),))
             isempty(extra) ||
                 error("@dynamicstruct $type: `@options` cannot combine with $(join(sort!(string.(collect(extra))), ", ")).")
             (Meta.isexpr(arg, :(=)) && arg.args[1] isa Symbol) ||
-                error("@dynamicstruct $type: `@options` must read `@options <parameter> = <domain expression>`, got `$arg`.")
-            push!(option_decls, (; parameter=arg.args[1], expression=arg.args[2], lnn))
-            metadata.doc[] = nothing
-            continue
+                error("@dynamicstruct $type: `@options` must read `@options(<parameter>) = <domain expression>`, got `$arg`.")
+            parameter, domain = arg.args
+            push!(option_decls, (; parameter, expression=domain, lnn))
+            arg = Expr(:(=),
+                Expr(:call, :__options__, Expr(:(::), Expr(:curly, Val, QuoteNode(parameter)))),
+                domain)
         end
         # Inline-method form: `f(__self__, ...) = body` (with optional `where`
         # clauses and qualified `Module.f` names). Bypasses property tooling —
@@ -4840,18 +4903,16 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             push!(opaque_props, name)
     end
     # ── `@options` domain declarations ───────────────────────────────────────
-    # Same dependency machinery as a property RHS, and for the same reason: a
-    # domain that reads a sibling is context-dependent, and a consumer has to
-    # know *which* sibling to re-evaluate it against. The walk runs on a COPY
-    # and its rewritten result is discarded — only the collected names are
-    # kept. The declared expression itself is emitted verbatim: DO records
-    # domains, it does not evaluate them.
+    # Each declaration became an ordinary `__options__(::Val{parameter})`
+    # property above, so its `dependson` was just populated by the pass above —
+    # a domain that reads a sibling is context-dependent, and that is exactly
+    # what `dependson` records. Declaration order is body order in both lists.
+    option_infos = [info for (name, info) in properties
+        if name === :__options__ && Symbol("@options") in info.macros]
+    @assert length(option_infos) == length(option_decls)
     option_declaration_records = Pair{Symbol,NamedTuple}[]
-    for decl in option_decls
-        deps = Set{Symbol}()
-        _collect_self_deps!(deps, walk_rhs(deepcopy(decl.expression);
-            locals=Set{Symbol}(), properties=walk_props, lnn=decl.lnn))
-        dependencies = sort!(collect(deps))
+    for (decl, info) in zip(option_decls, option_infos)
+        dependencies = sort!(collect(info.dependson))
         push!(option_declaration_records, decl.parameter => (;
             parameter=decl.parameter,
             expression=decl.expression,
@@ -7082,6 +7143,12 @@ function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
         progress_mode=_progress_mode(macros),
     )
     materialization = (;tier)
+    # The domain of the property's OWN value. A fixed field also reports it on
+    # its single `:field` input, but the shape that needs this is the
+    # overrideable default (`n_chain::Integer = 8`): it is a parameter a
+    # consumer sets, yet it is a computed property with no signature, so it has
+    # no `inputs` entry to hang a domain on.
+    domain = _input_domain((; name=prop, type=result_type), declarations)
     (;
         name=prop,
         role=_descriptor_role(Val(fixed), Val(indexed)),
@@ -7089,6 +7156,7 @@ function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
         indexed,
         description=property_doc(info),
         dependencies,
+        domain,
         inputs,
         output=(; type=result_type, materialization),
         semantics,
@@ -7103,14 +7171,20 @@ or `nothing` when the type or property has no DO metadata. The result describes
 inputs/output, lifecycle semantics, option domains, and declared
 materialization without reading or computing an object property.
 
-Each entry of `inputs` carries a `domain`, of one of three `kind`s:
+The descriptor's own `domain` is the domain of the property's *value*, and each
+entry of `inputs` carries the domain of that argument. Read the top-level one
+for a parameter a consumer sets — a fixed field, or an overrideable default like
+`n_chain::Integer = 8`, which is a computed property with no signature and
+therefore no `inputs` entry to hang a domain on. Every domain has one of three
+`kind`s:
 
 - `:static` — a finite domain the *type* proves (`Bool`, or an `Enum`), with the
   values in `options`.
 - `:declared` — an [`@options`](@ref option_declarations) declaration governs
   this parameter name. `domain.declaration` is the record (declared expression,
-  its `dependencies`, and `static`); `options` is empty because DO records the
-  expression and never evaluates it.
+  its `dependencies`, and `static`); `options` is empty because reflection
+  reports the declaration without running it. Call
+  [`property_options`](@ref)`(o, name)` for the domain's actual value.
 - `:unrestricted` — no domain is known; the type is the only constraint.
 """
 function property_descriptor(T::Type, prop::Symbol)
@@ -7640,7 +7714,7 @@ export print_structure, structure
 export tree_children_map, lint_index, lookup_type, callers_by_name, property_source_info, property_signature, property_doc, LintMessage
 export metafirst, metaall
 export static_domain, property_descriptor, property_descriptors, type_descriptor,
-    option_declarations
+    option_declarations, has_option_declaration, property_options
 export materialization_observation
 export execute_materialization, release_materialization!, materialization_ownership, materialization_gc!
 
