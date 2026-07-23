@@ -38,14 +38,26 @@ end
     end
 end
 
+# Does `m` carry the `compute_property` signature emitted for `T`'s property `name`?
+#
+# `m.sig` is a `UnionAll`, not a `Tuple` DataType, for every method a PARAMETRIC
+# `@dynamicstruct` emits (they carry a `where` clause). Reading `.parameters` off a
+# `UnionAll` throws `type UnionAll has no field parameters` — and `methods()` is
+# GLOBAL, so this predicate sees every parametric struct any other test file in the
+# same process has defined. That is why the file passes in isolation and errored
+# only in the full suite, once `test/parametric_structs.jl` had loaded. Unwrap
+# first; a parametric signature's `parameters[2]` is then a typevar-carrying type
+# that simply fails `=== T`, which is the match behaviour we want.
+_cp_sig_matches(m, T, name::Symbol) = begin
+    sig = Base.unwrap_unionall(m.sig)
+    sig isa DataType && length(sig.parameters) >= 3 &&
+        sig.parameters[2] === T && sig.parameters[3] === Val{name}
+end
+
 # The kwarg names of the `compute_property` method emitted for `T`'s property
 # `name` — the signature the fix is about, read straight off the method table.
 function cp_kwarg_names(T, name::Symbol)
-    ms = [
-        m for m in methods(DynamicObjects.compute_property)
-        if length(m.sig.parameters) >= 3 &&
-            m.sig.parameters[2] === T && m.sig.parameters[3] === Val{name}
-    ]
+    ms = [m for m in methods(DynamicObjects.compute_property) if _cp_sig_matches(m, T, name)]
     Base.kwarg_decl(only(ms))
 end
 end
