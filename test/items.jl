@@ -1619,7 +1619,7 @@ end # @testmodule DOAmbientFixtures
     const TBNode = DynamicObjects.Treebars.ProgressNode
 
     # Outside any computation there is nothing to attach to.
-    @test ambient_progress() === nothing
+    @test DynamicObjects.ambient_progress() === nothing
 
     o = AmbientTop(3)
     @test o.topval() == 2 * 3 + 1 + 100
@@ -1633,7 +1633,7 @@ end # @testmodule DOAmbientFixtures
 
     # The body sees itself as the ambient node while it runs, and the ambient
     # node is restored afterwards.
-    @test ambient_progress() === nothing
+    @test DynamicObjects.ambient_progress() === nothing
 end
 
 @testitem "ambient progress — cache hit keeps the subtree" tags=[:core] setup=[DOAmbientFixtures] begin
@@ -1666,23 +1666,23 @@ end
     const TBNode = DynamicObjects.Treebars.ProgressNode
 
     root = DynamicObjects.Treebars.initialize_progress!(:state; description="root")
-    @test ambient_progress() === nothing
-    inner = with_ambient_progress(root) do
-        ambient_progress()
+    @test DynamicObjects.ambient_progress() === nothing
+    inner = DynamicObjects.with_ambient_progress(root) do
+        DynamicObjects.ambient_progress()
     end
     @test inner === root
-    @test ambient_progress() === nothing
+    @test DynamicObjects.ambient_progress() === nothing
 
     # `nothing` is transparent: a property with no substatus must not orphan its
     # callees, so the current ambient node stays in place.
-    kept = with_ambient_progress(root) do
-        with_ambient_progress(nothing) do
-            ambient_progress()
+    kept = DynamicObjects.with_ambient_progress(root) do
+        DynamicObjects.with_ambient_progress(nothing) do
+            DynamicObjects.ambient_progress()
         end
     end
     @test kept === root
 
     # Restored even when the body throws.
-    @test_throws ErrorException with_ambient_progress(() -> error("x"), root)
-    @test ambient_progress() === nothing
+    @test_throws ErrorException DynamicObjects.with_ambient_progress(() -> error("x"), root)
+    @test DynamicObjects.ambient_progress() === nothing
 end

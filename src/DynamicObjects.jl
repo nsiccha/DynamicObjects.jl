@@ -42,7 +42,7 @@ optionally disk-cached properties.
 - [`materialization_gc!`](@ref): Collect only unreachable, provider-released storage with proven ownership.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, ambient_progress, with_ambient_progress, remake, remount, file_version, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, remount, file_version, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending
 
 import SHA, Serialization, Mmap, Treebars
 
@@ -637,22 +637,35 @@ end
 # node that is built either way (`_default_substatus`), it does not decide
 # whether one exists.
 #
-# Task-local, not global: concurrent requests each get their own stack, and a
-# `Threads.@spawn`ed compute starts with an empty TLS and installs its own node
-# (which is what we want — the spawned body is the callee). A body that spawns
-# its OWN tasks and reads properties inside them does not inherit the ambient
-# node; those reads stay unattached, exactly as they are today without a
-# hand-threaded `__progress__`.
-const _AMBIENT_PROGRESS_KEY = :__DynamicObjects_ambient_progress__
+# The dynamic scope itself is TREEBARS' (`Treebars.current_progress` /
+# `with_current_progress`), not a second one of our own. That is load-bearing,
+# not tidiness: two ambient stacks would be mutually invisible, so a
+# `progress_map` body reading a property, or a property body calling an
+# ambient-instrumented function, would each look up the wrong key and silently
+# lose the edge — the precise failure this mechanism exists to prevent. It also
+# keeps the version shim (`Base.ScopedValues` on 1.11+, task-local storage on
+# 1.10) in the one package that owns it. We deliberately export nothing here:
+# Treebars already exports `with_ambient_progress`, and a same-named DO export
+# would make `using DynamicObjects, Treebars` ambiguous.
+#
+# Task-local (on 1.10), not global: concurrent requests each get their own
+# stack, and a `Threads.@spawn`ed compute starts with an empty TLS and installs
+# its own node (which is what we want — the spawned body is the callee). A body
+# that spawns its OWN tasks and reads properties inside them does not inherit
+# the ambient node; those reads stay unattached, exactly as they are today
+# without a hand-threaded `__progress__`. On 1.11+ Treebars' shim switches to
+# `ScopedValues`, which fixes that inheritance with no change here.
 
 """
     ambient_progress()
 
 The progress node ordinary property/indexed-property reads currently attach to,
-or `nothing` outside any instrumented computation. Set for the duration of a
-property body by [`with_ambient_progress`](@ref).
+or `nothing` outside any instrumented computation.
+
+An alias for `Treebars.current_progress()` — DynamicObjects reads the ambient
+node, it does not own it.
 """
-ambient_progress() = get(task_local_storage(), _AMBIENT_PROGRESS_KEY, nothing)
+ambient_progress() = Treebars.current_progress()
 
 """
     with_ambient_progress(f, s)
@@ -662,18 +675,13 @@ previous node afterwards. `s === nothing` (a property with no substatus — a
 dunder, an indexed wrapper, or progress switched off) leaves the current
 ambient node in place, so such a property stays transparent and its callees
 attach to its own caller.
+
+Distinct from `Treebars.with_ambient_progress`, which CREATES a child node from
+a description; here the node already exists (the property's own substatus) and
+only needs binding, so this delegates to `Treebars.with_current_progress`.
 """
 with_ambient_progress(f, ::Nothing) = f()
-function with_ambient_progress(f, s)
-    tls = task_local_storage()
-    prev = get(tls, _AMBIENT_PROGRESS_KEY, nothing)
-    tls[_AMBIENT_PROGRESS_KEY] = s
-    try
-        f()
-    finally
-        tls[_AMBIENT_PROGRESS_KEY] = prev
-    end
-end
+with_ambient_progress(f, s) = Treebars.with_current_progress(f, s)
 
 # Mount `s` under the ambient node, mirroring `_attach_fetched!` on the explicit
 # `@fetch!` path — including the "(cached)" relabel for a documented in-memory
