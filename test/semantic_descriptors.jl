@@ -5,6 +5,7 @@ using DynamicObjects
 export SemanticQuality, draft, final, SemanticDescriptorFixture,
     SemanticPendingFixture, ComputedVersionedSemanticDescriptorFixture,
     AutomaticSemanticContextFixture, GovernedMaterializationFixture,
+    GOVERNED_MATERIALIZATION_CACHE_BASE,
     GOVERNED_MATERIALIZATION_CALLS, GOVERNED_MMAP_CALLS,
     GOVERNED_SERIAL_CALLS,
     LegacySemanticMeta, DeduplicatedKeyFixture
@@ -23,11 +24,14 @@ end
 const GOVERNED_MATERIALIZATION_CALLS = Threads.Atomic{Int}(0)
 const GOVERNED_MMAP_CALLS = Threads.Atomic{Int}(0)
 const GOVERNED_SERIAL_CALLS = Threads.Atomic{Int}(0)
+const GOVERNED_MATERIALIZATION_CACHE_BASE = Ref("cache")
 
 @dynamicstruct struct GovernedMaterializationFixture
     @versioned revision::Int
     value::Int
     request = nothing
+    __cache_base__ = GOVERNED_MATERIALIZATION_CACHE_BASE[]
+    __hold_recent_version__ = false
 
     compute(scale::Int) = begin
         Threads.atomic_add!(GOVERNED_MATERIALIZATION_CALLS, 1)
@@ -243,6 +247,7 @@ directory. Identity/version and retention remain reflected in the lifecycle.
     GOVERNED_MMAP_CALLS[] = 0
     GOVERNED_SERIAL_CALLS[] = 0
     cache_base = mktempdir()
+    GOVERNED_MATERIALIZATION_CACHE_BASE[] = cache_base
     context = (;
         scope=:job,
         key=(;mount="/study", job=:one),
@@ -250,9 +255,7 @@ directory. Identity/version and retention remain reflected in the lifecycle.
     )
 
     owned_path, owned_handle, owned_marker = let
-        retained = GovernedMaterializationFixture(1, 7;
-            __cache_base__=cache_base,
-            __hold_recent_version__=false)
+        retained = GovernedMaterializationFixture(1, 7)
         object = remount(retained; request=:current_request)
         path = object.__cache_path__
         @test !ispath(path)
@@ -277,7 +280,15 @@ directory. Identity/version and retention remain reflected in the lifecycle.
         @test ownership.owned_paths == [abspath(path)]
         @test !isfile(joinpath(path, "compute_3.sjl"))
         @test property_descriptor(
-            GovernedMaterializationFixture, :compute).output.materialization.tier === :automatic
+            GovernedMaterializationFixture,
+            :compute).output.materialization.tier === :automatic
+        # Duration is the non-compilation portion of first-hit wall time. A
+        # trivial scalar must not become a disk entry just because Julia had to
+        # compile its property method on first use.
+        @test !isfile(DynamicObjects.get_cache_path(object, :compute, 3))
+        @test DynamicObjects._effective_compute_seconds(
+            41_500_000_000, 41_450_000_000) ≈ 0.05
+        @test DynamicObjects._effective_compute_seconds(1, 2) == 0.0
 
         # No marker is needed for either disk format. The governed executor
         # chooses mmap for a large isbits array and serialization for a large
@@ -330,10 +341,8 @@ directory. Identity/version and retention remain reflected in the lifecycle.
 
     # A new @versioned value gets a distinct governed path under the same
     # logical identity. Nothing is configured beyond the ordinary DO field.
-    v1 = GovernedMaterializationFixture(1, 9;
-        __cache_base__=cache_base, __hold_recent_version__=false)
-    v2 = GovernedMaterializationFixture(2, 9;
-        __cache_base__=cache_base, __hold_recent_version__=false)
+    v1 = GovernedMaterializationFixture(1, 9)
+    v2 = GovernedMaterializationFixture(2, 9)
     @test v1.__identity_hash__ == v2.__identity_hash__
     @test v1.__version_tag__ != v2.__version_tag__
     @test v1.__cache_path__ != v2.__cache_path__
@@ -346,8 +355,7 @@ directory. Identity/version and retention remain reflected in the lifecycle.
         retention=(;max_entries=1, ttl=60.0),
     )
     unowned_path, unowned_file, unowned_handle = let
-        object = GovernedMaterializationFixture(3, 11;
-            __cache_base__=cache_base, __hold_recent_version__=false)
+        object = GovernedMaterializationFixture(3, 11)
         path = object.__cache_path__
         mkpath(path)
         user_file = joinpath(path, "user-owned.txt")

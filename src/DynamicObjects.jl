@@ -7063,6 +7063,15 @@ const _AUTOMATIC_MATERIALIZATION_MIN_SECONDS = 1.0
 _automatic_materialization_path(cache_path::AbstractString) =
     cache_path * _AUTOMATIC_MATERIALIZATION_SUFFIX
 
+function _effective_compute_seconds(wall_ns::Integer, compile_ns::Integer)
+    # Julia's cumulative compile counter is process-global. Concurrent
+    # compilation can therefore make `compile_ns` exceed this call's wall time;
+    # clamp at zero so that ambiguity is conservative (keep memory) rather than
+    # a false disk-promotion signal.
+    noncompile_ns = wall_ns > compile_ns ? wall_ns - compile_ns : zero(wall_ns)
+    Float64(noncompile_ns) / 1.0e9
+end
+
 function _automatic_materialization_metadata(cache_path::AbstractString)
     metadata_path = _automatic_materialization_path(cache_path)
     isfile(metadata_path) || return nothing
@@ -7417,6 +7426,29 @@ function _execute_materialization_target(target, name::Symbol, descriptor,
     getproperty(target, name)
 end
 
+function _timed_materialization_target(target, name::Symbol, descriptor,
+        args, kwargs::NamedTuple)
+    # This is the same compiler counter Base.@time uses. Its enable/disable
+    # operations nest, so concurrent/nested governed executions do not turn
+    # collection off underneath one another.
+    Base.cumulative_compile_timing(true)
+    compile_started = first(Base.cumulative_compile_time_ns())
+    wall_started = time_ns()
+    try
+        value = _execute_materialization_target(
+            target, name, descriptor, args, kwargs)
+        wall_ns = time_ns() - wall_started
+        compile_ns =
+            first(Base.cumulative_compile_time_ns()) - compile_started
+        (;
+            value,
+            elapsed_seconds=_effective_compute_seconds(wall_ns, compile_ns),
+        )
+    finally
+        Base.cumulative_compile_timing(false)
+    end
+end
+
 function _materialization_path_within(root::AbstractString, path::AbstractString)
     relative = relpath(normpath(abspath(path)), normpath(abspath(root)))
     relative == "." && return true
@@ -7456,7 +7488,18 @@ function _set_automatic_materialization_cache!(target, name, descriptor,
         target, name, descriptor, args, kwargs)
     slot === nothing && return false
     cache, key = slot
-    cache[key] = value
+    if cache isa AbstractThreadsafeDict
+        # Computed stores publish directly into the wrapped dictionary rather
+        # than through `setindex!`: mounted caches use the same distinction to
+        # preserve shared-vs-request-local routing, and plain ThreadsafeDicts do
+        # not expose a public `setindex!` mutation path.
+        lock(cache.lock) do
+            cache.cache[key] = value
+            _on_store!(cache, key)
+        end
+    else
+        cache[key] = value
+    end
     true
 end
 
@@ -7596,18 +7639,18 @@ function execute_materialization(context::NamedTuple, root, target,
         property_kwargs = (;kwargs...)
         automatic = _load_automatic_materialization!(
             owner, target, name, descriptor, args, property_kwargs)
-        started = time_ns()
-        value = _execute_materialization_target(
-            target, name, descriptor, args, property_kwargs)
         if automatic !== nothing
+            value = _execute_materialization_target(
+                target, name, descriptor, args, property_kwargs)
             automatic.tier === :serialized &&
                 _clear_automatic_materialization_cache!(
                     target, name, descriptor, args, property_kwargs)
             return value
         end
-        elapsed_seconds = (time_ns() - started) / 1.0e9
+        timed = _timed_materialization_target(
+            target, name, descriptor, args, property_kwargs)
         _persist_automatic_materialization!(owner, target, name, descriptor,
-            args, property_kwargs, value, elapsed_seconds)
+            args, property_kwargs, timed.value, timed.elapsed_seconds)
     finally
         _end_materialization!(owner)
     end
