@@ -3695,8 +3695,9 @@ _analysis_nested_type(::Type, ::Val) = nothing
 """    option_declarations(::Type{T}) -> Vector{Pair{Symbol,NamedTuple}}
 
 Every `@options(<parameter>) = <domain expression>` declaration in `T`'s body,
-in declaration order (duplicates preserved, first wins where a single answer is
-needed — same convention as [`meta`](@ref)).
+in declaration order. A parameter may be declared only once: duplicate
+declarations are rejected where the `@dynamicstruct` is defined so reflection
+and the generated `__options__(::Val{parameter})` method can never disagree.
 
 `@options` declares *which values a parameter may take*. It is the one thing the
 structural descriptors cannot infer: a finite domain is proved by the type only
@@ -4680,6 +4681,8 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             (Meta.isexpr(arg, :(=)) && arg.args[1] isa Symbol) ||
                 error("@dynamicstruct $type: `@options` must read `@options(<parameter>) = <domain expression>`, got `$arg`.")
             parameter, domain = arg.args
+            any(decl -> decl.parameter === parameter, option_decls) &&
+                error("@dynamicstruct $type: duplicate `@options` declaration for `$parameter`; each parameter may declare one domain.")
             push!(option_decls, (; parameter, expression=domain, lnn))
             arg = Expr(:(=),
                 Expr(:call, :__options__, Expr(:(::), Expr(:curly, Val, QuoteNode(parameter)))),
@@ -6985,9 +6988,9 @@ end
 
 # Domain of an input governed by an `@options` declaration. `options` stays
 # empty and `cardinality` `nothing` on purpose: DO records the declared
-# expression, it never evaluates it, so it cannot know the values. The consumer
-# evaluates `declaration.expression` — once for a `static` domain, and again
-# per change of `dependencies` for a context-dependent one.
+# expression, it never evaluates it during reflection, so it cannot know the
+# values. The consumer calls `property_options(object, parameter)` when it needs
+# the value and re-reads after a declared dependency changes.
 _declared_domain(declaration::NamedTuple) = (;
     kind=:declared,
     options=NamedTuple[],

@@ -274,4 +274,9 @@ end
     study::Symbol
     @cached @options study = [:a]
 end
+@test_throws LoadError @eval @dynamicstruct struct DuplicateOptionsParameter
+    study::Symbol
+    @options(study) = [:north]
+    @options(study) = [:south]
+end
 end
