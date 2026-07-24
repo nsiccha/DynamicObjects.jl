@@ -10,10 +10,11 @@ using TestItemRunner
 # the file: if any assertion here needs one added to pass, the feature is gone.
 @testmodule ImpliedProgressFixtures begin
 using DynamicObjects
+import DynamicObjects.Treebars
 using DynamicObjects.Treebars: render_text, @progress
 export render_text, @progress, rows, depth_of, labels,
     IPApp, IPInner, IPOuter, IPViaForeign, IPWithIP, IPBoom, IPPhased,
-    IPKw, IPSlow, IPUndocumented, IPMarked
+    IPQualifiedPhased, IPKw, IPSlow, IPUndocumented, IPMarked
 
 # ── Rendered-tree helpers ────────────────────────────────────────────────────
 # `render_text` is the offline preview of what the browser shows, and it shares
@@ -100,9 +101,8 @@ end
 end
 
 # The one remaining escape hatch: inline phase markers, still with NO marker on
-# the LHS. Spelled BARE — a module-qualified `Treebars.@progress "x"` is not
-# recognised as a phase marker (that is Treebars' own surface, and it fails the
-# same way with no DynamicObjects involved).
+# the LHS. Both the imported bare form and the module-qualified form are part of
+# Treebars' supported source surface.
 @dynamicstruct struct IPPhased
     n::Int
     """Two phases"""
@@ -110,6 +110,17 @@ end
         @progress "first"
         x = (sleep(0.01); n + 1)
         @progress "second"
+        (sleep(0.01); x * 2)
+    end
+end
+
+@dynamicstruct struct IPQualifiedPhased
+    n::Int
+    """Qualified phases"""
+    staged = begin
+        Treebars.@progress "qual-first"
+        x = (sleep(0.01); n + 1)
+        Treebars.@progress "qual-second"
         (sleep(0.01); x * 2)
     end
 end
@@ -275,6 +286,15 @@ p = IPPhased(5)
 staged = depth_of(p.__status__, "Two phases")
 @test depth_of(p.__status__, "first") > staged
 @test depth_of(p.__status__, "second") > staged
+end
+
+@testitem "implied progress: qualified inline phases need no LHS marker" tags=[:progress] setup=[ImpliedProgressFixtures] begin
+using .ImpliedProgressFixtures
+p = IPQualifiedPhased(5)
+@test p.staged == 12
+staged = depth_of(p.__status__, "Qualified phases")
+@test depth_of(p.__status__, "qual-first") > staged
+@test depth_of(p.__status__, "qual-second") > staged
 end
 
 @testitem "implied progress: keyword arguments nest" tags=[:progress] setup=[ImpliedProgressFixtures] begin
