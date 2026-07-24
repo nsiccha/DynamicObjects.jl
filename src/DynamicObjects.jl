@@ -559,46 +559,6 @@ _finalize_substatus!(::Nothing) = nothing
 _fail_substatus!(s, e) = nothing
 _fail_substatus!(::Nothing, e) = nothing
 
-# ── Automatic nesting via Treebars' ambient current-node ───────────────────
-#
-# Progress nesting used to be opt-in plumbing. A new substatus always hung under
-# the OBJECT ROOT (`o.__status__`), because an ordinary sibling read inside a
-# property body lowers to a plain `getproperty` with nothing to attach to — so
-# `b` read from `a`'s body mounted NEXT TO `a` instead of under it, and a correct
-# tree required the author to remember one of `@progress` / `@PROGRESS` /
-# `@fetch!` / `@dynamic_progress` on the caller. Every one of those threads a
-# LEXICAL `__progress__`, so nesting was also lost through any intermediate frame
-# a macro could not see: if `a` calls a plain helper `h` and `h` touches `o.b`,
-# `b` still landed on the root.
-#
-# `Treebars.current_progress()` (Treebars `aac3f34`, decision `13jb58i`) is a
-# dynamically-scoped "node currently being computed" that any frame can read at
-# any call depth. That turns nesting into runtime rules and no macro — see the
-# "Ambient (annotation-free) progress" block below for the edge-discovery half
-# (`with_ambient_progress` / `_attach_ambient!`); `_progress_parent` here is the
-# node-CREATION half.
-#
-# The markers still work and are still useful as *instrumentation* (they also
-# memoize, and relabel in-memory hits `(cached)`); they are no longer load-bearing
-# for correctness.
-
-# Parent for a newly created substatus: the node whose body we are running inside,
-# falling back to the object root when there is none. `nothing` (progress disabled)
-# flows through unchanged — `_default_substatus`'s generic method no-ops on it.
-#
-# Creating the node in its final place — rather than under the root and then
-# adding the ambient edge — is what keeps the ROOT's child set proportional to
-# the top-level reads instead of to every property evaluation in the object
-# graph. `_attach_ambient!` still adds the edge on the paths where no node is
-# created (warm hit, `:wait` / `:pending` / `:error` losers): there the node
-# belongs to whoever computed it, under THEIR caller, and the current reader
-# needs a second edge to it. `Treebars.add_child!` is a `ThreadsafeSet` push, so
-# the two halves overlapping on the compute path is an idempotent no-op.
-_progress_parent(o) = begin
-    ambient = Treebars.current_progress()
-    isnothing(ambient) ? o.__status__ : ambient
-end
-
 # Disk-load reporting hook — the generic method is a no-op; the
 # `::Treebars.ProgressNode` specialization below sets the substatus message to
 # "from disk: <size>". Called from `_computeproperty` just before
@@ -619,34 +579,12 @@ _report_disk_load!(::Nothing, _, _) = nothing
 # !isnothing(doc)` rule: undocumented properties add no labelled noise to the
 # tree, documented ones do.
 #
-# ── The parent: Treebars' AMBIENT node, falling back to `status` ─────────────
-#
-# This one line is what makes progress nesting implied. `status` is the DEFAULT
-# parent the caller had — for the two cache factories (`memoize!` /
-# `_bare_substatus_f`) that is always `o.__status__`, the object's ROOT, because
-# a cache has no idea who asked. Parenting there is why correct nesting used to
-# need `@fetch!` on every call site: the author had to hand the caller's node
-# down explicitly, and a body that reached a property through an ordinary
-# function could not hand it down at all.
-#
-# `Treebars.current_progress()` is that caller — the node whose compute we are
-# lexically inside, bound by `with_ambient_progress` below for the whole dynamic
-# extent of the body. So the substatus is born in the right place, at ANY call
-# depth and through ANY number of foreign frames, with nothing threaded through
-# the body. `nothing` (no tree running, or a read from top level) falls back to
-# `status`, reproducing the old parenting exactly.
-#
-# `o.__status__ === nothing` never reaches here — the generic `_default_substatus`
-# returns `nothing` — so an object with progress disabled stays silent even when
-# read from inside a live tree.
-#
-# `transient` now defaults to FALSE, which is the other half of the same change.
-# It existed to un-parent a node from the object root once `_attach_fetched!` had
-# re-homed it under the real caller (Treebars detaches transient nodes from their
-# parent on finalize, keeping failed ones pinned). Ambient parenting puts the node
-# under the real caller to begin with, so detaching on success would now delete
-# the very nesting we just built — a finished tree would render empty. Callers
-# that still want the old re-homing behaviour pass `transient=true` explicitly.
+# `status` is explicit: the generated property-body rewrite threads the caller's
+# lexical progress node into `maybefetchproperty!` / `maybefetchindex!`, and the
+# fetch path asks the substatus factory to create the node directly beneath that
+# caller. A top-level ordinary read passes the object's root instead. No
+# process-global, thread-local, task-local, or dynamically-scoped parent exists
+# in DynamicObjects.
 function _default_substatus(status::Treebars.ProgressNode, o, name, args...; transient=false, kwargs...)
     # Gate the label PER CALL SIGNATURE: `_is_property_documented` dispatches on
     # `args...` (one method emitted per declaration — `true` if documented,
@@ -660,8 +598,7 @@ function _default_substatus(status::Treebars.ProgressNode, o, name, args...; tra
     # fix rolls in as each struct is re-expanded.)
     desc = _is_property_documented(o, Val(name), args...; kwargs...) ?
         something(_property_description(o, Val(name), args...; kwargs...), "") : ""
-    parent = something(Treebars.current_progress(), status)
-    Treebars.initialize_progress!(parent; description=desc, transient)
+    Treebars.initialize_progress!(status; description=desc, transient)
 end
 
 # Lifecycle hooks — give DO's ThreadsafeDict-spawned substatuses the with_progress
@@ -685,101 +622,6 @@ function _format_size(n::Integer)
     n < 1024^2          && return string(round(n / 1024,        digits=1), " KB")
     n < 1024^3          && return string(round(n / 1024^2,      digits=1), " MB")
     string(round(n / 1024^3, digits=1), " GB")
-end
-
-# ── Ambient (annotation-free) progress ───────────────────────────────────────
-#
-# `@fetch!` / `@progress` make a nested computation visible by threading the
-# CALLER's node lexically and calling `Treebars.add_child!(caller, callee)`. The
-# node itself was never the missing piece — every generated property already
-# builds its own substatus (`_bare_substatus_f` / `memoize!`'s `substatus_f`)
-# and registers it in `c.status`. Only the tree EDGE needed an annotation.
-#
-# So the edge is discovered at RUNTIME instead: while a property body runs, its
-# own node is the *ambient* node (set in `_run_cache_compute!`, the one place
-# every body executes); every ordinary property/IP read performed underneath it
-# mounts its node under that ambient node (in `get!`, the one place every node
-# is created or found). Nesting therefore follows actual execution, needing no
-# call-site annotation and no macro-time dependency enumeration.
-#
-# ⚠️ This is deliberately NOT the auto-progress stack that was reverted in
-# 2026-05 (see the DO primer, "Rules & invariants"). That one wrapped bodies
-# implicitly at MACRO time, keyed the wrap on the docstring, emitted a
-# `_dependencies` pre-enumeration, and stored the node in a persistent
-# `__status__::Treebars.ProgressNode` STRUCT FIELD — which moved struct shape
-# (fatal under Julia 1.10 + Revise) and put presentation metadata in charge of
-# execution semantics. Here: nothing is emitted, no body is rewritten, no
-# struct shape changes, and the docstring keeps its existing role — it labels a
-# node that is built either way (`_default_substatus`), it does not decide
-# whether one exists.
-#
-# The dynamic scope itself is TREEBARS' (`Treebars.current_progress` /
-# `with_current_progress`), not a second one of our own. That is load-bearing,
-# not tidiness: two ambient stacks would be mutually invisible, so a
-# `progress_map` body reading a property, or a property body calling an
-# ambient-instrumented function, would each look up the wrong key and silently
-# lose the edge — the precise failure this mechanism exists to prevent. It also
-# keeps the version shim (`Base.ScopedValues` on 1.11+, task-local storage on
-# 1.10) in the one package that owns it. We deliberately export nothing here:
-# Treebars already exports `with_ambient_progress`, and a same-named DO export
-# would make `using DynamicObjects, Treebars` ambiguous.
-#
-# Task-local (on 1.10), not global: concurrent requests each get their own
-# stack, and a `Threads.@spawn`ed compute starts with an empty TLS and installs
-# its own node (which is what we want — the spawned body is the callee). A body
-# that spawns its OWN tasks and reads properties inside them does not inherit
-# the ambient node; those reads stay unattached, exactly as they are today
-# without a hand-threaded `__progress__`. On 1.11+ Treebars' shim switches to
-# `ScopedValues`, which fixes that inheritance with no change here.
-
-"""
-    ambient_progress()
-
-The progress node ordinary property/indexed-property reads currently attach to,
-or `nothing` outside any instrumented computation.
-
-An alias for `Treebars.current_progress()` — DynamicObjects reads the ambient
-node, it does not own it.
-"""
-ambient_progress() = Treebars.current_progress()
-
-"""
-    with_ambient_progress(f, s)
-
-Run `f()` with `s` installed as the ambient progress node, restoring the
-previous node afterwards. `s === nothing` (a property with no substatus — a
-dunder, an indexed wrapper, or progress switched off) leaves the current
-ambient node in place, so such a property stays transparent and its callees
-attach to its own caller.
-
-Distinct from `Treebars.with_ambient_progress`, which CREATES a child node from
-a description; here the node already exists (the property's own substatus) and
-only needs binding, so this delegates to `Treebars.with_current_progress`.
-
-This is the producer half of the implied-progress contract, and it is applied at
-the CACHE layer rather than in the emitted body: the cache is the one place every
-evaluation passes through, including the `Threads.@spawn`ed poller path. That
-spawn crosses a task boundary — and Treebars' ambient node is task-local on 1.10,
-NOT inherited by a spawned child — but `s` is handed to the spawned task
-explicitly, so re-binding it there re-establishes the ambient inside the new
-task. DO therefore does not inherit Treebars' consumer-spawn limitation on its
-own compute path.
-"""
-with_ambient_progress(f, ::Nothing) = f()
-with_ambient_progress(f, s) = Treebars.with_current_progress(f, s)
-
-# Mount `s` under the ambient node, mirroring `_attach_fetched!` on the explicit
-# `@fetch!` path — including the "(cached)" relabel for a documented in-memory
-# hit. Both `add_child!` (a `ThreadsafeSet` push) and `_mark_cached!` (an
-# `endswith` guard) are idempotent, so an explicitly threaded `@fetch!` inside a
-# `@progress` body — where the threaded node and the ambient node are the same
-# node — attaches once, not twice.
-function _attach_ambient!(ambient, s, hit::Bool)
-    ambient isa Treebars.ProgressNode || return nothing
-    hit && s isa Treebars.ProgressNode && !isempty(s.impl.description) &&
-        _mark_cached!(s)
-    Treebars.add_child!(ambient, s)
-    nothing
 end
 
 """
@@ -1045,13 +887,19 @@ n_running(c::AbstractThreadsafeDict) = lock(c.lock) do; length(c.computing); end
 Base.show(io::IO, c::ThreadsafeDict{K,V}) where {K,V} = lock(c.lock) do
     print(io, "ThreadsafeDict{", K, ",", V, "}(", length(c.cache), " cached, ", length(c.computing), " running)")
 end
-memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...; fetch=Base.fetch, retry_failed=true, kwargs...) where {name} = begin
+memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
+         fetch=Base.fetch, retry_failed=true, kwargs...) where {name} =
+    _memoize_with_progress!(nothing, ip, indices...; fetch, retry_failed, kwargs...)
+
+# Internal explicit-parent variant used by the generated property-body rewrite.
+# `progress` is lexical data passed in the emitted call, never ambient state.
+function _memoize_with_progress!(progress,
+        ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
+        fetch=Base.fetch, retry_failed=true, kwargs...) where {name}
     (;o, cache) = ip
     substatus_f = if name != :__substatus__ && name != :__status__
         () -> begin
-            # Ambient node when one is active (this IP was reached from another
-            # property's body → nest under it), else the object root.
-            root = _progress_parent(o)
+            root = isnothing(progress) ? o.__status__ : progress
             compute_property(o, Val(:__substatus__), name, indices...; __status__=root, kwargs...)
         end
     else
@@ -1079,13 +927,6 @@ end
 # `c.lock` would deadlock. So we fast-path first, then build `s` outside the lock and
 # re-take it to arbitrate; if we lose the arbitration we discard `s` via finalize.
 Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substatus=nothing, retry_failed=true) = begin
-    # This is the one place a property/IP progress node is created or found, so
-    # it is where an ordinary read mounts itself under the caller's node —
-    # `ambient_progress()` is the caller's node whenever we are running inside
-    # another property's body. Reading it costs one task-local lookup; when it is
-    # `nothing` (no instrumented computation in progress — the common case)
-    # `_attach_ambient!` is a typed no-op and every path below is unchanged.
-    ambient = ambient_progress()
     # Fast path: a ready value returns immediately, no substatus cost. (`_missing_sentinel`
     # distinguishes "absent" from a legitimately-cached `nothing`.)
     hit = lock(c.lock) do
@@ -1093,13 +934,7 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
         v !== _missing_sentinel && (_on_hit!(c, key); return v)
         _missing_sentinel
     end
-    if hit !== _missing_sentinel
-        # In-memory hit: the node from the ORIGINAL compute is still in `c.status`
-        # with its finished subtree; mount it and let `_attach_ambient!` apply the
-        # same "(cached)" relabel the explicit `@fetch!` path applies.
-        isnothing(ambient) || _attach_ambient!(ambient, _peek_status(c, key), true)
-        return hit
-    end
+    hit === _missing_sentinel || return hit
     # Build the substatus OUTSIDE the lock — factories recurse into DO props on the SAME
     # lock, so building under it would deadlock.
     s = isnothing(substatus) ? nothing : substatus()
@@ -1127,32 +962,22 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
         return sync ? (:inline, cnd) : (:spawn, cnd)
     end
     kind = action[1]
-    # Every branch below mounts the EFFECTIVE node under the ambient one, and does
-    # so BEFORE it blocks, computes or spawns — a node attached only after the work
-    # finished would never be seen running, which is the whole point of the tree.
-    # On the four non-computing branches the winner owns the status, so the node to
-    # mount is `c.status[key]`, never the `s` we built and are about to discard.
-    kind === :value && (isnothing(ambient) || _attach_ambient!(ambient, _peek_status(c, key), true);
-                        !isnothing(s) && _finalize_substatus!(s); return action[2])
+    kind === :value && (!isnothing(s) && _finalize_substatus!(s); return action[2])
     if kind === :error
-        isnothing(ambient) || _attach_ambient!(ambient, _peek_status(c, key), false)
         !isnothing(s) && _finalize_substatus!(s)
         throw(action[2])
     end
     if kind === :wait
         # Blocking waiter: block on the in-flight computer's latch, then read value/error.
         # We built `s` but aren't the computer; finalize it (the winner owns the status).
-        isnothing(ambient) || _attach_ambient!(ambient, _peek_status(c, key), false)
         !isnothing(s) && _finalize_substatus!(s)
         return _await_cache_value!(c, key, action[2]::Threads.Condition, f; fetch, substatus, retry_failed)
     end
     if kind === :pending
         # Poller, compute already in flight elsewhere — hand back a cheap Pending, no spawn.
-        isnothing(ambient) || _attach_ambient!(ambient, _peek_status(c, key), false)
         !isnothing(s) && _finalize_substatus!(s)
         return fetch(Pending(c, key, nothing))
     end
-    isnothing(ambient) || _attach_ambient!(ambient, s, false)
     if kind === :inline
         # Blocking first-arriver: compute on THIS thread (no spawn), publish, return value.
         return _run_cache_compute!(c, key, action[2]::Threads.Condition, f, s)
@@ -1163,12 +988,6 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     cnd = action[2]::Threads.Condition
     Threads.@spawn try; _run_cache_compute!(c, key, cnd, f, s); catch; end  # error already recorded
     return fetch(Pending(c, key, nothing))
-end
-
-# Read the winning computer's node without racing the cache lock. Used only on
-# the ambient-attach paths, so it costs nothing when no progress is in flight.
-_peek_status(c::AbstractThreadsafeDict, key) = lock(c.lock) do
-    get(c.status, key, nothing)
 end
 
 # Singleton sentinel so a single `get` lookup distinguishes "key absent" from
@@ -1186,12 +1005,7 @@ const _missing_sentinel = _Missing()
 function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condition, f, s)
     local v
     try
-        # Every property/IP body runs through here — inline on the caller's task
-        # and inside the fire-and-forget spawn alike — so this is the one place
-        # that installs the body's own node as the ambient one. Ordinary reads in
-        # the body then mount themselves under `s` (see `get!`), which is what
-        # makes the tree build itself without a single call-site annotation.
-        v = with_ambient_progress(() -> f(s), s)
+        v = f(s)
     catch e
         lock(c.lock) do
             get(c.computing, key, nothing) === cnd && delete!(c.computing, key)
@@ -1362,14 +1176,20 @@ fetchindex(app.results, key) do rv, status
 end
 ```
 """
-function fetchindex(fetch, ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}, indices...;
-                    force=false, retry_failed=force, kwargs...)
+fetchindex(fetch, ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}, indices...;
+           force=false, retry_failed=force, kwargs...) =
+    _fetchindex_with_progress(fetch, nothing, ip, indices...; force, retry_failed, kwargs...)
+
+function _fetchindex_with_progress(fetch, progress,
+        ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}, indices...;
+        force=false, retry_failed=force, kwargs...)
     if force
         maybepop!(ip.cache, (indices, (;kwargs...)))
         path = get_cache_path(ip.o, name(ip), indices...; kwargs...)
         isfile(path) && rm(path)
     end
-    rv = memoize!(ip, indices...; fetch=identity, retry_failed, kwargs...)
+    rv = _memoize_with_progress!(progress, ip, indices...;
+        fetch=identity, retry_failed, kwargs...)
     status = getstatus(ip, indices...; kwargs...)
     fetch(rv, status)
 end
@@ -1397,7 +1217,10 @@ substatus object or `nothing`.
 For `Dict`-backed caches (serial), falls through to `getproperty` (synchronous,
 no status). The two-phase dance only applies to `ThreadsafeDict`-backed caches.
 """
-fetchproperty(fetch, o, name::Symbol) = begin
+fetchproperty(fetch, o, name::Symbol) =
+    _fetchproperty_with_progress(fetch, nothing, o, name)
+
+function _fetchproperty_with_progress(fetch, progress, o, name::Symbol)
     if !(hasfield(typeof(o), :cache) && getfield(o, :cache) isa PropertyCache)
         return fetch(getproperty(o, name), nothing)
     end
@@ -1409,7 +1232,7 @@ fetchproperty(fetch, o, name::Symbol) = begin
     if !(c isa AbstractThreadsafeDict) || is_indexed_property(o, name)
         return fetch(getproperty(o, name), nothing)
     end
-    substatus_f = _bare_substatus_f(o, name)
+    substatus_f = _bare_substatus_f(o, name, progress)
     rv = get!(c, name; substatus=substatus_f, fetch=identity) do s
         v = _computeproperty(o, name; __status__=s)
         v
@@ -1482,6 +1305,14 @@ function _mark_cached!(s::Treebars.ProgressNode)
     nothing
 end
 
+fetchindex!(status::Treebars.ProgressNode,
+            ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict},
+            indices...; fetch=Base.fetch, kwargs...) =
+    _fetchindex_with_progress(status, ip, indices...; kwargs...) do rv, s
+        _attach_fetched!(status, rv, s)
+        fetch(rv)
+    end
+
 fetchindex!(status::Treebars.ProgressNode, ip, indices...; fetch=Base.fetch, kwargs...) =
     fetchindex(ip, indices...; kwargs...) do rv, s
         _attach_fetched!(status, rv, s)
@@ -1489,7 +1320,7 @@ fetchindex!(status::Treebars.ProgressNode, ip, indices...; fetch=Base.fetch, kwa
     end
 
 fetchproperty!(status::Treebars.ProgressNode, o, name::Symbol) =
-    fetchproperty(o, name) do rv, s
+    _fetchproperty_with_progress(status, o, name) do rv, s
         _attach_fetched!(status, rv, s)
         Base.fetch(rv)
     end
@@ -2058,13 +1889,6 @@ function _peek_hit(c::AbstractThreadsafeDict, name::Symbol)
 end
 _peek_hit(c::AbstractDict, name::Symbol) = get(c, name, _missing_sentinel)
 
-# Bare-property counterpart to `_peek_status`, unwrapping the `PropertyCache`.
-# A `Dict`-backed (`:serial`) cache carries no status at all, hence the fallback.
-_peek_bare_status(pc::PropertyCache, name::Symbol) =
-    _peek_bare_status(getfield(pc, :cache), name)
-_peek_bare_status(c::AbstractThreadsafeDict, name::Symbol) = _peek_status(c, name)
-_peek_bare_status(::AbstractDict, ::Symbol) = nothing
-
 getorcomputeproperty(o, name, indices...; kwargs...) = if hasfield(typeof(o), name)
     @assert length(indices) == length(kwargs) == 0
     getfield(o, name)
@@ -2087,17 +1911,7 @@ else
     # directly is behaviourally identical to routing through `get!`. Only misses
     # pay the closures.
     hit = _peek_hit(cache, name)
-    if hit !== _missing_sentinel
-        # This path deliberately skips `get!`, so it has to do `get!`'s ambient
-        # attach itself — otherwise a warm property read inside another body would
-        # silently drop out of the tree the first time it is re-read, and the
-        # subtree it already computed would disappear along with it. Only pays the
-        # lookup when a computation is actually being instrumented.
-        ambient = ambient_progress()
-        isnothing(ambient) ||
-            _attach_ambient!(ambient, _peek_bare_status(cache, name), true)
-        return hit
-    end
+    hit === _missing_sentinel || return hit
     substatus_f = _bare_substatus_f(o, name)
     get!(cache, name; substatus=substatus_f) do s
         # When called with no indices on an indexed property (declared with
@@ -2112,14 +1926,12 @@ else
         _computeproperty(o, name; __status__=s)
     end
 end
-_bare_substatus_f(o, name) =
+_bare_substatus_f(o, name, progress=nothing) =
     if name != :__substatus__ && name != :__status__ &&
        !(startswith(string(name), "__") && endswith(string(name), "__")) &&
        is_generated_property(o, name) && !is_indexed_property(o, name)
         () -> begin
-            # Ambient node when one is active (this property was reached from
-            # another property's body → nest under it), else the object root.
-            root = _progress_parent(o)
+            root = isnothing(progress) ? o.__status__ : progress
             compute_property(o, Val(:__substatus__), name; __status__=root)
         end
     else
@@ -2568,18 +2380,176 @@ function _fetch_rewrite_kwarg(pv::Symbol, a::Expr)
     return _fetch_rewrite(pv, a)
 end
 
+# A syntactic property access (`obj.name`), as distinct from broadcast syntax
+# (`f.(xs)`) which also uses the `:.` head.
+_is_property_access(x) = Meta.isexpr(x, :.) && length(x.args) == 2 &&
+    x.args[2] isa QuoteNode
+
+# Rebuild the callee of a property-rooted call without fetching the terminal
+# property itself. `obj.ip(args...)` must first evaluate to the
+# `IndexableProperty` wrapper so `maybefetchindex!` can dispatch on it; any
+# property access in the receiver (`obj.child.ip(args...)`) is still rewritten.
+_progress_property_callee(pv::Symbol, x::Expr) =
+    Expr(:., _progress_property_rewrite(pv, x.args[1]), x.args[2])
+
+_progress_assignment_head(head) =
+    head isa Symbol && head !== :kw && endswith(String(head), "=")
+
+# Property-scoped implied progress (decision 18urwkj).
+#
+# Rewrite only operations that can be DO evaluations:
+#
+#   obj.name       -> maybefetchproperty!(progress, obj, :name)
+#   obj.ip(args...) -> maybefetchindex!(progress, obj.ip, args...)
+#
+# Ordinary calls (`sum`, arithmetic, helpers, constructors) are left as calls;
+# only their argument expressions are walked. This is intentionally narrower
+# than `_fetch_rewrite`, which wraps every call, and broader than
+# `_progress_self_rewrite`, which only sees `__self__.name`.
+#
+# The walker runs after `walk_rhs`, so bare sibling names have already become
+# `__self__.name`. It is syntax-aware at the sites that cannot be treated as
+# ordinary values: assignment/function LHSes, quoted code, macro heads, type
+# positions, keyword shorthand, do-blocks, and broadcast calls.
+_progress_property_rewrite(pv::Symbol, x) = x
+function _progress_property_rewrite(pv::Symbol, x::Expr)
+    # Quoted/type syntax is data, not an evaluation in this property body.
+    Meta.isexpr(x, (:quote, :inert, :curly)) && return x
+    if Meta.isexpr(x, :(::))
+        return length(x.args) == 2 ?
+            Expr(:(::), _progress_property_rewrite(pv, x.args[1]), x.args[2]) :
+            x
+    end
+    Meta.isexpr(x, :where) && return x
+
+    # Preserve the macro identifier and source line exactly. Its runtime
+    # arguments are still body expressions, except quoted arguments which the
+    # branch above leaves opaque.
+    if Meta.isexpr(x, :macrocall)
+        length(x.args) <= 2 && return x
+        return Expr(:macrocall, x.args[1], x.args[2],
+            Any[_progress_property_rewrite(pv, a) for a in x.args[3:end]]...)
+    end
+
+    # Local function/lambda signatures are declarations. Rewrite only the body.
+    if Meta.isexpr(x, (:function, :(->))) && length(x.args) == 2
+        return Expr(x.head, x.args[1], _progress_property_rewrite(pv, x.args[2]))
+    end
+
+    # Named destructuring performs implicit property reads during lowering.
+    # Make those reads explicit, evaluate the source once, and preserve the
+    # assignment's value and scope.
+    if Meta.isexpr(x, :(=)) && Meta.isexpr(x.args[1], :tuple) &&
+       length(x.args[1].args) == 1 && Meta.isexpr(x.args[1].args[1], :parameters)
+        binds = _fetch_destructure_binds(x.args[1].args[1])
+        if binds !== nothing
+            src = gensym(:progress_src)
+            block = Expr(:block,
+                :($src = $(_progress_property_rewrite(pv, x.args[2]))))
+            for (lhs, nm) in binds
+                push!(block.args, :($lhs = $(Expr(:call,
+                    GlobalRef(@__MODULE__, :maybefetchproperty!),
+                    pv, src, QuoteNode(nm)))))
+            end
+            push!(block.args, src)
+            return block
+        end
+    end
+
+    # Never rewrite an assignment target (including short-form method
+    # signatures and dotted/compound assignment). The RHS is an evaluation.
+    if length(x.args) >= 2 && _progress_assignment_head(x.head)
+        return Expr(x.head, x.args[1],
+            Any[_progress_property_rewrite(pv, a) for a in x.args[2:end]]...)
+    end
+
+    # `f(args...) do ... end`: a property-rooted callee needs the lambda in the
+    # helper's first user-argument position. A foreign callee remains a do-call.
+    if Meta.isexpr(x, :do) && length(x.args) == 2 &&
+       Meta.isexpr(x.args[1], :call)
+        call = x.args[1]
+        lambda = _progress_property_rewrite(pv, x.args[2])
+        if !isempty(call.args) && _is_property_access(call.args[1])
+            callee = _progress_property_callee(pv, call.args[1])
+            rest = Any[_progress_property_rewrite(pv, a) for a in call.args[2:end]]
+            return fixcall(Expr(:call,
+                GlobalRef(@__MODULE__, :maybefetchindex!),
+                pv, callee, lambda, rest...))
+        end
+        rewritten_call = fixcall(Expr(:call,
+            Any[_progress_property_rewrite(pv, a) for a in call.args]...))
+        return Expr(:do, rewritten_call, lambda)
+    end
+
+    # Broadcasted property call. Added helper arguments are scalars under
+    # broadcast; keep any `:parameters` block first in the tuple AST.
+    if Meta.isexpr(x, :.) && length(x.args) == 2 &&
+       Meta.isexpr(x.args[2], :tuple)
+        callee = x.args[1]
+        args = Any[_progress_property_rewrite(pv, a) for a in x.args[2].args]
+        if _is_property_access(callee)
+            params = Any[a for a in args if Meta.isexpr(a, :parameters)]
+            positional = Any[a for a in args if !Meta.isexpr(a, :parameters)]
+            tuple = Expr(:tuple, params..., pv,
+                _progress_property_callee(pv, callee), positional...)
+            return Expr(:., GlobalRef(@__MODULE__, :maybefetchindex!), tuple)
+        end
+        return Expr(:., _progress_property_rewrite(pv, callee),
+            Expr(:tuple, args...))
+    end
+
+    # Ordinary property-rooted call. Keep the terminal `obj.ip` literal so the
+    # helper sees an `IndexableProperty`; recurse through its receiver and args.
+    if Meta.isexpr(x, :call) && !isempty(x.args)
+        if _is_property_access(x.args[1])
+            callee = _progress_property_callee(pv, x.args[1])
+            rest = Any[_progress_property_rewrite(pv, a) for a in x.args[2:end]]
+            return fixcall(Expr(:call,
+                GlobalRef(@__MODULE__, :maybefetchindex!),
+                pv, callee, rest...))
+        end
+        return fixcall(Expr(:call,
+            Any[_progress_property_rewrite(pv, a) for a in x.args]...))
+    end
+
+    # Keyword/named-tuple shorthand `; obj.field` must remain keyword syntax.
+    if Meta.isexpr(x, :parameters)
+        return Expr(:parameters,
+            Any[_progress_property_rewrite_kwarg(pv, a) for a in x.args]...)
+    end
+    if Meta.isexpr(x, :kw) && length(x.args) == 2
+        return Expr(:kw, x.args[1], _progress_property_rewrite(pv, x.args[2]))
+    end
+
+    if _is_property_access(x)
+        return Expr(:call, GlobalRef(@__MODULE__, :maybefetchproperty!),
+            pv, _progress_property_rewrite(pv, x.args[1]), x.args[2])
+    end
+
+    Expr(x.head, Any[_progress_property_rewrite(pv, a) for a in x.args]...)
+end
+
+_progress_property_rewrite_kwarg(pv::Symbol, a) =
+    _progress_property_rewrite(pv, a)
+function _progress_property_rewrite_kwarg(pv::Symbol, a::Expr)
+    if _is_property_access(a)
+        return Expr(:kw, a.args[2].value,
+            _progress_property_rewrite(pv, a))
+    end
+    return _progress_property_rewrite(pv, a)
+end
+
 # True iff `x` is a direct self-property / self-IP access `__self__.name` — the
 # shape `walk_rhs` rewrites a bare sibling reference into.
-_is_self_access(x) = Meta.isexpr(x, :.) && length(x.args) == 2 &&
-    x.args[1] === :__self__ && x.args[2] isa QuoteNode
+_is_self_access(x) = _is_property_access(x) && x.args[1] === :__self__
 
 # `@progress` property-marker self-access rewrite (decision w0rn26 → A).
 #
 # A focused post-`walk_rhs` pass for the `@progress` body-wrap: rewrites ONLY the
 # self-property / self-IP accesses `walk_rhs` already resolved to `__self__.X`,
 # threading `__progress__` (the var the enclosing `Treebars.@progress __status__
-# begin…end` binds) so each self-access hangs its progress node under the ambient
-# phase. Foreign calls, locals, and accesses on other objects are left untouched —
+# begin…end` binds) so each self-access hangs its progress node under the
+# enclosing phase. Foreign calls, locals, and accesses on other objects are left untouched —
 # this is "less exhaustive than @dynamic_progress": it follows only the
 # property-dependency tree, never wraps foreign work.
 #
@@ -2740,9 +2710,7 @@ maybeprogress!(progress, ip::IndexableProperty{name}, indices...; kwargs...) whe
     # `_default_substatus` (gated on the property's docstring).
     s = _default_substatus(progress, o, name, indices...; kwargs...)
     try
-        rv = with_ambient_progress(s) do
-            _computeproperty(o, name, indices...; __status__=s, kwargs...)
-        end
+        rv = _computeproperty(o, name, indices...; __status__=s, kwargs...)
         _finalize_substatus!(s)
         rv
     catch e
@@ -2750,6 +2718,21 @@ maybeprogress!(progress, ip::IndexableProperty{name}, indices...; kwargs...) whe
         rethrow()
     end
 end
+
+# Preserve call-site `@memo!` / `@fresh` semantics after the enclosing
+# property-scoped rewrite has already produced
+# `maybefetchindex!(progress, callee, ...)`.
+maybememoize!(::typeof(maybefetchindex!), progress,
+              ip::IndexableProperty, args...; kwargs...) =
+    fetchindex!(progress, ip, args...; kwargs...)
+maybememoize!(::typeof(maybefetchindex!), progress, f, args...; kwargs...) =
+    maybefetchindex!(progress, f, args...; kwargs...)
+
+maybefresh(::typeof(maybefetchindex!), progress,
+           ip::IndexableProperty, args...; kwargs...) =
+    maybeprogress!(progress, ip, args...; kwargs...)
+maybefresh(::typeof(maybefetchindex!), progress, f, args...; kwargs...) =
+    maybefetchindex!(progress, f, args...; kwargs...)
 
 # Recursively rewrite every call site to `maybeprogress!($progress_var, …)`.
 # Mirrors `_call_rewrite`'s shape; orthogonal but stackable.
@@ -5694,8 +5677,8 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 # property's `__status__` (the substatus a parent threaded in;
                 # `nothing` when none → the wrap is a transparent no-op and the
                 # `maybefetch*` calls degrade to `memoize!` / `getproperty`), so the
-                # property's self-accesses hang under the caller's ambient phase —
-                # ambient nesting, behaving like Tb's `@progress`. The self-access
+                # property's self-accesses hang under the caller's lexical phase,
+                # behaving like Tb's `@progress`. The self-access
                 # rewrite runs FIRST (on the walked body), so `__progress__` is
                 # literal in the source the `Treebars.@progress` walker then renames;
                 # the wrap is emitted as a qualified `Treebars.@progress` (DO does NOT
@@ -5728,22 +5711,20 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                         _progress_body_block(_fetch_rewrite(:__progress__, walked_rhs)))
                 end
                 # UNMARKED — the default, and so the shape almost every property
-                # in the ecosystem takes. Progress is IMPLIED, and the nesting
-                # comes from the CACHE layer, not from rewriting this body: the
-                # substatus `_bare_substatus_f` / `memoize!` build for this
-                # evaluation is parented at Treebars' AMBIENT node and made
-                # ambient for the duration of the compute, so any property or IP
-                # reached from here — at any call depth, through any number of
-                # foreign functions — nests underneath automatically. The
-                # property's DOCSTRING stays the only user-facing progress
-                # metadata (it drives `_is_property_documented` → label vs.
-                # inlined-away, emitted just above).
+                # in the ecosystem takes. Progress is implied by a
+                # PROPERTY-SCOPED source rewrite (decision 18urwkj): property
+                # accesses become `maybefetchproperty!(__progress__, …)` and
+                # property-rooted calls become
+                # `maybefetchindex!(__progress__, …)`. Ordinary calls remain
+                # ordinary calls, so arithmetic, loops, helpers and constructors
+                # pay no blanket splat+dispatch tax.
                 #
-                # The wrap emitted here is therefore NOT what threads the
-                # nesting; it exists so that an inline `@progress "phase"` marker
-                # — the one remaining escape hatch — works in ANY body without a
-                # marker on the LHS. It is a label-less bare wrapper, which the
-                # renderer inlines away, so it adds no row.
+                # The surrounding label-less `Treebars.@progress __status__`
+                # block binds the literal `__progress__` references emitted by
+                # the rewrite and also keeps inline `@progress "phase"` markers
+                # working without a marker on the LHS. No current-task or
+                # dynamically-scoped parent is read anywhere in DynamicObjects;
+                # every edge is carried explicitly by these generated calls.
                 #
                 # The four markers stay as overrides — `@progress` (self-accesses
                 # only), `@PROGRESS` / `@fetch!` (everything, via the poller's
@@ -5760,7 +5741,8 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                         GlobalRef(Treebars, Symbol("@progress")),
                         something(info.lnn, LineNumberNode(0, :unknown)),
                         :__status__,
-                        _progress_body_block(walked_rhs))
+                        _progress_body_block(
+                            _progress_property_rewrite(:__progress__, walked_rhs)))
                 end
                 block = Expr(:block,
                     _lnn, Expr(:(=), _call(:compute_property, cp_kwargs...), Expr(:block, _lnn, walked_rhs)),

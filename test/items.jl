@@ -1154,11 +1154,9 @@ end
     # which beats the child's declared `__status__ = nothing`. That override is the
     # point of @include — it is what mounts the child under the parent's tree.
     #
-    # ANCESTOR, not direct parent: with implied progress the substatus is parented
-    # at the ambient node, so the child mounts under the property that included it
-    # rather than flat at the object root. That is the intended shape — the kid's
-    # work renders nested beneath `kid`, not beside it — and the root is still what
-    # the whole subtree hangs from.
+    # The generated property-body rewrite passes the including property's status
+    # explicitly, so the child mounts beneath `kid` without any current-task
+    # context. The object root remains an ancestor of the whole subtree.
     p = StatusParentDefault()
     @test p.kid.__status__ isa _TBProgressNode
     status_chain(n) = isnothing(n) ? Any[] : pushfirst!(status_chain(n.parent), n)
@@ -1562,34 +1560,33 @@ while the ordinary inline-struct form remains memoized.
     @test occursin("@cached", sprint(showerror, cached_err))
 end
 
-# ── Ambient (annotation-free) progress ───────────────────────────────────────
+# ── Property-scoped implied progress ─────────────────────────────────────────
 # An ordinary property/IP read performed inside another property's body mounts
 # its progress node under the caller's node, exactly as an explicit `@fetch!`
-# would — no `@progress`, no `@fetch!`, no threaded `__progress__` anywhere in
-# these fixtures. The docstrings only LABEL the nodes; a node is built either
-# way (`_default_substatus`), which is what keeps this distinct from the
-# docstring-triggered auto-progress stack that was reverted in 2026-05.
-@testmodule DOAmbientFixtures begin
+# would — no progress marker on any property LHS. The macro emits explicit
+# `maybefetch*(__progress__, ...)` calls only for property evaluations; ordinary
+# foreign calls stay untouched.
+@testmodule DOImpliedRewriteFixtures begin
 using DynamicObjects
-export AmbientLeaf, AmbientMid, AmbientTop, AmbientTwice, AmbientBoom,
-    ambient_descendants
+export RewriteLeaf, RewriteMid, RewriteTop, RewriteTwice, RewriteBoom,
+    progress_descendants
 
-@dynamicstruct struct AmbientLeaf
+@dynamicstruct struct RewriteLeaf
     n::Int
     "Leaf work"
     leafval() = 2n
 end
 
-@dynamicstruct struct AmbientMid
+@dynamicstruct struct RewriteMid
     n::Int
-    @include leaf = AmbientLeaf(n)
+    @include leaf = RewriteLeaf(n)
     "Mid work"
     midval() = leaf.leafval() + 1
 end
 
-@dynamicstruct struct AmbientTop
+@dynamicstruct struct RewriteTop
     n::Int
-    @include mid = AmbientMid(n)
+    @include mid = RewriteMid(n)
     "Top work"
     topval() = mid.midval() + 100
 end
@@ -1597,59 +1594,56 @@ end
 # Two siblings reading the SAME nested IP on the SAME instance: the first
 # computes it, the second takes an in-memory hit and must still mount the
 # original node with its subtree intact.
-@dynamicstruct struct AmbientTwice
-    @include t = AmbientTop(5)
+@dynamicstruct struct RewriteTwice
+    @include t = RewriteTop(5)
     "First consumer"
     first_use() = t.topval()
     "Second consumer"
     second_use() = t.topval()
 end
 
-@dynamicstruct struct AmbientBoom
+@dynamicstruct struct RewriteBoom
     "Boom leaf"
     boomleaf() = error("nested boom")
     "Boom top"
     boomtop() = boomleaf()
 end
 
-function ambient_descendants(node, acc=String[])
+function progress_descendants(node, acc=String[])
     for child in node.children
         push!(acc, child.impl.description)
-        ambient_descendants(child, acc)
+        progress_descendants(child, acc)
     end
     acc
 end
-end # @testmodule DOAmbientFixtures
+end # @testmodule DOImpliedRewriteFixtures
 
-@testitem "ambient progress — nesting without annotations" tags=[:core] setup=[DOAmbientFixtures] begin
+@testitem "property rewrite progress — nesting without annotations" tags=[:core] setup=[DOImpliedRewriteFixtures] begin
     using DynamicObjects
     const TBNode = DynamicObjects.Treebars.ProgressNode
 
-    # Outside any computation there is nothing to attach to.
-    @test DynamicObjects.ambient_progress() === nothing
+    # The rejected dynamically-scoped API is absent from DynamicObjects.
+    @test !isdefined(DynamicObjects, :ambient_progress)
+    @test !isdefined(DynamicObjects, :with_ambient_progress)
 
-    o = AmbientTop(3)
+    o = RewriteTop(3)
     @test o.topval() == 2 * 3 + 1 + 100
     top = DynamicObjects.getstatus(o.topval)
     @test top isa TBNode
     @test top.impl.description == "Top work"
-    desc = ambient_descendants(top)
-    # Three levels deep, discovered purely from execution nesting.
+    desc = progress_descendants(top)
+    # Three levels deep, threaded by generated property-scoped fetch calls.
     @test "Mid work" in desc
     @test "Leaf work" in desc
-
-    # The body sees itself as the ambient node while it runs, and the ambient
-    # node is restored afterwards.
-    @test DynamicObjects.ambient_progress() === nothing
 end
 
-@testitem "ambient progress — cache hit keeps the subtree" tags=[:core] setup=[DOAmbientFixtures] begin
+@testitem "property rewrite progress — cache hit keeps the subtree" tags=[:core] setup=[DOImpliedRewriteFixtures] begin
     using DynamicObjects
 
-    x = AmbientTwice()
+    x = RewriteTwice()
     @test x.first_use() == x.second_use()
 
-    second = ambient_descendants(DynamicObjects.getstatus(x.second_use))
+    second = progress_descendants(DynamicObjects.getstatus(x.second_use))
     # The hit mounts the ORIGINAL node, relabelled in place — not a childless
     # "(cached)" stub, which is the collapsed-subtree bug this guards.
     @test "Top work (cached)" in second
@@ -1657,39 +1651,13 @@ end
     @test "Leaf work" in second
 end
 
-@testitem "ambient progress — nested failure stays visible" tags=[:core] setup=[DOAmbientFixtures] begin
+@testitem "property rewrite progress — nested failure stays visible" tags=[:core] setup=[DOImpliedRewriteFixtures] begin
     using DynamicObjects
 
-    b = AmbientBoom()
+    b = RewriteBoom()
     @test_throws DynamicObjects.PropertyComputationError b.boomtop()
     node = DynamicObjects.getstatus(b.boomtop)
     # A failed node is pinned rather than detached, so the tree still shows
     # WHICH nested step failed.
-    @test "Boom leaf" in ambient_descendants(node)
-end
-
-@testitem "ambient progress — with_ambient_progress scoping" tags=[:core] setup=[DOAmbientFixtures] begin
-    using DynamicObjects
-    const TBNode = DynamicObjects.Treebars.ProgressNode
-
-    root = DynamicObjects.Treebars.initialize_progress!(:state; description="root")
-    @test DynamicObjects.ambient_progress() === nothing
-    inner = DynamicObjects.with_ambient_progress(root) do
-        DynamicObjects.ambient_progress()
-    end
-    @test inner === root
-    @test DynamicObjects.ambient_progress() === nothing
-
-    # `nothing` is transparent: a property with no substatus must not orphan its
-    # callees, so the current ambient node stays in place.
-    kept = DynamicObjects.with_ambient_progress(root) do
-        DynamicObjects.with_ambient_progress(nothing) do
-            DynamicObjects.ambient_progress()
-        end
-    end
-    @test kept === root
-
-    # Restored even when the body throws.
-    @test_throws ErrorException DynamicObjects.with_ambient_progress(() -> error("x"), root)
-    @test DynamicObjects.ambient_progress() === nothing
+    @test "Boom leaf" in progress_descendants(node)
 end
