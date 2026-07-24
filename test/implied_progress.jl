@@ -390,7 +390,7 @@ count_ref(x, target) = x == target ? 1 :
 # A foreign call remains a foreign call; its property-valued argument is fetched.
 foreign = rw(:(sum(obj.y)))
 @test foreign.args[1] === :sum
-@test foreign.args[2].args[1] == propfetch
+@test count_ref(foreign, propfetch) == 1
 
 # A property-rooted call is the only call form wrapped by maybefetchindex!.
 ipcall = rw(:(obj.ip(x; k=other.y)))
@@ -404,7 +404,7 @@ assignment = rw(assignment_src)
 @test assignment.args[1] == assignment_src.args[1]
 @test assignment.args[2].args[1] == propfetch
 
-quoted = quote obj.y end
+quoted = Expr(:quote, :(obj.y))
 @test rw(quoted) == quoted
 
 macro_src = :(@example obj.y)

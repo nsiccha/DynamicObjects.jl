@@ -506,8 +506,9 @@ end
 # in a struct body is that struct's *standalone* default.
 compute_property(o, ::Val{:__status__}) = Treebars.initialize_progress!(:state; description="")
 compute_property(o, ::Val{:__strict__}) = true
-compute_property(o, ::Val{:__substatus__}, name, args...; kwargs...) =
-    _default_substatus(o.__status__, o, name, args...; kwargs...)
+compute_property(o, ::Val{:__substatus__}, name, args...;
+                 __status__=o.__status__, kwargs...) =
+    _default_substatus(__status__, o, name, args...; kwargs...)
 _default_substatus(status, o, name, args...; kwargs...) = nothing
 
 # ── Magic-property deprecations (2026-07-07, decision 2canrl) ──────────────
@@ -2490,8 +2491,14 @@ function _progress_property_rewrite(pv::Symbol, x::Expr)
         if _is_property_access(callee)
             params = Any[a for a in args if Meta.isexpr(a, :parameters)]
             positional = Any[a for a in args if !Meta.isexpr(a, :parameters)]
-            tuple = Expr(:tuple, params..., pv,
-                _progress_property_callee(pv, callee), positional...)
+            # `ProgressNode` is iterable for tree traversal, so broadcast would
+            # otherwise try to collect it. Both the parent and callable IP are
+            # scalar inputs; only the user's arguments participate in broadcast.
+            scalar_progress = Expr(:call, GlobalRef(Core, :Ref), pv)
+            scalar_callee = Expr(:call, GlobalRef(Core, :Ref),
+                _progress_property_callee(pv, callee))
+            tuple = Expr(:tuple, params..., scalar_progress,
+                scalar_callee, positional...)
             return Expr(:., GlobalRef(@__MODULE__, :maybefetchindex!), tuple)
         end
         return Expr(:., _progress_property_rewrite(pv, callee),
