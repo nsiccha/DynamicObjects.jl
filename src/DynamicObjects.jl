@@ -2247,13 +2247,15 @@ maybefetchindex!(progress, p::IndexableProperty, args...; kwargs...) = fetchinde
 
 Dispatch helper used by `@fetch!` for property accesses. For `@dynamicstruct`
 instances, routes through [`fetchproperty!`](@ref) (cached + progress-tree
-attachment). For indexed properties (IPs) and non-DO objects, falls through
-to `getproperty(o, name)`.
+attachment). Fixed fields return their stored value directly; indexed
+properties (IPs) and non-DO objects fall through to `getproperty(o, name)`.
 """
 maybefetchproperty!(progress, o, name::Symbol) =
-    hasfield(typeof(o), :cache) && getfield(o, :cache) isa PropertyCache ?
-        fetchproperty!(progress, o, name) :
-        getproperty(o, name)
+    hasfield(typeof(o), name) ?
+        getfield(o, name) :
+        hasfield(typeof(o), :cache) && getfield(o, :cache) isa PropertyCache ?
+            fetchproperty!(progress, o, name) :
+            getproperty(o, name)
 
 """
     @fetch! progress expr
