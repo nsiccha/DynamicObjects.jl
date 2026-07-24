@@ -302,7 +302,60 @@ end
 
 end # @testmodule DOFixtures
 
+@testmodule DOMemberMethodFixtures begin
+using DynamicObjects
+export MemberMethods, member_middle, member_first
+
+@dynamicstruct struct MemberMethods
+    value::Int
+    doubled = 2value
+
+    # Short form, with `__self__` in the middle of the positional arguments.
+    member_middle(prefix::T, __self__, suffix::AbstractString="!") where {T<:AbstractString} =
+        string(prefix, doubled, suffix)
+
+    # Long form, with `__self__` first plus standard return, where, default,
+    # and keyword syntax.
+    function member_first(__self__, factor::T=1; suffix::AbstractString="")::String where {T<:Integer}
+        string(doubled * factor, suffix)
+    end
+
+    # Qualified names are the motivating rendering use case.
+    function Base.show(io::IO, ::MIME"text/plain", __self__)
+        print(io, "MemberMethods(", doubled, ")")
+    end
+end
+
+end # @testmodule DOMemberMethodFixtures
+
 # --- Tests ---
+
+@testitem "inline methods carrying __self__ are ordinary methods" tags=[:core] setup=[DOImports, DOMemberMethodFixtures] begin
+    object = MemberMethods(4)
+
+    @test member_middle("value=", object) == "value=8!"
+    @test member_middle("value=", object, ".") == "value=8."
+    @test member_first(object, 3; suffix="x") == "24x"
+    @test repr("text/plain", object) == "MemberMethods(8)"
+
+    # A bare positional `__self__` is specialized to the concrete DO type,
+    # wherever it occurs. The definitions remain methods rather than
+    # properties/IPs, so they never enter metadata or the property cache.
+    @test hasmethod(member_middle, Tuple{String, MemberMethods, String})
+    @test hasmethod(member_first, Tuple{MemberMethods, Int})
+    middle_sig = Base.unwrap_unionall(which(member_middle, (String, MemberMethods, String)).sig)
+    first_sig = Base.unwrap_unionall(which(member_first, (MemberMethods, Int)).sig)
+    show_sig = Base.unwrap_unionall(which(show, (IO, MIME"text/plain", MemberMethods)).sig)
+    @test middle_sig.parameters[3] === MemberMethods
+    @test first_sig.parameters[2] === MemberMethods
+    @test show_sig.parameters[4] === MemberMethods
+    declared = first.(DynamicObjects.meta(MemberMethods))
+    @test :member_middle ∉ declared
+    @test :member_first ∉ declared
+    @test !hasproperty(object, :member_middle)
+    @test !hasproperty(object, :member_first)
+    @test DynamicObjects.property_descriptor(MemberMethods, :member_middle) === nothing
+end
 
 @testitem "Multi-lhs assignment" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     _multi_lhs_counter[] = 0

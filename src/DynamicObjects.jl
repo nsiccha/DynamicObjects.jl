@@ -4179,22 +4179,42 @@ function _process_include_externals!(body)
     externals
 end
 
-# Detect an inline-method form `f(__self__, ...) = body` (or with `where`
-# clauses, qualified function names like `Base.show`, and `__self__` at any
-# positional index). Returns `(; fname, sig_args, where_params, self_idx)`
-# or `nothing` if the LHS isn't a method-shaped definition with a `__self__`
-# parameter.
+# Find the call node inside a standard method signature. Julia wraps calls in
+# `:where` and/or `:(::)` for type parameters and return annotations; preserving
+# those wrappers is what lets inline methods support the same signature forms as
+# ordinary methods.
+_inline_method_call(_) = nothing
+function _inline_method_call(sig::Expr)
+    Meta.isexpr(sig, :call) && return sig
+    Meta.isexpr(sig, (:where, :(::))) || return nothing
+    _inline_method_call(sig.args[1])
+end
+
+function _collect_inline_where_params!(params, sig)
+    sig isa Expr || return params
+    if Meta.isexpr(sig, :where)
+        append!(params, sig.args[2:end])
+        _collect_inline_where_params!(params, sig.args[1])
+    elseif Meta.isexpr(sig, :(::))
+        _collect_inline_where_params!(params, sig.args[1])
+        length(sig.args) >= 2 && _collect_inline_where_params!(params, sig.args[2])
+    end
+    params
+end
+
+# Detect an inline-method signature carrying `__self__` (short or long form,
+# with `where` clauses, return annotations, qualified function names such as
+# `Base.show`, and `__self__` at any positional index). Returns the original
+# signature plus the argument metadata needed for body walking, or `nothing`
+# when this isn't a method-shaped definition with a positional `__self__`.
 _detect_inline_method_lhs(_) = nothing
 function _detect_inline_method_lhs(lhs::Expr)
+    call = _inline_method_call(lhs)
+    isnothing(call) && return nothing
     where_params = Any[]
-    sig = lhs
-    while Meta.isexpr(sig, :where)
-        append!(where_params, sig.args[2:end])
-        sig = sig.args[1]
-    end
-    Meta.isexpr(sig, :call) || return nothing
-    length(sig.args) >= 2 || return nothing
-    sig_args = collect(sig.args[2:end])
+    _collect_inline_where_params!(where_params, lhs)
+    length(call.args) >= 2 || return nothing
+    sig_args = collect(call.args[2:end])
     self_idx = nothing
     for (i, a) in enumerate(sig_args)
         Meta.isexpr(a, :parameters) && continue
@@ -4206,7 +4226,7 @@ function _detect_inline_method_lhs(lhs::Expr)
         end
     end
     isnothing(self_idx) && return nothing
-    (; fname=sig.args[1], sig_args, where_params, self_idx)
+    (; signature=lhs, sig_args, where_params, self_idx)
 end
 
 dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, lint=true) = begin
@@ -4688,12 +4708,11 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 Expr(:call, :__options__, Expr(:(::), Expr(:curly, Val, QuoteNode(parameter)))),
                 domain)
         end
-        # Inline-method form: `f(__self__, ...) = body` (with optional `where`
-        # clauses and qualified `Module.f` names). Bypasses property tooling —
-        # no compute_property, no getproperty entry — but the body still gets
-        # bare-name → `__self__.<prop>` rewriting like a property RHS. Detect
-        # before the function-form error and the `:(=)` LHS/RHS split so the
-        # full LHS (which may carry `where` clauses) is intact.
+        # Inline-method short form: `f(__self__, ...) = body`. Bypasses property
+        # tooling — no compute_property, no getproperty entry — but the body
+        # still gets bare-name → `__self__.<prop>` rewriting like a property
+        # RHS. Detect before the `:(=)` LHS/RHS split so the full signature
+        # (including `where` and return-type wrappers) stays intact.
         if Meta.isexpr(arg, :(=))
             method_info = _detect_inline_method_lhs(arg.args[1])
             if !isnothing(method_info)
@@ -4705,6 +4724,18 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             end
         end
         if Meta.isexpr(arg, :function)
+            # Long-form methods carrying a positional `__self__` have the same
+            # ordinary-method semantics as the short form above. A long-form
+            # definition without `__self__` is still neither a property nor an
+            # inline method and keeps the focused property-syntax diagnostic.
+            method_info = _detect_inline_method_lhs(arg.args[1])
+            if !isnothing(method_info)
+                isempty(macros) ||
+                    error("Property-level macros (@cached, …) cannot be applied to inline methods in @dynamicstruct.")
+                push!(inline_methods, (; method_info..., body=arg.args[2], lnn))
+                metadata.doc[] = nothing
+                continue
+            end
             fname = Meta.isexpr(arg.args[1], :call) ? arg.args[1].args[1] : arg.args[1]
             error("Use short-form syntax for properties in @dynamicstruct: `$fname(...) = ...` instead of `function $fname(...) ... end`. If `$fname` is a helper that doesn't depend on the struct's state, move it outside the @dynamicstruct body.")
         end
@@ -5357,19 +5388,22 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         # directly in getorcomputeproperty (via meta check), so no zero-arg
         # compute_property methods are needed here.
     ))
-    # Emit inline-method definitions: `f(__self__, …) = body` collected from
-    # the struct body. These are plain methods on `::type` (so standard
-    # multiple dispatch on the remaining args works) — no property entry,
-    # no compute_property, not reachable via getproperty. The body is walked
-    # with the `prop_names` set so bare references to registered property
-    # names are rewritten to `__self__.<name>`, matching the rewrite that
-    # runs on property RHSs.
+    # Emit inline-method definitions collected from the struct body. These are
+    # plain methods on `::type` (so standard multiple dispatch on the remaining
+    # args works) — no property entry, no compute_property, not reachable via
+    # getproperty. Preserve the user's complete signature, changing only a bare
+    # positional `__self__` to `__self__::<type>`. The body is walked with the
+    # `prop_names` set so bare references to registered property names are
+    # rewritten to `__self__.<name>`, matching the property-RHS rewrite.
     for m in inline_methods
-        sig_args = collect(m.sig_args)
+        sig = deepcopy(m.signature)
+        call = something(_inline_method_call(sig))
+        sig_args = call.args[2:end]
         # Type the bare `__self__` arg to `__self__::<type>`. If the user
         # already wrote `__self__::T`, leave the user's annotation alone.
         if sig_args[m.self_idx] === :__self__
-            sig_args[m.self_idx] = :(__self__::$type)
+            call.args[m.self_idx + 1] = :(__self__::$type)
+            sig_args = call.args[2:end]
         end
         # Locals shielded from bare-name rewriting: `__self__`, every name
         # introduced by the signature args (incl. typed/destructured/kw),
@@ -5384,10 +5418,6 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             Meta.isexpr(wp, :comparison) && wp.args[1] isa Symbol && push!(method_locals, wp.args[1])
         end
         walked_body = walk_rhs(m.body; locals=method_locals, properties=walk_props, lnn=m.lnn)
-        sig = Expr(:call, m.fname, sig_args...)
-        if !isempty(m.where_params)
-            sig = Expr(:where, sig, m.where_params...)
-        end
         method_lnn = something(m.lnn, LineNumberNode(0, :unknown))
         push!(result.args, Expr(:(=), sig, Expr(:block, method_lnn, walked_body)))
     end
