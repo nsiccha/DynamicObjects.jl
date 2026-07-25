@@ -4,12 +4,17 @@ using TestItemRunner
 using DynamicObjects
 export OptionDomainFixture, SpaceFormOptionFixture, OverrideableDefaultFixture,
     UndeclaredOptionFixture, VarargOperationFixture, DocumentedNodeFixture,
-    UndocumentedNodeFixture, OPTION_STUDIES, option_values_for
+    UndocumentedNodeFixture, LabelledOptionFixture, OPTION_STUDIES,
+    option_values_for, labelled_doses_for
 
 # Application data DynamicObjects knows nothing about. The point of `@options`
 # is that a domain may be spelled in terms of these and still be recorded.
 const OPTION_STUDIES = Dict(:north => [:depot_1cmt], :south => [:depot_1cmt, :tmdd])
 option_values_for(study) = OPTION_STUDIES[study]
+
+labelled_doses_for(study) = study === :north ?
+    [50.0 => "50 mg", 100.0 => "100 mg"] :
+    [50.0 => "50 mg", 100.0 => "100 mg", 200.0 => "200 mg"]
 
 """A study gallery."""
 @dynamicstruct struct OptionDomainFixture
@@ -25,6 +30,20 @@ option_values_for(study) = OPTION_STUDIES[study]
     @options(dose) = 10.0:10.0:100.0
 
     prediction_grid(dose::Float64=100.0; seed::Int=0) = (study, model, dose, seed)
+end
+
+# A gallery's controls must read prose, so the values carry labels. The second
+# domain is dependent, which is why the labels ride WITH the values instead of
+# living in a parallel declaration that could disagree with them.
+@dynamicstruct struct LabelledOptionFixture
+    study::Symbol
+    dose::Float64
+
+    @options(study) = option_domain([
+        :north => "Northern cohort",
+        :south => "Southern cohort",
+    ])
+    @options(dose) = option_domain(labelled_doses_for(study))
 end
 
 # The space form parses to the same thing.
@@ -253,6 +272,82 @@ documented = type_descriptor(DocumentedNodeFixture)
 
 @test type_descriptor(OptionDomainFixture).description == "A study gallery."
 @test first.(type_descriptor(OptionDomainFixture).options) == [:study, :model, :dose]
+end
+
+@testitem "option_domain labels values without entering membership" setup=[OptionFixtures] begin
+using DynamicObjects
+
+o = LabelledOptionFixture(:south, 100.0)
+
+# A labelled domain IS a collection of the machine values: every consumer
+# idiom a bare vector supported keeps working, membership included.
+domain = property_options(o, :study)
+@test collect(domain) == [:north, :south]
+@test eltype(domain) === Symbol
+@test length(domain) == 2
+@test o.study in domain
+@test !(:east in domain)
+
+# ...and it carries the labels a renderer needs.
+@test getproperty.(option_records(domain), :value) == [:north, :south]
+@test getproperty.(option_records(domain), :label) ==
+    ["Northern cohort", "Southern cohort"]
+
+# A dependent domain relabels together with its values, per object.
+sparse = LabelledOptionFixture(:north, 100.0)
+@test getproperty.(option_records(property_options(o, :dose)), :label) ==
+    ["50 mg", "100 mg", "200 mg"]
+@test getproperty.(option_records(property_options(sparse, :dose)), :value) ==
+    [50.0, 100.0]
+@test 200.0 in property_options(o, :dose)
+@test !(200.0 in property_options(sparse, :dose))
+
+# Memoized and invalidated like any other property.
+@test property_options(o, :dose) === property_options(o, :dose)
+
+# Reflection is unchanged: it still never evaluates a declaration, so the
+# labels stay on the evaluated value rather than on the static descriptor.
+declared = property_descriptor(LabelledOptionFixture, :study).inputs[1].domain
+@test declared.kind === :declared
+@test isempty(declared.options)
+@test last(first(option_declarations(LabelledOptionFixture))).static
+end
+
+@testitem "option_records normalizes any finite domain" setup=[OptionFixtures] begin
+using DynamicObjects
+
+# An unlabelled declaration still renders, with default labels.
+o = OptionDomainFixture(:south, :tmdd)
+@test getproperty.(option_records(property_options(o, :model)), :label) ==
+    ["depot_1cmt", "tmdd"]
+@test getproperty.(option_records(10.0:10.0:30.0), :value) == [10.0, 20.0, 30.0]
+@test getproperty.(option_records((:a, :b)), :label) == ["a", "b"]
+
+# Not a finite collection — there is no list to render.
+@test option_records(Float64) === nothing
+end
+
+@testitem "option_domain accepts every option-record spelling" setup=[OptionFixtures] begin
+using DynamicObjects
+
+domain = option_domain([
+    :plain,
+    :paired => "Paired",
+    (; value=:record, label="Record", help="the long form", disabled=true),
+])
+records = option_records(domain)
+
+@test collect(domain) == [:plain, :paired, :record]
+@test getproperty.(records, :label) == ["plain", "Paired", "Record"]
+@test records[3].help == "the long form"
+@test records[3].disabled
+@test :record in domain
+# Membership compares machine values, never whole records.
+@test !((; value=:record, label="Record") in domain)
+
+# A generator is a domain too, and an empty one is not an error.
+@test collect(option_domain(v => uppercase(string(v)) for v in (:a, :b))) == [:a, :b]
+@test isempty(option_records(option_domain(())))
 end
 
 @testitem "malformed @options declarations are rejected" setup=[OptionFixtures] begin
