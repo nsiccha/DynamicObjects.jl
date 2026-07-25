@@ -1785,7 +1785,7 @@ $_cache_context""")
                     end
                     if isnothing(rv) || resumes(o, vname, indices...; kwargs...)
                         @debug "Generating $cache_path...\n$_cache_context"
-                        rv = compute_property(o, vname, indices...; _status_kw..., (name=>rv, )..., kwargs...)
+                        rv = compute_property(o, vname, indices...; _status_kw..., _resume_kw(o, vname, rv)..., kwargs...)
                         _atomic_save(_disk_format(o, vname), cache_path, rv)
                         if _disk_format(o, vname) == Val(:mmap)
                             rv = load(Val(:mmap), cache_path, _disk_eltype(o, vname))
@@ -1818,7 +1818,7 @@ $_cache_context""")
                 end
                 if cache_status != :ready || resumes(o, vname, indices...; kwargs...)
                     @debug "Generating $cache_path...\n$_cache_context"
-                    rv = compute_property(o, vname, indices...; _status_kw..., (name=>rv, )..., kwargs...)
+                    rv = compute_property(o, vname, indices...; _status_kw..., _resume_kw(o, vname, rv)..., kwargs...)
                     _atomic_save(_disk_format(o, vname), cache_path, rv)
                     if _disk_format(o, vname) == Val(:mmap)
                         rv = load(Val(:mmap), cache_path, _disk_eltype(o, vname))
@@ -3665,6 +3665,25 @@ IP call form consults this and routes to `fresh` (the uncached `_computeproperty
 instead of `memoize!`. Method-level, so Revise-safe; constant-foldable so the
 call form's branch is free at runtime."""
 _never_cache(o, ::Val) = false
+"""    _self_named_index(o, ::Val{name})
+
+Per-type override: `true` when one of property `name`'s own index args is also
+called `name` — `dataset(dataset::Dataset) = …`. An indexed property normally
+gets a kwarg named after itself, defaulting to `__self__.name`, which is how a
+body reaches its own `IndexableProperty` (recursion) and how a `@cached` body
+receives the partially-loaded disk value to resume from. When an index arg
+already binds that name, the kwarg would be a duplicate argument name — a
+`syntax:` error at expansion — so it is not emitted, and the resume value has
+nowhere to go (the positional shadows it in the body regardless). This trait
+tells [`_computeproperty`](@ref) to stop passing it. Default `false`;
+constant-foldable."""
+_self_named_index(o, ::Val) = false
+# The resume kwarg: the loaded (possibly partial, possibly `nothing`) disk value
+# handed back to the body under the property's own name, so a `resumes`-enabled
+# computation can continue from it. Empty when the property has no such kwarg to
+# receive it — passing it anyway is an unsupported-keyword MethodError.
+_resume_kw(o, ::Val{name}, rv) where {name} =
+    _self_named_index(o, Val(name)) ? NamedTuple() : NamedTuple{(name,)}((rv,))
 """    _remount_opaque_properties(::Type{T})
 
 Names whose generated RHS reaches `__self__` in a way the static dependency
@@ -5331,7 +5350,20 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                     _wrapper_desc = isempty(_wrappers) ? "another macro" : join(_wrappers, ", ")
                     error("@struct on property `$name`: `@struct` must be outermost (only `@doc` and `@fresh` may wrap it), but here it is wrapped by $_wrapper_desc. A wrapping marker shadows the inline-child rewrite, so the child type and its injected `__parent__` are never emitted and the property would throw `UndefVarError: __parent__` when its call form is first hit (a clean compile that breaks only live). Write `@struct $name(…) = begin … end` (optionally `@fresh @struct $name(…) = …` for a fresh child per call). Disk-cache markers `@cached`/`@mmap` on an inline child are not supported — disk-cache a plain computed property instead.")
                 end
-                cp_kwargs = [Expr(:kw, name, length(info.indices) > 0 ? :(__self__.$name) : nothing)]
+                # An index arg may legitimately be named after the property it
+                # indexes — `dataset(dataset::Dataset) = DatasetWorkspace(dataset)`
+                # reads as "the workspace FOR this dataset". The self-named kwarg
+                # below would then be a second argument called `dataset` in the
+                # same signature, which Julia rejects outright ("function argument
+                # name not unique"). Suppress it: the index arg is in `locals`, so
+                # the body's bare `dataset` already resolves to the positional and
+                # the kwarg was unreachable anyway. `_self_named_index` tells
+                # `_computeproperty` not to pass the resume value it can no longer
+                # receive.
+                self_named_index = name in extractnames(collect(info.indices))
+                cp_kwargs = Any[]
+                self_named_index || push!(cp_kwargs,
+                    Expr(:kw, name, length(info.indices) > 0 ? :(__self__.$name) : nothing))
                 name != :__status__ && push!(cp_kwargs, Expr(:kw, :__status__, :nothing))
                 # Build method definitions with Expr directly (not :() syntax)
                 # so the parser doesn't insert DynamicObjects.jl LNNs into
@@ -5523,6 +5555,15 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                     )
                     nc_expr = (_lnn, Expr(:(=), nc_method, Expr(:block, _lnn, true)))
                     push!(block.args, nc_expr...)
+                end
+                # See the suppression above: this property has no kwarg named
+                # after itself, so the disk-cache resume value must not be passed.
+                if self_named_index
+                    sni_method = Expr(:call,
+                        Expr(:., DynamicObjects, QuoteNode(:_self_named_index)),
+                        :(__self__::$type), :(::Val{$(Meta.quot(name))}),
+                    )
+                    push!(block.args, _lnn, Expr(:(=), sni_method, Expr(:block, _lnn, true)))
                 end
                 push!(block.args, isdoc_expr...)
                 !isnothing(desc_expr) && push!(block.args, desc_expr...)
