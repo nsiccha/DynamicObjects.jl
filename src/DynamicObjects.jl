@@ -3784,6 +3784,102 @@ property_options(o, parameter::Symbol) =
     has_option_declaration(typeof(o), parameter) ?
         getproperty(o, :__options__)(Val(parameter)) : nothing
 
+"""
+    OptionDomain
+
+A domain that carries a human label next to each machine value. Construct one
+with [`option_domain`](@ref); read the labels back with [`option_records`](@ref).
+
+It *is* a collection of the machine values: it iterates them, `length` counts
+them, and `in` compares against them. A consumer that already treats a domain as
+"any value supporting `in`" therefore needs no change — the labels ride along
+without entering the membership test.
+"""
+struct OptionDomain{V<:AbstractVector,O<:AbstractVector{<:NamedTuple}}
+    values::V
+    options::O
+end
+
+Base.in(value, domain::OptionDomain) = value in domain.values
+Base.iterate(domain::OptionDomain, state...) = iterate(domain.values, state...)
+Base.length(domain::OptionDomain) = length(domain.values)
+Base.eltype(::Type{<:OptionDomain{V}}) where {V} = eltype(V)
+Base.show(io::IO, domain::OptionDomain) = print(io, "option_domain([",
+    join(("$(repr(option.value)) => $(repr(option.label))" for option in domain.options), ", "),
+    "])")
+
+"""
+    option_domain(values) -> OptionDomain
+
+An `@options` domain whose values carry human labels. The labels travel *with*
+the values, in one declaration, so they can never disagree about how many
+options there are or what order they are in.
+
+```julia
+@dynamicstruct struct Gallery
+    study::Symbol
+    dose::Float64
+
+    @options(study) = option_domain([
+        :synthetic_depot_v1       => "Sparse depot PK",
+        :synthetic_depot_dense_v1 => "Dense depot PK",
+    ])
+    @options(dose) = option_domain(d => "\$(Int(d)) mg" for d in doses_for(study))
+end
+```
+
+Each element is normalized to the same option record `static_domain` produces —
+`(; value, label, group, help, disabled)` — from any of three spellings:
+
+- `value => label`, the usual case;
+- a `NamedTuple` with a `value` field plus any of `label`, `group`, `help`,
+  `disabled` (`label` defaults to `string(value)`); or
+- a bare value, which takes the default label.
+
+Nothing else about `@options` changes. The declaration is still an ordinary
+lazily computed property, so a *dependent* domain works exactly as before —
+`dose`'s labels are recomputed with `dose`'s values whenever `study` changes.
+Membership is still on machine values: `o.study in property_options(o, :study)`
+is true for the same values a bare vector would have accepted, which is why a
+domain may be labelled without touching validation.
+
+Labels are deliberately *not* on the descriptor's `domain`: an `@options` domain
+may depend on the object, so its labels are per-object too, and reflection never
+evaluates a declaration ([`option_declarations`](@ref)). `domain.kind` stays
+`:declared` with `options` empty; a renderer reads the labels from the evaluated
+value via [`property_options`](@ref) + [`option_records`](@ref).
+"""
+function option_domain(values)
+    options = NamedTuple[_option_descriptor(value) for value in values]
+    OptionDomain(map(option -> option.value, options), options)
+end
+
+"""
+    option_records(domain) -> Vector{NamedTuple} or nothing
+
+The option records of an evaluated domain — one `(; value, label, group, help,
+disabled)` per value, in domain order. This is the one call a renderer makes; it
+does not care how the domain was spelled:
+
+```julia
+for option in option_records(property_options(object, :study))
+    radio(option.value; label=option.label, checked=(option.value == object.study))
+end
+```
+
+An [`option_domain`](@ref) returns its declared labels. Any other finite
+collection — a vector, tuple, range, or `Set` — is normalized with default
+labels (`string(value)`), so an unlabelled `@options` declaration still renders.
+Returns `nothing` for a domain that is not a finite collection (a type, an
+interval): there is no list to render, and the consumer falls back to a free
+input.
+"""
+option_records(domain::OptionDomain) = domain.options
+function option_records(domain)
+    (applicable(iterate, domain) && applicable(length, domain)) || return nothing
+    NamedTuple[_option_descriptor(value) for value in domain]
+end
+
 # Union of both hooks for analyzer + render code paths. `_nested_struct_type`
 # wins if both are defined for the same property (shouldn't normally happen).
 function _walk_nested_type(T, name::Symbol)
@@ -6983,6 +7079,8 @@ function _option_descriptor(option::NamedTuple)
     defaults = _option_descriptor(option.value)
     merge(defaults, option)
 end
+# `value => label`, the ergonomic spelling an `option_domain` list is written in.
+_option_descriptor(option::Pair) = _option_descriptor(first(option); label=string(last(option)))
 
 _unrestricted_domain() = (;
     kind=:unrestricted,
@@ -8010,7 +8108,8 @@ export print_structure, structure
 export tree_children_map, lint_index, lookup_type, callers_by_name, property_source_info, property_signature, property_doc, LintMessage
 export metafirst, metaall
 export static_domain, property_descriptor, property_descriptors, type_descriptor,
-    option_declarations, has_option_declaration, property_options
+    option_declarations, has_option_declaration, property_options,
+    option_domain, option_records
 export materialization_observation
 export execute_materialization, release_materialization!, materialization_ownership, materialization_gc!
 
