@@ -149,7 +149,6 @@ o = SelfNamedLooseFixture("/data"; __cache_base__ = base, __strict__ = false)
 ).dataset("a.csv") == "/data/a.csv"
 @test LOOSE_CALLS[] == 1
 end
-
 @testitem "self-named indices reach the descriptors unchanged" setup=[SelfNamedFixtures] begin
 using DynamicObjects
 

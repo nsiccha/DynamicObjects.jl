@@ -506,8 +506,9 @@ end
 # in a struct body is that struct's *standalone* default.
 compute_property(o, ::Val{:__status__}) = Treebars.initialize_progress!(:state; description="")
 compute_property(o, ::Val{:__strict__}) = true
-compute_property(o, ::Val{:__substatus__}, name, args...; kwargs...) =
-    _default_substatus(o.__status__, o, name, args...; kwargs...)
+compute_property(o, ::Val{:__substatus__}, name, args...;
+                 __status__=o.__status__, kwargs...) =
+    _default_substatus(__status__, o, name, args...; kwargs...)
 _default_substatus(status, o, name, args...; kwargs...) = nothing
 
 # ── Magic-property deprecations (2026-07-07, decision 2canrl) ──────────────
@@ -579,10 +580,13 @@ _report_disk_load!(::Nothing, _, _) = nothing
 # !isnothing(doc)` rule: undocumented properties add no labelled noise to the
 # tree, documented ones do.
 #
-# `transient` is consumed here (default true → substatus auto-detaches on finalize);
-# it does not reach the property body. Pass transient=false to keep finished substatuses
-# pinned to the parent tree (e.g. for historical "N finished" pill display).
-function _default_substatus(status::Treebars.ProgressNode, o, name, args...; transient=true, kwargs...)
+# `status` is explicit: the generated property-body rewrite threads the caller's
+# lexical progress node into `maybefetchproperty!` / `maybefetchindex!`, and the
+# fetch path asks the substatus factory to create the node directly beneath that
+# caller. A top-level ordinary read passes the object's root instead. No
+# process-global, thread-local, task-local, or dynamically-scoped parent exists
+# in DynamicObjects.
+function _default_substatus(status::Treebars.ProgressNode, o, name, args...; transient=false, kwargs...)
     # Gate the label PER CALL SIGNATURE: `_is_property_documented` dispatches on
     # `args...` (one method emitted per declaration — `true` if documented,
     # `false` if not), so a property with multiple signatures resolves its OWN
@@ -884,11 +888,19 @@ n_running(c::AbstractThreadsafeDict) = lock(c.lock) do; length(c.computing); end
 Base.show(io::IO, c::ThreadsafeDict{K,V}) where {K,V} = lock(c.lock) do
     print(io, "ThreadsafeDict{", K, ",", V, "}(", length(c.cache), " cached, ", length(c.computing), " running)")
 end
-memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...; fetch=Base.fetch, retry_failed=true, kwargs...) where {name} = begin
+memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
+         fetch=Base.fetch, retry_failed=true, kwargs...) where {name} =
+    _memoize_with_progress!(nothing, ip, indices...; fetch, retry_failed, kwargs...)
+
+# Internal explicit-parent variant used by the generated property-body rewrite.
+# `progress` is lexical data passed in the emitted call, never ambient state.
+function _memoize_with_progress!(progress,
+        ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
+        fetch=Base.fetch, retry_failed=true, kwargs...) where {name}
     (;o, cache) = ip
     substatus_f = if name != :__substatus__ && name != :__status__
         () -> begin
-            root = o.__status__
+            root = isnothing(progress) ? o.__status__ : progress
             compute_property(o, Val(:__substatus__), name, indices...; __status__=root, kwargs...)
         end
     else
@@ -1165,14 +1177,20 @@ fetchindex(app.results, key) do rv, status
 end
 ```
 """
-function fetchindex(fetch, ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}, indices...;
-                    force=false, retry_failed=force, kwargs...)
+fetchindex(fetch, ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}, indices...;
+           force=false, retry_failed=force, kwargs...) =
+    _fetchindex_with_progress(fetch, nothing, ip, indices...; force, retry_failed, kwargs...)
+
+function _fetchindex_with_progress(fetch, progress,
+        ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}, indices...;
+        force=false, retry_failed=force, kwargs...)
     if force
         maybepop!(ip.cache, (indices, (;kwargs...)))
         path = get_cache_path(ip.o, name(ip), indices...; kwargs...)
         isfile(path) && rm(path)
     end
-    rv = memoize!(ip, indices...; fetch=identity, retry_failed, kwargs...)
+    rv = _memoize_with_progress!(progress, ip, indices...;
+        fetch=identity, retry_failed, kwargs...)
     status = getstatus(ip, indices...; kwargs...)
     fetch(rv, status)
 end
@@ -1200,7 +1218,10 @@ substatus object or `nothing`.
 For `Dict`-backed caches (serial), falls through to `getproperty` (synchronous,
 no status). The two-phase dance only applies to `ThreadsafeDict`-backed caches.
 """
-fetchproperty(fetch, o, name::Symbol) = begin
+fetchproperty(fetch, o, name::Symbol) =
+    _fetchproperty_with_progress(fetch, nothing, o, name)
+
+function _fetchproperty_with_progress(fetch, progress, o, name::Symbol)
     if !(hasfield(typeof(o), :cache) && getfield(o, :cache) isa PropertyCache)
         return fetch(getproperty(o, name), nothing)
     end
@@ -1212,7 +1233,7 @@ fetchproperty(fetch, o, name::Symbol) = begin
     if !(c isa AbstractThreadsafeDict) || is_indexed_property(o, name)
         return fetch(getproperty(o, name), nothing)
     end
-    substatus_f = _bare_substatus_f(o, name)
+    substatus_f = _bare_substatus_f(o, name, progress)
     rv = get!(c, name; substatus=substatus_f, fetch=identity) do s
         v = _computeproperty(o, name; __status__=s)
         v
@@ -1285,6 +1306,14 @@ function _mark_cached!(s::Treebars.ProgressNode)
     nothing
 end
 
+fetchindex!(status::Treebars.ProgressNode,
+            ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict},
+            indices...; fetch=Base.fetch, kwargs...) =
+    _fetchindex_with_progress(status, ip, indices...; kwargs...) do rv, s
+        _attach_fetched!(status, rv, s)
+        fetch(rv)
+    end
+
 fetchindex!(status::Treebars.ProgressNode, ip, indices...; fetch=Base.fetch, kwargs...) =
     fetchindex(ip, indices...; kwargs...) do rv, s
         _attach_fetched!(status, rv, s)
@@ -1292,7 +1321,7 @@ fetchindex!(status::Treebars.ProgressNode, ip, indices...; fetch=Base.fetch, kwa
     end
 
 fetchproperty!(status::Treebars.ProgressNode, o, name::Symbol) =
-    fetchproperty(o, name) do rv, s
+    _fetchproperty_with_progress(status, o, name) do rv, s
         _attach_fetched!(status, rv, s)
         Base.fetch(rv)
     end
@@ -1898,12 +1927,12 @@ else
         _computeproperty(o, name; __status__=s)
     end
 end
-_bare_substatus_f(o, name) =
+_bare_substatus_f(o, name, progress=nothing) =
     if name != :__substatus__ && name != :__status__ &&
        !(startswith(string(name), "__") && endswith(string(name), "__")) &&
        is_generated_property(o, name) && !is_indexed_property(o, name)
         () -> begin
-            root = o.__status__
+            root = isnothing(progress) ? o.__status__ : progress
             compute_property(o, Val(:__substatus__), name; __status__=root)
         end
     else
@@ -2218,13 +2247,15 @@ maybefetchindex!(progress, p::IndexableProperty, args...; kwargs...) = fetchinde
 
 Dispatch helper used by `@fetch!` for property accesses. For `@dynamicstruct`
 instances, routes through [`fetchproperty!`](@ref) (cached + progress-tree
-attachment). For indexed properties (IPs) and non-DO objects, falls through
-to `getproperty(o, name)`.
+attachment). Fixed fields return their stored value directly; indexed
+properties (IPs) and non-DO objects fall through to `getproperty(o, name)`.
 """
 maybefetchproperty!(progress, o, name::Symbol) =
-    hasfield(typeof(o), :cache) && getfield(o, :cache) isa PropertyCache ?
-        fetchproperty!(progress, o, name) :
-        getproperty(o, name)
+    hasfield(typeof(o), name) ?
+        getfield(o, name) :
+        hasfield(typeof(o), :cache) && getfield(o, :cache) isa PropertyCache ?
+            fetchproperty!(progress, o, name) :
+            getproperty(o, name)
 
 """
     @fetch! progress expr
@@ -2352,18 +2383,182 @@ function _fetch_rewrite_kwarg(pv::Symbol, a::Expr)
     return _fetch_rewrite(pv, a)
 end
 
+# A syntactic property access (`obj.name`), as distinct from broadcast syntax
+# (`f.(xs)`) which also uses the `:.` head.
+_is_property_access(x) = Meta.isexpr(x, :.) && length(x.args) == 2 &&
+    x.args[2] isa QuoteNode
+
+# Rebuild the callee of a property-rooted call without fetching the terminal
+# property itself. `obj.ip(args...)` must first evaluate to the
+# `IndexableProperty` wrapper so `maybefetchindex!` can dispatch on it; any
+# property access in the receiver (`obj.child.ip(args...)`) is still rewritten.
+_progress_property_callee(pv::Symbol, x::Expr) =
+    Expr(:., _progress_property_rewrite(pv, x.args[1]), x.args[2])
+
+_progress_assignment_head(head) =
+    head isa Symbol && head !== :kw && endswith(String(head), "=")
+
+# Property-scoped implied progress (decision 18urwkj).
+#
+# Rewrite only operations that can be DO evaluations:
+#
+#   obj.name       -> maybefetchproperty!(progress, obj, :name)
+#   obj.ip(args...) -> maybefetchindex!(progress, obj.ip, args...)
+#
+# Ordinary calls (`sum`, arithmetic, helpers, constructors) are left as calls;
+# only their argument expressions are walked. This is intentionally narrower
+# than `_fetch_rewrite`, which wraps every call, and broader than
+# `_progress_self_rewrite`, which only sees `__self__.name`.
+#
+# The walker runs after `walk_rhs`, so bare sibling names have already become
+# `__self__.name`. It is syntax-aware at the sites that cannot be treated as
+# ordinary values: assignment/function LHSes, quoted code, macro heads, type
+# positions, keyword shorthand, do-blocks, and broadcast calls.
+_progress_property_rewrite(pv::Symbol, x) = x
+function _progress_property_rewrite(pv::Symbol, x::Expr)
+    # Quoted/type syntax is data, not an evaluation in this property body.
+    Meta.isexpr(x, (:quote, :inert, :curly)) && return x
+    if Meta.isexpr(x, :(::))
+        return length(x.args) == 2 ?
+            Expr(:(::), _progress_property_rewrite(pv, x.args[1]), x.args[2]) :
+            x
+    end
+    Meta.isexpr(x, :where) && return x
+
+    # Preserve the macro identifier and source line exactly. Its runtime
+    # arguments are still body expressions, except quoted arguments which the
+    # branch above leaves opaque.
+    if Meta.isexpr(x, :macrocall)
+        length(x.args) <= 2 && return x
+        return Expr(:macrocall, x.args[1], x.args[2],
+            Any[_progress_property_rewrite(pv, a) for a in x.args[3:end]]...)
+    end
+
+    # Local function/lambda signatures are declarations. Rewrite only the body.
+    if Meta.isexpr(x, (:function, :(->))) && length(x.args) == 2
+        return Expr(x.head, x.args[1], _progress_property_rewrite(pv, x.args[2]))
+    end
+
+    # Named destructuring performs implicit property reads during lowering.
+    # Make those reads explicit, evaluate the source once, and preserve the
+    # assignment's value and scope.
+    if Meta.isexpr(x, :(=)) && Meta.isexpr(x.args[1], :tuple) &&
+       length(x.args[1].args) == 1 && Meta.isexpr(x.args[1].args[1], :parameters)
+        binds = _fetch_destructure_binds(x.args[1].args[1])
+        if binds !== nothing
+            src = gensym(:progress_src)
+            block = Expr(:block,
+                :($src = $(_progress_property_rewrite(pv, x.args[2]))))
+            for (lhs, nm) in binds
+                push!(block.args, :($lhs = $(Expr(:call,
+                    GlobalRef(@__MODULE__, :maybefetchproperty!),
+                    pv, src, QuoteNode(nm)))))
+            end
+            push!(block.args, src)
+            return block
+        end
+    end
+
+    # Never rewrite an assignment target (including short-form method
+    # signatures and dotted/compound assignment). The RHS is an evaluation.
+    if length(x.args) >= 2 && _progress_assignment_head(x.head)
+        return Expr(x.head, x.args[1],
+            Any[_progress_property_rewrite(pv, a) for a in x.args[2:end]]...)
+    end
+
+    # `f(args...) do ... end`: a property-rooted callee needs the lambda in the
+    # helper's first user-argument position. A foreign callee remains a do-call.
+    if Meta.isexpr(x, :do) && length(x.args) == 2 &&
+       Meta.isexpr(x.args[1], :call)
+        call = x.args[1]
+        lambda = _progress_property_rewrite(pv, x.args[2])
+        if !isempty(call.args) && _is_property_access(call.args[1])
+            callee = _progress_property_callee(pv, call.args[1])
+            rest = Any[_progress_property_rewrite(pv, a) for a in call.args[2:end]]
+            return fixcall(Expr(:call,
+                GlobalRef(@__MODULE__, :maybefetchindex!),
+                pv, callee, lambda, rest...))
+        end
+        rewritten_call = fixcall(Expr(:call,
+            Any[_progress_property_rewrite(pv, a) for a in call.args]...))
+        return Expr(:do, rewritten_call, lambda)
+    end
+
+    # Broadcasted property call. Added helper arguments are scalars under
+    # broadcast; keep any `:parameters` block first in the tuple AST.
+    if Meta.isexpr(x, :.) && length(x.args) == 2 &&
+       Meta.isexpr(x.args[2], :tuple)
+        callee = x.args[1]
+        args = Any[_progress_property_rewrite(pv, a) for a in x.args[2].args]
+        if _is_property_access(callee)
+            params = Any[a for a in args if Meta.isexpr(a, :parameters)]
+            positional = Any[a for a in args if !Meta.isexpr(a, :parameters)]
+            # `ProgressNode` is iterable for tree traversal, so broadcast would
+            # otherwise try to collect it. Both the parent and callable IP are
+            # scalar inputs; only the user's arguments participate in broadcast.
+            scalar_progress = Expr(:call, GlobalRef(Core, :Ref), pv)
+            scalar_callee = Expr(:call, GlobalRef(Core, :Ref),
+                _progress_property_callee(pv, callee))
+            tuple = Expr(:tuple, params..., scalar_progress,
+                scalar_callee, positional...)
+            return Expr(:., GlobalRef(@__MODULE__, :maybefetchindex!), tuple)
+        end
+        return Expr(:., _progress_property_rewrite(pv, callee),
+            Expr(:tuple, args...))
+    end
+
+    # Ordinary property-rooted call. Keep the terminal `obj.ip` literal so the
+    # helper sees an `IndexableProperty`; recurse through its receiver and args.
+    if Meta.isexpr(x, :call) && !isempty(x.args)
+        if _is_property_access(x.args[1])
+            callee = _progress_property_callee(pv, x.args[1])
+            rest = Any[_progress_property_rewrite(pv, a) for a in x.args[2:end]]
+            return fixcall(Expr(:call,
+                GlobalRef(@__MODULE__, :maybefetchindex!),
+                pv, callee, rest...))
+        end
+        return fixcall(Expr(:call,
+            Any[_progress_property_rewrite(pv, a) for a in x.args]...))
+    end
+
+    # Keyword/named-tuple shorthand `; obj.field` must remain keyword syntax.
+    if Meta.isexpr(x, :parameters)
+        return Expr(:parameters,
+            Any[_progress_property_rewrite_kwarg(pv, a) for a in x.args]...)
+    end
+    if Meta.isexpr(x, :kw) && length(x.args) == 2
+        return Expr(:kw, x.args[1], _progress_property_rewrite(pv, x.args[2]))
+    end
+
+    if _is_property_access(x)
+        return Expr(:call, GlobalRef(@__MODULE__, :maybefetchproperty!),
+            pv, _progress_property_rewrite(pv, x.args[1]), x.args[2])
+    end
+
+    Expr(x.head, Any[_progress_property_rewrite(pv, a) for a in x.args]...)
+end
+
+_progress_property_rewrite_kwarg(pv::Symbol, a) =
+    _progress_property_rewrite(pv, a)
+function _progress_property_rewrite_kwarg(pv::Symbol, a::Expr)
+    if _is_property_access(a)
+        return Expr(:kw, a.args[2].value,
+            _progress_property_rewrite(pv, a))
+    end
+    return _progress_property_rewrite(pv, a)
+end
+
 # True iff `x` is a direct self-property / self-IP access `__self__.name` — the
 # shape `walk_rhs` rewrites a bare sibling reference into.
-_is_self_access(x) = Meta.isexpr(x, :.) && length(x.args) == 2 &&
-    x.args[1] === :__self__ && x.args[2] isa QuoteNode
+_is_self_access(x) = _is_property_access(x) && x.args[1] === :__self__
 
 # `@progress` property-marker self-access rewrite (decision w0rn26 → A).
 #
 # A focused post-`walk_rhs` pass for the `@progress` body-wrap: rewrites ONLY the
 # self-property / self-IP accesses `walk_rhs` already resolved to `__self__.X`,
 # threading `__progress__` (the var the enclosing `Treebars.@progress __status__
-# begin…end` binds) so each self-access hangs its progress node under the ambient
-# phase. Foreign calls, locals, and accesses on other objects are left untouched —
+# begin…end` binds) so each self-access hangs its progress node under the
+# enclosing phase. Foreign calls, locals, and accesses on other objects are left untouched —
 # this is "less exhaustive than @dynamic_progress": it follows only the
 # property-dependency tree, never wraps foreign work.
 #
@@ -2420,6 +2615,44 @@ function _progress_self_rewrite_kwarg(a::Expr)
     end
     return _progress_self_rewrite(a)
 end
+
+# ── Implied progress: which declarations keep their own marker ────────────────
+#
+# True iff the author wrote any progress-family marker on this declaration, in
+# which case that marker owns the body and the implied wrap stands down. A
+# function rather than a `const` tuple on purpose: a tuple's arity is part of its
+# type, so growing this list under a live Revise session would be a hard
+# `invalid redefinition of constant` (`dev` §11).
+_is_progress_marked(macros) = any(m -> m in macros,
+    (Symbol("@progress"), Symbol("@PROGRESS"), Symbol("@fetch!"), Symbol("@dynamic_progress")))
+
+# The body as a block `Treebars.@progress` can safely lower.
+#
+# Two hazards, both of which only a DEFAULT wrap is wide enough to hit:
+#
+# 1. A BARE STRING in statement position is read by Treebars as a phase LABEL —
+#    the documented "a bare `"label"` is silently swallowed as a docstring"
+#    trap. A property whose body IS a string (`item(x="default") = "got: $x"`,
+#    `__cache_base__ = "custom"`) would then return a `ProgressNode` instead of
+#    its value. Wrapping each such statement in `identity` leaves the value
+#    bit-identical while making it a call Treebars has no interest in.
+# 2. A NON-BLOCK body must be block-wrapped, or a bare comprehension/generator
+#    reaches `Treebars.@progress` as a comprehension — lowered to a per-element
+#    counter, and an outright macro-expansion error on a filtered or multi-dim
+#    one.
+#
+# An already-`:block` body is rebuilt in place rather than nested in a fresh
+# block (`1ce8892`): re-wrapping buries an inline `@progress "phase"` marker one
+# level deep, and Treebars requires a marker to be a DIRECT statement of the
+# enclosing block.
+_progress_safe_stmt(x) = x
+_progress_safe_stmt(x::String) = Expr(:call, GlobalRef(Base, :identity), x)
+_progress_safe_stmt(x::Expr) =
+    Meta.isexpr(x, :string) ? Expr(:call, GlobalRef(Base, :identity), x) : x
+
+_progress_body_block(rhs) = Meta.isexpr(rhs, :block) ?
+    Expr(:block, Any[_progress_safe_stmt(a) for a in rhs.args]...) :
+    Expr(:block, _progress_safe_stmt(rhs))
 
 """
     noprogress(f, args...; kwargs...)
@@ -2494,6 +2727,21 @@ maybeprogress!(progress, ip::IndexableProperty{name}, indices...; kwargs...) whe
         rethrow()
     end
 end
+
+# Preserve call-site `@memo!` / `@fresh` semantics after the enclosing
+# property-scoped rewrite has already produced
+# `maybefetchindex!(progress, callee, ...)`.
+maybememoize!(::typeof(maybefetchindex!), progress,
+              ip::IndexableProperty, args...; kwargs...) =
+    fetchindex!(progress, ip, args...; kwargs...)
+maybememoize!(::typeof(maybefetchindex!), progress, f, args...; kwargs...) =
+    maybefetchindex!(progress, f, args...; kwargs...)
+
+maybefresh(::typeof(maybefetchindex!), progress,
+           ip::IndexableProperty, args...; kwargs...) =
+    maybeprogress!(progress, ip, args...; kwargs...)
+maybefresh(::typeof(maybefetchindex!), progress, f, args...; kwargs...) =
+    maybefetchindex!(progress, f, args...; kwargs...)
 
 # Recursively rewrite every call site to `maybeprogress!($progress_var, …)`.
 # Mirrors `_call_rewrite`'s shape; orthogonal but stackable.
@@ -3906,6 +4154,25 @@ function _walk_nested_type(T, name::Symbol)
     t !== nothing && return t
     _analysis_nested_type(T, Val(name))
 end
+"""    nested_object_type(::Type{T}, name::Symbol)
+
+The **DynamicObject** type reachable under property `name` of `T`, whichever
+form declared it — an inline `@struct` child, an `@include`d external in either
+the bare (`kid = Child(…)`) or the call (`item(key) = Child(key)`) form, or a
+`prop::Child = …` annotation — and `nothing` when the property is not backed by
+one.
+
+This is the guarded reading of [`_walk_nested_type`](@ref), which answers with
+whatever type was registered and so returns `Int` for `port::Int = 8080`. That
+trap is why `_nested_struct_type` and `_analysis_nested_type` were kept apart in
+the first place; a consumer that wants "the child type, however it was declared"
+should ask here rather than pick a hook and inherit one hook's blind spot. A
+route walker can follow this without wedging on `meta(Int)`.
+"""
+function nested_object_type(T::Type, name::Symbol)
+    child = _walk_nested_type(T, name)
+    child isa Type && _type_is_dynamic(child) ? child : nothing
+end
 # Every Symbol appearing in a type annotation — `value::Vector{T}` mentions `T`.
 # Used to decide whether a struct's type parameters are solvable from its fields.
 _type_symbols(_) = Set{Symbol}()
@@ -3995,6 +4262,21 @@ end
 # inner expression so the loop continues peeling.
 _apply_property_macro!(state::_PropertyMacroState, ::Val{name}, arg) where {name} =
     (push!(state.macros, name); arg.args[end])
+
+# DO's own markers that act on a right-hand side: each one changes how a
+# property's BODY is computed, cached or stored, so on a declaration with no
+# body it is silently inert — a mistake DO is in a position to name (see the
+# rhs-less check in `dynamicstruct`). Deliberately NOT a whitelist of the
+# allowed markers: a marker DO does not recognise belongs to a downstream
+# consumer (`@include`, `@get`, …), is captured-but-inert by design, and is
+# meaningful on an rhs-less declaration — `@include mount(key::Symbol)`
+# declares a call form whose implementation the consumer mounts.
+# `@versioned` is DO's own but IS meaningful without an rhs (it declares a
+# fixed field to be a cache-version dimension), so it is absent here.
+const _RHS_ACTING_MARKERS = Set([
+    Symbol("@cached"), Symbol("@mmap"), Symbol("@fresh"),
+    Symbol("@dynamic_progress"), Symbol("@struct"), Symbol("@options"),
+])
 
 # `@doc "str" <def>` — silently consume (don't push to macros) and capture
 # the docstring. `length(arg.args) >= 4` matches Julia's lowered shape
@@ -4239,6 +4521,30 @@ function _inject_include_kwargs!(call_expr, prop_name)
     call_expr
 end
 
+"""    _unwrap_short_form_body(rhs)
+
+Undo the `:block` the parser wraps a short-form method body in.
+
+`f(args…) = rhs` is a SHORT-FORM METHOD DEFINITION, and Julia wraps its rhs in a
+`:block` however the source read — so `@include item(key) = Leaf(key)` arrives
+with exactly the same head as `@include kid = begin … end`. LHS shape alone
+cannot tell them apart; the block's payload can. One statement (LineNumberNodes
+aside) is the parser's wrapping and unwraps to the bare expression; several are a
+body the author wrote.
+
+**Total: anything this cannot unwrap comes back unchanged**, so a caller tests
+the RESULT (`Meta.isexpr(out, :block)` still means "a real body") rather than a
+sentinel. HTMXObjects delegates here so both sides of one declaration agree by
+construction; a sentinel return would silently fall through every `isexpr` check
+on that side and drop the declaration on the floor.
+"""
+_unwrap_short_form_body(rhs) = rhs
+function _unwrap_short_form_body(rhs::Expr)
+    Meta.isexpr(rhs, :block) || return rhs
+    statements = [a for a in rhs.args if !(a isa LineNumberNode)]
+    length(statements) == 1 ? only(statements) : rhs
+end
+
 function _process_include_externals!(body)
     # Returned: (prop_name, type_expr) for each `@include`'d external. Used
     # to emit `_analysis_nested_type` so `analyze_structure` walks the
@@ -4262,6 +4568,13 @@ function _process_include_externals!(body)
         Meta.isexpr(inner, :(=)) || continue
         lhs = inner.args[1]
         rhs = inner.args[2]
+        # Call-form LHS (`@include item(key) = Leaf(key)`): Julia has wrapped the
+        # rhs in a short-form-method `:block`. Unwrap it, or the `:block` check
+        # below rejects the CALL form with the block form's error message — which
+        # is what made every call-form indexed `@include` unreachable: no
+        # `_analysis_nested_type`, so nothing downstream could recover the child
+        # type. A real body comes back as the same block and the check speaks.
+        Meta.isexpr(lhs, :call) && (rhs = _unwrap_short_form_body(rhs))
         # `@include name = begin … end` (inline sub-router) is an HTMXObjects
         # construct: under `@htmx`, `_convert_include_to_struct!` replaces the
         # block form with a `prop = struct …` inline child BEFORE `dynamicstruct`
@@ -4947,7 +5260,13 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         if Meta.isexpr(arg, (:ref, :call))
             arg, indices... = arg.args
             indexed = true
-            union!(locals, extractnames(indices))
+            # `locals` is `nothing` until the `:(=)` branch above creates it, and
+            # an indexed declaration may legitimately have NO rhs — `foo(i)` on
+            # its own, which is what an indexed `@include` leaves behind once its
+            # (inert here) marker is peeled. There is no body to walk, so there
+            # is nothing to shadow. Same guard the `foo(i)::T` path below already
+            # carries; without it this unioned into `nothing`.
+            !isnothing(locals) && union!(locals, extractnames(indices))
         end
         name, ext_type = if Meta.isexpr(arg, :(::))
             arg.args[1], arg.args[2]
@@ -5010,10 +5329,16 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         metadata.doc[] = nothing
         !isnothing(locals) && push!(locals, name)
         !isnothing(locals) && push!(locals, :__status__)
-        # A fixed field (no rhs) may carry ONLY `@versioned` (the cache version
-        # dimension); every other marker (@cached/@mmap/@fresh/@dynamic_progress)
-        # acts on a computed property and is a mistake on a field.
-        @assert !isnothing(rhs) || issubset(macros, (Symbol("@versioned"),)) "fixed field `$name` may not carry markers other than @versioned (got $(sort!(string.(collect(macros)))))"
+        # No rhs → no body for a marker to act on. Reject DO's OWN rhs-acting
+        # markers, which would be silently inert (`_RHS_ACTING_MARKERS`), and
+        # let every other marker through: an unrecognised marker belongs to a
+        # downstream consumer and `@include mount(key::Symbol)` — a call form
+        # implemented elsewhere — is a legitimate declaration, not a field with
+        # a stray marker.
+        if isnothing(rhs)
+            inert = intersect(macros, _RHS_ACTING_MARKERS)
+            isempty(inert) || error("@dynamicstruct $type: `$name` has no right-hand side, so $(join(sort!(string.(collect(inert))), ", ")) has nothing to act on — the marker would be silently ignored. Give `$name` a body, or drop the marker.")
+        end
         push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices, indexed, cache_version, result_type=ext_type, doc))
     end
     # `properties` holds the per-declaration list (preserves order AND duplicate
@@ -5488,8 +5813,8 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 # property's `__status__` (the substatus a parent threaded in;
                 # `nothing` when none → the wrap is a transparent no-op and the
                 # `maybefetch*` calls degrade to `memoize!` / `getproperty`), so the
-                # property's self-accesses hang under the caller's ambient phase —
-                # ambient nesting, behaving like Tb's `@progress`. The self-access
+                # property's self-accesses hang under the caller's lexical phase,
+                # behaving like Tb's `@progress`. The self-access
                 # rewrite runs FIRST (on the walked body), so `__progress__` is
                 # literal in the source the `Treebars.@progress` walker then renames;
                 # the wrap is emitted as a qualified `Treebars.@progress` (DO does NOT
@@ -5498,19 +5823,11 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 # calls (NOT a nested `@fetch! __progress__ …`) avoid the `fecc238`
                 # outside-in dangling-`__progress__` footgun.
                 if Symbol("@progress") in info.macros
-                    # Pass the rewritten body to Treebars.@progress. If it is already a
-                    # block, pass it DIRECTLY — wrapping a block inside another block
-                    # buries inline `@progress "phase"` markers one level deep, and Tb
-                    # requires a phase marker to be a DIRECT statement of the enclosing
-                    # @progress block (else: "phase marker must be a direct statement of
-                    # an enclosing @progress block"). Only a bare-expr body needs a fresh
-                    # block wrapper.
-                    _rewritten = _progress_self_rewrite(walked_rhs)
                     walked_rhs = Expr(:macrocall,
                         GlobalRef(Treebars, Symbol("@progress")),
                         something(info.lnn, LineNumberNode(0, :unknown)),
                         :__status__,
-                        Meta.isexpr(_rewritten, :block) ? _rewritten : Expr(:block, _rewritten))
+                        _progress_body_block(_progress_self_rewrite(walked_rhs)))
                 end
                 # `@PROGRESS`-marked: the "throw everything at @progress" form. Exactly
                 # like `@progress` above, but rewrites the body with `_fetch_rewrite`
@@ -5523,12 +5840,45 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 # path as `@progress`, and inline `@progress`/`@phases` markers in the body
                 # still work (Tb expands the wrap first).
                 if Symbol("@PROGRESS") in info.macros
-                    _rewritten_all = _fetch_rewrite(:__progress__, walked_rhs)
                     walked_rhs = Expr(:macrocall,
                         GlobalRef(Treebars, Symbol("@progress")),
                         something(info.lnn, LineNumberNode(0, :unknown)),
                         :__status__,
-                        Meta.isexpr(_rewritten_all, :block) ? _rewritten_all : Expr(:block, _rewritten_all))
+                        _progress_body_block(_fetch_rewrite(:__progress__, walked_rhs)))
+                end
+                # UNMARKED — the default, and so the shape almost every property
+                # in the ecosystem takes. Progress is implied by a
+                # PROPERTY-SCOPED source rewrite (decision 18urwkj): property
+                # accesses become `maybefetchproperty!(__progress__, …)` and
+                # property-rooted calls become
+                # `maybefetchindex!(__progress__, …)`. Ordinary calls remain
+                # ordinary calls, so arithmetic, loops, helpers and constructors
+                # pay no blanket splat+dispatch tax.
+                #
+                # The surrounding label-less `Treebars.@progress __status__`
+                # block binds the literal `__progress__` references emitted by
+                # the rewrite and also keeps inline `@progress "phase"` markers
+                # working without a marker on the LHS. No current-task or
+                # dynamically-scoped parent is read anywhere in DynamicObjects;
+                # every edge is carried explicitly by these generated calls.
+                #
+                # The four markers stay as overrides — `@progress` (self-accesses
+                # only), `@PROGRESS` / `@fetch!` (everything, via the poller's
+                # spawning path), `@dynamic_progress` (foreign calls too) — so
+                # nothing that relies on them changes.
+                #
+                # Two shapes are excluded. `__status__` gets no `__status__`
+                # kwarg at all (see `cp_kwargs` above), and `__substatus__` is the
+                # factory that BUILDS the node this wrap would parent under —
+                # wrapping either is circular.
+                if !_is_progress_marked(info.macros) &&
+                   name !== :__status__ && name !== :__substatus__
+                    walked_rhs = Expr(:macrocall,
+                        GlobalRef(Treebars, Symbol("@progress")),
+                        something(info.lnn, LineNumberNode(0, :unknown)),
+                        :__status__,
+                        _progress_body_block(
+                            _progress_property_rewrite(:__progress__, walked_rhs)))
                 end
                 block = Expr(:block,
                     _lnn, Expr(:(=), _call(:compute_property, cp_kwargs...), Expr(:block, _lnn, walked_rhs)),
@@ -7011,7 +7361,9 @@ function property_source_info(T::Type, prop::Symbol)
     signature = isempty(info.indices) ? string(info.lhs) :
                 string(info.lhs, "(", join(info.indices, ", "), ")")
     macros = isempty(info.macros) ? "" : join(string.(info.macros), " ") * " "
-    dependson = isempty(info.dependson) ? Symbol[] : sort!(collect(info.dependson))
+    # `nothing` (not an empty Set) for a declaration with no rhs — there was no
+    # body to walk. Renders the same as "depends on nothing".
+    dependson = isnothing(info.dependson) ? Symbol[] : sort!(collect(info.dependson))
     (; rhs_string, signature, macros, dependson)
 end
 
@@ -8195,12 +8547,791 @@ function materialization_ownership(context::NamedTuple, root)
     end
 end
 
+# --- tracked primitives -------------------------------------------------------
+#
+# A changeable value needs no annotation at its declaration site. It is an
+# ordinary property whose VALUE is one of the types below, each of which owns
+# its lock, its version and its observer list. A Base-style mutation or an
+# observed filesystem change bumps the version; [`sync!`](@ref) turns a version
+# change into cache invalidation for the transitive closure of properties that
+# read it.
+#
+# Why version-and-sync rather than pushing invalidation from the mutation site.
+# A tracked value does not know which objects hold it — the same
+# `ThreadSafeDict` is reachable from a store and from every node that
+# destructured it — and a filesystem change has no mutation site at all. One
+# integer compared per tracked value at a request boundary treats an external
+# change and a local `setindex!` identically, costs nothing on the property
+# hot path, and needs no bookkeeping at read time. `on_change!` is there for a
+# host that also wants a push signal.
+#
+# This is DO's first in-place invalidation: `remake`/`remount` build a NEW
+# object and carry over the entries a field change provably cannot affect.
+# `sync!` is the mirror image — the object stays, and the entries a tracked
+# value provably CAN affect are dropped.
+
+mutable struct _TrackedState
+    lock::ReentrantLock
+    version::UInt64
+    observers::Vector{Any}
+end
+_TrackedState() = _TrackedState(ReentrantLock(), UInt64(1), Any[])
+
+# Bump under the lock, notify outside it: an observer that reads the value it
+# was notified about must not deadlock against the writer, and one that throws
+# must not leave the version unbumped — the change already happened.
+function _bump!(state::_TrackedState)
+    version, observers = lock(state.lock) do
+        state.version += UInt64(1)
+        state.version, copy(state.observers)
+    end
+    for observer in observers
+        try
+            observer()
+        catch err
+            @warn "tracked-value observer threw; the change already happened" exception=(err, catch_backtrace())
+        end
+    end
+    version
+end
+
+"""    tracked_version(x) -> Union{UInt64,Nothing}
+
+Observable version of `x`, or `nothing` for a value that is not tracked.
+
+Monotone: any Base-style mutation of a tracked container, or any observed
+change to a tracked path, produces a strictly greater number. Equal versions
+mean "nothing has changed that this value can see"; they carry no other
+information, and the number itself is not comparable across values.
+
+For [`TrackedFile`](@ref) / [`TrackedDirectory`](@ref) this call POLLS the
+filesystem, which is what makes an external change observable without a
+watcher. For the in-memory containers it is a lock and a field read.
+
+The `nothing` fallback is what makes tracking extensible: [`sync!`](@ref)
+treats anything answering non-`nothing` as tracked, so another package can
+opt its own type in by adding a method.
+"""
+tracked_version(::Any) = nothing
+
+"""    on_change!(f, tracked) -> f
+
+Register a zero-argument `f` to run after `tracked` changes.
+
+Called outside the value's lock, so `f` may read the value it was notified
+about. A throwing `f` is logged and skipped — the change has already
+happened, and one bad observer must not take down the writer. Observers are
+never removed; register them once, at wiring time.
+
+The push counterpart to [`sync!`](@ref)'s poll. Neither is required for the
+other: a host may poll, may observe, or may do both.
+"""
+function on_change!(f, tracked)
+    state = _tracked_state(tracked)
+    lock(state.lock) do
+        push!(state.observers, f)
+    end
+    f
+end
+
+"""    notify_change!(tracked) -> UInt64
+
+Bump `tracked`'s version and run its observers, returning the new version.
+
+Called for you by every mutating Base method. Call it directly only after
+changing something the container cannot see for itself — mutating a value
+already stored in it, for instance.
+"""
+notify_change!(tracked) = _bump!(_tracked_state(tracked))
+
+"""
+    ThreadSafeDict{K,V}(pairs...)
+
+A `Dict` that is safe to share between tasks and reports a version.
+
+Every operation takes the dict's own lock, and every mutation that actually
+changes something bumps [`tracked_version`](@ref) — a `delete!` of an absent
+key and a `get!` that hits do not, so a version change always means the
+contents differ.
+
+`get!(f, dict, key)` holds the lock across `f`, which is what makes
+check-and-insert atomic: two tasks racing to create the same entry both
+observe the same winner, and the loser can detect that it lost by identity.
+Keep `f` short — it is running under the lock.
+
+`keys`, `values` and iteration return a snapshot taken under the lock, so a
+sweep never observes a torn view and never blocks a writer for its duration.
+The snapshot is a plain `Vector`, not a lazy view.
+"""
+struct ThreadSafeDict{K,V} <: AbstractDict{K,V}
+    state::_TrackedState
+    entries::Dict{K,V}
+    ThreadSafeDict{K,V}(entries) where {K,V} = new{K,V}(_TrackedState(), Dict{K,V}(entries))
+    ThreadSafeDict{K,V}() where {K,V} = new{K,V}(_TrackedState(), Dict{K,V}())
+end
+ThreadSafeDict{K,V}(pairs::Pair...) where {K,V} = ThreadSafeDict{K,V}(pairs)
+ThreadSafeDict() = ThreadSafeDict{Any,Any}()
+function ThreadSafeDict(pairs::Pair...)
+    entries = Dict(pairs...)
+    ThreadSafeDict{keytype(entries),valtype(entries)}(entries)
+end
+
+"""
+    ProviderRoots()
+
+The retained roots a provider is holding, keyed by id.
+
+A `ThreadSafeDict{String,Any}` in every respect, plus the one fact that makes
+a root a root: who retained it. `retain!` records the provider, `release!`
+drops everything one provider holds, and `delete!` releases a single id.
+Entries are held STRONGLY — that is the point of a root — so an id that is
+never released is a leak, exactly as intended.
+
+DO attaches no policy: which objects deserve retaining, when they are
+released, and what a provider means are the application's.
+"""
+struct ProviderRoots <: AbstractDict{String,Any}
+    state::_TrackedState
+    entries::Dict{String,Any}
+    providers::Dict{String,Symbol}
+    ProviderRoots() = new(_TrackedState(), Dict{String,Any}(), Dict{String,Symbol}())
+end
+
+"""
+    TrackedFile(path; read=Base.read, version=:mtime)
+
+One file, observed rather than re-read.
+
+`read(file)` returns `read(path)`'s result, memoized until the file changes;
+pass `read=TOML.parsefile` (or any `path -> value`) to track parsed content
+instead of bytes. `version` selects the change probe — `:mtime` (cheap,
+coarse), `:hash` (exact, reads the file) or `:git` — and is passed straight to
+[`file_version`](@ref).
+
+A missing file is not an error: it stamps as `""`, so a path that does not
+exist yet has a stable version and starts producing changes the moment it
+appears. `read` on a missing file throws, as `Base.read` would.
+
+There is no watcher. The probe runs when someone asks for the version or the
+content, which is what "poll on access" means here.
+"""
+mutable struct TrackedFile
+    state::_TrackedState
+    path::String
+    reader::Any
+    probe::Symbol
+    stamp::String
+    value::Any
+    has_value::Bool
+end
+function TrackedFile(path::AbstractString; read=Base.read, version::Symbol=:mtime)
+    version in (:mtime, :hash, :git) ||
+        error("TrackedFile: unknown version probe `$version` — use :mtime, :hash or :git.")
+    TrackedFile(_TrackedState(), String(path), read, version, "", nothing, false)
+end
+
+"""
+    TrackedDirectory(path; match=Returns(true), key=path -> Symbol(basename(path)),
+                     read=identity, version=:mtime)
+
+The files of one directory, as an `AbstractDict` that observes both
+membership and content.
+
+Directory membership and every matched file's version are ONE observed
+version: a file appearing, disappearing or changing all move
+[`tracked_version`](@ref) by the same mechanism, so a consumer cannot see a
+listing that disagrees with the contents.
+
+`match` filters absolute paths, `key` names each file (the key is derived from
+the path, so a file cannot disagree with itself about what it is called), and
+`read` turns a path into the value — the default `identity` yields the path,
+so a directory of things you will open yourself needs no reader. Values are
+memoized per file and dropped only for files that actually changed.
+
+A missing directory is empty, not an error, and starts producing entries when
+it appears. Keys iterate in sorted path order, so a sweep is reproducible.
+"""
+mutable struct TrackedDirectory <: AbstractDict{Any,Any}
+    state::_TrackedState
+    path::String
+    match::Any
+    key::Any
+    reader::Any
+    probe::Symbol
+    stamps::Dict{String,String}
+    order::Vector{Any}
+    paths::Dict{Any,String}
+    values::Dict{Any,Any}
+end
+function TrackedDirectory(path::AbstractString;
+        match=Returns(true), key=path -> Symbol(basename(path)),
+        read=identity, version::Symbol=:mtime)
+    version in (:mtime, :hash, :git) ||
+        error("TrackedDirectory: unknown version probe `$version` — use :mtime, :hash or :git.")
+    TrackedDirectory(_TrackedState(), String(path), match, key, read, version,
+        Dict{String,String}(), Any[], Dict{Any,String}(), Dict{Any,Any}())
+end
+
+const TrackedValue = Union{ThreadSafeDict,ProviderRoots,TrackedFile,TrackedDirectory}
+
+_tracked_state(t::TrackedValue) = t.state
+
+# Poll the outside world. In-memory containers already know when they changed.
+_poll!(::Union{ThreadSafeDict,ProviderRoots}) = nothing
+
+function _poll!(f::TrackedFile)
+    stamp = file_version(f.path; by=f.probe)
+    changed = lock(f.state.lock) do
+        stamp == f.stamp && return false
+        f.stamp = stamp
+        f.value = nothing
+        f.has_value = false
+        true
+    end
+    changed && _bump!(f.state)
+    nothing
+end
+
+function _poll!(d::TrackedDirectory)
+    entries = isdir(d.path) ? sort!(readdir(d.path; join=true)) : String[]
+    matched = filter(d.match, entries)
+    stamps = Dict{String,String}(path => file_version(path; by=d.probe) for path in matched)
+    changed = lock(d.state.lock) do
+        stamps == d.stamps && return false
+        # Keep the memoized value of every file that did not change; drop only
+        # the ones that did, and the ones that are gone.
+        for (key, path) in d.paths
+            get(stamps, path, nothing) == get(d.stamps, path, nothing) || delete!(d.values, key)
+        end
+        d.stamps = stamps
+        d.order = Any[d.key(path) for path in matched]
+        keep = Set{Any}(d.order)
+        d.paths = Dict{Any,String}(d.key(path) => path for path in matched)
+        for key in collect(keys(d.values))
+            key in keep || delete!(d.values, key)
+        end
+        true
+    end
+    changed && _bump!(d.state)
+    nothing
+end
+
+tracked_version(t::TrackedValue) = (_poll!(t); lock(t.state.lock) do; t.state.version; end)
+
+"""    tracked_path(tracked) -> String
+
+The filesystem path a [`TrackedFile`](@ref) or [`TrackedDirectory`](@ref)
+observes. Fixed for the lifetime of the value: a different path is a different
+tracked value, not a mutation of this one.
+"""
+tracked_path(t::Union{TrackedFile,TrackedDirectory}) = t.path
+
+# --- ThreadSafeDict / ProviderRoots Base interface ---------------------------
+#
+# One lock per operation; snapshots for anything that sweeps. `_entries` and
+# `_state` let the two containers share every method.
+
+_entries(d::ThreadSafeDict) = d.entries
+_entries(r::ProviderRoots) = r.entries
+const _LockedDict = Union{ThreadSafeDict,ProviderRoots}
+
+Base.length(d::_LockedDict) = lock(d.state.lock) do; length(_entries(d)); end
+Base.isempty(d::_LockedDict) = lock(d.state.lock) do; isempty(_entries(d)); end
+Base.haskey(d::_LockedDict, key) = lock(d.state.lock) do; haskey(_entries(d), key); end
+Base.getindex(d::_LockedDict, key) = lock(d.state.lock) do; _entries(d)[key]; end
+Base.get(d::_LockedDict, key, default) = lock(d.state.lock) do; get(_entries(d), key, default); end
+Base.get(f::Function, d::_LockedDict, key) = lock(d.state.lock) do; get(f, _entries(d), key); end
+Base.keys(d::_LockedDict) = lock(d.state.lock) do; collect(keys(_entries(d))); end
+Base.values(d::_LockedDict) = lock(d.state.lock) do; collect(values(_entries(d))); end
+_snapshot(d::_LockedDict) = lock(d.state.lock) do; collect(pairs(_entries(d))); end
+
+function Base.setindex!(d::_LockedDict, value, key)
+    changed = lock(d.state.lock) do
+        entries = _entries(d)
+        # An identical re-assignment is not a change: a version bump would
+        # invalidate every dependent for nothing.
+        haskey(entries, key) && entries[key] === value && return false
+        entries[key] = value
+        d isa ProviderRoots && get!(d.providers, key, :default)
+        true
+    end
+    changed && _bump!(d.state)
+    d
+end
+
+# The lock is held across `f` — that is what makes check-and-insert atomic.
+function Base.get!(f::Function, d::_LockedDict, key)
+    inserted = false
+    value = lock(d.state.lock) do
+        entries = _entries(d)
+        haskey(entries, key) && return entries[key]
+        inserted = true
+        v = f()
+        entries[key] = v
+        d isa ProviderRoots && get!(d.providers, key, :default)
+        v
+    end
+    inserted && _bump!(d.state)
+    value
+end
+Base.get!(d::_LockedDict, key, default) = get!(() -> default, d, key)
+
+function Base.delete!(d::_LockedDict, key)
+    deleted = lock(d.state.lock) do
+        entries = _entries(d)
+        haskey(entries, key) || return false
+        delete!(entries, key)
+        d isa ProviderRoots && delete!(d.providers, key)
+        true
+    end
+    deleted && _bump!(d.state)
+    d
+end
+
+function Base.pop!(d::_LockedDict, key, default)
+    found = Ref(false)
+    value = lock(d.state.lock) do
+        entries = _entries(d)
+        haskey(entries, key) || return default
+        found[] = true
+        v = pop!(entries, key)
+        d isa ProviderRoots && delete!(d.providers, key)
+        v
+    end
+    found[] && _bump!(d.state)
+    value
+end
+function Base.pop!(d::_LockedDict, key)
+    sentinel = Ref{Any}()
+    value = pop!(d, key, sentinel)
+    value === sentinel && throw(KeyError(key))
+    value
+end
+
+function Base.empty!(d::_LockedDict)
+    emptied = lock(d.state.lock) do
+        entries = _entries(d)
+        isempty(entries) && return false
+        empty!(entries)
+        d isa ProviderRoots && empty!(d.providers)
+        true
+    end
+    emptied && _bump!(d.state)
+    d
+end
+
+# Iteration walks a snapshot taken once, so a concurrent mutation can neither
+# tear the sweep nor be blocked by it. The snapshot travels in the state.
+function Base.iterate(d::_LockedDict)
+    snapshot = _snapshot(d)
+    result = iterate(snapshot)
+    result === nothing && return nothing
+    item, state = result
+    item, (snapshot, state)
+end
+function Base.iterate(::_LockedDict, state::Tuple{Vector,Any})
+    snapshot, inner = state
+    result = iterate(snapshot, inner)
+    result === nothing && return nothing
+    item, next = result
+    item, (snapshot, next)
+end
+
+Base.show(io::IO, d::ThreadSafeDict{K,V}) where {K,V} =
+    print(io, "ThreadSafeDict{", K, ",", V, "}(", length(d), " entries, v", tracked_version(d), ")")
+Base.show(io::IO, ::MIME"text/plain", d::ThreadSafeDict) = show(io, d)
+Base.show(io::IO, r::ProviderRoots) =
+    print(io, "ProviderRoots(", length(r), " retained, v", tracked_version(r), ")")
+Base.show(io::IO, ::MIME"text/plain", r::ProviderRoots) = show(io, r)
+
+"""    retain!(roots::ProviderRoots, id::AbstractString, root; provider::Symbol=:default) -> root
+
+Retain `root` under `id` on behalf of `provider`.
+
+Replacing an existing id re-retains it under the new provider. The returned
+value is `root`, so a retain reads as part of the expression that produced it.
+"""
+function retain!(roots::ProviderRoots, id::AbstractString, root; provider::Symbol=:default)
+    key = String(id)
+    changed = lock(roots.state.lock) do
+        same = get(roots.entries, key, nothing) === root &&
+               get(roots.providers, key, nothing) === provider
+        same && return false
+        roots.entries[key] = root
+        roots.providers[key] = provider
+        true
+    end
+    changed && _bump!(roots.state)
+    root
+end
+
+"""    release!(roots::ProviderRoots; provider::Symbol) -> Vector{String}
+
+Release every root `provider` retained, returning the ids dropped (sorted).
+
+One bump for the whole release, not one per id: a provider going away is a
+single change to everyone downstream.
+"""
+function release!(roots::ProviderRoots; provider::Symbol)
+    released = lock(roots.state.lock) do
+        ids = sort!([id for (id, owner) in roots.providers if owner === provider])
+        for id in ids
+            delete!(roots.entries, id)
+            delete!(roots.providers, id)
+        end
+        ids
+    end
+    isempty(released) || _bump!(roots.state)
+    released
+end
+
+"""    provider_of(roots::ProviderRoots, id) -> Union{Symbol,Nothing}
+
+Which provider retained `id`, or `nothing` if nobody has.
+"""
+provider_of(roots::ProviderRoots, id) =
+    lock(roots.state.lock) do; get(roots.providers, String(id), nothing); end
+
+"""    retained_providers(roots::ProviderRoots) -> Vector{Symbol}
+
+Every provider currently holding at least one root, sorted.
+"""
+retained_providers(roots::ProviderRoots) =
+    lock(roots.state.lock) do; sort!(unique(values(roots.providers))); end
+
+# --- TrackedFile / TrackedDirectory Base interface ----------------------------
+
+"""    read(file::TrackedFile)
+
+The file's content through its reader, memoized until the file changes.
+
+Polls first, so a change made since the last read is picked up here rather
+than at some later boundary.
+"""
+function Base.read(f::TrackedFile)
+    _poll!(f)
+    lock(f.state.lock) do
+        f.has_value && return f.value
+        # Under the lock: two tasks must not both run the reader and disagree
+        # about which result is the memoized one.
+        f.value = f.reader(f.path)
+        f.has_value = true
+        f.value
+    end
+end
+Base.stat(f::TrackedFile) = stat(f.path)
+Base.isfile(f::TrackedFile) = isfile(f.path)
+Base.ispath(f::TrackedFile) = ispath(f.path)
+Base.show(io::IO, f::TrackedFile) =
+    print(io, "TrackedFile(", repr(f.path), "; version=", repr(f.probe), ")")
+Base.show(io::IO, ::MIME"text/plain", f::TrackedFile) = show(io, f)
+
+Base.length(d::TrackedDirectory) = (_poll!(d); lock(d.state.lock) do; length(d.order); end)
+Base.isempty(d::TrackedDirectory) = length(d) == 0
+Base.keys(d::TrackedDirectory) = (_poll!(d); lock(d.state.lock) do
+    # `identity.` narrows the element type, so `collect(keys(dir))` yields the
+    # `Vector{Symbol}` the key function actually produced rather than `Any`.
+    identity.(d.order)
+end)
+Base.haskey(d::TrackedDirectory, key) = (_poll!(d); lock(d.state.lock) do; haskey(d.paths, key); end)
+Base.stat(d::TrackedDirectory) = stat(d.path)
+Base.isdir(d::TrackedDirectory) = isdir(d.path)
+
+function Base.getindex(d::TrackedDirectory, key)
+    _poll!(d)
+    lock(d.state.lock) do
+        haskey(d.values, key) && return d.values[key]
+        haskey(d.paths, key) || throw(KeyError(key))
+        d.values[key] = d.reader(d.paths[key])
+    end
+end
+Base.get(d::TrackedDirectory, key, default) = haskey(d, key) ? d[key] : default
+Base.values(d::TrackedDirectory) = [d[key] for key in keys(d)]
+
+"""    tracked_paths(dir::TrackedDirectory) -> Dict
+
+Each key's path, for a consumer that needs the file rather than its content.
+"""
+tracked_paths(d::TrackedDirectory) = (_poll!(d); lock(d.state.lock) do; copy(d.paths); end)
+
+# Sorted-key snapshot, then read per key — so a file appearing mid-sweep does
+# not change what this sweep yields.
+function Base.iterate(d::TrackedDirectory)
+    snapshot = keys(d)
+    isempty(snapshot) && return nothing
+    (snapshot[1] => d[snapshot[1]]), (snapshot, 2)
+end
+function Base.iterate(d::TrackedDirectory, state::Tuple{Vector,Int})
+    snapshot, i = state
+    i > length(snapshot) && return nothing
+    (snapshot[i] => d[snapshot[i]]), (snapshot, i + 1)
+end
+
+Base.show(io::IO, d::TrackedDirectory) =
+    print(io, "TrackedDirectory(", repr(d.path), "; version=", repr(d.probe), ")")
+Base.show(io::IO, ::MIME"text/plain", d::TrackedDirectory) = show(io, d)
+
+# --- downstream invalidation --------------------------------------------------
+
+# Transitive dependents, inverted from `meta(T)`'s `dependson` and memoized
+# per type — the graph is a property of the type, not of any object.
+const _DEPENDENTS_LOCK = ReentrantLock()
+const _DEPENDENTS = Dict{Type,Dict{Symbol,Vector{Symbol}}}()
+
+function _dependents_map(T::Type)
+    lock(_DEPENDENTS_LOCK) do
+        get!(_DEPENDENTS, T) do
+            direct = Dict{Symbol,Set{Symbol}}()
+            for (name, info) in meta(T)
+                deps = get(info, :dependson, nothing)
+                deps === nothing && continue
+                for dep in deps
+                    push!(get!(() -> Set{Symbol}(), direct, dep), name)
+                end
+            end
+            transitive = Dict{Symbol,Vector{Symbol}}()
+            for source in keys(direct)
+                seen = Set{Symbol}()
+                stack = Symbol[source]
+                while !isempty(stack)
+                    current = pop!(stack)
+                    for dependent in get(direct, current, ())
+                        dependent in seen && continue
+                        push!(seen, dependent)
+                        push!(stack, dependent)
+                    end
+                end
+                transitive[source] = sort!(collect(seen))
+            end
+            transitive
+        end
+    end
+end
+
+"""    dependents(T::Type, name::Symbol) -> Vector{Symbol}
+
+Every property of `T` whose value can change when `name`'s does, transitively.
+
+The inverse of the `dependson` walk the macro already runs, so it is exact for
+ordinary sibling reads and knows nothing about a value obtained some other way
+(through a global, or off an object DO did not build). Sorted, and excludes
+`name` itself.
+"""
+dependents(T::Type, name::Symbol) = get(_dependents_map(T), name, Symbol[])
+
+_property_cache(o) = getfield(o, :cache).cache
+
+"""    invalidate!(o, name::Symbol; self=false) -> Vector{Symbol}
+
+Drop the cached values of every property of `o` that depends on `name`,
+returning the names actually dropped (sorted).
+
+`self=true` drops `name`'s own cached value too. The default is `false`
+because the case this exists for is a tracked value that mutated IN PLACE:
+the property still holds the same container, and only what was derived from
+it is stale.
+
+Indexed properties are not reached — their per-argument caches live in an
+`IndexableProperty`, not in the object's `PropertyCache`.
+"""
+function invalidate!(o, name::Symbol; self::Bool=false)
+    cache = _property_cache(o)
+    targets = dependents(typeof(o), name)
+    self && (targets = sort!(vcat(targets, name)))
+    dropped = Symbol[]
+    for target in targets
+        haskey(cache, target) || continue
+        delete!(cache, target)
+        push!(dropped, target)
+    end
+    if !isempty(dropped)
+        _cache_generation(o)[] += UInt64(1)
+        # A dropped property's next value is a different incarnation — new
+        # child objects, each with its own version — so any [`sync!`](@ref)
+        # stamp taken from the old one is meaningless. Forget it, and the next
+        # sync re-baselines instead of reporting a change that already
+        # happened.
+        stamps = _tracked_stamps(o)
+        for name in dropped
+            delete!(stamps, name)
+        end
+    end
+    dropped
+end
+
+# Per-object record of the version each tracked value had when we last looked.
+#
+# Anchored on a MUTABLE object reachable from `o`'s cache, because a DO object
+# is an immutable struct and therefore cannot be weakly referenced or
+# finalized — `WeakKeyDict` rejects it outright. The anchor is per-object,
+# lives exactly as long as the cache does, and takes the stamps with it when
+# it dies. Keying on the cache also gives the right answer for `remake`: a new
+# object gets a new cache, hence new stamps, hence recomputes rather than
+# inheriting a stale "already seen this version".
+const _TRACKED_STAMPS_LOCK = ReentrantLock()
+const _TRACKED_STAMPS = WeakKeyDict{Any,Dict{Symbol,UInt64}}()
+const _CACHE_GENERATIONS = WeakKeyDict{Any,Base.RefValue{UInt64}}()
+
+_stamp_anchor(cache::AbstractThreadsafeDict) = cache.lock
+_stamp_anchor(cache::AbstractDict) = cache
+
+_tracked_stamps(o) = lock(_TRACKED_STAMPS_LOCK) do
+    get!(() -> Dict{Symbol,UInt64}(), _TRACKED_STAMPS, _stamp_anchor(_property_cache(o)))
+end
+
+_cache_generation(o) = lock(_TRACKED_STAMPS_LOCK) do
+    get!(() -> Ref(UInt64(1)), _CACHE_GENERATIONS, _stamp_anchor(_property_cache(o)))
+end
+
+"""    object_version(o) -> UInt64
+
+How many times anything has been invalidated on `o`, as a monotone number.
+
+The aggregate a holder watches: an object is stale to whoever derived from it
+exactly when this moves, and [`invalidate!`](@ref) is the only thing that
+moves it. That makes a DO object observable on the same terms as a tracked
+value — [`sync!`](@ref) compares it per holder, so an object shared by several
+parents reports the change to each of them once, whenever each looks.
+
+Only about this object's own cache; a change inside a child moves the child's
+number, and this one only if something here was dropped as a result.
+"""
+object_version(o) = _cache_generation(o)[]
+
+# A DO object is exactly one that carries a `PropertyCache` — cheaper to ask
+# than `hasmethod(meta, …)`, and it is the field `sync!` needs anyway. Unwrap
+# first: `nested_object_type` may be handed a parametric type as the bare
+# `Child` UnionAll, which `hasfield` will not take.
+_type_is_dynamic(T::Type) = begin
+    body = Base.unwrap_unionall(T)
+    body isa DataType && hasfield(body, :cache) && fieldtype(body, :cache) <: PropertyCache
+end
+_is_dynamic(x) = _type_is_dynamic(typeof(x))
+
+# Worth descending into a container? Only if its elements could be DO objects.
+# A concrete non-DO eltype (`Vector{Float64}`, `Vector{String}`) is skipped
+# without touching an element.
+_may_hold_dynamic(::Type{T}) where {T} = !isconcretetype(T) || _type_is_dynamic(T)
+
+# Sync everything below `value` and fold the children's [`object_version`](@ref)
+# into one number, or `nothing` when there is nothing dynamic down there.
+# Returning a VERSION rather than "did it drop" is what makes a shared child
+# correct: the drop happens once, but each holder compares against its own
+# stamp and so learns about it exactly once, whenever it next looks.
+function _below_version(value, visited)
+    _is_dynamic(value) || return nothing
+    _sync!(value, visited)
+    object_version(value)
+end
+function _below_version(value::Union{AbstractArray,Tuple}, visited)
+    _may_hold_dynamic(eltype(value)) || return nothing
+    folded = nothing
+    for element in value
+        below = _below_version(element, visited)
+        below === nothing && continue
+        folded = hash(below, folded === nothing ? UInt64(0) : folded)
+    end
+    folded
+end
+function _below_version(value::AbstractDict, visited)
+    value isa TrackedValue && return nothing
+    _may_hold_dynamic(valtype(value)) || return nothing
+    _below_version(collect(values(value)), visited)
+end
+
+"""    sync!(o) -> Vector{Symbol}
+
+Bring `o`'s cache up to date with its tracked values, returning the property
+names dropped from `o` (sorted).
+
+For every already-computed property of `o` whose value answers
+[`tracked_version`](@ref), compare that version with the one seen last time.
+Where it moved — a `setindex!` on a `ThreadSafeDict`, a file rewritten under a
+[`TrackedFile`](@ref), a file added to a [`TrackedDirectory`](@ref) — drop the
+transitive dependents of that property. The tracked value itself is kept: it
+is the same container, and it is the thing that observed the change.
+
+Child objects are synced by the same rule, one level of indirection out. A
+property holding a DO object (or an array, tuple or dict of them) is synced
+first, and if anything dropped inside it, that property counts as changed and
+`o`'s dependents of it are dropped. So a file appearing under a nested store
+invalidates the store's derived properties, which invalidates whatever the
+root derived from the store, with no annotation anywhere and no knowledge of
+what the objects mean. A child that reports no drops changes nothing in its
+parent — nothing there was stale.
+
+Each object is synced once per call even when several parents hold it, and the
+result is reused, so a shared store gives every holder the same answer.
+Reference cycles (`__parent__` back-references, which are not followed) and
+diamonds terminate.
+
+Call it where a host decides what to serve — once per request or per render.
+It computes nothing: only already-cached properties are examined, so the walk
+covers the live object graph rather than the possible one, and its cost is a
+version probe per tracked value.
+
+The first call on an object records versions without dropping anything: there
+is no "before" to compare against.
+"""
+sync!(o) = _sync!(o, IdDict{Any,Vector{Symbol}}())
+
+function _sync!(o, visited)
+    cache = _property_cache(o)
+    anchor = _stamp_anchor(cache)
+    # Also the cycle guard: an object still being synced reports no drops, so
+    # a `__parent__`-style loop terminates instead of recursing forever.
+    haskey(visited, anchor) && return visited[anchor]
+    visited[anchor] = Symbol[]
+    dropped = Set{Symbol}()
+    # Fixed fields as well as cached properties: a child object arrives through
+    # the constructor as often as it is computed (`Dataset(; store, key)`), and
+    # a field is just as able to hold a tracked value. A field can never be
+    # dropped — it is immutable — but what was derived FROM it can.
+    names = sort!(collect(union(
+        Symbol[field for field in fieldnames(typeof(o)) if field !== :cache],
+        keys(cache),
+    )))
+    lock(_TRACKED_STAMPS_LOCK) do
+        stamps = _tracked_stamps(o)
+        for name in names
+            value = try
+                getproperty(o, name)
+            catch
+                # A property cached as an error, or one whose access needs
+                # arguments: it holds nothing we can probe.
+                continue
+            end
+            version = tracked_version(value)
+            if version === nothing
+                # Not a tracked value: it may still HOLD one, one level out.
+                # `__parent__`/`__self__` are back-references — following them
+                # would sync the whole application from any node.
+                (name === :__parent__ || name === :__self__) && continue
+                version = _below_version(value, visited)
+                version === nothing && continue
+            end
+            previous = get(stamps, name, nothing)
+            stamps[name] = version
+            (previous === nothing || previous == version) && continue
+            union!(dropped, invalidate!(o, name))
+        end
+    end
+    result = sort!(collect(dropped))
+    visited[anchor] = result
+    result
+end
+
 export print_structure, structure
 export tree_children_map, lint_index, lookup_type, callers_by_name, property_source_info, property_signature, property_doc, LintMessage
 export metafirst, metaall
+export nested_object_type
 export static_domain, property_descriptor, property_descriptors, type_descriptor,
     option_declarations, has_option_declaration, property_options,
     option_domain, option_records
+export ThreadSafeDict, ProviderRoots, TrackedFile, TrackedDirectory
+export tracked_version, tracked_path, on_change!, notify_change!
+export retain!, release!, provider_of, retained_providers, tracked_paths
+export dependents, invalidate!, sync!, object_version
 export materialization_observation
 export execute_materialization, release_materialization!, materialization_ownership, materialization_gc!
 

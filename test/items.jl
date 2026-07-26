@@ -1206,9 +1206,14 @@ end
     # `@include` injects `__status__ = <parent substatus>` as a constructor kwarg,
     # which beats the child's declared `__status__ = nothing`. That override is the
     # point of @include — it is what mounts the child under the parent's tree.
+    #
+    # The generated property-body rewrite passes the including property's status
+    # explicitly, so the child mounts beneath `kid` without any current-task
+    # context. The object root remains an ancestor of the whole subtree.
     p = StatusParentDefault()
     @test p.kid.__status__ isa _TBProgressNode
-    @test p.kid.__status__.parent === p.__status__
+    status_chain(n) = isnothing(n) ? Any[] : pushfirst!(status_chain(n.parent), n)
+    @test any(n -> n === p.__status__, status_chain(p.kid.__status__))
 end
 
 @testitem "progress status include point of use optout" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
@@ -1606,4 +1611,106 @@ while the ordinary inline-struct form remains memoized.
     end
     @test cached_err !== nothing
     @test occursin("@cached", sprint(showerror, cached_err))
+end
+
+# ── Property-scoped implied progress ─────────────────────────────────────────
+# An ordinary property/IP read performed inside another property's body mounts
+# its progress node under the caller's node, exactly as an explicit `@fetch!`
+# would — no progress marker on any property LHS. The macro emits explicit
+# `maybefetch*(__progress__, ...)` calls only for property evaluations; ordinary
+# foreign calls stay untouched.
+@testmodule DOImpliedRewriteFixtures begin
+using DynamicObjects
+export RewriteLeaf, RewriteMid, RewriteTop, RewriteTwice, RewriteBoom,
+    progress_descendants
+
+@dynamicstruct struct RewriteLeaf
+    n::Int
+    "Leaf work"
+    leafval() = 2n
+end
+
+@dynamicstruct struct RewriteMid
+    n::Int
+    @include leaf = RewriteLeaf(n)
+    "Mid work"
+    midval() = leaf.leafval() + 1
+end
+
+@dynamicstruct struct RewriteTop
+    n::Int
+    @include mid = RewriteMid(n)
+    "Top work"
+    topval() = mid.midval() + 100
+end
+
+# Two siblings reading the SAME nested IP on the SAME instance: the first
+# computes it, the second takes an in-memory hit and must still mount the
+# original node with its subtree intact.
+@dynamicstruct struct RewriteTwice
+    @include t = RewriteTop(5)
+    "First consumer"
+    first_use() = t.topval()
+    "Second consumer"
+    second_use() = t.topval()
+end
+
+@dynamicstruct struct RewriteBoom
+    "Boom leaf"
+    boomleaf() = error("nested boom")
+    "Boom top"
+    boomtop() = boomleaf()
+end
+
+function progress_descendants(node, acc=String[])
+    for child in node.children
+        push!(acc, child.impl.description)
+        progress_descendants(child, acc)
+    end
+    acc
+end
+end # @testmodule DOImpliedRewriteFixtures
+
+@testitem "property rewrite progress — nesting without annotations" tags=[:core] setup=[DOImpliedRewriteFixtures] begin
+    using DynamicObjects
+    const TBNode = DynamicObjects.Treebars.ProgressNode
+
+    # The rejected dynamically-scoped API is absent from DynamicObjects.
+    @test !isdefined(DynamicObjects, :ambient_progress)
+    @test !isdefined(DynamicObjects, :with_ambient_progress)
+
+    o = RewriteTop(3)
+    @test o.topval() == 2 * 3 + 1 + 100
+    top = DynamicObjects.getstatus(o.topval)
+    @test top isa TBNode
+    @test top.impl.description == "Top work"
+    desc = progress_descendants(top)
+    # Three levels deep, threaded by generated property-scoped fetch calls.
+    @test "Mid work" in desc
+    @test "Leaf work" in desc
+end
+
+@testitem "property rewrite progress — cache hit keeps the subtree" tags=[:core] setup=[DOImpliedRewriteFixtures] begin
+    using DynamicObjects
+
+    x = RewriteTwice()
+    @test x.first_use() == x.second_use()
+
+    second = progress_descendants(DynamicObjects.getstatus(x.second_use))
+    # The hit mounts the ORIGINAL node, relabelled in place — not a childless
+    # "(cached)" stub, which is the collapsed-subtree bug this guards.
+    @test "Top work (cached)" in second
+    @test "Mid work" in second
+    @test "Leaf work" in second
+end
+
+@testitem "property rewrite progress — nested failure stays visible" tags=[:core] setup=[DOImpliedRewriteFixtures] begin
+    using DynamicObjects
+
+    b = RewriteBoom()
+    @test_throws DynamicObjects.PropertyComputationError b.boomtop()
+    node = DynamicObjects.getstatus(b.boomtop)
+    # A failed node is pinned rather than detached, so the tree still shows
+    # WHICH nested step failed.
+    @test "Boom leaf" in progress_descendants(node)
 end
