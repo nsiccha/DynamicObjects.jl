@@ -2207,11 +2207,16 @@ end
     maybefetchindex!(progress, f, args...; kwargs...)
 
 Dispatch helper used by `@fetch!` for call sites. The default just calls
-`f(args...; kwargs...)`; the specialization for `IndexableProperty` routes
-through [`fetchindex!`](@ref) (memoized + progress-tree attachment).
+`f(args...; kwargs...)`; the specialization for `IndexableProperty` preserves
+the property's declaration-site cache policy while attaching progress:
+ordinary properties route through [`fetchindex!`](@ref) (memoized + progress),
+while `@fresh` properties route through [`maybeprogress!`](@ref) (fresh +
+progress, with no cache read or write).
 """
 maybefetchindex!(progress, f, args...; kwargs...) = f(args...; kwargs...)
-maybefetchindex!(progress, p::IndexableProperty, args...; kwargs...) = fetchindex!(progress, p, args...; kwargs...)
+maybefetchindex!(progress, p::IndexableProperty{name}, args...; kwargs...) where {name} =
+    _never_cache(p.o, Val(name)) ? maybeprogress!(progress, p, args...; kwargs...) :
+                                   fetchindex!(progress, p, args...; kwargs...)
 
 """
     maybefetchproperty!(progress, o, name::Symbol)

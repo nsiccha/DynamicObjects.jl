@@ -17,7 +17,8 @@ export MultiLhs, CachedMultiLhs, ThreeValues, NamedDestr, RenameDestr,
     WithDefault, Remakeable, RemountGraph, Cached, VersionedCache, UnversionedCache,
     VersionedIndexedCache, Idx, AllDefaults, CallVsBracket, Par, D1,
     LetScope, LambdaScope, SharedDep, AsyncApp, FailingProps,
-    EntriesApp, ClearAllApp, FetchKwargs, HashLeaf, HashParent, HashNoDOs,
+    EntriesApp, ClearAllApp, FetchKwargs, FetchFreshProgress,
+    HashLeaf, HashParent, HashNoDOs,
     BareRefMagic, BareRefOverride,
     _multi_lhs_counter, _multi_lhs_cached_path, _named_destr_counter,
     _prefix_destr_counter_x, _prefix_destr_counter_y, _clearable_path,
@@ -25,7 +26,8 @@ export MultiLhs, CachedMultiLhs, ThreeValues, NamedDestr, RenameDestr,
     _remount_child_count, _remount_indexed_child_count, _remount_cache_base,
     _remount_started, _remount_release,
     _disk_cache_path, _version_cache_path, _idx_path,
-    _call_vs_bracket_counter, _regression_path, _clearall_path
+    _call_vs_bracket_counter, _regression_path, _clearall_path,
+    _fetch_fresh_counter, _fetch_fresh_status
 
 # --- Struct definitions (hoisted to module scope) ---
 
@@ -268,6 +270,17 @@ end
     from_schedule(a, b; n_grid=1) = a + b + n_grid           # IP with a kwarg
     @fetch! shorthand() = from_schedule(base, base; n_grid)   # `; n_grid` (n_grid is a sibling property)
     @fetch! explicit() = from_schedule(base, base; n_grid=7)  # `; n_grid=literal`
+end
+
+_fetch_fresh_counter = Ref(0)
+_fetch_fresh_status = Ref{Any}(nothing)
+@dynamicstruct struct FetchFreshProgress
+    "Build one scheduled value."
+    @fresh from_schedule(key::Int) = begin
+        _fetch_fresh_counter[] += 1
+        _fetch_fresh_status[] = __status__
+        key * 2
+    end
 end
 
 @dynamicstruct struct HashLeaf
@@ -799,6 +812,28 @@ end
     params = rw2.args[findfirst(a -> Meta.isexpr(a, :parameters), rw2.args)]
     @test Meta.isexpr(params.args[1], :kw)
     @test params.args[1].args[1] == :n
+end
+
+@testitem "@fetch! respects declaration-site @fresh" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
+    _fetch_fresh_counter[] = 0
+    _fetch_fresh_status[] = nothing
+    owner = FetchFreshProgress()
+    root = owner.__status__
+
+    @test DynamicObjects._never_cache(owner, Val(:from_schedule))
+    @test (@fetch! root owner.from_schedule(7)) == 14
+    @test (@fetch! root owner.from_schedule(7)) == 14
+
+    # `@fetch!` must not override the declaration's compute-and-drop policy.
+    @test _fetch_fresh_counter[] == 2
+    @test length(owner.from_schedule.cache) == 0
+
+    # Unlike the `fresh(owner.from_schedule, 7)` workaround, the computation
+    # still receives a per-call progress child rather than the bare root.
+    status = _fetch_fresh_status[]
+    @test status isa DynamicObjects.Treebars.ProgressNode
+    @test status !== root
+    @test status.parent === root
 end
 
 """
