@@ -736,6 +736,88 @@ clear_mem_caches!(parent.sub)                                          # singlet
 foreach(clear_mem_caches!, last.(cached_entries(parent.weighted)))     # cached indexed children
 ```
 
+## Reflection and application declaration graphs
+
+`declaration_graph(App)` turns ordinary `@dynamicstruct` declarations into a
+deterministic architecture graph without constructing `App` or evaluating a
+property. Its `dynamicobjects.declaration-graph/v1` schema contains stable type,
+property, and declared-domain nodes; containment, direct dependency, and domain
+descriptor edges; structured signatures/defaults/types; docs and options; and
+the complete captured RHS plus file/line provenance.
+
+```julia
+graph = declaration_graph(App)
+graph.root
+property_id = declaration_node_id(graph, App, :result)
+property_node = only(node for node in graph.nodes if node.id == property_id)
+property_node.metadata.source.code
+property_node.metadata.descriptor.dependencies
+```
+
+Use the lookup helper for links and deep-link anchors instead of reproducing the
+ID encoding. Duplicate same-name declarations are preserved and selected with
+`declaration=2`, etc.
+
+Framework and application packages can attach their own pure-data nodes without
+DynamicObjects learning their vocabulary. A contribution is a namespace plus
+node/edge vectors using the graph's uniform envelopes:
+
+```julia
+artifact = (;
+    namespace="myapp.models",
+    nodes=[(;
+        id="myapp:model:pk",
+        kind=:model,
+        label="PK model",
+        metadata=(;language=:stan),
+    )],
+    edges=[(;
+        id="myapp:edge:result-pk",
+        kind=:describes,
+        from=declaration_node_id(graph, App, :result),
+        to="myapp:model:pk",
+        metadata=(;),
+    )],
+)
+
+graph = declaration_graph(App; contributions=(artifact,))
+```
+
+DynamicObjects data comes first, then contributions in caller order. A
+fragment's namespace is provenance only: it never rewrites IDs. All node and
+edge IDs must be globally unique, including across fragments and between nodes
+and edges. Duplicate IDs and dangling endpoints fail immediately after all
+fragments have been merged, so one fragment may explicitly link to a node in a
+later fragment.
+
+Declaration tools can contribute type/property metadata in the same spirit as
+docstrings by extending `declaration_metadata`. The three-argument `Val` form
+can distinguish duplicate declarations:
+
+```julia
+DynamicObjects.declaration_metadata(::Type{App}) = (;section=:analysis)
+DynamicObjects.declaration_metadata(::Type{App}, ::Val{:result}) =
+    (;artifact=:primary)
+```
+
+Live state is deliberately separate. `declaration_observations(object, graph)`
+returns `dynamicobjects.declaration-observations/v1`, keyed only by declaration
+node IDs. It observes fixed/scalar root properties automatically and accepts
+explicit indexed call keys; it never computes a value:
+
+```julia
+overlay = declaration_observations(app, graph; calls=((;
+    node=declaration_node_id(graph, App, :result),
+    args=(:north,),
+    kwargs=(;draws=1000),
+),))
+```
+
+Nested or externally contributed nodes are omitted unless a higher-level
+composer explicitly binds an object for them. This keeps the static graph
+authoritative and makes enabling a live overlay incapable of changing the
+declaration topology.
+
 ## Advanced
 
 ### Pluggable key tracking: `KeyTracker`

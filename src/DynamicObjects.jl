@@ -37,6 +37,8 @@ optionally disk-cached properties.
 - [`record!`](@ref): Record an accessed key via a `KeyTracker`.
 - [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
 - [`property_descriptor`](@ref): Reflect semantic inputs, dependencies, and storage policy without execution.
+- [`declaration_graph`](@ref): Build a stable application declaration graph, with extension fragments, without execution.
+- [`declaration_observations`](@ref): Add a separate non-computing runtime-state overlay keyed by declaration IDs.
 - [`execute_materialization`](@ref): Framework-only governed semantic execution (applications call operations normally).
 - [`release_materialization!`](@ref): Release a retained semantic root without racing active executions.
 - [`materialization_gc!`](@ref): Collect only unreachable, provider-released storage with proven ownership.
@@ -7470,6 +7472,600 @@ type_descriptor(T::Type) = (;
     options=option_declarations(T),
 )
 
+# ── Application declaration graph ──────────────────────────────────────────
+
+const _DECLARATION_GRAPH_SCHEMA = "dynamicobjects.declaration-graph/v1"
+const _DECLARATION_OBSERVATIONS_SCHEMA =
+    "dynamicobjects.declaration-observations/v1"
+const _DECLARATION_FRAGMENT = "dynamicobjects"
+
+"""
+    declaration_metadata(T::Type) -> NamedTuple
+    declaration_metadata(T::Type, ::Val{property}) -> NamedTuple
+    declaration_metadata(T::Type, ::Val{property}, ::Val{declaration}) -> NamedTuple
+
+Extension hook for declaration-site metadata that belongs on a type or property
+node in [`declaration_graph`](@ref). The default is an empty `NamedTuple`.
+
+A declaration macro in another package can emit a method beside the declaration
+it expands, just as a docstring attaches information to a binding. The
+three-argument form distinguishes duplicate declarations with the same property
+name; by default it falls back to the two-argument property method. Return only
+pure data. DynamicObjects stores the result verbatim under
+`node.metadata.extensions` and does not interpret its keys.
+"""
+declaration_metadata(::Type) = (;)
+declaration_metadata(::Type, ::Val) = (;)
+declaration_metadata(T::Type, property::Val, ::Val) =
+    declaration_metadata(T, property)
+
+function _checked_declaration_metadata(value, subject)
+    value isa NamedTuple || error(
+        "declaration_metadata for $subject must return a NamedTuple, got $(typeof(value))")
+    value
+end
+
+function _declaration_parameter_key(value::Type)
+    _declaration_type_key(value)
+end
+_declaration_parameter_key(value::TypeVar) = string(
+    value.name, ">:", _declaration_parameter_key(value.lb),
+    "<:", _declaration_parameter_key(value.ub))
+_declaration_parameter_key(value) = repr(value)
+
+function _declaration_type_key(T::Type)
+    mod = join(string.(Base.fullname(parentmodule(T))), ".")
+    base = isempty(mod) ? string(nameof(T)) : string(mod, ".", nameof(T))
+    T isa DataType || return base
+    isempty(T.parameters) && return base
+    string(base, "{", join(_declaration_parameter_key.(T.parameters), ","), "}")
+end
+
+function _declaration_id(kind::AbstractString, parts...)
+    encoded = join((string(ncodeunits(string(part)), ":", part) for part in parts), "|")
+    digest = bytes2hex(SHA.sha1(Vector{UInt8}(codeunits(encoded))))
+    string("do:", kind, ":", first(digest, 24))
+end
+
+_declaration_type_id(T::Type) =
+    _declaration_id("type", _declaration_type_key(T))
+_declaration_property_id(owner::AbstractString, name::Symbol, declaration::Integer) =
+    _declaration_id("property", owner, name, declaration)
+_declaration_domain_id(owner::AbstractString, parameter::Symbol) =
+    _declaration_id("domain", owner, parameter)
+_declaration_edge_id(kind::Symbol, from::AbstractString, to::AbstractString, slot) =
+    _declaration_id("edge", kind, from, to, slot)
+
+_declaration_properties(T::Type) = applicable(meta, T) ? meta(T) : Pair[]
+
+# Declaration-order breadth-first traversal. Unlike `_all_types_in_tree`, the
+# public result must never inherit Set iteration order.
+function _declaration_types(root::Type)
+    types = Type[root]
+    seen = Set{Type}((root,))
+    cursor = 1
+    while cursor <= length(types)
+        T = types[cursor]
+        cursor += 1
+        seen_names = Set{Symbol}()
+        for (name, _) in _declaration_properties(T)
+            name in seen_names && continue
+            push!(seen_names, name)
+            nested = _walk_nested_type(T, name)
+            nested isa Type || continue
+            applicable(meta, nested) || continue
+            nested in seen && continue
+            push!(seen, nested)
+            push!(types, nested)
+        end
+    end
+    types
+end
+
+function _declaration_expression_string(expression)
+    expression === nothing && return nothing
+    normalized = expression isa Expr ?
+        Base.remove_linenums!(deepcopy(expression)) : expression
+    string(normalized)
+end
+
+function _declaration_source(name::Symbol, info::NamedTuple)
+    indices = get(info, :indices, ())
+    lhs = get(info, :lhs, name)
+    signature = isempty(indices) ? string(lhs) :
+        string(lhs, "(", join(indices, ", "), ")")
+    macros = sort!(string.(collect(get(info, :macros, Set{Symbol}()))))
+    expression = get(info, :rhs, nothing)
+    rhs = _declaration_expression_string(expression)
+    prefix = isempty(macros) ? "" : string(join(macros, " "), " ")
+    code = expression === nothing ? string(prefix, signature) :
+        string(prefix, signature, " = ", rhs)
+    lnn = get(info, :lnn, nothing)
+    location = lnn isa LineNumberNode ? (;
+        file=string(lnn.file),
+        line=lnn.line,
+    ) : (;
+        file=nothing,
+        line=nothing,
+    )
+    (;
+        location,
+        signature,
+        macros,
+        code,
+        lhs,
+        expression,
+        rhs,
+    )
+end
+
+_declaration_node(id, kind, label, metadata) = (;
+    id=String(id),
+    kind,
+    label=String(label),
+    metadata,
+    fragment=_DECLARATION_FRAGMENT,
+)
+
+_declaration_edge(id, kind, from, to, metadata) = (;
+    id=String(id),
+    kind,
+    from=String(from),
+    to=String(to),
+    metadata,
+    fragment=_DECLARATION_FRAGMENT,
+)
+
+function _base_declaration_graph(root::Type)
+    types = _declaration_types(root)
+    type_ids = Dict(T => _declaration_type_id(T) for T in types)
+    nodes = NamedTuple[]
+    edges = NamedTuple[]
+    property_records = NamedTuple[]
+    domain_records = NamedTuple[]
+    first_property_ids = Dict{Tuple{String,Symbol},String}()
+
+    type_lookup = NamedTuple[]
+    property_lookup = NamedTuple[]
+    domain_lookup = NamedTuple[]
+
+    for T in types
+        type_id = type_ids[T]
+        type_key = _declaration_type_key(T)
+        extensions = _checked_declaration_metadata(
+            declaration_metadata(T), "type $T")
+        push!(nodes, _declaration_node(type_id, :type, string(nameof(T)), (;
+            type_key,
+            descriptor=type_descriptor(T),
+            extensions,
+        )))
+        push!(type_lookup, (;type_key, id=type_id))
+
+        occurrences = Dict{Symbol,Int}()
+        for (name, info) in _declaration_properties(T)
+            declaration = get(occurrences, name, 0) + 1
+            occurrences[name] = declaration
+            property_id = _declaration_property_id(type_id, name, declaration)
+            get!(first_property_ids, (type_id, name), property_id)
+            descriptor = property_descriptor(T, name, info)
+            source = _declaration_source(name, info)
+            extensions = _checked_declaration_metadata(
+                declaration_metadata(T, Val(name), Val(declaration)),
+                "property $T.$name declaration $declaration")
+            metadata = (;
+                owner=type_id,
+                owner_type_key=type_key,
+                name,
+                declaration,
+                descriptor,
+                signature=property_signature(info, parentmodule(T)),
+                source,
+                extensions,
+            )
+            push!(nodes, _declaration_node(
+                property_id, :property, source.signature, metadata))
+            push!(property_records, (;
+                type=T,
+                owner=type_id,
+                owner_type_key=type_key,
+                name,
+                declaration,
+                id=property_id,
+                descriptor,
+            ))
+            push!(property_lookup, (;
+                owner=type_id,
+                owner_type_key=type_key,
+                name,
+                declaration,
+                id=property_id,
+            ))
+        end
+
+        for (parameter, declaration) in option_declarations(T)
+            domain_id = _declaration_domain_id(type_id, parameter)
+            push!(nodes, _declaration_node(
+                domain_id, :domain, "@options($parameter)", (;
+                    owner=type_id,
+                    owner_type_key=type_key,
+                    parameter,
+                    declaration,
+                )))
+            push!(domain_records, (;
+                type=T,
+                owner=type_id,
+                owner_type_key=type_key,
+                parameter,
+                id=domain_id,
+                declaration,
+            ))
+            push!(domain_lookup, (;
+                owner=type_id,
+                owner_type_key=type_key,
+                parameter,
+                id=domain_id,
+            ))
+        end
+    end
+
+    domain_ids = Dict((record.owner, record.parameter) => record.id
+        for record in domain_records)
+
+    for record in property_records
+        contains_id = _declaration_edge_id(
+            :contains, record.owner, record.id,
+            (:property, record.name, record.declaration))
+        push!(edges, _declaration_edge(
+            contains_id, :contains, record.owner, record.id, (;role=:property)))
+
+        nested = _walk_nested_type(record.type, record.name)
+        if nested isa Type && haskey(type_ids, nested)
+            child_id = type_ids[nested]
+            edge_id = _declaration_edge_id(
+                :contains, record.id, child_id,
+                (:nested_type, record.name, record.declaration))
+            push!(edges, _declaration_edge(
+                edge_id, :contains, record.id, child_id, (;role=:nested_type)))
+        end
+
+        for dependency in record.descriptor.dependencies
+            dependency_id = get(
+                first_property_ids, (record.owner, dependency), nothing)
+            dependency_id === nothing && continue
+            edge_id = _declaration_edge_id(
+                :depends_on, record.id, dependency_id, dependency)
+            push!(edges, _declaration_edge(
+                edge_id, :depends_on, record.id, dependency_id,
+                (;declared=true)))
+        end
+
+        domain_sites = Dict{String,Vector{NamedTuple}}()
+        if record.descriptor.domain.kind === :declared
+            parameter = record.descriptor.domain.declaration.parameter
+            domain_id = get(domain_ids, (record.owner, parameter), nothing)
+            domain_id === nothing || push!(get!(
+                domain_sites, domain_id, NamedTuple[]),
+                (;scope=:value, parameter))
+        end
+        for input in record.descriptor.inputs
+            input.domain.kind === :declared || continue
+            parameter = input.domain.declaration.parameter
+            domain_id = get(domain_ids, (record.owner, parameter), nothing)
+            domain_id === nothing && continue
+            push!(get!(domain_sites, domain_id, NamedTuple[]), (;
+                scope=:input,
+                parameter,
+                input=input.name,
+                input_kind=input.kind,
+            ))
+        end
+        for domain_id in sort!(collect(keys(domain_sites)))
+            edge_id = _declaration_edge_id(
+                :describes, record.id, domain_id, domain_sites[domain_id])
+            push!(edges, _declaration_edge(
+                edge_id, :describes, record.id, domain_id,
+                (;sites=domain_sites[domain_id])))
+        end
+    end
+
+    for record in domain_records
+        contains_id = _declaration_edge_id(
+            :contains, record.owner, record.id, (:domain, record.parameter))
+        push!(edges, _declaration_edge(
+            contains_id, :contains, record.owner, record.id, (;role=:domain)))
+        for dependency in record.declaration.dependencies
+            dependency_id = get(
+                first_property_ids, (record.owner, dependency), nothing)
+            dependency_id === nothing && continue
+            edge_id = _declaration_edge_id(
+                :depends_on, record.id, dependency_id, dependency)
+            push!(edges, _declaration_edge(
+                edge_id, :depends_on, record.id, dependency_id,
+                (;declared=true, source=:options)))
+        end
+    end
+
+    lookup = (;
+        types=type_lookup,
+        properties=property_lookup,
+        domains=domain_lookup,
+    )
+    root_id = type_ids[root]
+    (;root=root_id, nodes, edges, lookup)
+end
+
+_declaration_contributions(contribution::NamedTuple) = (contribution,)
+_declaration_contributions(contributions) = contributions
+
+function _normalize_declaration_node(node::NamedTuple, namespace::String)
+    id = get(node, :id, nothing)
+    kind = get(node, :kind, nothing)
+    label = get(node, :label, nothing)
+    metadata = get(node, :metadata, nothing)
+    id isa AbstractString || error(
+        "declaration contribution `$namespace` has a node without a String `id`")
+    kind isa Symbol || error(
+        "declaration contribution `$namespace` node `$id` needs a Symbol `kind`")
+    label isa AbstractString || error(
+        "declaration contribution `$namespace` node `$id` needs a String `label`")
+    haskey(node, :metadata) || error(
+        "declaration contribution `$namespace` node `$id` needs `metadata`")
+    merge((;id=String(id), kind, label=String(label), metadata,
+           fragment=namespace), node,
+          (;id=String(id), kind, label=String(label), metadata,
+           fragment=namespace))
+end
+
+function _normalize_declaration_edge(edge::NamedTuple, namespace::String)
+    id = get(edge, :id, nothing)
+    kind = get(edge, :kind, nothing)
+    from = get(edge, :from, nothing)
+    to = get(edge, :to, nothing)
+    metadata = get(edge, :metadata, nothing)
+    id isa AbstractString || error(
+        "declaration contribution `$namespace` has an edge without a String `id`")
+    kind isa Symbol || error(
+        "declaration contribution `$namespace` edge `$id` needs a Symbol `kind`")
+    from isa AbstractString || error(
+        "declaration contribution `$namespace` edge `$id` needs a String `from`")
+    to isa AbstractString || error(
+        "declaration contribution `$namespace` edge `$id` needs a String `to`")
+    haskey(edge, :metadata) || error(
+        "declaration contribution `$namespace` edge `$id` needs `metadata`")
+    merge((;id=String(id), kind, from=String(from), to=String(to), metadata,
+           fragment=namespace), edge,
+          (;id=String(id), kind, from=String(from), to=String(to), metadata,
+           fragment=namespace))
+end
+
+function _validate_declaration_graph(root, nodes, edges)
+    owners = Dict{String,String}()
+    for item in Iterators.flatten((nodes, edges))
+        id = item.id
+        previous = get(owners, id, nothing)
+        previous === nothing || error(
+            "duplicate declaration id `$id` in fragments `$previous` and `$(item.fragment)`")
+        owners[id] = item.fragment
+    end
+    node_ids = Set(node.id for node in nodes)
+    root in node_ids || error("declaration graph root `$root` is not a node")
+    for edge in edges
+        edge.from in node_ids || error(
+            "declaration edge `$(edge.id)` has unknown `from` node `$(edge.from)`")
+        edge.to in node_ids || error(
+            "declaration edge `$(edge.id)` has unknown `to` node `$(edge.to)`")
+    end
+    nothing
+end
+
+"""
+    declaration_graph(root::Type; contributions=())
+    declaration_graph(object; contributions=())
+
+Build a deterministic, non-evaluating application declaration graph from
+DynamicObjects metadata. The object overload reflects `typeof(object)`; it does
+not read the object. The result is pure Julia data:
+
+`(; schema="dynamicobjects.declaration-graph/v1", root, nodes, edges, metadata)`
+
+`root` is the stable ID of the root `:type` node. Every node has at least
+`(;id::String, kind::Symbol, label::String, metadata, fragment::String)` and
+every edge at least
+`(;id::String, kind::Symbol, from::String, to::String, metadata,
+fragment::String)`. DynamicObjects emits `:type`, `:property`, and `:domain`
+nodes, connected only by explicit `:contains`, direct `:depends_on`, and
+`:describes` relations. Property metadata includes its owner type ID, semantic
+name, duplicate-declaration occurrence, normalized semantic descriptor,
+structured signature, declaration extensions, and full captured source AST,
+code, and file/line provenance.
+
+Each contribution is a pure-data
+`(;namespace::String, nodes, edges)` fragment using the same envelopes. Base DO
+data comes first; fragments and the node/edge vectors inside each fragment keep
+caller order. The namespace is recorded as `fragment` for provenance but never
+rewrites IDs. IDs must be globally unique across all nodes and edges; collisions
+(including with DO IDs) and dangling endpoints are rejected after every
+fragment is present, so cross-fragment edges may target later fragments.
+
+Use [`declaration_node_id`](@ref) to connect external nodes to a DO declaration
+without depending on the spelling of DO IDs. Runtime state is deliberately not
+part of this graph; see [`declaration_observations`](@ref).
+"""
+function declaration_graph(root::Type; contributions=())
+    base = _base_declaration_graph(root)
+    nodes = copy(base.nodes)
+    edges = copy(base.edges)
+    fragments = NamedTuple[(;
+        namespace=_DECLARATION_FRAGMENT,
+        nodes=length(nodes),
+        edges=length(edges),
+    )]
+
+    for contribution in _declaration_contributions(contributions)
+        contribution isa NamedTuple || error(
+            "a declaration contribution must be a NamedTuple, got $(typeof(contribution))")
+        namespace = get(contribution, :namespace, nothing)
+        namespace isa AbstractString || error(
+            "a declaration contribution requires a String `namespace`")
+        namespace = String(namespace)
+        contribution_nodes = get(contribution, :nodes, nothing)
+        contribution_edges = get(contribution, :edges, nothing)
+        contribution_nodes === nothing && error(
+            "declaration contribution `$namespace` requires `nodes`")
+        contribution_edges === nothing && error(
+            "declaration contribution `$namespace` requires `edges`")
+        normalized_nodes = NamedTuple[
+            _normalize_declaration_node(node, namespace)
+            for node in contribution_nodes
+        ]
+        normalized_edges = NamedTuple[
+            _normalize_declaration_edge(edge, namespace)
+            for edge in contribution_edges
+        ]
+        append!(nodes, normalized_nodes)
+        append!(edges, normalized_edges)
+        push!(fragments, (;
+            namespace,
+            nodes=length(normalized_nodes),
+            edges=length(normalized_edges),
+        ))
+    end
+
+    _validate_declaration_graph(base.root, nodes, edges)
+    (;
+        schema=_DECLARATION_GRAPH_SCHEMA,
+        root=base.root,
+        nodes,
+        edges,
+        metadata=(;
+            namespace=_DECLARATION_FRAGMENT,
+            fragments,
+            lookup=base.lookup,
+        ),
+    )
+end
+
+declaration_graph(object; contributions=()) =
+    declaration_graph(typeof(object); contributions)
+
+"""
+    declaration_node_id(graph, T::Type) -> Union{String,Nothing}
+    declaration_node_id(graph, T::Type, property::Symbol; declaration=1)
+        -> Union{String,Nothing}
+
+Look up stable DO node IDs without depending on their encoded spelling. The
+property form selects the one-based occurrence among same-name declarations.
+"""
+function declaration_node_id(graph, T::Type)
+    type_key = _declaration_type_key(T)
+    for record in graph.metadata.lookup.types
+        record.type_key == type_key && return record.id
+    end
+    nothing
+end
+
+function declaration_node_id(
+    graph, T::Type, property::Symbol; declaration::Integer=1)
+    declaration > 0 || error("declaration occurrence must be positive")
+    owner = declaration_node_id(graph, T)
+    owner === nothing && return nothing
+    for record in graph.metadata.lookup.properties
+        record.owner == owner && record.name === property &&
+            record.declaration == declaration && return record.id
+    end
+    nothing
+end
+
+_declaration_observation_calls(call::NamedTuple) = (call,)
+_declaration_observation_calls(calls) = calls
+
+"""
+    declaration_observations(
+        object, graph=declaration_graph(typeof(object)); calls=())
+
+Return a separate, non-computing runtime-state overlay:
+
+`(;schema="dynamicobjects.declaration-observations/v1", graph=graph.root,
+observations)`
+
+Each observation is keyed by a stable property node ID as
+`(;node, call, observation)`. Fixed and scalar properties owned by the root type
+are observed automatically. Indexed properties are omitted unless `calls`
+contains an explicit `(;node, args=(), kwargs=(;))` record; this avoids
+inventing a call key. Nodes owned by nested types and contributed nodes are
+omitted unless a future composer binds an object for them.
+
+The implementation only calls [`materialization_observation`](@ref), which
+inspects fields, memory caches, pending state, and existing disk paths without
+calling `getproperty`, an indexed property, or a property body.
+"""
+function declaration_observations(
+    object, graph=declaration_graph(typeof(object)); calls=())
+    owner = declaration_node_id(graph, typeof(object))
+    owner == graph.root || error(
+        "observation object type $(typeof(object)) is not the declaration graph root")
+
+    calls_by_node = Dict{String,Vector{NamedTuple}}()
+    for call in _declaration_observation_calls(calls)
+        call isa NamedTuple || error(
+            "an observation call must be a NamedTuple, got $(typeof(call))")
+        node = get(call, :node, nothing)
+        node isa AbstractString || error(
+            "an observation call requires a String `node`")
+        args = get(call, :args, ())
+        args = args isa Tuple ? args : Tuple(args)
+        kwargs = get(call, :kwargs, (;))
+        kwargs isa NamedTuple || error(
+            "observation call `$node` requires NamedTuple `kwargs`")
+        push!(get!(calls_by_node, String(node), NamedTuple[]), (;args, kwargs))
+    end
+
+    node_by_id = Dict(node.id => node for node in graph.nodes)
+    for node_id in keys(calls_by_node)
+        node = get(node_by_id, node_id, nothing)
+        node === nothing && error("observation call names unknown node `$node_id`")
+        node.kind === :property || error(
+            "observation call node `$node_id` is not a property")
+        node.metadata.owner == owner || error(
+            "observation call node `$node_id` is not owned by the root object")
+        node.metadata.descriptor.indexed || error(
+            "explicit observation calls are only needed for indexed properties")
+    end
+
+    observations = NamedTuple[]
+    for node in graph.nodes
+        node.kind === :property || continue
+        node.fragment == _DECLARATION_FRAGMENT || continue
+        node.metadata.owner == owner || continue
+        descriptor = node.metadata.descriptor
+        name = node.metadata.name
+        if descriptor.indexed
+            for call in get(calls_by_node, node.id, NamedTuple[])
+                observation = materialization_observation(
+                    object, name, call.args...; call.kwargs...)
+                push!(observations, (;
+                    node=node.id,
+                    call,
+                    observation,
+                ))
+            end
+        else
+            observation = materialization_observation(object, name)
+            push!(observations, (;
+                node=node.id,
+                call=nothing,
+                observation,
+            ))
+        end
+    end
+
+    (;
+        schema=_DECLARATION_OBSERVATIONS_SCHEMA,
+        graph=graph.root,
+        observations,
+    )
+end
+
 # Snapshot cache state without calling `getproperty`, `memoize!`, or a property
 # body. `has_value` distinguishes a cached `nothing` from an absent entry.
 _empty_cache_snapshot() = (;
@@ -8206,6 +8802,8 @@ export metafirst, metaall
 export static_domain, property_descriptor, property_descriptors, type_descriptor,
     option_declarations, has_option_declaration, property_options,
     option_domain, option_records
+export declaration_metadata, declaration_graph, declaration_node_id,
+    declaration_observations
 export materialization_observation
 export execute_materialization, release_materialization!, materialization_ownership, materialization_gc!
 
