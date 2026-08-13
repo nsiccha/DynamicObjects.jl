@@ -46,6 +46,19 @@ fetchindex!
 getstatus
 ```
 
+## Reflection and application declarations
+
+```@docs
+property_descriptor
+property_descriptors
+type_descriptor
+declaration_metadata
+declaration_graph
+declaration_node_id
+materialization_observation
+declaration_observations
+```
+
 ## Cache maintenance
 
 ```@docs
