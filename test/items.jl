@@ -16,7 +16,7 @@ export MultiLhs, CachedMultiLhs, ThreeValues, NamedDestr, RenameDestr,
     PrefixDestr, MixedDestr, Clearable, TwoFields, Basic,
     WithDefault, Remakeable, RemountGraph, Cached, VersionedCache, UnversionedCache,
     VersionedIndexedCache, Idx, AllDefaults, CallVsBracket, Par, D1,
-    LetScope, LambdaScope, SharedDep, AsyncApp, FailingProps,
+    LetScope, LambdaScope, SharedDep, AsyncApp, FailingProps, SetPropApp,
     EntriesApp, ClearAllApp, FetchKwargs, FetchFreshProgress,
     HashLeaf, HashParent, HashNoDOs,
     BareRefMagic, BareRefOverride,
@@ -243,6 +243,15 @@ end
 @dynamicstruct struct FailingProps
     will_fail = error("serial failure")
     will_fail_indexed(key) = error("serial failure for key=$key")
+end
+
+@dynamicstruct struct SetPropApp
+    a::Int
+    x = a + 1
+    dep = x * 10
+    @struct child = begin
+        row = Dict(:k => a)
+    end
 end
 
 @dynamicstruct struct EntriesApp
@@ -1641,4 +1650,39 @@ while the ordinary inline-struct form remains memoized.
     end
     @test cached_err !== nothing
     @test occursin("@cached", sprint(showerror, cached_err))
+end
+\n
+"""
+Pins that `obj.prop = value` is refused on a `@dynamicstruct` — for a computed
+property, a fixed field, an undeclared name and an inline child alike — with a
+message naming the two supported override paths, construction kwargs and
+`remake`, and that those paths do land the override (decision `1srli5g`; snag
+`dynamicstruct-se-7099e55c`, reporter `Bruno:report`, which hit the former
+opaque `MethodError … setindex!(::ThreadsafeDict{Symbol,Any}, …)`).
+"""
+@testitem "setproperty! is refused; overrides go through construction or remake" tags=[:core] setup=[DOImports, DOFixtures] begin
+    o = SetPropApp(1)
+    @test o.x == 2
+    for (name, value) in ((:x, 42), (:a, 7), (:report_repo, "REPO"))
+        err = (@test_throws ErrorException setproperty!(o, name, value)).value
+        @test occursin("is not supported", err.msg)
+        @test occursin("SetPropApp(…; $name=value)", err.msg)
+        @test occursin("remake(obj; $name=value)", err.msg)
+    end
+    @test o.x == 2
+    @test o.a == 1
+    @test_throws ErrorException (o.child.row = Dict(:k => 99))
+    @test o.child.row == Dict(:k => 1)
+    # The supported paths: a constructor kwarg seeds the cache …
+    s = SetPropApp(1; x = 42)
+    @test s.x == 42
+    @test s.dep == 420
+    # … and `remake` reconstructs with the same seeding, computed and fixed alike.
+    r = remake(SetPropApp(1); x = 43)
+    @test r.x == 43
+    @test r.dep == 430
+    @test r.a == 1
+    r2 = remake(o; a = 5)
+    @test r2.a == 5
+    @test r2.x == 6
 end
