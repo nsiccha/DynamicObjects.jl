@@ -844,9 +844,11 @@ function MountedThreadsafeDict(shared::ThreadsafeDict{Symbol,Any}, source,
     )
 end
 
-# `setproperty!` on a mounted object is always a local shadow. Computed stores
-# bypass this method and write through `c.cache`, whose static routing set sends
-# only proven-invalidated keys local and intrinsic keys to the retained cache.
+# An explicit store on a mounted object — remount's own nested-child seeding;
+# the public `setproperty!` is refused — is always a local shadow. Computed
+# stores bypass this method and write through `c.cache`, whose static routing
+# set sends only proven-invalidated keys local and intrinsic keys to the
+# retained cache.
 function Base.setindex!(c::MountedThreadsafeDict, value, key::Symbol)
     lock(c.lock) do
         push!(c.local_names, key)
@@ -5277,7 +5279,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         quote
             $Base.hasproperty(__self__::$type, name::Symbol) = name in $(Tuple(prop_names))
             $Base.getproperty(__self__::$type, name::Symbol) = $getorcomputeproperty(__self__, name)
-            $Base.setproperty!(__self__::$type, name::Symbol, value) = getfield(__self__, :cache)[name] = value
+            $Base.setproperty!(__self__::$type, name::Symbol, value) = $_reject_setproperty(__self__, name)
             $DynamicObjects.meta(::Type{$type_dispatch}) = $properties
             $(option_declaration_defs...)
             $_carryover_expr
@@ -5634,6 +5636,19 @@ end
 # now. Reject it at macro-parse with a clear message (mirrors the ctor-kwarg
 # deprecation) rather than letting it fall through to an opaque unsupported-kwarg
 # error. `_parse_macro_opt` is a plain function the macro calls at expansion.
+# `obj.prop = value` is deliberately unsupported (user, 2026-09-05, decision
+# 1srli5g): a `@dynamicstruct` instance is immutable, and its property cache is
+# written only by DO's own compute/seed paths. Overrides go in at
+# construction — the generated constructor seeds the cache from its kwargs —
+# or through `remake`, which reconstructs with the same seeding. Before this
+# the generated method wrote straight into the cache: a silent no-op for a
+# fixed field (the read path serves those from `getfield`), and — since the
+# cache became always-`ThreadsafeDict`, which has no `setindex!` — an opaque
+# `MethodError` for everything else (snag dynamicstruct-se-7099e55c).
+_reject_setproperty(o, name::Symbol) = error(
+    "setproperty!: a `", nameof(typeof(o)), "` (a @dynamicstruct) is immutable — `obj.", name,
+    " = value` is not supported. Override a property at construction, `", nameof(typeof(o)),
+    "(…; ", name, "=value)`, or reconstruct with `remake(obj; ", name, "=value)`.")
 _reject_cache_type_opt() = error("@dynamicstruct: the `cache_type` macro option was removed (2026-07-07, decision 2canrl); the cache is always threadsafe (`ThreadsafeDict`) now — drop it.")
 
 # Parse a single positional macro arg into a (kwarg-name => value) pair.
@@ -5975,7 +5990,7 @@ function _seed_nested_remounts!(mounted, source, explicit)
         value = get(shared, name, _missing_sentinel)
         (value === _missing_sentinel || value isa Pending || value isa IndexableProperty ||
          !_is_dynamic_object(value)) && continue
-        setproperty!(mounted, name, _remount_child(value, mounted))
+        getfield(mounted, :cache)[name] = _remount_child(value, mounted)
     end
     mounted
 end
