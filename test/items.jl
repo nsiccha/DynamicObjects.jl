@@ -905,6 +905,37 @@ end
     @test app.uncached == 99
 end
 
+@testitem "clear memory and disk caches independently" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
+    _clearall_path[] = mktempdir()
+    app = ClearAllApp()
+    @test app.a == 42
+    @test app.b(3) == 6
+    a_path = @cache_path app.a
+    b_path = @cache_path app.b(3)
+    @test isfile(a_path)
+    @test isfile(b_path)
+
+    # Memory-only clearing preserves the durable entries. The next reads load
+    # those files back into the in-memory PropertyCache.
+    @test haskey(app.cache.cache, :a)
+    clear_mem_caches!(app)
+    @test isempty(app.cache.cache)
+    @test isfile(a_path)
+    @test isfile(b_path)
+    @test app.a == 42
+    @test app.b(3) == 6
+
+    # Disk-only clearing preserves the now-warm values. Reading them again is
+    # therefore an in-memory hit and must not recreate either file.
+    clear_disk_caches!(app)
+    @test !isfile(a_path)
+    @test !isfile(b_path)
+    @test app.a == 42
+    @test app.b(3) == 6
+    @test !isfile(a_path)
+    @test !isfile(b_path)
+end
+
 @testitem "PersistentSet" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     path = joinpath(mktempdir(), "test_set.sjl")
     s = PersistentSet(path)
@@ -955,6 +986,78 @@ end
         push!(items, item)
     end
     @test items == Set([1, 2, 3])
+end
+
+@testitem "LazyPersistentDict and key trackers" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
+    base = mktempdir()
+    dict_path = joinpath(base, "dict.sjl")
+    path_calls = Ref(0)
+    seed_calls = Ref(0)
+    lazy_path = () -> begin
+        path_calls[] += 1
+        dict_path
+    end
+    d = LazyPersistentDict(lazy_path, Dict{String,Int}(); seed! = data -> begin
+        seed_calls[] += 1
+        data["seed"] = 1
+    end)
+
+    # Construction is I/O-free; the first operation loads/seeds/persists once.
+    @test path_calls[] == 0
+    @test length(d) == 1
+    @test seed_calls[] == 1
+    @test isfile(dict_path)
+    @test !isempty(d)
+    @test haskey(d, "seed")
+    @test d["seed"] == 1
+    @test get(d, "missing", 9) == 9
+    @test collect(keys(d)) == ["seed"]
+    @test collect(values(d)) == [1]
+    @test collect(pairs(d)) == ["seed" => 1]
+    @test collect(d) == ["seed" => 1]
+    @test Base.IteratorSize(typeof(d)) == Base.HasLength()
+    @test eltype(typeof(d)) == Pair{String,Int}
+
+    @test (d["second"] = 2) == 2
+    computed = Ref(0)
+    @test get!(() -> (computed[] += 1; 99), d, "second") == 2
+    @test computed[] == 0
+    @test get!(() -> (computed[] += 1; 3), d, "third") == 3
+    @test computed[] == 1
+    @test delete!(d, "seed") === d
+
+    # A new instance loads the synchronously persisted state without seeding.
+    reload_seed_calls = Ref(0)
+    d2 = LazyPersistentDict(dict_path, Dict{String,Int}(); seed! = data -> begin
+        reload_seed_calls[] += 1
+        data["unexpected"] = 0
+    end)
+    @test Dict(d2) == Dict("second" => 2, "third" => 3)
+    @test reload_seed_calls[] == 0
+
+    # Loading into a differently typed backing dict exercises the merge path.
+    d3 = LazyPersistentDict(dict_path, Dict{Any,Any}())
+    @test Dict(d3) == Dict("second" => 2, "third" => 3)
+
+    tracker_path = joinpath(base, "keys.sjl")
+    tracker = SharedFileTracker(tracker_path)
+    @test tracker isa KeyTracker
+    @test isempty(load_keys(tracker))
+    @test record!(tracker, (:row, 1)) === nothing
+    @test record!(tracker, (:row, 2)) === nothing
+    @test record!(tracker, (:row, 1)) === nothing
+    @test load_keys(SharedFileTracker(tracker_path)) == Set([(:row, 1), (:row, 2)])
+
+    no_tracker = NoKeyTracker()
+    @test no_tracker isa KeyTracker
+    @test record!(no_tracker, :ignored) === nothing
+    @test isempty(load_keys(no_tracker))
+
+    _clearall_path[] = base
+    owner = ClearAllApp()
+    default_tracker = key_tracker(owner, Val(:b))
+    @test default_tracker isa SharedFileTracker
+    @test default_tracker.path == joinpath(owner.__cache_path__, "b_keys.sjl")
 end
 
 @testitem "Hash with nested DOs" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
@@ -1457,6 +1560,46 @@ read-only mappings plus truncated-file recovery.
 @testitem "@mmap payload contract" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
     _mmap_base[] = mktempdir()
     o = MmapPayloads()
+
+    # Loading Arrow + DataFrames must activate the package extension and its
+    # runtime eligibility hook. Pin each malformed-container diagnostic: Arrow
+    # itself accepts some partial inputs as empty tables, so these checks are
+    # what turns corrupt cache files into recomputation rather than false hits.
+    @test Base.get_extension(DynamicObjects, :DataFramesArrowExt) !== nothing
+    @test DynamicObjects._automatic_mmap_eligible(DataFrame(a=[1]))
+
+    short_arrow = joinpath(_mmap_base[], "short.arrow")
+    write(short_arrow, UInt8[0x41])
+    short_err = try
+        DynamicObjects.load(Val(:mmap), short_arrow, DataFrame)
+        nothing
+    catch e
+        e
+    end
+    @test short_err !== nothing
+    @test occursin("too short to be an Arrow file", sprint(showerror, short_err))
+
+    bad_magic = joinpath(_mmap_base[], "bad-magic.arrow")
+    write(bad_magic, zeros(UInt8, 12))
+    magic_err = try
+        DynamicObjects.load(Val(:mmap), bad_magic, DataFrame)
+        nothing
+    catch e
+        e
+    end
+    @test magic_err !== nothing
+    @test occursin("not an Arrow file", sprint(showerror, magic_err))
+
+    truncated_arrow = joinpath(_mmap_base[], "truncated.arrow")
+    write(truncated_arrow, vcat(collect(codeunits("ARROW1")), zeros(UInt8, 6)))
+    truncated_err = try
+        DynamicObjects.load(Val(:mmap), truncated_arrow, DataFrame)
+        nothing
+    catch e
+        e
+    end
+    @test truncated_err !== nothing
+    @test occursin("missing the trailing", sprint(showerror, truncated_err))
 
     # Annotated array: type-stable, mmap-backed, PROT_READ.
     @test o.annotated isa Matrix{Float64}
