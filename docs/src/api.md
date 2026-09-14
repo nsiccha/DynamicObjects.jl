@@ -12,17 +12,13 @@ the [manual](index.md).
 ## In-struct property markers
 
 These are *not* real macros — they are pattern-matched by `@dynamicstruct`
-inside a struct body. Outside a struct body they're either no-ops, real
-macros (e.g. `@memo`), or undefined. Don't rely on them in arbitrary
-positions.
+inside a struct body. Don't rely on them in arbitrary positions.
 
 | Marker                       | Effect                                                                                  |
 |------------------------------|-----------------------------------------------------------------------------------------|
 | `@cached prop = expr`        | Persist to disk under `cache_path`. Per-key for indexed properties.                     |
 | `@cached v"N" prop = expr`   | Versioned disk cache; bumping `N` invalidates files without changing inputs.            |
 | `@persist prop = expr`       | Write the in-memory value back to disk on demand (see [`@persist`](@ref)).              |
-| `@lru N prop(idx) = expr`    | Bound the per-property in-memory dict to `N` entries (LRU eviction).                    |
-| `@memo prop = expr`          | Inside a struct: rewrite call → bracket access. Outside: process-wide function memoize. |
 
 ## Cache inspection
 
@@ -41,9 +37,13 @@ a body, drop the object prefix and use the bare property name.
 
 ```@docs
 remake
+remount
 fetchindex
 fetchindex!
+fetchproperty
+fetchproperty!
 getstatus
+Pending
 ```
 
 ## Reflection and application declarations
@@ -52,6 +52,11 @@ getstatus
 property_descriptor
 property_descriptors
 type_descriptor
+option_declarations
+has_option_declaration
+property_options
+option_domain
+option_records
 declaration_metadata
 declaration_graph
 declaration_node_id
@@ -69,13 +74,6 @@ clear_mem_caches!
 clear_disk_caches!
 ```
 
-## Cancellation
-
-```@docs
-cancel!
-cancel_all!
-```
-
 ## Error handling
 
 ```@docs
@@ -83,13 +81,11 @@ PropertyComputationError
 unwrap_error
 ```
 
-## Persistent / bounded collections
+## Persistent collections
 
 ```@docs
 PersistentSet
 LazyPersistentDict
-LRUDict
-ThreadsafeLRUDict
 ```
 
 ## Pluggable key tracking
@@ -99,7 +95,6 @@ For bounding on-disk caches when the full key set isn't known up front.
 ```@docs
 KeyTracker
 SharedFileTracker
-PerPodFileTracker
 NoKeyTracker
 key_tracker
 record!

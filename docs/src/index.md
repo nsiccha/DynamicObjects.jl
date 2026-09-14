@@ -32,16 +32,15 @@ cache. Bare names like `x` and `y` on the RHS are auto-rewritten to
 - **Lazy properties.** Order-independent; any RHS may reference any other
   field or property by bare name.
 - **Indexed properties.** `prop(args...) = expr` declares a property that
-  takes arguments. `obj.prop(args...)` recomputes; `@memo obj.prop(args...)`
-  caches per `(args, kwargs)` tuple.
+  takes arguments. `obj.prop(args...)` memoizes per `(args, kwargs)` tuple;
+  `@fresh obj.prop(args...)` bypasses the cache.
 - **Disk caching.** `@cached prop = …` persists results under a
-  hash-derived path. `@memo f(x) = …` does the same for free functions.
-- **Thread-safe async.** With `cache_type=:parallel` (the default), indexed
-  property access spawns a `Task`, deduplicates concurrent requests for the
-  same key, and integrates with [`fetchindex`](#async-access) for
-  non-blocking UI polling.
+  hash-derived path.
+- **Thread-safe async.** Indexed property access starts background work,
+  deduplicates concurrent requests for the same key, and integrates with
+  [`fetchindex`](#async-access) for non-blocking UI polling.
 
-## Three orthogonal axes (read before writing DO code)
+## Two orthogonal axes (read before writing DO code)
 
 These are independent. Conflating them is the single most common source of
 bugs and confused explanations:
@@ -52,16 +51,13 @@ bugs and confused explanations:
    - `prop(args...; kwargs...) = expr` (LHS has a call) → **this is an IP**,
      with *or without* arguments, with *or without* kwargs.
      `prop() = …` is an IP. `prop(i) = …` is an IP. `prop(; k=1) = …` is an IP.
-2. **`cache_type`** decides what dict backs the IP's per-key memo.
-   `:parallel` → `ThreadsafeDict` that spawns a `Task` per key, dedupes
-   concurrent requests, and is the thing that makes polling via
-   [`fetchindex`](#async-access) possible. `:serial` → plain `Dict`.
-3. **`@cached`** adds **disk serialisation** on top. It is purely an I/O
+2. **`@cached`** adds **disk serialisation** on top. It is purely an I/O
    concern — it doesn't decide IP-ness, it doesn't create polling, it
    doesn't spawn tasks. Any IP is pollable regardless of `@cached`; any
    non-IP scalar property can be `@cached` without becoming pollable.
 
-If you want a property to be pollable / cancellable / background-runnable,
+The in-memory cache is always a threadsafe `ThreadsafeDict`. If you want a
+property to be pollable or background-runnable,
 declare it with call syntax — that is what makes it an IP. `@cached` is
 orthogonal. You almost never need `@cached` just to "make something async".
 
@@ -112,34 +108,31 @@ Use call syntax `prop(args...; kwargs...) = expr`:
 end
 
 a = App()
-a.filter(iseven)                  # [2, 4] — fresh each call, no caching
-@memo a.filter(iseven)            # [2, 4] — cached in the per-property dict
-a.render(1; tag="span")           # "<span>1</span>" — fresh
-@memo a.render(1; tag="b")        # "<b>1</b>"       — cached, kwargs included
+a.filter(iseven)                  # [2, 4] — cached in the per-property dict
+@fresh a.filter(iseven)           # [2, 4] — recomputed, bypassing the cache
+a.render(1; tag="span")           # "<span>1</span>" — cached, kwargs included
+@memo! a.render(1; tag="b")       # explicit cached access (same as a bare call)
 ```
 
 Two access forms:
 
 | Access                    | Behavior                                                          |
 |---------------------------|-------------------------------------------------------------------|
-| `obj.prop(args...)`       | Recompute every call. No caching.                                 |
-| `@memo obj.prop(args...)` | Look up `(args, kwargs)` in the per-property dict (cached access). |
+| `obj.prop(args...)`        | Look up `(args, kwargs)` in the per-property dict (cached access). |
+| `@fresh obj.prop(args...)` | Recompute, bypassing the in-memory cache.                          |
 
-`@memo obj.prop(args...)` is the preferred way to get cached access at a
-call site — the `@memo` marker makes the caching visible to a reader. The
-underlying bracket form `obj.prop[args...]` still works (and is what
-`@memo` expands to), but prefer `@memo` in new code: the cache is doing
-something that a bare `[...]` doesn't make obvious.
+`@memo! obj.prop(args...)` is an explicit equivalent of the bare cached call.
+It is useful when code wants to emphasize caching, or when wrapping an
+expression whose callees may or may not be `IndexableProperty` values.
 
 !!! note "`obj.prop` (no call) returns the wrapper"
     Bare `obj.prop` on an indexed property does **not** invoke the body. It
     returns an `IndexableProperty` wrapper that you can pass around (to
-    `fetchindex`, `cancel!`, `entries`, etc.). To actually compute, append
-    `(args...)` (fresh call) or `@memo` it (cached call):
+    `fetchindex`, `entries`, etc.). To compute, append `(args...)`:
     ```julia
     a.filter            # IndexableProperty :filter (Dict(...))
-    a.filter(iseven)    # [2, 4]              — fresh
-    @memo a.filter(iseven)  # [2, 4]          — cached
+    a.filter(iseven)    # [2, 4]              — cached
+    @fresh a.filter(iseven)  # [2, 4]         — recomputed
     fetchindex(a.filter, (iseven,)) do rv, status; … end  # non-blocking
     ```
 
@@ -150,20 +143,18 @@ greet(name::String) = "Hello, $(name)!"
 greet(n::Int)       = "Hello, person #$(n)!"
 ```
 
-!!! warning "Brackets and kwargs don't mix, in either direction"
+!!! warning "Use call syntax, not bracket syntax"
     - **Declaration:** always `prop(i; kw=default) = …`, never
-      `prop[i] = …` — the bracket form can't take kwargs and is
-      deprecated.
-    - **Access:** always `obj.prop(i; kw=v)` or `@memo obj.prop(i; kw=v)`,
-      never `obj.prop[i; kw=v]` — that's invalid Julia (`;` inside `[]`
-      means concatenation).
+      `prop[i] = …`.
+    - **Access:** always `obj.prop(i; kw=v)`, `@memo! obj.prop(i; kw=v)`,
+      or `@fresh obj.prop(i; kw=v)`. The former bracket access API was removed.
 
 #### Zero-arg call vs plain property
 
 ```julia
 timestamp = time()                 # plain: cached once on first read
-now()     = time()                 # indexed: obj.now() is fresh
-@memo obj.now()                    # cached zero-arg access
+now()     = time()                 # indexed: obj.now() caches by default
+@fresh obj.now()                   # recompute the zero-arg property
 ```
 
 ### Multi-LHS destructuring
@@ -223,20 +214,13 @@ totals = [sum(row) for row in items]         # `row` local; `items` rewrites
 
 ### "Assignment shadows property" error
 
-Writing `prop = value` inside a property body is interpreted as
-`__self__.prop = value` — i.e. it writes to the in-memory cache, not to a
-local. To avoid silent bugs, an assignment to a name that is also a property
-of the surrounding struct is a compile-time error. Declare the local
-explicitly:
+An assignment to a name that is also a property of the surrounding struct is
+a compile-time error. DynamicObjects does not support assigning property
+values after construction. Declare a local explicitly:
 
 ```julia
 @dynamicstruct struct Counter
     @cached count = 0
-    increment = begin
-        count = count + 1   # explicitly: rewrites to __self__.count = …
-        count
-    end
-
     safe = begin
         local count = 0     # local, doesn't touch the cache
         for _ in 1:10
@@ -254,27 +238,9 @@ end
 ### In-memory cache
 
 Every derived property's value is stored in an instance-level
-`PropertyCache` after first compute. The backing dict type is controlled by
-`cache_type`:
-
-| `cache_type`       | Backing dict       | Access semantics                                        |
-|--------------------|--------------------|---------------------------------------------------------|
-| `:parallel` (default) | `ThreadsafeDict` | Lock-protected; concurrent requests for the same key share one `Task`. |
-| `:serial`          | `Dict`             | Single-threaded; faster but unsafe under concurrency.   |
-
-```julia
-obj = Foo(3; cache_type=:serial)
-```
-
-Pass a dict type directly to use a custom backend. The package-level default
-can also be set via the multi-arg macro form:
-
-```julia
-@dynamicstruct "doc" :serial struct Q
-    n::Int
-    data(id) = expensive(id)
-end
-```
+`PropertyCache` after first compute. The backing cache is always a
+`ThreadsafeDict`: concurrent requests for one key share the same in-flight
+computation. The former `cache_type` macro/constructor option was removed.
 
 ### Constructor kwargs as cache overrides
 
@@ -285,13 +251,6 @@ pre-populated values. Same goes for [`remake`](@ref):
 p  = Point(3.0, 4.0; r=10.0)   # p.r returns 10.0 without computing
 p2 = remake(p; r=99.0)         # same fields, override r
 ```
-
-### Writing to the cache from a body
-
-Inside a property body, `prop = value` rewrites to
-`__self__.prop = value`, mutating the cached entry. Useful for stepwise
-updates — and the explanation for the [shadowing error](#assignment-shadows-property-error)
-above.
 
 ### Disk caching: `@cached`
 
@@ -360,45 +319,20 @@ want to skip the lock.
 ### `@persist`: write the in-memory value to disk
 
 `@cached` reads from disk on first access and writes after computing. If you
-later mutate the in-memory value (`obj.result = …`), it stays in RAM until
-you flush it:
+later mutate a mutable value in place, the change stays in RAM until you flush
+it:
 
 ```julia
+push!(obj.result, new_item)
 @persist obj.result             # plain
 @persist obj.data(url)          # indexed (call form — preferred)
 ```
 
-### `@lru N`: bound an indexed property's in-memory dict
+### `@memo!`: explicit cached access
 
-```julia
-@dynamicstruct struct Models
-    @lru 100 sim(subject_id)         = simulate(subject_id)        # 100 most-recent kept
-    @cached @lru 50 fit(model, seed) = run_fit(model, seed)        # disk + LRU in RAM
-end
-```
-
-`@lru` is orthogonal to `@cached`: it only bounds the in-memory dict, never
-the on-disk cache. On `:parallel` structs, eviction is task-aware — keys
-with an in-flight `Task` are never evicted, so awaiters never see their cache
-slot vanish. If every slot is pinned, the dict temporarily exceeds `maxsize`.
-
-`maxsize` must be a literal `Int`; only indexed properties may carry `@lru`.
-
-### `@memo`: two distinct meanings
-
-Outside `@dynamicstruct`:
-
-```julia
-@memo expensive(x, y) = heavy_computation(x, y)
-```
-
-Produces a process-wide memoised version of `expensive` — the usual
-[memoize-a-function](https://en.wikipedia.org/wiki/Memoization) pattern.
-
-Inside a `@dynamicstruct` body, `@memo` is a **call-site rewrite** that
-turns `obj.prop(args...; kwargs...)` into the cached access path. It is
-the preferred way to ask for cached access at a call site — the marker
-makes the caching visible to the reader. See
+Bare indexed calls cache by default. `@memo! expr` rewrites calls inside
+`expr` through `maybememoize!`, making that default explicit without requiring
+the callee to be an `IndexableProperty`. See
 [indexed properties](#indexed-properties).
 
 ### Inspecting and clearing caches
@@ -451,8 +385,8 @@ end
 
 p = Parent(1.0)
 p.sub.z                                # 3.0
-p.weighted(3; bias=1).total            # fresh each call (default scale=2)
-p.weighted[3; bias=1, scale=5].total   # cached in `weighted`'s per-key dict
+p.weighted(3; bias=1).total            # cached child (default scale=2)
+p.weighted(3; bias=1, scale=5).total   # distinct cached key
 ```
 
 - **`@struct name = begin … end`** — singleton child, one instance per parent.
@@ -468,7 +402,6 @@ that auto-generates the child name. In every form:
 
 - The parent's properties (including those introduced by destructuring)
   auto-forward into the child.
-- The parent's `cache_type` is inherited.
 - The child's `__status__` is auto-wired as a `__substatus__` of the
   parent. Opt out by declaring the child's own `__status__` (e.g.
   `__status__ = nothing` to disable, or `__status__ = __parent__.__status__`
@@ -491,20 +424,19 @@ pathfinder(instance, init; rng=Xoshiro(42), maxiters=100) =
     initialize_mcmc(instance, init; rng, progress=__status__, maxiters)
 ```
 
-`@memo obj.pathfinder(m, init; maxiters=500)` shows
+`obj.pathfinder(m, init; maxiters=500)` shows
 `Pathfinder(maxiters=500)`, not the default. Works at any nesting depth.
 
 ## Async access
 
-With `cache_type=:parallel` (default), cached access on an indexed property
-(`@memo obj.prop(args...)`):
+Cached access on an indexed property (`obj.prop(args...)`):
 
 1. Locks the cache.
 2. If the value is present → returns it.
-3. If a `Task` for the same key is in flight → returns the existing `Task`.
-4. Otherwise → spawns a fresh `Task` and registers it.
+3. If work for the same key is in flight → waits on its shared condition.
+4. Otherwise → starts a fresh background computation and registers it.
 
-After the lock is released, the access waits on the `Task` (`fetch`) and
+After the lock is released, the access waits for the shared result and
 returns the result. If the task throws, the cache slot stays in the failed
 state until `retry_failed=true` clears it on the next access.
 
@@ -512,9 +444,7 @@ state until `retry_failed=true` clears it on the next access.
 
 ```julia
 fetchindex(app.results, key) do rv, status
-    if rv isa Task && istaskfailed(rv)
-        render_error(rv.result)
-    elseif rv isa Task
+    if rv isa Pending
         render_progress(status)        # still running
     else
         render(rv)                     # done
@@ -522,27 +452,27 @@ fetchindex(app.results, key) do rv, status
 end
 
 fetchindex(app.results, key; force=true) do rv, status
-    # `force=true` clears in-memory + on-disk first → fresh Task
+    # `force=true` clears in-memory + on-disk first
 end
 ```
 
-The `(rv, status)` callback receives the `Task` (when running/failed/just-finished)
-or the cached value (when complete), plus the substatus object (or `nothing`).
-This is the contract used by HTMX-style UIs that poll a "running" page until
-the result drops in.
+The `(rv, status)` callback receives a [`Pending`](@ref) handle while work is
+running or the cached value when complete, plus the substatus object (or
+`nothing`). `fetch(rv)` blocks and rethrows a recorded failure. This is the
+contract used by HTMX-style UIs that poll a "running" page until the result
+drops in.
 
-### Status, cancellation, enumeration
+### Status and enumeration
 
 | Function                              | Purpose                                                              |
 |---------------------------------------|----------------------------------------------------------------------|
 | `getstatus(ip, indices...)`           | Current substatus, or `nothing`                                      |
-| `cancel!(ip, indices...)`             | Schedule `InterruptException` on the running task; returns `true` if found |
-| `cancel_all!(ip)`                     | Cancel every running task on `ip`                                    |
 | `entries(ip)`                         | Vector of `(; key, state, status, value)` for *all* entries          |
 | `cached_entries(ip)`                  | Just the completed entries, as `(key, value)` pairs                  |
 
-`state` from `entries` is one of `:running`, `:failed`, `:finishing`, or
-`:done`.
+`state` from `entries` is one of `:running`, `:failed`, or `:done`.
+Cancellation is not supported: DynamicObjects no longer retains the compute
+task after launching it.
 
 ### Treebars progress: `__status__` and `__substatus__`
 
@@ -551,10 +481,10 @@ Two conventional properties hook DO into a progress tree:
 - `__status__` — root progress node, default `nothing`.
 - `__substatus__(name, args...; kwargs...)` — per-property child node hook.
 
-When Treebars.jl is loaded, the `TreebarsExt` extension provides a default
-`__substatus__` that creates a child progress node initialised from the
+Treebars.jl is a direct dependency and provides the default `__substatus__`
+that creates a child progress node initialised from the
 property's `_property_description`. Lifecycle hooks
-(`_finalize_substatus!` / `_fail_substatus!`) wire the spawned `Task` into
+(`_finalize_substatus!` / `_fail_substatus!`) wire the computation into
 the tree's init/finalize symmetry.
 
 ```julia
@@ -573,12 +503,12 @@ fetchindex!(app.__status__, app.fit, "k1")   # extension method
 
 Inside any property body, `__status__` is bound to the relevant node — the
 root for plain access, the per-key substatus for cached access on a
-`ThreadsafeDict` (i.e. `@memo obj.prop(key)`). Pass it to your inner code
+`ThreadsafeDict` (i.e. `obj.prop(key)`). Pass it to your inner code
 via the `progress=` kwarg of whatever long-running API you call.
 
 `__substatus__` only fires on the **cached** access path
-(`@memo obj.prop(key)` / equivalently `obj.prop[key]`). Fresh call syntax
-`obj.prop(key)` and scalar property access don't trigger it.
+(`obj.prop(key)` or `@memo! obj.prop(key)`). Explicit `@fresh` access and
+scalar property access don't trigger it.
 
 ## Construction and `remake`
 
@@ -669,17 +599,17 @@ Stacktrace:
 
 ### Inspecting in-flight tasks
 
-For `:parallel` indexed properties, `entries(ip)` returns a vector of `(; key, state, status, value)` for every key seen so far — `:running`, `:failed`, `:finishing`, or `:done`:
+For indexed properties, `entries(ip)` returns a vector of `(; key, state, status, value)` for every key seen so far — `:running`, `:failed`, or `:done`:
 
 ```julia
 julia> entries(app.fit)
 3-element Vector:
  (key = ("k1",), state = :done,    status = nothing, value = …)
- (key = ("k2",), state = :running, status = ProgressNode(…), value = Task(…))
- (key = ("k3",), state = :failed,  status = nothing, value = Task(…))
+ (key = ("k2",), state = :running, status = ProgressNode(…), value = Pending(…))
+ (key = ("k3",), state = :failed,  status = nothing, value = ErrorException(…))
 ```
 
-`getstatus(ip, args...)` returns the substatus of a single key (or `nothing` if absent). `cancel!(ip, args...)` schedules an `InterruptException` on a single running task; `cancel_all!(ip)` does it across the whole property.
+`getstatus(ip, args...)` returns the substatus of a single key (or `nothing` if absent).
 
 ### Cache state inspection
 
@@ -830,14 +760,13 @@ persisted:
 | Tracker                          | Strategy                                                       |
 |----------------------------------|----------------------------------------------------------------|
 | `SharedFileTracker(path)` (default) | One `_keys.sjl` shared by every writer. Simple; not NFS-safe. |
-| `PerPodFileTracker(base, pod_id)` | One `_keys_<pod_id>.sjl` per writer; `load_keys` unions them. |
 | `NoKeyTracker()`                 | No-op.                                                          |
 
 Override per-type / per-property:
 
 ```julia
 DynamicObjects.key_tracker(o::MyType, ::Val{name}) where {name} =
-    PerPodFileTracker(joinpath(o.cache_path, string(name) * "_keys"), pod_id)
+    NoKeyTracker()
 ```
 
 `record!` and `load_keys` are the read/write API; recording is currently a
@@ -847,12 +776,10 @@ writes land — see the source for details).
 
 ### Persistent collections
 
-| Type                                                      | Purpose                                                                                       |
-|-----------------------------------------------------------|-----------------------------------------------------------------------------------------------|
-| `PersistentSet(path)`                                     | Thread-safe `Set` that re-serialises on every `push!`/`pop!`.                                 |
-| `LazyPersistentDict(path[, empty]; seed!)`                | Threadsafe dict; backing file resolved lazily, loaded on first op (precompile-safe).          |
-| `LRUDict{K,V}(maxsize)`                                   | Plain LRU dict, used internally for `@lru` on `:serial` structs.                              |
-| `ThreadsafeLRUDict{K,V}(maxsize)`                         | Lock-protected LRU dict, used internally for `@lru` on `:parallel` structs (task-aware eviction). |
+| Type                                       | Purpose                                                                              |
+|--------------------------------------------|--------------------------------------------------------------------------------------|
+| `PersistentSet(path)`                      | Thread-safe `Set` that re-serialises on every `push!`/`pop!`.                        |
+| `LazyPersistentDict(path[, empty]; seed!)` | Threadsafe dict; backing file resolved lazily, loaded on first op (precompile-safe). |
 
 These are exposed as exports; you can use them outside `@dynamicstruct`
 contexts wherever they're useful.
