@@ -24,7 +24,7 @@ optionally disk-cached properties.
 - [`PropertyComputationError`](@ref): Exception wrapper for errors during property computation.
 - [`unwrap_error`](@ref): Dig through exception wrappers to find the root cause.
 - [`entries`](@ref): List all entries in a `ThreadsafeDict`-backed property with state info.
-- [`cached_entries`](@ref): Iterate completed (non-Task) entries of an indexed property.
+- [`cached_entries`](@ref): Iterate completed entries of an indexed property.
 - [`clear_mem_caches!`](@ref): Clear in-memory memoized values (disk caches untouched).
 - [`clear_disk_caches!`](@ref): Delete on-disk cache files (in-memory values untouched).
 - [`clear_all_caches!`](@ref): Clear both in-memory and disk caches.
@@ -1539,7 +1539,7 @@ end
 """
     cached_entries(ip::IndexableProperty)
 
-Return a vector of `(key, value)` pairs for completed (non-Task) entries only.
+Return a vector of `(key, value)` pairs for completed entries only.
 """
 function cached_entries(ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict})
     lock(ip.cache.lock) do
@@ -6009,7 +6009,7 @@ rebound context.
 The keyword names are existing non-fixed properties such as `__parent__`,
 `__req__`, or `__prefix__`. They, every transitive dependent in `meta(T)`, every
 opaque self-dependent property, progress state, and nested child are routed to a
-fresh mount-local cache. Each mounted [`IndexableProperty`](@ref) wrapper is
+fresh mount-local cache. Each mounted `IndexableProperty` wrapper is
 recreated with the mounted owner; its per-argument cache is shared only when the
 property is context-independent. Context-dependent `@cached`/`@mmap` properties
 bypass their intrinsic disk entry because the rebound context is intentionally
@@ -6044,6 +6044,7 @@ end
 function remount(obj; kwargs...)
     _remount_impl(obj, values(kwargs))
 end
+@doc (@doc _remount_impl) remount
 
 # --- Error display for property computations ---
 
@@ -7440,10 +7441,10 @@ therefore no `inputs` entry to hang a domain on. Every domain has one of three
 
 - `:static` — a finite domain the *type* proves (`Bool`, or an `Enum`), with the
   values in `options`.
-- `:declared` — an [`@options`](@ref option_declarations) declaration governs
-  this parameter name. `domain.declaration` is the record (declared expression,
-  its `dependencies`, and `static`); `options` is empty because reflection
-  reports the declaration without running it. Call
+- `:declared` — an `@options` declaration governs this parameter name; see
+  [`option_declarations`](@ref). `domain.declaration` is the record (declared
+  expression, its `dependencies`, and `static`); `options` is empty because
+  reflection reports the declaration without running it. Call
   [`property_options`](@ref)`(o, name)` for the domain's actual value.
 - `:unrestricted` — no domain is known; the type is the only constraint.
 """
