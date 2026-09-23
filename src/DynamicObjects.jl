@@ -574,12 +574,39 @@ _report_disk_load!(::Nothing, _, _) = nothing
 # progress tree whenever a real `Treebars.ProgressNode` is threaded; with
 # `__status__===nothing` the generic no-op methods above run instead. ──
 
-# Description of a property's substatus node: the property's docstring — the
-# opt-in signal for "label this in the progress tree" — when present, else an
-# empty string, which makes the Treebars node a bare wrapper the renderer
-# inlines (children hoist up; no empty level). This is the `displayed =
-# !isnothing(doc)` rule: undocumented properties add no labelled noise to the
-# tree, documented ones do.
+# Docstring summary core — the SAME rule HTMXObjects applies to its operation
+# surfaces (`_docstring_first_line` / `_docstring_summary`, HTMXObjects fa92501:
+# auto-poller header, semantic operation title, OpenAPI summary). A progress
+# label is the docstring's first non-blank line with the ATX `#` sigil shed, so
+# the poller header and the progress-tree node beneath it render byte-identical
+# text. Kept name- and edge-for-edge identical to the HTMXObjects pair
+# deliberately: the three surfaces share one convention, and a docstring's
+# first line is its author-controlled summary everywhere.
+function _docstring_first_line(doc::AbstractString)
+    for line in split(doc, '\n')
+        stripped = strip(line)
+        isempty(stripped) || return stripped
+    end
+    nothing
+end
+
+function _docstring_summary(description)
+    description isa AbstractString || return nothing
+    line = _docstring_first_line(description)
+    line === nothing && return nothing
+    value = strip(replace(line, r"^#{1,6}\s+" => ""))
+    isempty(value) ? nothing : value
+end
+
+# Description of a property's substatus node: the property's docstring SUMMARY —
+# the docstring is the opt-in signal for "label this in the progress tree", but
+# the node shows only its first line (ATX `#` shed), never the full text. A
+# route docstring's `# Arguments` block is curl/API reference for schema and
+# OpenAPI readers, not a progress label (snag property-progres-3d8a7460). An
+# undocumented property gets an empty string, which makes the Treebars node a
+# bare wrapper the renderer inlines (children hoist up; no empty level). This
+# is the `displayed = !isnothing(doc)` rule: undocumented properties add no
+# labelled noise to the tree, documented ones do — concisely.
 #
 # `transient` is consumed here (default true → substatus auto-detaches on finalize);
 # it does not reach the property body. Pass transient=false to keep finished substatuses
@@ -591,12 +618,25 @@ function _default_substatus(status::Treebars.ProgressNode, o, name, args...; tra
     # doc-presence here — unlike the old `property_doc(metafirst(T, name))`, which
     # keyed on type+name only and always reflected the first declaration. The
     # matching `_property_description` override is likewise per-signature, so the
-    # rendered label text is the right signature's docstring. (Structs expanded by
-    # an older DO carry no overrides and hit the `_is_property_documented` default,
-    # which reproduces that historic first-sig gate — no regression; the per-sig
-    # fix rolls in as each struct is re-expanded.)
-    desc = _is_property_documented(o, Val(name), args...; kwargs...) ?
-        something(_property_description(o, Val(name), args...; kwargs...), "") : ""
+    # rendered label text derives from the right signature's docstring. (Structs
+    # expanded by an older DO carry no overrides and hit the
+    # `_is_property_documented` default, which reproduces that historic first-sig
+    # gate — no regression; the per-sig fix rolls in as each struct is re-expanded.)
+    #
+    # Summarize AFTER `_property_description` evaluates: interpolated docstrings
+    # (`$kwarg` against call-site values) can inject newlines, and the summary
+    # must truncate those too. The full text stays on `_property_description`
+    # for reflection (`property_doc`, descriptors, schema/OpenAPI). A docstring
+    # with no usable line summaries to `nothing` → `""`, so the node inlines
+    # exactly like an undocumented property's. A non-string override result
+    # (exotic custom `_property_description` methods) passes through untouched,
+    # preserving today's behavior for those.
+    desc = if _is_property_documented(o, Val(name), args...; kwargs...)
+        full = _property_description(o, Val(name), args...; kwargs...)
+        full isa AbstractString ? something(_docstring_summary(full), "") : something(full, "")
+    else
+        ""
+    end
     Treebars.initialize_progress!(status; description=desc, transient)
 end
 
