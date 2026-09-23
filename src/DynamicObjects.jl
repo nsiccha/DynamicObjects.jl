@@ -1999,7 +1999,15 @@ _bare_substatus_f(o, name) =
 
 maybehash(x::Number) = x
 maybehash(x::Symbol) = x
-maybehash(x) = persistent_hash(x)
+# Route through the `_hash_replace` canonicalization seam — the same one the
+# `__hash__` compute uses — so a `@dynamicstruct` argument hashes by its stable
+# `__hash__` (per-type overloads emitted by the macro) instead of serializing
+# the whole object including its PropertyCache. Without this the segment grew
+# with whatever was memoized on the argument and changed across restarts, so a
+# disk cache written with a cold argument never hit with a warm one. Plain
+# values are unaffected: `_hash_replace` is the identity there (modulo
+# rebuilding an equal Tuple/NamedTuple, which serializes identically).
+maybehash(x) = persistent_hash(_hash_replace(x))
 
 # POSIX per-path-component byte limit. A single file or directory name longer
 # than this fails with ENAMETOOLONG on `mkpath`/`open`, no matter how short
