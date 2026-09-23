@@ -574,12 +574,82 @@ _report_disk_load!(::Nothing, _, _) = nothing
 # progress tree whenever a real `Treebars.ProgressNode` is threaded; with
 # `__status__===nothing` the generic no-op methods above run instead. ──
 
-# Description of a property's substatus node: the property's docstring — the
-# opt-in signal for "label this in the progress tree" — when present, else an
-# empty string, which makes the Treebars node a bare wrapper the renderer
-# inlines (children hoist up; no empty level). This is the `displayed =
-# !isnothing(doc)` rule: undocumented properties add no labelled noise to the
-# tree, documented ones do.
+# Docstring section separators (snag property-progres-3d8a7460, user-resolved
+# 2026-09-23): a line of 3+ dashes splits summary from details, a line of 3+
+# equals splits the progress part from the OpenAPI part. Surrounding whitespace
+# is tolerated (source-indented docstrings, CRLF). The 3+ runs are deliberate:
+# any long run works, so there is no magic dash count to remember — the
+# resolving comment's `--------------` / `=================` are instances.
+# Julia `?` help rendering of these lines is explicitly not a concern (same
+# resolution); every structured consumer splits first, so the delimiters never
+# reach a renderer.
+const _SUMMARY_SEP = r"^\s*-{3,}\s*$"
+const _OPENAPI_SEP = r"^\s*={3,}\s*$"
+
+# Split a docstring into its (summary, details, openapi) sections. The FIRST
+# `===` line ends the progress part (everything below feeds OpenAPI/schema
+# only, never progress); the FIRST `---` line *within the progress part* ends
+# the summary (everything between feeds the expanded progress details, once
+# Treebars renders them). `---` below `===` is OpenAPI content, not a summary
+# split. `explicit_summary` reports whether a `---` split fired — the label
+# policy below needs it. All parts are stripped; absent parts are `""`.
+function _docstring_sections(doc::AbstractString)
+    lines = split(doc, '\n')
+    api_at = findfirst(l -> occursin(_OPENAPI_SEP, l), lines)
+    progress_lines = api_at === nothing ? lines : lines[1:api_at-1]
+    openapi_lines = api_at === nothing ? similar(lines, 0) : lines[api_at+1:end]
+    sum_at = findfirst(l -> occursin(_SUMMARY_SEP, l), progress_lines)
+    summary_lines = sum_at === nothing ? progress_lines : progress_lines[1:sum_at-1]
+    details_lines = sum_at === nothing ? similar(lines, 0) : progress_lines[sum_at+1:end]
+    (;
+        summary=strip(join(summary_lines, "\n")),
+        details=strip(join(details_lines, "\n")),
+        openapi=strip(join(openapi_lines, "\n")),
+        explicit_summary=sum_at !== nothing,
+    )
+end
+
+# Docstring summary core — the progress label for a docstring. An EXPLICIT
+# summary (author delimited with `---`) is used verbatim: the author drew the
+# line, so there is no further magic. Without one, the minimal magic the
+# resolution accepted: the progress part's first non-blank line (which keeps
+# every existing separator-less docstring rendering sanely). Single-line labels
+# shed a leading ATX `#` sigil (heading-led docstrings); multi-line explicit
+# summaries pass verbatim. Returns `nothing` when no usable line exists.
+#
+# This DIVERGES from HTMXObjects' same-named pair (HTMXObjects fa92501) by
+# direction of the resolution: the poller header / semantic title / OpenAPI
+# summary stay first-line until the HTMXO OpenAPI half of this contract lands,
+# at which point the `===` part feeds OpenAPI description and `# Arguments`
+# parsing there.
+function _docstring_first_line(doc::AbstractString)
+    for line in split(doc, '\n')
+        stripped = strip(line)
+        isempty(stripped) || return stripped
+    end
+    nothing
+end
+
+function _docstring_summary(description)
+    description isa AbstractString || return nothing
+    sec = _docstring_sections(description)
+    text = sec.explicit_summary ? sec.summary : _docstring_first_line(sec.summary)
+    text === nothing && return nothing
+    isempty(text) && return nothing
+    value = occursin('\n', text) ? text : strip(replace(text, r"^#{1,6}\s+" => ""))
+    isempty(value) ? nothing : value
+end
+
+# Description of a property's substatus node: the property's docstring SUMMARY —
+# the docstring is the opt-in signal for "label this in the progress tree", but
+# the node shows only the summary section (snag property-progres-3d8a7460). An
+# explicit `---`-delimited summary is used verbatim; without one the progress
+# part's first line is the label. Everything below `===` is OpenAPI/API
+# reference for schema readers, never progress. An undocumented property gets
+# an empty string, which makes the Treebars node a bare wrapper the renderer
+# inlines (children hoist up; no empty level). This is the
+# `displayed = !isnothing(doc)` rule: undocumented properties add no labelled
+# noise to the tree, documented ones do — concisely.
 #
 # `transient` is consumed here (default true → substatus auto-detaches on finalize);
 # it does not reach the property body. Pass transient=false to keep finished substatuses
@@ -591,12 +661,25 @@ function _default_substatus(status::Treebars.ProgressNode, o, name, args...; tra
     # doc-presence here — unlike the old `property_doc(metafirst(T, name))`, which
     # keyed on type+name only and always reflected the first declaration. The
     # matching `_property_description` override is likewise per-signature, so the
-    # rendered label text is the right signature's docstring. (Structs expanded by
-    # an older DO carry no overrides and hit the `_is_property_documented` default,
-    # which reproduces that historic first-sig gate — no regression; the per-sig
-    # fix rolls in as each struct is re-expanded.)
-    desc = _is_property_documented(o, Val(name), args...; kwargs...) ?
-        something(_property_description(o, Val(name), args...; kwargs...), "") : ""
+    # rendered label text derives from the right signature's docstring. (Structs
+    # expanded by an older DO carry no overrides and hit the
+    # `_is_property_documented` default, which reproduces that historic first-sig
+    # gate — no regression; the per-sig fix rolls in as each struct is re-expanded.)
+    #
+    # Summarize AFTER `_property_description` evaluates: interpolated docstrings
+    # (`$kwarg` against call-site values) can inject newlines, and the summary
+    # must truncate those too. The full text stays on `_property_description`
+    # for reflection (`property_doc`, descriptors, schema/OpenAPI). A docstring
+    # with no usable line summaries to `nothing` → `""`, so the node inlines
+    # exactly like an undocumented property's. A non-string override result
+    # (exotic custom `_property_description` methods) passes through untouched,
+    # preserving today's behavior for those.
+    desc = if _is_property_documented(o, Val(name), args...; kwargs...)
+        full = _property_description(o, Val(name), args...; kwargs...)
+        full isa AbstractString ? something(_docstring_summary(full), "") : something(full, "")
+    else
+        ""
+    end
     Treebars.initialize_progress!(status; description=desc, transient)
 end
 
