@@ -344,6 +344,7 @@ the callee to be an `IndexableProperty`. See
 | `@cache_path obj.result`           | The on-disk path                                    |
 | `@clear_cache! obj.result`         | Drop in-memory + delete all on-disk files           |
 | `@clear_cache! obj.result(key)`    | Drop a single index                                 |
+| `invalidate!(obj.result, key)`     | Drop a single index (function form)                 |
 | `clear_mem_caches!(obj)`           | Drop every in-memory entry on `obj`                 |
 | `clear_disk_caches!(obj)`          | Delete every `@cached` file under `obj.cache_path`  |
 | `clear_all_caches!(obj)`           | Both                                                |
@@ -454,6 +455,9 @@ end
 fetchindex(app.results, key; force=true) do rv, status
     # `force=true` clears in-memory + on-disk first
 end
+
+# outside the poll dance: drop one entry so the next access recomputes
+invalidate!(app.results, key)
 ```
 
 The `(rv, status)` callback receives a [`Pending`](@ref) handle while work is

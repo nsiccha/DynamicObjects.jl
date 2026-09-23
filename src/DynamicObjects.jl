@@ -20,6 +20,7 @@ optionally disk-cached properties.
 - [`fetchindex`](@ref): Non-blocking access to `ThreadsafeDict`-backed properties with `(rv, status)` callback.
 - [`getstatus`](@ref): Read the status object for an in-flight computation.
 - [`@clear_cache!`](@ref): Clear the disk and in-memory cache for a property.
+- [`invalidate!`](@ref): Drop one indexed-property entry (memory + disk) so the next access recomputes.
 - [`@persist`](@ref): Manually persist a property value to disk cache.
 - [`PropertyComputationError`](@ref): Exception wrapper for errors during property computation.
 - [`unwrap_error`](@ref): Dig through exception wrappers to find the root cause.
@@ -44,7 +45,7 @@ optionally disk-cached properties.
 - [`materialization_gc!`](@ref): Collect only unreachable, provider-released storage with proven ownership.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, remount, file_version, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, invalidate!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, remount, file_version, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending
 
 import SHA, Serialization, Mmap, Treebars
 
@@ -1227,6 +1228,36 @@ getstatus(::IndexableProperty, indices...; kwargs...) = nothing
 # replacement; cancellation is not a supported operation.
 
 """
+    invalidate!(ip::IndexableProperty, indices...; kwargs...)
+
+Drop exactly one indexed-property cache entry — the in-memory value (plus any
+in-flight latch, recorded error, and status node) and the on-disk payload
+(`@cached` / `@mmap` / auto-materialized) — for the key
+`(indices, (;kwargs...))`. Sibling entries are untouched. The next access
+recomputes and re-caches.
+
+This is the same primitive `fetchindex(...; force=true)` runs before
+recomputing, also reachable as `@clear_cache! obj.prop(indices...)`.
+
+In-flight semantics (there is no cancellation — DynamicObjects retains no
+compute handle): invalidating while a compute runs does not stop it. Its value
+still lands if the slot is empty when it finishes, so a bare `invalidate!`
+followed by a re-access can serve the pre-invalidation result; `force=true`
+spawns a second compute and the two race, first-published-wins. Blocking
+waiters migrate onto the new compute; a `Pending` handle `fetch`ed in the gap
+between the drop and the new compute's registration throws an
+`ErrorException` ("no value and no compute in flight").
+"""
+function invalidate!(ip::IndexableProperty, indices...; kwargs...)
+    maybepop!(ip.cache, (indices, (;kwargs...)))
+    path = get_cache_path(ip.o, name(ip), indices...; kwargs...)
+    isfile(path) && rm(path)
+    metadata_path = _automatic_materialization_path(path)
+    isfile(metadata_path) && rm(metadata_path)
+    nothing
+end
+
+"""
     fetchindex(fetch, ip, indices...; kwargs...)
 
 Call `memoize!(ip, indices...; kwargs...)` with a custom `fetch` function.
@@ -1236,8 +1267,9 @@ For `IndexableProperty` backed by a `ThreadsafeDict`, the `fetch` callback recei
 result (done), and `status` is the substatus object (from `__substatus__`) or
 `nothing`. `fetch(::Pending)` blocks for the value (rethrowing if the compute failed).
 
-Pass `force=true` to unconditionally recompute: clears both the in-memory cache
-entry and the on-disk cache file so the next access recomputes from scratch.
+Pass `force=true` to unconditionally recompute: runs [`invalidate!`](@ref) on
+the entry first (in-memory + on-disk dropped), so the access recomputes from
+scratch. See `invalidate!` for the in-flight semantics.
 
 # Example
 ```julia
@@ -1255,9 +1287,7 @@ end
 function fetchindex(fetch, ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}, indices...;
                     force=false, retry_failed=force, kwargs...)
     if force
-        maybepop!(ip.cache, (indices, (;kwargs...)))
-        path = get_cache_path(ip.o, name(ip), indices...; kwargs...)
-        isfile(path) && rm(path)
+        invalidate!(ip, indices...; kwargs...)
     end
     rv = memoize!(ip, indices...; fetch=identity, retry_failed, kwargs...)
     status = getstatus(ip, indices...; kwargs...)
@@ -2663,12 +2693,6 @@ persist(v, args...; kwargs...) = begin
     )
 end
 
-# Pop a specific (indices, kwargs) entry from an IndexableProperty's cache,
-# or no-op when the entry isn't an IP.
-_maybepop_indexed!(v::IndexableProperty, indices, kwargs) =
-    (maybepop!(v.cache, (indices, (;kwargs...))); nothing)
-_maybepop_indexed!(args...) = nothing
-
 clear_cache!(o, name::Symbol, indices...; kwargs...) = begin
     cache = getfield(o, :cache).cache
     if isempty(indices) && isempty(kwargs)
@@ -2685,13 +2709,17 @@ clear_cache!(o, name::Symbol, indices...; kwargs...) = begin
             end
         end
     else
-        # Clear specific indexed entry from in-memory cache
-        haskey(cache, name) && _maybepop_indexed!(cache[name], indices, kwargs)
-        # Clear specific disk cache file
-        path = get_cache_path(o, name, indices...; kwargs...)
-        isfile(path) && rm(path)
-        metadata_path = _automatic_materialization_path(path)
-        isfile(metadata_path) && rm(metadata_path)
+        # Clear one indexed entry — the shared per-entry primitive when the
+        # wrapper is resident; disk files alone when it is not.
+        v = get(cache, name, nothing)
+        if v isa IndexableProperty
+            invalidate!(v, indices...; kwargs...)
+        else
+            path = get_cache_path(o, name, indices...; kwargs...)
+            isfile(path) && rm(path)
+            metadata_path = _automatic_materialization_path(path)
+            isfile(metadata_path) && rm(metadata_path)
+        end
     end
     nothing
 end
