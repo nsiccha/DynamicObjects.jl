@@ -1672,12 +1672,31 @@ Clear all in-memory memoized property values on a `@dynamicstruct` instance,
 leaving disk caches (`@cached` files) untouched. Every derived property —
 including child DOs stored as values — will be recomputed on next access.
 
+Indexed-property entries are dropped from the per-argument subcaches
+themselves, not merely by dropping the top-level wrapper: a live
+[`remount`](@ref) request view (or any destructured wrapper handle) shares
+the retained subcache object, so dropping only the wrapper would leave a
+same-request render serving pre-clear values while later requests
+recompute. After this call every holder re-reads from scratch.
+
 This is useful after hot-reloading code via Revise: property values computed by
 old method definitions stay memoized until the process restarts or this function
 is called.
+
+In-flight semantics: as with [`invalidate!`](@ref), a compute running at
+clear time still lands if its slot is empty when it finishes.
 """
 function clear_mem_caches!(obj)
-    empty!(getfield(obj, :cache).cache)
+    c = getfield(obj, :cache).cache
+    # Snapshot the wrapper subcaches under the top lock, then empty each under
+    # its own lock. A per-argument subcache object outlives the top-level
+    # wrapper entry through every alias — a mounted request view shares it by
+    # design — so `empty!(c)` alone would leave those aliases stale.
+    subcaches = lock(c.lock) do
+        [ip.cache for ip in values(c.cache) if ip isa IndexableProperty]
+    end
+    empty!(c)
+    foreach(empty!, subcaches)
     nothing
 end
 
