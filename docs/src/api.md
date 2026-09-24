@@ -72,6 +72,7 @@ cached_entries
 clear_all_caches!
 clear_mem_caches!
 clear_disk_caches!
+invalidate!
 ```
 
 ## Error handling
