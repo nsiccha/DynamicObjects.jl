@@ -45,7 +45,7 @@ optionally disk-cached properties.
 - [`materialization_gc!`](@ref): Collect only unreachable, provider-released storage with proven ownership.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, invalidate!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, remount, file_version, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, invalidate!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, remount, file_version, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending, Deferred, DeferredCompute, ComputeAbandoned
 
 import SHA, Serialization, Mmap, Treebars
 
@@ -1062,10 +1062,139 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     # :spawn — poller first-arriver: kick the REAL compute off fire-and-forget (it writes
     # the cache, or records a failure in `c.errors`), and hand back a Pending. The Task is
     # NOT retained — its value/error both reach us through the cache/errors + the latch.
+    # `_start_compute` dispatches on the selector: `identity` spawns on the `:default`
+    # pool; a `Deferred` hands the compute to its executor (queue, bounded pool, …).
     cnd = action[2]::Threads.Condition
-    Threads.@spawn try; _run_cache_compute!(c, key, cnd, f, s); catch; end  # error already recorded
-    return fetch(Pending(c, key, nothing))
+    _start_compute(fetch, DeferredCompute(c, key, cnd, f, s))
+    p = Pending(c, key, nothing)
+    # A `Deferred` executor may have run the compute synchronously: hand back the value.
+    fetch isa Deferred && isready(p) && return Base.fetch(p)
+    return fetch(p)
 end
+
+# --- Deferred compute starts -------------------------------------------------------------
+
+"""
+    ComputeAbandoned(reason)
+
+Recorded as a key's failure when an executor [`abandon!`](@ref)s a queued compute instead of
+running it. Waiters and pollers see it like any other failure; with the default
+`retry_failed=true` the next access starts a fresh compute.
+"""
+struct ComputeAbandoned <: Exception
+    reason::String
+end
+Base.showerror(io::IO, e::ComputeAbandoned) =
+    print(io, "ComputeAbandoned: the queued compute was abandoned before it started: ", e.reason)
+
+"""
+    DeferredCompute
+
+One first-arriving compute, handed to a [`Deferred`](@ref) executor. Its in-flight latch is
+already registered, so concurrent accessors of the same key already dedupe onto it — blocking
+callers wait for it, pollers receive a `Pending` — for as long as it sits in the executor's
+queue.
+
+The executor must eventually call exactly one of:
+
+- [`run!(d)`](@ref run!) — run the compute on the calling task. Call it from a worker to run
+  in the background; calling it synchronously inside the executor makes the originating
+  `get!` behave like a blocking accessor — the value, not a `Pending`, comes back (the escape
+  hatch for a compute started from inside one of the executor's own workers, where queueing
+  behind yourself would deadlock).
+- [`abandon!(d, reason)`](@ref abandon!) — never run it; the key fails with
+  [`ComputeAbandoned`](@ref).
+
+Only the first of the two takes effect. Dropping a `DeferredCompute` without calling either
+leaves the key in flight forever.
+"""
+mutable struct DeferredCompute
+    const cache::AbstractThreadsafeDict
+    const key::Any
+    const latch::Threads.Condition
+    const f::Any
+    const status::Any
+    @atomic claimed::Bool
+end
+DeferredCompute(c, key, cnd, f, s) = DeferredCompute(c, key, cnd, f, s, false)
+
+_claim!(d::DeferredCompute) = (@atomicswap d.claimed = true) === false
+
+"""
+    run!(d::DeferredCompute) -> Bool
+
+Run a deferred compute on the calling task, publishing its value (or recording its failure)
+exactly as an undeferred compute would. Returns `false` without running if `d` was already
+run or abandoned. Failures are recorded for waiters/pollers, not rethrown.
+"""
+function run!(d::DeferredCompute)
+    _claim!(d) || return false
+    try
+        _run_cache_compute!(d.cache, d.key, d.latch, d.f, d.status)
+    catch
+        # recorded in `d.cache.errors` and the substatus by `_run_cache_compute!`
+    end
+    true
+end
+
+"""
+    abandon!(d::DeferredCompute, reason="abandoned") -> Bool
+
+Fail a queued compute without running it: records [`ComputeAbandoned`](@ref) for the key,
+releases its latch (waking blocked accessors) and fails its substatus. Returns `false` if `d`
+was already run or abandoned.
+"""
+function abandon!(d::DeferredCompute, reason::AbstractString="abandoned")
+    _claim!(d) || return false
+    err = ComputeAbandoned(String(reason))
+    c = d.cache
+    lock(c.lock) do
+        get(c.computing, d.key, nothing) === d.latch && delete!(c.computing, d.key)
+        c.errors[d.key] = err
+        notify(d.latch)
+    end
+    !isnothing(d.status) && _fail_substatus!(d.status, err)
+    true
+end
+
+"""
+    Deferred(executor)
+
+Two-phase `fetch` selector that behaves like `identity` — a first-arriving caller gets a
+[`Pending`](@ref) back immediately — but starts the compute by calling
+`executor(d::DeferredCompute)` instead of `Threads.@spawn`. Pass it wherever `fetch=identity`
+is accepted (`memoize!`, `fetchindex`, IP calls, `execute_materialization`).
+
+Use it to put background computes behind a queue or a bounded worker pool so that many heavy
+computes do not all run at once. A minimal FIFO pool of `n` workers:
+
+```julia
+function bounded_executor(n)
+    queue = Channel{DynamicObjects.DeferredCompute}(Inf)
+    for _ in 1:n
+        worker = Threads.@spawn for d in queue
+            DynamicObjects.run!(d)
+        end
+        errormonitor(worker)
+    end
+    d -> put!(queue, d)
+end
+rv = ip(args...; fetch=Deferred(bounded_executor(2)))   # Pending while queued or running
+```
+
+The executor is called with the key's in-flight latch registered and no cache lock held; it
+should return promptly (enqueue, don't compute) unless it deliberately runs inline. See
+[`DeferredCompute`](@ref) for the contract.
+"""
+struct Deferred{E}
+    executor::E
+end
+
+# As a selector a `Deferred` is `identity`: the handle it is applied to is returned as is.
+(::Deferred)(x) = x
+
+_start_compute(::Any, d::DeferredCompute) = (Threads.@spawn run!(d); nothing)
+_start_compute(sel::Deferred, d::DeferredCompute) = (sel.executor(d); nothing)
 
 # Singleton sentinel so a single `get` lookup distinguishes "key absent" from
 # "key present with value === nothing" without allowing collision with any
