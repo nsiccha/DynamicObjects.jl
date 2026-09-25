@@ -5389,6 +5389,17 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         @assert Meta.isexpr(child_result, :escape)
         push!(result.args, child_result.args[1])
     end
+    # Per-name marker dedup: `_never_cache` and `_self_named_index` are keyed
+    # by (type, name) only, but `oproperties` is per-DECLARATION — same-name
+    # declarations (multi-verb routes: `@get x` + `@post x`) would each emit
+    # an identical method, and Julia rejects the duplicate during
+    # precompilation ("Method overwriting is not permitted"). The per-name
+    # emissions below fire only for the first declaration carrying them.
+    # One set per marker, not one shared set: a name may carry `@fresh` on
+    # one declaration and a self-named index on another, and both methods
+    # must still be emitted.
+    _never_cache_emitted = Set{Symbol}()
+    _self_named_emitted = Set{Symbol}()
     # Docstring precedence — without emitting two `@doc` calls (which would
     # warn "Replacing docs" on every Revise reload and, worse, cause
     # `Core.@__doc__` to copy the parent's user docstring onto hoisted
@@ -5695,7 +5706,10 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 # true` so the IP call form routes to the uncached `fresh` instead
                 # of `memoize!`. Per-property (keyed by name only, no indices) —
                 # same direct-`Expr` shape as `cache_version`, not `_call`.
-                if Symbol("@fresh") in info.macros
+                # First declaration wins: same-name repeats would emit an
+                # identical method (see `_never_cache_emitted` above).
+                if Symbol("@fresh") in info.macros && name ∉ _never_cache_emitted
+                    push!(_never_cache_emitted, name)
                     nc_method = Expr(:call,
                         Expr(:., DynamicObjects, QuoteNode(:_never_cache)),
                         :(__self__::$type), :(::Val{$(Meta.quot(name))}),
@@ -5705,7 +5719,9 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 end
                 # See the suppression above: this property has no kwarg named
                 # after itself, so the disk-cache resume value must not be passed.
-                if self_named_index
+                # First declaration wins, as with `_never_cache` above.
+                if self_named_index && name ∉ _self_named_emitted
+                    push!(_self_named_emitted, name)
                     sni_method = Expr(:call,
                         Expr(:., DynamicObjects, QuoteNode(:_self_named_index)),
                         :(__self__::$type), :(::Val{$(Meta.quot(name))}),
