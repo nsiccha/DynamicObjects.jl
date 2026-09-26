@@ -2973,14 +2973,24 @@ function _collect_self_deps_walk!(deps::Set{Symbol}, opaque::Ref{Bool}, e)
     nothing
 end
 
-# Fixed fields that (transitively) invalidate `prop`'s value: the fixed-field
-# leaves reachable from `prop` in the direct-dependency graph. An opaque reach —
-# `prop` opaque, a dependency opaque, or a content-hash dunder in the closure —
-# means independence from a changed field cannot be proven, so ALL fixed fields
-# invalidate (conservative, keeps `remake` carry-over sound-by-construction).
+# Names that (transitively) invalidate `prop`'s value: every fixed-field AND
+# rhs-declared name reachable from `prop` in the direct-dependency graph. A
+# `remake` kwarg may override an rhs-declared property (a cache override, not
+# just a fixed field), so restricting this set to fixed fields serves the
+# overridden property's memoized dependents STALE — silent wrong values. The
+# `isdisjoint(changed_kwargs, invalidators)` gate compares against ALL remake
+# kwargs, so the invalidators must span every overridable name.
+#
+# Returns `(inv, tainted)`. An opaque reach — `prop` itself opaque or an
+# opaque property in the closure — means the dependency set is NOT a sound
+# over-approximation, so NO kwarg change can be proven independent: `tainted`
+# carries only when `remake` changed nothing at all. A content-hash dunder in
+# the closure is taint-free but unprovable from fixed fields alone, so ALL
+# fixed fields invalidate (explicit cache overrides cannot move an identity
+# hash, which derives from fixed fields only).
 const _HASH_DUNDERS = (:__hash__, :__hash_fields__, :__cache_base__, :__cache_path__)
 function _carry_invalidators(prop::Symbol, direct_deps::AbstractDict, fixed_set, opaque_props)
-    (prop in opaque_props) && return copy(fixed_set)
+    (prop in opaque_props) && return (Set{Symbol}(), true)
     inv = Set{Symbol}()
     seen = Set{Symbol}()
     stack = Symbol[prop]
@@ -2989,12 +2999,13 @@ function _carry_invalidators(prop::Symbol, direct_deps::AbstractDict, fixed_set,
         (n in seen) && continue
         push!(seen, n)
         for d in get(direct_deps, n, ())
-            (d in _HASH_DUNDERS || d in opaque_props) && return copy(fixed_set)
-            (d in fixed_set) && push!(inv, d)
+            (d in opaque_props) && return (Set{Symbol}(), true)
+            (d in _HASH_DUNDERS) && return (copy(fixed_set), false)
+            push!(inv, d)
             push!(stack, d)
         end
     end
-    inv
+    (inv, false)
 end
 
 # --- Linter ----------------------------------------------------------------
@@ -5292,10 +5303,12 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     end
     # ── `remake` carry-over bake (decision yf4z8x) ───────────────────────────
     # A memoized bare property may be reused verbatim by `remake` when NONE of
-    # the fixed fields it (transitively) depends on is among the changed kwargs.
-    # Compute each carry-eligible property's invalidating fixed fields and emit a
-    # per-type `_carryover` with them baked as a literal, so the per-property
-    # `isdisjoint(changed_kwargs, invalidators)` gate const-folds at each call.
+    # the names it (transitively) depends on — fixed fields AND rhs-declared
+    # properties — is among the changed kwargs. Compute each carry-eligible
+    # property's invalidating names and emit a per-type `_carryover` with them
+    # baked as a literal, so the per-property `isdisjoint(changed_kwargs,
+    # invalidators)` gate const-folds at each call. Opaque-tainted properties
+    # (whose dependency set is unsound) carry only when nothing changed at all.
     # Excluded (v1): fixed fields, indexed props (not PropertyCache-backed),
     # inline `@struct` children (they wire `__parent__` to the SOURCE object),
     # and the `__…__` machinery/status properties.
@@ -5312,9 +5325,14 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         (isfixed(info) || info.indexed || name in inline_child_names ||
             name in _seen_carry || startswith(String(name), "__")) && continue
         push!(_seen_carry, name)
-        inv = sort!(collect(_carry_invalidators(name, direct_deps, fixed_set, opaque_props)))
-        push!(_carry_calls, :($DynamicObjects._carry1(__obj__, Val(__KW__), Val($(QuoteNode(name))),
-            Val($(Expr(:tuple, (QuoteNode(f) for f in inv)...))))))
+        _inv, _tainted = _carry_invalidators(name, direct_deps, fixed_set, opaque_props)
+        if _tainted
+            push!(_carry_calls, :($DynamicObjects._carry1_tainted(__obj__, Val(__KW__), Val($(QuoteNode(name))))))
+        else
+            _inv_sorted = sort!(collect(_inv))
+            push!(_carry_calls, :($DynamicObjects._carry1(__obj__, Val(__KW__), Val($(QuoteNode(name))),
+                Val($(Expr(:tuple, (QuoteNode(f) for f in _inv_sorted)...))))))
+        end
     end
     _carryover_expr = isempty(_carry_calls) ?
         :($DynamicObjects._carryover(__obj__::$type, ::Val) = (;)) :
@@ -5945,13 +5963,17 @@ end
 # --- `remake` carry-over machinery (decision yf4z8x) ---
 # `_carryover(obj, Val(KW))` returns a NamedTuple of the source's memoized
 # bare-property values that survive a `remake` whose changed kwargs are `KW` —
-# every carry-eligible property none of whose invalidating fixed fields is in
-# `KW`. `@dynamicstruct` bakes a per-type method with each property's
-# invalidators as a literal, so the `isdisjoint` gate below const-folds per
-# call; this generic fallback (untyped `Val`) carries nothing.
+# every carry-eligible property none of whose invalidating names (fixed or
+# rhs-declared) is in `KW`. `@dynamicstruct` bakes a per-type method with each
+# property's invalidators as a literal, so the `isdisjoint` gate below
+# const-folds per call; this generic fallback (untyped `Val`) carries nothing.
+# Opaque-tainted properties carry only when NOTHING changed: their dependency
+# set is unsound, so no kwarg change can be proven independent.
 _carryover(obj, ::Val) = (;)
 @inline _carry1(obj, ::Val{KW}, ::Val{P}, ::Val{INV}) where {KW,P,INV} =
     isdisjoint(KW, INV) ? _carry_if_settled(obj, Val(P)) : (;)
+@inline _carry1_tainted(obj, ::Val{KW}, ::Val{P}) where {KW,P} =
+    isempty(KW) ? _carry_if_settled(obj, Val(P)) : (;)
 struct _CarryMiss end
 const _CARRY_MISS = _CarryMiss()
 # Peek the source cache without triggering compute/wait; carry only a settled
@@ -5971,13 +5993,16 @@ Keyword arguments that correspond to fixed fields replace those field values in
 the new instance. Any remaining keyword arguments are forwarded to the
 constructor as cache pre-population overrides.
 
-Because a `@dynamicstruct` is a pure function of its fixed fields, any already
-memoized property of `obj` whose (transitive) fixed-field dependencies are all
+Because a `@dynamicstruct` is a pure function of its fixed fields and cache
+overrides, any already memoized property of `obj` whose transitive
+dependencies — fixed fields and rhs-declared properties alike — are all
 unchanged is **carried over** to the new instance instead of being recomputed —
 the per-type carry set is baked from the `dependson` graph at macro-expansion,
-so the decision costs nothing at runtime. Impure properties (reading `rand`, the
-clock, or external mutable state) violate this contract and must not be relied
-on across `remake`.
+so the decision costs nothing at runtime. Overriding an rhs-declared property
+therefore recomputes its dependents; properties whose dependency set is
+unprovable (an opaque reach of object state) recompute on any change. Impure
+properties (reading `rand`, the clock, or external mutable state) violate this
+contract and must not be relied on across `remake`.
 
 # Example
 ```julia
