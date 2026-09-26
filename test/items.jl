@@ -14,7 +14,7 @@ using DynamicObjects, Random
 
 export MultiLhs, CachedMultiLhs, ThreeValues, NamedDestr, RenameDestr,
     PrefixDestr, MixedDestr, Clearable, TwoFields, Basic,
-    WithDefault, Remakeable, RemountGraph, Cached, VersionedCache, UnversionedCache,
+    WithDefault, Remakeable, RemakeOverride, RemountGraph, Cached, VersionedCache, UnversionedCache,
     VersionedIndexedCache, Idx, AllDefaults, CallVsBracket, Par, D1,
     LetScope, LambdaScope, SharedDep, AsyncApp, FailingProps, SetPropApp,
     EntriesApp, ClearAllApp, FetchKwargs, FetchFreshProgress,
@@ -104,6 +104,20 @@ end
     x::Float64
     y::Float64
     sum_xy = x + y
+end
+
+# rhs-declared `mid` with a direct dependent (`leaf`), a transitive dependent
+# (`root`), an independent branch (`other`), and an opaque reader (a bare
+# `__self__` handed to a helper, so its dependency set is unprovable).
+_read_mid(o) = o.mid * 2
+@dynamicstruct struct RemakeOverride
+    a::Int
+    b::Int
+    mid = a + 1
+    leaf = mid * 10
+    root = leaf + 1
+    other = b + 100
+    opq = _read_mid(__self__)
 end
 
 _remount_intrinsic_count = Ref(0)
@@ -514,6 +528,50 @@ end
     @test r3.x == 1.0
     @test r3.y == 2.0
     @test r3.sum_xy == 99.0
+end
+
+"""
+Pins that `remake` with an rhs-declared (cache-override) kwarg invalidates the
+overridden property's memoized dependents — directly, transitively, and through
+an opaque reader — instead of carrying them stale (snag
+`remake-override-457e3bc5`, reporter `Bruno:fix-pkpd`: `healthy`/`diseased`
+reported `n_subjects=2` and reseeds were bit-identical, with no error). The
+source MUST be read before the remake: the stale-carry path only triggers for
+settled values, which is why the earlier `remake`-from-fresh-source coverage
+never caught it.
+"""
+@testitem "remake invalidates dependents of overridden rhs-declared properties" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
+    orig = RemakeOverride(1, 2)
+    # Memoize everything on the SOURCE first — stale carry needs settled values.
+    @test orig.leaf == 20
+    @test orig.root == 21
+    @test orig.other == 102
+    @test orig.opq == 4
+
+    # Overriding `mid` lands on `mid` and recomputes every (transitive) dependent.
+    r = remake(orig; mid=43)
+    @test r.mid == 43
+    @test r.leaf == 430
+    @test r.root == 431
+    # The opaque reader's dependency set is unprovable, so any change recomputes it.
+    @test r.opq == 86
+    # The independent branch still carries its settled value.
+    @test r.other == 102
+
+    # Overriding a dependent itself: the override wins, ITS dependents recompute.
+    r2 = remake(orig; leaf=7)
+    @test r2.leaf == 7
+    @test r2.root == 8
+    @test r2.mid == 2
+    @test r2.opq == 4
+
+    # Fixed-field changes are unaffected: the whole downstream recomputes.
+    r3 = remake(orig; a=5)
+    @test r3.mid == 6
+    @test r3.leaf == 60
+    @test r3.root == 61
+    @test r3.opq == 12
+    @test r3.other == 102
 end
 
 @testitem "remount retains intrinsic cache identity and rebinds context" tags=[:core] setup=[DOImports, DOFixtures] begin
