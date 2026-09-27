@@ -4831,8 +4831,19 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         # won't hit it because the parent wrapper's call signature enforces
         # them at the call site).
         for (kname, kdefault) in index_kwargs
-            rhs = kdefault === nothing ? nothing : something(kdefault)
-            push!(prepend, :($kname = $rhs))
+            # A required kwarg (no user default) falls back to `nothing` —
+            # but it must be the literal-source `nothing` (a Symbol, like
+            # the `:($ip = nothing)` index prepend above), NEVER the
+            # interpolated value: `Expr(:(=), k, nothing)` has
+            # `rhs === nothing`, which `isfixed` reads as "no rhs" and
+            # lowers to a FIXED STRUCT FIELD — and then the kwargs-only
+            # child constructor call matches no method (snag
+            # required-indexed-165c772b).
+            if kdefault === nothing
+                push!(prepend, :($kname = nothing))
+            else
+                push!(prepend, :($kname = $(something(kdefault))))
+            end
         end
         if will_prepend_hash_fields
             push!(prepend, :(__hash_fields__ = $(Expr(:tuple, :__parent__, index_params..., kwarg_names...))))
@@ -4896,8 +4907,21 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         # `__status__ = __parent__.__status__` inherits the parent's status
         # directly without creating a child progress node.
         if !(:__status__ in child_props)
+            # Forward the call-site indices AND kwargs into the
+            # `__substatus__` probe: the emitted `_is_property_documented`
+            # / `_property_description` overrides carry the property's full
+            # signature, so a required kwarg (e.g. `K` in `@struct
+            # rows(key; K::Int)`) must be supplied here — dropping it dies
+            # with `UndefKeywordError` before the body runs (snag
+            # required-indexed-165c772b). `Expr(:call)` layout is (func,
+            # [parameters], positional...): the parameters block goes right
+            # after the callee.
+            substatus_args = Any[compute_property, :__self__, :(Val(:__substatus__)),
+                QuoteNode(prop_name), index_params...]
+            !isempty(index_kwargs) && insert!(substatus_args, 2,
+                Expr(:parameters, [Expr(:kw, kn, kn) for (kn, _) in index_kwargs]...))
             push!(constructor_kwargs,
-                Expr(:kw, :__status__, Expr(:call, compute_property, :__self__, :(Val(:__substatus__)), QuoteNode(prop_name), index_params...)))
+                Expr(:kw, :__status__, Expr(:call, substatus_args...)))
         end
         constructor = Expr(:call, gen_name, Expr(:parameters, constructor_kwargs...))
         # Use `index_param_exprs` (typed `:(name::T)` when annotated, bare
