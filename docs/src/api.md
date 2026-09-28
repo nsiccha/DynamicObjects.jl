@@ -101,3 +101,46 @@ key_tracker
 record!
 load_keys
 ```
+
+## Composite mmap formats
+
+An extension implements both `DynamicObjects.save(Val(:mmap), path, value)` and
+`DynamicObjects.load(Val(:mmap), path, Type)`. Register a distinct leading magic
+with `DynamicObjects.register_mmap_container!(magic::AbstractVector{UInt8}, loader)`
+from the extension's `__init__`; `loader(path)` handles unannotated properties.
+DO supplies the writer with an unpublished sibling temporary path and renames
+it atomically after `save` succeeds. The extension must close and validate its
+whole envelope before returning, including its structural metadata and EOF.
+
+Composite containers can reuse DOMM numeric blocks without copying DO's type
+registry, alignment or mmap implementation:
+
+```julia
+path = tempname()
+blocks = open(path, "w") do io
+    write(io, "container-prefix")
+    map(([1.0, 2.0], fill(Int16(3)))) do array
+        start = position(io)
+        DynamicObjects.save(Val(:mmap), io, array)
+        (start, position(io))
+    end
+end
+arrays = open(path, "r") do io
+    map(blocks) do (start, stop)
+        seek(io, start)
+        DynamicObjects.load(Val(:mmap), io; end_offset=stop)
+    end
+end
+# arrays == ([1.0, 2.0], fill(Int16(3))); mappings survive the stream close.
+```
+
+Stream overloads leave stream ownership with the caller. Loads require a
+read-only file stream and advance to the exact numeric block end. Supply the
+exclusive `end_offset` stored by the envelope to keep a corrupt leaf header from
+mapping the next leaf's bytes. Stream loading handles numeric DOMM blocks; the
+container registry remains the path-level format dispatcher.
+
+```@docs
+DynamicObjects.save
+DynamicObjects.load
+```

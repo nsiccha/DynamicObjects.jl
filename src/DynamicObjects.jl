@@ -149,21 +149,56 @@ _mmap_eltype_of(tag::UInt8) = let i = Int(tag)
     _MMAP_ELTYPE_TAGS[i]
 end
 
-function save(::Val{:mmap}, path::AbstractString, x::AbstractArray)
+function _mmap_prepare_array(x::AbstractArray)
     A = x isa Array ? x : Array(x)   # ensure dense column-major isbits payload
     isbitstype(eltype(A)) || error("@mmap: array eltype $(eltype(A)) is not isbits; only isbits arrays can be memory-mapped.")
-    tag = _mmap_tag_of(eltype(A))
+    ndims(A) <= _MMAP_MAXDIMS || error("@mmap: array ndims $(ndims(A)) exceeds the supported maximum $_MMAP_MAXDIMS.")
+    A, _mmap_tag_of(eltype(A))
+end
+
+function _mmap_write_array(io::IO, A::Array, tag::UInt8)
+    start = position(io)
+    write(io, _MMAP_MAGIC...)
+    write(io, _MMAP_VERSION)
+    write(io, tag)
+    write(io, UInt8(ndims(A)))
+    for d in size(A); write(io, Int64(d)); end
+    position(io) == start + 7 + 8ndims(A) || error("@mmap: incomplete numeric header write.")
+    pad = mod(-position(io), _MMAP_ALIGN)
+    write(io, zeros(UInt8, pad))
+    offset = position(io)
+    len = sizeof(A)
+    write(io, A) == len || error("@mmap: incomplete numeric payload write (expected $len bytes).")
+    position(io) == offset + len || error("@mmap: incomplete numeric payload write.")
+    (offset, len)
+end
+
+"""
+    DynamicObjects.save(Val(:mmap), io::IO, array::AbstractArray)
+
+Write a self-describing DOMM numeric array block at `position(io)` and leave
+`io` open at its end. Return the dense array written, without mutating the input.
+Supports the same numeric element types as the path overload, including empty
+and zero-dimensional arrays. Payload alignment is relative to the whole stream.
+
+Composite mmap formats can record the starting and ending positions of each
+block and reuse [`load`](@ref). This overload flushes and checks the block write;
+the enclosing format must also validate its complete file after closing its
+writer. When implementing `save(Val(:mmap), path, container)`, DO supplies an
+unpublished temporary path and atomically publishes it only after `save` returns.
+"""
+function save(::Val{:mmap}, io::IO, x::AbstractArray)
+    A, tag = _mmap_prepare_array(x)
+    offset, len = _mmap_write_array(io, A, tag)
+    flush(io)
+    io isa IOStream && _mmap_check_complete(io, "numeric block", offset, len)
+    A
+end
+
+function save(::Val{:mmap}, path::AbstractString, x::AbstractArray)
+    A, tag = _mmap_prepare_array(x)
     offset, len = open(path, "w") do io
-        write(io, _MMAP_MAGIC...)
-        write(io, _MMAP_VERSION)
-        write(io, tag)
-        write(io, UInt8(ndims(A)))
-        for d in size(A); write(io, Int64(d)); end
-        pad = mod(-position(io), _MMAP_ALIGN)
-        write(io, zeros(UInt8, pad))
-        offset = position(io)
-        write(io, A)
-        (offset, sizeof(A))
+        _mmap_write_array(io, A, tag)
     end
     # `IOStream.write` may return normally after a short write on a full disk
     # (observed on macOS). Validate after `close` has flushed the stream, before
@@ -229,9 +264,15 @@ end
 # permissions, not on the payload actually being there. Check it ourselves.
 function _mmap_check_complete(io::IO, path, offset::Int, len::Int)
     fsz = filesize(io)
-    need = offset + len
+    need = _mmap_payload_end(offset, len, path)
     fsz >= need && return nothing
     error("@mmap: $path is truncated — need $need bytes (header offset $offset + payload $len) but the file holds $fsz. A partial cache file; it will be deleted and recomputed.")
+end
+
+function _mmap_payload_end(offset::Int, len::Int, path)
+    need, ovf = Base.Checked.add_with_overflow(offset, len)
+    ovf && error("@mmap: payload end overflows in $path — corrupt header.")
+    need
 end
 
 # Validate a newly-written mmap file after the write stream has been closed.
@@ -246,15 +287,54 @@ function _mmap_check_written_complete(path, offset::Int, len::Int)
 end
 
 # Annotated fast path: the property's `::T` array type is known → type-stable.
+function _mmap_array_type(::Type{A}, tag, nd, path) where {A<:AbstractArray}
+    ET, N = eltype(A), ndims(A)
+    nd == N || error("@mmap: header ndims $nd ≠ annotated ndims $N for $path.")
+    _mmap_eltype_of(tag) === ET || error("@mmap: header eltype $(_mmap_eltype_of(tag)) ≠ annotated eltype $ET for $path.")
+    Array{ET,N}
+end
+_mmap_array_type(::Nothing, tag, nd, path) = Array{_mmap_eltype_of(tag),nd}
+
+function _mmap_load_array(io::IOStream, path, annotation; end_offset::Integer=filesize(io))
+    0 <= position(io) <= end_offset <= filesize(io) ||
+        throw(ArgumentError("@mmap: invalid numeric block bounds for $path."))
+    tag, nd, dims, offset = _mmap_read_header(io)
+    A = _mmap_array_type(annotation, tag, nd, path)
+    len = _mmap_payload_bytes(eltype(A), dims, path)
+    _mmap_check_complete(io, path, offset, len)
+    stop = _mmap_payload_end(offset, len, path)
+    stop <= end_offset || error("@mmap: numeric block in $path exceeds end_offset $end_offset (needs $stop bytes).")
+    result = Mmap.mmap(io, A, Tuple(dims), offset)
+    seek(io, stop)
+    result
+end
+
+"""
+    DynamicObjects.load(Val(:mmap), io::IOStream, annotation=nothing; end_offset=filesize(io))
+
+Read a DOMM numeric array block from `position(io)` and memory-map its payload.
+`io` must be a read-only file stream. Leave it open at the block's end; the array
+remains valid after the caller closes the stream. An optional array type checks
+the stored element type and number of dimensions; `nothing` reads them from the
+header. Only numeric DOMM blocks are supported by the stream overload.
+
+Set `end_offset` to the exclusive end of an embedded block so a corrupt header
+cannot map bytes belonging to the next block. Header dimensions, byte-count
+overflow, file truncation and this enclosing boundary are checked before mapping.
+"""
+function load(::Val{:mmap}, io::IOStream, ::Type{A}; end_offset::Integer=filesize(io)) where {A<:AbstractArray}
+    iswritable(io) && throw(ArgumentError("@mmap: load requires a read-only file stream."))
+    _mmap_load_array(io, "numeric block", A; end_offset)
+end
+function load(::Val{:mmap}, io::IOStream, ::Nothing=nothing; end_offset::Integer=filesize(io))
+    iswritable(io) && throw(ArgumentError("@mmap: load requires a read-only file stream."))
+    _mmap_load_array(io, "numeric block", nothing; end_offset)
+end
+
 function load(::Val{:mmap}, path::AbstractString, ::Type{A}) where {A<:AbstractArray}
-    ET = eltype(A); N = ndims(A)
     io = open(path, "r")
     try
-        tag, nd, dims, offset = _mmap_read_header(io)
-        nd == N || error("@mmap: header ndims $nd ≠ annotated ndims $N for $path.")
-        _mmap_eltype_of(tag) === ET || error("@mmap: header eltype $(_mmap_eltype_of(tag)) ≠ annotated eltype $ET for $path.")
-        _mmap_check_complete(io, path, offset, _mmap_payload_bytes(ET, dims, path))
-        Mmap.mmap(io, Array{ET,N}, NTuple{N,Int}(dims), offset)
+        _mmap_load_array(io, path, A)
     finally
         close(io)   # mapping survives the fd close
     end
@@ -320,10 +400,7 @@ _check_mmap_annotation(::Symbol, ::Symbol, ::Any) = nothing
 function _mmap_load_domm(path::AbstractString)
     io = open(path, "r")
     try
-        tag, nd, dims, offset = _mmap_read_header(io)
-        ET = _mmap_eltype_of(tag)
-        _mmap_check_complete(io, path, offset, _mmap_payload_bytes(ET, dims, path))
-        Mmap.mmap(io, Array{ET,nd}, NTuple{nd,Int}(dims), offset)
+        _mmap_load_array(io, path, nothing)
     finally
         close(io)
     end
