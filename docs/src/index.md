@@ -309,6 +309,44 @@ stale `.sjl` files to load:
 The version mixes into the cache filename
 (`result_v2.sjl`); old `result.sjl` files just sit there until cleared.
 
+#### Callable arguments and named statistic bundles
+
+Persistent indexed requests accept Julia callables directly, including named
+functions, closures from a stable factory with numeric captures, and immutable
+callable structs with serializable configuration. A named bundle preserves the
+requested statistic names and evaluates all its functions against the same input:
+
+```julia
+scaled_total(factor) = input -> factor * sum(input)
+
+@dynamicstruct struct Statistics
+    input::NTuple{3,Float64}
+    @cached v"1" summary(statistics) = map(f -> f(input), statistics)
+end
+
+request = (total=sum, scaled=scaled_total(2))
+stats = Statistics((1.0, 2.0, 3.0); __cache_base__="statistics-cache")
+stats.summary(request) # (total=6.0, scaled=12.0)
+Statistics((1.0, 2.0, 3.0); __cache_base__="statistics-cache").summary(request)
+# Reuses the disk entry, including in a new process with the same definitions.
+stats.summary((total=sum, scaled=scaled_total(3))) # different capture, new entry
+```
+
+Keys use Julia Serialization, including closure captures and callable-struct
+fields; they do not substitute a transient process ID or a display name for the
+argument. Named methods are serialized by reference, so their identity is **not**
+a fingerprint of their implementation. Bump `@cached v"…"` or `@mmap v"…"` when
+changing statistic bodies, their helpers, or uncaptured global configuration.
+Reconstruct the owner or clear its memory caches to discard existing live memos.
+DO does not automatically track callable method changes or external state.
+
+Keep inputs, captures, trajectories handed to callbacks, and published results
+read-only. Pass external configuration explicitly as serializable request values;
+process-local handles and stateful callables are not a supported durable identity.
+Cross-version serialization stability is not promised. The cold-process fixture
+covers named functions, scalar captures, an immutable callable struct, positional
+and keyword arguments, named bundles, and explicit implementation-version changes.
+
 #### Disk-write locking: `__strict__`
 
 `__strict__ = true` (the default) makes `@cached` writes go through a per-path
