@@ -149,21 +149,29 @@ _mmap_eltype_of(tag::UInt8) = let i = Int(tag)
     _MMAP_ELTYPE_TAGS[i]
 end
 
-function save(::Val{:mmap}, path::AbstractString, x::AbstractArray)
+function _mmap_prepare_array(x::AbstractArray)
     A = x isa Array ? x : Array(x)   # ensure dense column-major isbits payload
     isbitstype(eltype(A)) || error("@mmap: array eltype $(eltype(A)) is not isbits; only isbits arrays can be memory-mapped.")
-    tag = _mmap_tag_of(eltype(A))
+    A, _mmap_tag_of(eltype(A))
+end
+
+function _mmap_write_array(io::IO, A::Array, tag::UInt8)
+    write(io, _MMAP_MAGIC...)
+    write(io, _MMAP_VERSION)
+    write(io, tag)
+    write(io, UInt8(ndims(A)))
+    for d in size(A); write(io, Int64(d)); end
+    pad = mod(-position(io), _MMAP_ALIGN)
+    write(io, zeros(UInt8, pad))
+    offset = position(io)
+    write(io, A)
+    (offset, sizeof(A))
+end
+
+function save(::Val{:mmap}, path::AbstractString, x::AbstractArray)
+    A, tag = _mmap_prepare_array(x)
     offset, len = open(path, "w") do io
-        write(io, _MMAP_MAGIC...)
-        write(io, _MMAP_VERSION)
-        write(io, tag)
-        write(io, UInt8(ndims(A)))
-        for d in size(A); write(io, Int64(d)); end
-        pad = mod(-position(io), _MMAP_ALIGN)
-        write(io, zeros(UInt8, pad))
-        offset = position(io)
-        write(io, A)
-        (offset, sizeof(A))
+        _mmap_write_array(io, A, tag)
     end
     # `IOStream.write` may return normally after a short write on a full disk
     # (observed on macOS). Validate after `close` has flushed the stream, before
@@ -246,15 +254,25 @@ function _mmap_check_written_complete(path, offset::Int, len::Int)
 end
 
 # Annotated fast path: the property's `::T` array type is known → type-stable.
+function _mmap_array_type(::Type{A}, tag, nd, path) where {A<:AbstractArray}
+    ET, N = eltype(A), ndims(A)
+    nd == N || error("@mmap: header ndims $nd ≠ annotated ndims $N for $path.")
+    _mmap_eltype_of(tag) === ET || error("@mmap: header eltype $(_mmap_eltype_of(tag)) ≠ annotated eltype $ET for $path.")
+    Array{ET,N}
+end
+_mmap_array_type(::Nothing, tag, nd, path) = Array{_mmap_eltype_of(tag),nd}
+
+function _mmap_load_array(io::IOStream, path, annotation)
+    tag, nd, dims, offset = _mmap_read_header(io)
+    A = _mmap_array_type(annotation, tag, nd, path)
+    _mmap_check_complete(io, path, offset, _mmap_payload_bytes(eltype(A), dims, path))
+    Mmap.mmap(io, A, Tuple(dims), offset)
+end
+
 function load(::Val{:mmap}, path::AbstractString, ::Type{A}) where {A<:AbstractArray}
-    ET = eltype(A); N = ndims(A)
     io = open(path, "r")
     try
-        tag, nd, dims, offset = _mmap_read_header(io)
-        nd == N || error("@mmap: header ndims $nd ≠ annotated ndims $N for $path.")
-        _mmap_eltype_of(tag) === ET || error("@mmap: header eltype $(_mmap_eltype_of(tag)) ≠ annotated eltype $ET for $path.")
-        _mmap_check_complete(io, path, offset, _mmap_payload_bytes(ET, dims, path))
-        Mmap.mmap(io, Array{ET,N}, NTuple{N,Int}(dims), offset)
+        _mmap_load_array(io, path, A)
     finally
         close(io)   # mapping survives the fd close
     end
@@ -320,10 +338,7 @@ _check_mmap_annotation(::Symbol, ::Symbol, ::Any) = nothing
 function _mmap_load_domm(path::AbstractString)
     io = open(path, "r")
     try
-        tag, nd, dims, offset = _mmap_read_header(io)
-        ET = _mmap_eltype_of(tag)
-        _mmap_check_complete(io, path, offset, _mmap_payload_bytes(ET, dims, path))
-        Mmap.mmap(io, Array{ET,nd}, NTuple{nd,Int}(dims), offset)
+        _mmap_load_array(io, path, nothing)
     finally
         close(io)
     end
