@@ -73,14 +73,14 @@ using DynamicObjects
 empty!(SEED_CALLS)
 o = SeedInlineOwner("/base")
 e = o.editor("a.txt")
-@test e.abs_path == "/base/a.txt"
+@test e.abs_path == joinpath("/base", "a.txt")
 @test e.__parent__ === o
 @test SEED_CALLS[(:abs_path, "a.txt")] == 1
 
 clear_mem_caches!(e)
 
 @test e.__parent__ === o
-@test e.abs_path == "/base/a.txt"
+@test e.abs_path == joinpath("/base", "a.txt")
 @test SEED_CALLS[(:abs_path, "a.txt")] == 2
 end
 
