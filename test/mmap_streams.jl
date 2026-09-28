@@ -70,15 +70,20 @@ open(path, "r+") do io
     @test_throws ArgumentError DynamicObjects.load(Val(:mmap), io)
 end
 
-# Atomic replacement must leave previously published mappings on the old inode.
-standalone = tempname()
-DynamicObjects.save(Val(:mmap), standalone, first(inputs))
-old = DynamicObjects.load(Val(:mmap), standalone)
-replacement = Float32[11 12; 13 14]
-DynamicObjects._atomic_save(Val(:mmap), standalone, replacement)
-@test old == first(originals)
-@test DynamicObjects.load(Val(:mmap), standalone) == replacement
-@test first(inputs) == first(originals)
+# Windows does not permit replacing a file with a live mapping. Unix must keep
+# the old inode's published bytes stable while the new entry becomes visible.
+if Sys.iswindows()
+    @test_skip "atomic replacement of a live mmap requires Unix file semantics"
+else
+    standalone = tempname()
+    DynamicObjects.save(Val(:mmap), standalone, first(inputs))
+    old = DynamicObjects.load(Val(:mmap), standalone)
+    replacement = Float32[11 12; 13 14]
+    DynamicObjects._atomic_save(Val(:mmap), standalone, replacement)
+    @test old == first(originals)
+    @test DynamicObjects.load(Val(:mmap), standalone) == replacement
+    @test first(inputs) == first(originals)
+end
 end
 
 @testitem "DOMM stream loaders reject truncated and overflowing payloads before mapping" tags=[:core] begin
