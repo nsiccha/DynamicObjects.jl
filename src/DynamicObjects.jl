@@ -712,12 +712,19 @@ end
 
 Per-DO-instance memoization cache for `@dynamicstruct` properties. `cache::D` is
 the underlying `Dict` (`:serial`) or `ThreadsafeDict` (`:parallel`) holding the
-memoized values for non-indexed properties.
+memoized values for non-indexed properties. `seed` is the exact kwargs the
+instance (or, for a [`remount`](@ref) view, the view) was created with: instance
+inputs, not derived memos. [`clear_mem_caches!`](@ref) drops the memos and
+restores the seeds, so constructor wiring (`__parent__`, index params, property
+overrides, request context) survives a clear instead of recomputing from a
+fallback or throwing `MethodError` for an undeclared name.
 """
 struct PropertyCache{D<:AbstractDict{Symbol,Any}}
     cache::D
-    PropertyCache(D, c::NamedTuple) = new{D{Symbol,Any}}(D{Symbol,Any}(pairs(c)))
-    PropertyCache(c::D) where {D<:AbstractDict{Symbol,Any}} = new{D}(c)
+    seed::NamedTuple
+    PropertyCache(D, c::NamedTuple) = new{D{Symbol,Any}}(D{Symbol,Any}(pairs(c)), c)
+    PropertyCache(c::D) where {D<:AbstractDict{Symbol,Any}} = new{D}(c, (;))
+    PropertyCache(c::D, seed::NamedTuple) where {D<:AbstractDict{Symbol,Any}} = new{D}(c, seed)
 end
 
 
@@ -1672,6 +1679,16 @@ Clear all in-memory memoized property values on a `@dynamicstruct` instance,
 leaving disk caches (`@cached` files) untouched. Every derived property —
 including child DOs stored as values — will be recomputed on next access.
 
+Constructor-passed inputs are NOT dropped: the kwargs the instance was created
+with (`__parent__` wiring, inline-child index params, property overrides such
+as `__status__ = nothing`) are restored after the clear, so the instance keeps
+its meaning and only derived memos recompute. Without this a cleared parented
+child could never recompute: an undeclared `__parent__` has no
+`compute_property` fallback (`MethodError`), and a declared one falls back to
+`nothing`. The same holds for a [`remount`](@ref) view, whose request context
+is restored into the view-local overlay (and the retained object's own inputs
+back into the shared cache).
+
 Indexed-property entries are dropped from the per-argument subcaches
 themselves, not merely by dropping the top-level wrapper: a live
 [`remount`](@ref) request view (or any destructured wrapper handle) shares
@@ -1687,7 +1704,8 @@ In-flight semantics: as with [`invalidate!`](@ref), a compute running at
 clear time still lands if its slot is empty when it finishes.
 """
 function clear_mem_caches!(obj)
-    c = getfield(obj, :cache).cache
+    pc = getfield(obj, :cache)
+    c = pc.cache
     # Snapshot the wrapper subcaches under the top lock, then empty each under
     # its own lock. A per-argument subcache object outlives the top-level
     # wrapper entry through every alias — a mounted request view shares it by
@@ -1697,6 +1715,39 @@ function clear_mem_caches!(obj)
     end
     empty!(c)
     foreach(empty!, subcaches)
+    _restore_seeds!(pc)
+    nothing
+end
+
+# Internal unconditional store into a cache dict, for seed restoration and
+# `remake` carry-over writes. The public `setproperty!` stays refused; these
+# are DO's own instance-input writes. A `ThreadsafeDict` has no `setindex!`
+# (stores normally publish through the `get!` machinery), so write the backing
+# dict under the lock directly.
+_seed_store!(c::ThreadsafeDict, key::Symbol, value) = lock(c.lock) do
+    c.cache[key] = value
+end
+_seed_store!(c::AbstractDict, key::Symbol, value) = setindex!(c, value, key)
+
+# Restore the creation inputs (`PropertyCache.seed`) after `empty!` dropped
+# everything. For a remounted view the seed is the request context, which
+# routes back into the view-local overlay via the mounted `setindex!` (always
+# a local shadow); the retained object's own inputs are restored into the
+# shared cache alongside, since `empty!` on a view clears both.
+function _restore_seeds!(pc::PropertyCache)
+    c = pc.cache
+    if c isa MountedThreadsafeDict
+        for (key, value) in pairs(pc.seed)
+            c[key] = value
+        end
+        for (key, value) in pairs(getfield(c.source, :cache).seed)
+            _seed_store!(c.shared, key, value)
+        end
+    else
+        for (key, value) in pairs(pc.seed)
+            _seed_store!(c, key, value)
+        end
+    end
     nothing
 end
 
@@ -6049,9 +6100,20 @@ function _remake(obj::T, nt::NamedTuple{KW}) where {T,KW}
     args = Any[haskey(nt, n) ? nt[n] : getfield(obj, n) for n in fixed]
     # Reuse the source's still-valid memoized properties; explicit cache
     # pre-population kwargs (non-fixed-field) override any carried value.
+    # Carried values are written into the new cache AFTER construction rather
+    # than passed as constructor kwargs: they are still-valid memos, not
+    # instance inputs, so a later `clear_mem_caches!` must drop (recompute)
+    # them while the explicit seeds survive.
     carried = _carryover(obj, Val(KW))
     explicit = Base.structdiff(nt, NamedTuple{fixed})
-    T(args...; carried..., explicit...)
+    remade = T(args...; explicit...)
+    if !isempty(carried)
+        c = getfield(remade, :cache).cache
+        for (key, value) in pairs(carried)
+            haskey(explicit, key) || _seed_store!(c, key, value)
+        end
+    end
+    remade
 end
 
 # --- immutable cache remounting ------------------------------------------------
@@ -6234,7 +6296,9 @@ function _remount_impl(obj, nt::NamedTuple, forced_local=())
     _validate_remount_keys(source, changed)
     invalidated, local_names = _remount_partition(source, shared, changed, forced_local)
     mounted = MountedThreadsafeDict(shared, source, local_names, invalidated, nt)
-    pc = PropertyCache(mounted)
+    # The request context is this view's creation input: record it as the
+    # seed so `clear_mem_caches!` on the view restores it into the overlay.
+    pc = PropertyCache(mounted, nt)
     T = typeof(source)
     fixed = fieldnames(T)[1:end-1]
     args = Any[getfield(source, name) for name in fixed]
