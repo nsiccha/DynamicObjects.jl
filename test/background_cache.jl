@@ -463,3 +463,71 @@ v = poll_advanced(() -> c["a"], v_old)
 @test v[1] == :v && v != v_old
 poll_quiet(c)
 end
+
+@testitem "on_settle fires after each store with the previous value" setup=[BackgroundCacheFixtures] begin
+using DynamicObjects
+
+# ttl=60: settled reads never kick, so the callback's re-entrant read observes
+# without disturbing and each phase settles exactly once.
+events = Channel{Any}(4)
+seen = Channel{Any}(4)
+gen = Ref(0)
+build = k -> (gen[] += 1; (:v, gen[]))
+c = BackgroundCache{String,Tuple{Symbol,Int}}(build; ttl=60.0, unbuilt=(:none, 0),
+    on_settle=(k, old, new) -> begin
+        put!(events, (k, old, new))
+        # Re-entrant read: the callback runs outside the lock after the store,
+        # so this must observe the new value (and, at ttl=60, kick nothing).
+        put!(seen, c[k])
+    end)
+
+# First settle: old is unbuilt, and the callback already sees the new value.
+@test c["a"] == (:none, 0)
+@test take!(events) == ("a", (:none, 0), (:v, 1))
+@test take!(seen) == (:v, 1)
+@test poll_value_quiet(c, "a", (:v, 1)) == (:v, 1)
+
+# Re-settle (white-box, synchronous on the main task — no timing): old is the
+# previously settled value.
+DynamicObjects._run_swr_refresh!(c, "a")
+@test take!(events) == ("a", (:v, 1), (:v, 2))
+@test take!(seen) == (:v, 2)
+@test poll_value_quiet(c, "a", (:v, 2)) == (:v, 2)
+poll_quiet(c)
+end
+
+@testitem "on_settle fires per key in batch mode; callback errors are logged" setup=[BackgroundCacheFixtures] begin
+using DynamicObjects, Logging
+
+events = Channel{Any}(4)
+build_many = ks -> Dict{String,Any}(k => (:v, k) for k in ks)
+logger = CollectLogger()
+c = BackgroundCache{String,Any}(build_many; batch=10, ttl=60.0, unbuilt=:unbuilt,
+    on_settle=(k, old, new) -> begin
+        k == "bad" && error("boom-settle-", k)
+        put!(events, (k, old, new))
+    end)
+
+old = global_logger(logger)
+try
+    @test c["a"] === :unbuilt
+    @test c["bad"] === :unbuilt
+    # One batch or two (schedule-dependent), but each key settles exactly once:
+    # "a" reports its settle, "bad" throws out of its callback.
+    @test take!(events) == ("a", :unbuilt, (:v, "a"))
+    poll_settled(() -> nrecords(logger), 1)
+    rec = only(snaprecords(logger))
+    @test rec.level == Logging.Error
+    @test rec.message == "BackgroundCache on_settle callback failed"
+    @test rec.kwargs[:key] == "bad"
+    ex, bt = rec.kwargs[:exception]
+    @test ex isa ErrorException
+    @test bt isa Vector && !isempty(bt)
+    # The throwing callback broke nothing: "bad" still settled, nothing else logged.
+    @test poll_value_quiet(c, "bad", (:v, "bad")) == (:v, "bad")
+    poll_quiet(c)
+    @test nrecords(logger) == 1
+finally
+    global_logger(old)
+end
+end
