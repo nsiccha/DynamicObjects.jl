@@ -319,3 +319,138 @@ sleep(0.06)
 poll_quiet(c)
 poll_quiet(cinf)
 end
+
+@testitem "batched builds drain up to batch keys per call" setup=[BackgroundCacheFixtures] begin
+using DynamicObjects
+
+@test_throws ArgumentError BackgroundCache{String,Int}(ks -> Dict{String,Int}(); ttl=1.0, unbuilt=0, batch=0)
+@test_throws ArgumentError BackgroundCache{String,Int}(ks -> Dict{String,Int}(); ttl=1.0, unbuilt=0, batch=-2)
+
+ncalls = Ref(0)
+sizes = Channel{Int}(8)
+gate = Channel{Nothing}(8)
+# Bump BEFORE the gate (see the concurrent-readers item): the count observes
+# calls, so a spurious extra call blocks on the empty gate and fails closed via
+# the quiescence poll below instead of passing silently.
+build_many = function (ks)
+    ncalls[] += 1
+    take!(gate)
+    put!(sizes, length(ks))
+    Dict{String,Tuple{Symbol,Int}}(k => (:v, 1) for k in ks)
+end
+c = BackgroundCache{String,Tuple{Symbol,Int}}(build_many; batch=2, ttl=60.0, unbuilt=(:none, 0))
+
+keys = ["k$i" for i in 1:5]
+for k in keys
+    @test c[k] == (:none, 0)
+end
+# All five are wanted before the first build may land: the first claim takes 1
+# or 2 keys (schedule-dependent), the rest drain maximally — 3 calls either
+# way, each carrying at most `batch` keys, every key built exactly once.
+for _ in 1:3
+    put!(gate, nothing)
+end
+for k in keys
+    @test poll_value_quiet(c, k, (:v, 1)) == (:v, 1)
+end
+poll_quiet(c)
+@test ncalls[] == 3
+seen = [take!(sizes) for _ in 1:3]
+@test all(<=(2), seen)
+@test sum(seen) == 5
+end
+
+@testitem "a thrown batch fails every key with per-key backoff and logging" setup=[BackgroundCacheFixtures] begin
+using DynamicObjects, Logging
+
+ncalls = Ref(0)
+build_many = ks -> (ncalls[] += 1; error("boom-batch"))
+logger = CollectLogger()
+c = BackgroundCache{String,Any}(build_many; batch=10, ttl=0, unbuilt=:unbuilt,
+                                backoff_base=30.0, backoff_max=30.0)
+
+old = global_logger(logger)
+try
+    @test c["a"] === :unbuilt
+    @test c["b"] === :unbuilt
+    # One log per key whether the two shared one batch call or split across
+    # two (the batching shape is pinned by the gated item above; this item owns
+    # the per-key failure contract).
+    poll_settled(() -> nrecords(logger), 2)
+    recs = snaprecords(logger)
+    @test sort!([r.kwargs[:key] for r in recs]) == ["a", "b"]
+    @test all(r -> r.level == Logging.Error, recs)
+    for r in recs
+        ex, bt = r.kwargs[:exception]
+        @test ex isa ErrorException
+        @test bt isa Vector && !isempty(bt)
+    end
+    # Gated: further reads serve unbuilt without kicking (the 30 s gate
+    # outlasts any scheduling stall, so this holds on any schedule).
+    calls_seen = ncalls[]
+    @test c["a"] === :unbuilt
+    @test c["b"] === :unbuilt
+    @test ncalls[] == calls_seen
+    @test nrecords(logger) == 2
+    poll_quiet(c)
+finally
+    global_logger(old)
+end
+end
+
+@testitem "keys missing from a batch result fail per key while present keys settle" setup=[BackgroundCacheFixtures] begin
+using DynamicObjects, Logging
+
+ncalls = Ref(0)
+# Settles "a", drops "b": a missing key counts as a per-key failure with
+# backoff. The first batch always contains "a" ("a" is wanted before "b" is
+# read and before the drain's first claim), so "a" settles on call 1 whether
+# the two share one call or split across two.
+build_many = ks -> (ncalls[] += 1; Dict{String,Any}("a" => (:v, ncalls[])))
+logger = CollectLogger()
+c = BackgroundCache{String,Any}(build_many; batch=10, ttl=60.0, unbuilt=:unbuilt,
+                                backoff_base=30.0, backoff_max=30.0)
+
+old = global_logger(logger)
+try
+    @test c["a"] === :unbuilt
+    @test c["b"] === :unbuilt
+    poll_settled(() -> nrecords(logger), 1)
+    rec = only(snaprecords(logger))
+    @test rec.level == Logging.Error
+    @test rec.kwargs[:key] == "b"
+    ex, bt = rec.kwargs[:exception]
+    @test ex isa KeyError
+    @test bt isa Vector && !isempty(bt)
+    # "a" settled from the same batch (settles precede the missing-key log on
+    # either schedule); "b" stays unbuilt behind its gate.
+    @test poll_value_quiet(c, "a", (:v, 1)) == (:v, 1)
+    @test c["b"] === :unbuilt
+    calls_seen = ncalls[]
+    @test c["a"] == (:v, 1)
+    @test c["b"] === :unbuilt
+    @test ncalls[] == calls_seen
+    @test nrecords(logger) == 1
+    poll_quiet(c)
+finally
+    global_logger(old)
+end
+end
+
+@testitem "batched stale reads serve old values then swap on success" setup=[BackgroundCacheFixtures] begin
+using DynamicObjects
+
+# ttl=0: every idle read is stale by construction — no sleeps, no stall window.
+gen = Ref(0)
+build_many = ks -> (gen[] += 1; Dict{String,Tuple{Symbol,Int}}(k => (:v, gen[]) for k in ks))
+c = BackgroundCache{String,Tuple{Symbol,Int}}(build_many; batch=10, ttl=0, unbuilt=(:none, 0))
+
+@test c["a"] == (:none, 0)
+poll_settled(() -> c["a"], (:v, 1))
+
+v_old = c["a"]
+@test v_old[1] == :v
+v = poll_advanced(() -> c["a"], v_old)
+@test v[1] == :v && v != v_old
+poll_quiet(c)
+end
