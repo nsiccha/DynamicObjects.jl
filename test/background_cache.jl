@@ -496,6 +496,33 @@ DynamicObjects._run_swr_refresh!(c, "a")
 poll_quiet(c)
 end
 
+@testitem "a stamp newer than the read's clock sample reads as just-settled" setup=[BackgroundCacheFixtures] begin
+using DynamicObjects
+
+# Regression: `now` was sampled before the lock, so it could predate a stamp
+# a refresh published under it; the staleness subtraction then underflowed
+# (UInt64) into a spurious stale plus a phantom kick — observed on CI as
+# `counts["a"] == 2` evaluating `3 == 2`: the satisfying read served the
+# just-settled value while kicking a third build. A future stamp must read
+# as just-settled: serve the value, kick nothing. The forced future stamp
+# below is exactly the state that interleaving presents to the read.
+counts = Dict{Any,Int}()
+build = k -> (n = (counts[k] = get(counts, k, 0) + 1); (:v, n))
+c = BackgroundCache{String,Tuple{Symbol,Int}}(build; ttl=60.0, unbuilt=(:none, 0))
+
+@test c["a"] == (:none, 0)
+@test poll_value_quiet(c, "a", (:v, 1)) == (:v, 1)
+poll_quiet(c)
+lock(c.lock) do
+    c.stamps["a"] = time_ns() + 10_000_000_000
+end
+@test c["a"] == (:v, 1)
+@test c["a"] == (:v, 1)
+# Let any phantom kick land, so the count below is final either way.
+poll_quiet(c)
+@test counts["a"] == 1
+end
+
 @testitem "on_settle fires per key in batch mode; callback errors are logged" setup=[BackgroundCacheFixtures] begin
 using DynamicObjects, Logging
 
