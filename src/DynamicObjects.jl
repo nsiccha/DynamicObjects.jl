@@ -45,7 +45,7 @@ optionally disk-cached properties.
 - [`materialization_gc!`](@ref): Collect only unreachable, provider-released storage with proven ownership.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, invalidate!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, remount, file_version, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending, Deferred, DeferredCompute, ComputeAbandoned
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, invalidate!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, remount, file_version, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending, Deferred, DeferredCompute, ComputeAbandoned, BackgroundCache
 
 import SHA, Serialization, Mmap, Treebars
 
@@ -1467,6 +1467,179 @@ function invalidate!(ip::IndexableProperty, indices...; kwargs...)
     isfile(path) && rm(path)
     metadata_path = _automatic_materialization_path(path)
     isfile(metadata_path) && rm(metadata_path)
+    nothing
+end
+
+# --- Stale-while-revalidate background cache -------------------------------------------
+#
+# A standalone keyed cache for values refreshed from slow external sources (remote
+# APIs, filesystem scans). Deliberately NOT built on `ThreadsafeDict`: that machinery
+# is compute-at-most-once with blocking waiters / `Pending` handles and rethrown
+# failures, while this contract is serve-stale-never-block with logged failures —
+# sharing the implementation would couple two different policies.
+
+"""
+    BackgroundCache{K,V}(build; ttl, unbuilt, maxsize=0, backoff_base=1.0, backoff_max=60.0)
+
+Keyed stale-while-revalidate cache over `build(key)::V`.
+
+Reads (`c[key]`) never block and never throw for cache reasons:
+
+- a fresh value (settled less than `ttl` seconds ago) is returned as is;
+- a stale value is returned immediately while one background refresh is kicked
+  off — at most one refresh per key is ever in flight, so concurrent readers of
+  a stale key share it;
+- a key with no settled value reads as `unbuilt` (declared at construction —
+  there is no default) while its first build runs in the background.
+
+A refresh that throws keeps the previous value (or `unbuilt`), logs an error
+with a backtrace, and gates the key behind an exponential backoff
+(`backoff_base * 2^(n-1)` seconds after the `n`th consecutive failure, capped
+at `backoff_max`): reads during the gate serve the old value without kicking
+another refresh. A success clears the failure count.
+
+With `maxsize > 0` the cache holds at most `maxsize` settled entries; storing
+past the bound evicts settled keys with the oldest settle time first (an
+`O(n)` scan — this is a small policy cache, not a store). `ttl=Inf` never goes
+stale; `ttl=0` revalidates on every idle read.
+
+Timestamps use the monotonic clock. Treat returned values (including `unbuilt`)
+as read-only. See also [`invalidate!`](@ref).
+"""
+struct BackgroundCache{K,V,F}
+    lock::ReentrantLock
+    values::Dict{K,V}
+    stamps::Dict{K,UInt64}
+    refreshing::Set{K}
+    failures::Dict{K,Int}
+    not_before::Dict{K,UInt64}
+    build::F
+    ttl_ns::UInt64
+    unbuilt::V
+    maxsize::Int
+    backoff_base::Float64
+    backoff_max::Float64
+    function BackgroundCache{K,V}(build::F; ttl::Real, unbuilt::V, maxsize::Integer=0,
+                                  backoff_base::Real=1.0, backoff_max::Real=60.0) where {K,V,F}
+        ttl >= 0 || throw(ArgumentError("BackgroundCache ttl must be non-negative or Inf, got $ttl"))
+        maxsize >= 0 || throw(ArgumentError("BackgroundCache maxsize must be non-negative, got $maxsize"))
+        backoff_base >= 0 || throw(ArgumentError("BackgroundCache backoff_base must be non-negative, got $backoff_base"))
+        backoff_max >= 0 || throw(ArgumentError("BackgroundCache backoff_max must be non-negative, got $backoff_max"))
+        ttl_ns = isinf(ttl) ? typemax(UInt64) : round(UInt64, Float64(ttl) * 1e9)
+        new{K,V,F}(ReentrantLock(), Dict{K,V}(), Dict{K,UInt64}(), Set{K}(),
+                   Dict{K,Int}(), Dict{K,UInt64}(), build, ttl_ns, unbuilt,
+                   Int(maxsize), Float64(backoff_base), Float64(backoff_max))
+    end
+end
+
+Base.show(io::IO, c::BackgroundCache{K,V}) where {K,V} = lock(c.lock) do
+    print(io, "BackgroundCache{", K, ",", V, "}(", length(c.values), " settled, ",
+          length(c.refreshing), " refreshing)")
+end
+
+_backoff_ns(c::BackgroundCache, n::Int) = begin
+    delay = min(c.backoff_base * 2.0^(n - 1), c.backoff_max)
+    isfinite(delay) ? round(UInt64, delay * 1e9) : typemax(UInt64)
+end
+
+# Drop every settled/gate record for `key`. The in-flight marker is owned by the
+# refresh task and is never cleared here. Call under `c.lock`.
+function _drop_swr_key!(c::BackgroundCache, key)
+    delete!(c.values, key)
+    delete!(c.stamps, key)
+    delete!(c.failures, key)
+    delete!(c.not_before, key)
+    nothing
+end
+
+# Evict stalest-settled keys until within `maxsize`. Call under `c.lock`.
+function _enforce_swr_bound!(c::BackgroundCache)
+    c.maxsize <= 0 && return nothing
+    while length(c.values) > c.maxsize
+        oldest = first(keys(c.values))
+        oldest_t = c.stamps[oldest]
+        for k in keys(c.values)
+            t = c.stamps[k]
+            if t < oldest_t
+                oldest = k
+                oldest_t = t
+            end
+        end
+        _drop_swr_key!(c, oldest)
+    end
+    nothing
+end
+
+# Run one refresh to completion: build OUTSIDE the lock, then publish (or, on
+# any failure, gate behind backoff and log with a backtrace — never rethrow, so
+# the background task carries nothing out).
+function _run_swr_refresh!(c::BackgroundCache{K,V}, key::K) where {K,V}
+    try
+        v = c.build(key)::V
+        lock(c.lock) do
+            delete!(c.refreshing, key)
+            c.values[key] = v
+            c.stamps[key] = time_ns()
+            delete!(c.failures, key)
+            delete!(c.not_before, key)
+            _enforce_swr_bound!(c)
+        end
+    catch e
+        n = lock(c.lock) do
+            delete!(c.refreshing, key)
+            n = get(c.failures, key, 0) + 1
+            c.failures[key] = n
+            c.not_before[key] = time_ns() + _backoff_ns(c, n)
+            n
+        end
+        @error "BackgroundCache refresh failed; keeping the previous value" key = key attempt = n exception = (e, catch_backtrace())
+    end
+    nothing
+end
+
+function _kick_swr_refresh!(c::BackgroundCache{K,V}, key::K) where {K,V}
+    errormonitor(Threads.@spawn _run_swr_refresh!(c, key))
+    nothing
+end
+
+function Base.getindex(c::BackgroundCache{K,V}, key::K) where {K,V}
+    now = time_ns()
+    outcome = lock(c.lock) do
+        v = get(c.values, key, _missing_sentinel)
+        if v === _missing_sentinel
+            # The backoff gate applies before the first build too: without it a
+            # failing build would re-kick on every read instead of backing off.
+            if key in c.refreshing || now < get(c.not_before, key, UInt64(0))
+                return (:settled, c.unbuilt)
+            end
+            push!(c.refreshing, key)
+            return (:kick, c.unbuilt)
+        end
+        # A missing stamp (impossible by construction — stamps track values at
+        # every writer) reads as infinitely old rather than throwing: the read
+        # path stays total and the refresh re-settles the key.
+        now - get(c.stamps, key, UInt64(0)) < c.ttl_ns && return (:settled, v)
+        if key in c.refreshing || now < get(c.not_before, key, UInt64(0))
+            return (:settled, v)
+        end
+        push!(c.refreshing, key)
+        (:kick, v)
+    end
+    outcome[1] === :kick && _kick_swr_refresh!(c, key)
+    outcome[2]
+end
+
+"""
+    invalidate!(c::BackgroundCache, key)
+
+Drop the settled value (and any failure/backoff record) for `key`; the next
+read serves the cache's `unbuilt` value and kicks a fresh background build. A
+refresh already in flight is not stopped — its value still lands.
+"""
+function invalidate!(c::BackgroundCache{K,V}, key::K) where {K,V}
+    lock(c.lock) do
+        _drop_swr_key!(c, key)
+    end
     nothing
 end
 
