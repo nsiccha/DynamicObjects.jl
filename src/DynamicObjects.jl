@@ -1747,8 +1747,12 @@ function _run_swr_batch!(c::BackgroundCache{K,V}, batch_keys::Vector{K}) where {
 end
 
 function Base.getindex(c::BackgroundCache{K,V}, key::K) where {K,V}
-    now = time_ns()
     outcome = lock(c.lock) do
+        # Sampled under the lock: a timestamp taken before the lock can
+        # predate a stamp published under it, and the staleness subtraction
+        # below would underflow (UInt64) into a spurious stale plus a
+        # phantom kick.
+        now = time_ns()
         v = get(c.values, key, _missing_sentinel)
         if v === _missing_sentinel
             # The backoff gate applies before the first build too: without it a
@@ -1762,8 +1766,14 @@ function Base.getindex(c::BackgroundCache{K,V}, key::K) where {K,V}
         end
         # A missing stamp (impossible by construction — stamps track values at
         # every writer) reads as infinitely old rather than throwing: the read
-        # path stays total and the refresh re-settles the key.
-        now - get(c.stamps, key, UInt64(0)) < c.ttl_ns && return (:settled, v)
+        # path stays total and the refresh re-settles the key. A stamp newer
+        # than `now` reads as just-settled, never stale: with `now` sampled
+        # under this same lock that ordering only arises via clock weirdness,
+        # and the subtraction would underflow into a phantom kick.
+        if haskey(c.stamps, key)
+            stamp = c.stamps[key]
+            (stamp > now || now - stamp < c.ttl_ns) && return (:settled, v)
+        end
         if key in c.refreshing || now < get(c.not_before, key, UInt64(0))
             return (:settled, v)
         end
