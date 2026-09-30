@@ -1661,10 +1661,11 @@ end
 # Run one batch build to completion: build OUTSIDE the lock, then settle each
 # key individually (or, on any failure, gate behind backoff and log with a
 # backtrace — never rethrow, so the background task carries nothing out). A
-# thrown call fails every key in the batch; a key missing from the result (or
-# holding a non-`V` value) fails that key alone. The builder gets a copy of the
-# claimed keys, so a builder that mutates its input cannot strand keys in
-# `refreshing`.
+# thrown call fails every key in the batch but logs once for the whole batch
+# (one exception/backtrace shared by every key); a key missing from the result
+# (or holding a non-`V` value) fails that key alone and logs per key. The
+# builder gets a copy of the claimed keys, so a builder that mutates its input
+# cannot strand keys in `refreshing`.
 function _run_swr_batch!(c::BackgroundCache{K,V}, batch_keys::Vector{K}) where {K,V}
     local results
     try
@@ -1682,9 +1683,10 @@ function _run_swr_batch!(c::BackgroundCache{K,V}, batch_keys::Vector{K}) where {
             end
             ns
         end
-        for k in batch_keys
-            @error "BackgroundCache batch refresh failed; keeping the previous value" key = k attempt = attempts[k] exception = (e, bt)
-        end
+        # One record for the whole batch: a thrown call is a single failure
+        # event, so every key shares one exception/backtrace. (Per-key records
+        # stay for keys missing from, or mistyped in, a successful result.)
+        @error "BackgroundCache batch refresh failed; keeping the previous values" batch_size = length(batch_keys) keys = batch_keys attempts = attempts exception = (e, bt)
         return nothing
     end
     for k in batch_keys

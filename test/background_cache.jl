@@ -360,7 +360,7 @@ seen = [take!(sizes) for _ in 1:3]
 @test sum(seen) == 5
 end
 
-@testitem "a thrown batch fails every key with per-key backoff and logging" setup=[BackgroundCacheFixtures] begin
+@testitem "a thrown batch fails every key with per-key backoff and one log record" setup=[BackgroundCacheFixtures] begin
 using DynamicObjects, Logging
 
 ncalls = Ref(0)
@@ -371,27 +371,36 @@ c = BackgroundCache{String,Any}(build_many; batch=10, ttl=0, unbuilt=:unbuilt,
 
 old = global_logger(logger)
 try
-    @test c["a"] === :unbuilt
-    @test c["b"] === :unbuilt
-    # One log per key whether the two shared one batch call or split across
-    # two (the batching shape is pinned by the gated item above; this item owns
-    # the per-key failure contract).
-    poll_settled(() -> nrecords(logger), 2)
-    recs = snaprecords(logger)
-    @test sort!([r.kwargs[:key] for r in recs]) == ["a", "b"]
-    @test all(r -> r.level == Logging.Error, recs)
-    for r in recs
-        ex, bt = r.kwargs[:exception]
-        @test ex isa ErrorException
-        @test bt isa Vector && !isempty(bt)
+    # White-box: one fixed batch, so no batching-shape schedule dependence
+    # (the batching shape itself is pinned by the gated item above).
+    DynamicObjects._run_swr_batch!(c, ["a", "b", "c"])
+    @test ncalls[] == 1
+    # A thrown call is ONE failure event: one record for the whole batch,
+    # carrying the shared exception/backtrace plus the batch keys and the
+    # per-key attempt counts — never one backtrace per key.
+    rec = only(snaprecords(logger))
+    @test rec.level == Logging.Error
+    @test rec.message == "BackgroundCache batch refresh failed; keeping the previous values"
+    @test rec.kwargs[:batch_size] == 3
+    @test sort!(copy(rec.kwargs[:keys])) == ["a", "b", "c"]
+    @test rec.kwargs[:attempts] == Dict("a" => 1, "b" => 1, "c" => 1)
+    ex, bt = rec.kwargs[:exception]
+    @test ex isa ErrorException
+    @test bt isa Vector && !isempty(bt)
+    # Per-key failure state still landed individually: refreshing cleared,
+    # backoff armed per key.
+    lock(c.lock) do
+        @test isempty(c.refreshing)
+        @test c.failures == Dict("a" => 1, "b" => 1, "c" => 1)
+        @test Set(keys(c.not_before)) == Set(["a", "b", "c"])
     end
     # Gated: further reads serve unbuilt without kicking (the 30 s gate
     # outlasts any scheduling stall, so this holds on any schedule).
-    calls_seen = ncalls[]
     @test c["a"] === :unbuilt
     @test c["b"] === :unbuilt
-    @test ncalls[] == calls_seen
-    @test nrecords(logger) == 2
+    @test c["c"] === :unbuilt
+    @test ncalls[] == 1
+    @test nrecords(logger) == 1
     poll_quiet(c)
 finally
     global_logger(old)
