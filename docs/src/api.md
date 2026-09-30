@@ -67,6 +67,7 @@ declaration_observations
 ## Cache maintenance
 
 ```@docs
+BackgroundCache
 entries
 cached_entries
 clear_all_caches!
