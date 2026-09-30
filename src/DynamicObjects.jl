@@ -1480,13 +1480,14 @@ end
 
 """
     BackgroundCache{K,V}(build; ttl, unbuilt, maxsize=0, backoff_base=1.0, backoff_max=60.0)
+    BackgroundCache{K,V}(build_many; batch, ttl, unbuilt, maxsize=0, backoff_base=1.0, backoff_max=60.0)
 
-Keyed stale-while-revalidate cache over `build(key)::V`.
+Keyed stale-while-revalidate cache.
 
 Reads (`c[key]`) never block and never throw for cache reasons:
 
 - a fresh value (settled less than `ttl` seconds ago) is returned as is;
-- a stale value is returned immediately while one background refresh is kicked
+- a stale value is returned immediately while a background refresh is kicked
   off — at most one refresh per key is ever in flight, so concurrent readers of
   a stale key share it;
 - a key with no settled value reads as `unbuilt` (declared at construction —
@@ -1502,6 +1503,15 @@ With `maxsize > 0` the cache holds at most `maxsize` settled entries; storing
 past the bound evicts settled keys with the oldest settle time first (an
 `O(n)` scan — this is a small policy cache, not a store). `ttl=Inf` never goes
 stale; `ttl=0` revalidates on every idle read.
+
+By default `build(key)::V` builds one key per background task. Pass `batch=N`
+(a positive integer) to refresh up to `N` wanted keys with one call instead:
+the first positional argument is then `build_many(keys::Vector{K})::AbstractDict`,
+one background drain task per cache feeds it batches of at most `N` keys, and
+each key in a batch settles (or fails with backoff) individually. A thrown
+batch call fails every key in that batch; a key missing from the returned dict
+— or holding a value that is not a `V` — fails that key alone while present
+keys still settle. Extra keys in the result are ignored.
 
 Timestamps use the monotonic clock. Treat returned values (including `unbuilt`)
 as read-only. See also [`invalidate!`](@ref).
@@ -1519,16 +1529,26 @@ struct BackgroundCache{K,V,F}
     maxsize::Int
     backoff_base::Float64
     backoff_max::Float64
+    batched::Bool
+    batch_size::Int
+    pending::Vector{K}
+    batch_running::Ref{Bool}
     function BackgroundCache{K,V}(build::F; ttl::Real, unbuilt::V, maxsize::Integer=0,
-                                  backoff_base::Real=1.0, backoff_max::Real=60.0) where {K,V,F}
+                                  backoff_base::Real=1.0, backoff_max::Real=60.0,
+                                  batch::Union{Nothing,Integer}=nothing) where {K,V,F}
         ttl >= 0 || throw(ArgumentError("BackgroundCache ttl must be non-negative or Inf, got $ttl"))
         maxsize >= 0 || throw(ArgumentError("BackgroundCache maxsize must be non-negative, got $maxsize"))
         backoff_base >= 0 || throw(ArgumentError("BackgroundCache backoff_base must be non-negative, got $backoff_base"))
         backoff_max >= 0 || throw(ArgumentError("BackgroundCache backoff_max must be non-negative, got $backoff_max"))
+        if batch !== nothing
+            batch >= 1 || throw(ArgumentError("BackgroundCache batch must be a positive integer, got $batch"))
+        end
         ttl_ns = isinf(ttl) ? typemax(UInt64) : round(UInt64, Float64(ttl) * 1e9)
         new{K,V,F}(ReentrantLock(), Dict{K,V}(), Dict{K,UInt64}(), Set{K}(),
                    Dict{K,Int}(), Dict{K,UInt64}(), build, ttl_ns, unbuilt,
-                   Int(maxsize), Float64(backoff_base), Float64(backoff_max))
+                   Int(maxsize), Float64(backoff_base), Float64(backoff_max),
+                   batch !== nothing, batch === nothing ? 1 : Int(batch),
+                   K[], Ref(false))
     end
 end
 
@@ -1602,6 +1622,97 @@ function _kick_swr_refresh!(c::BackgroundCache{K,V}, key::K) where {K,V}
     nothing
 end
 
+# Mark `key` wanted by the batch drain, starting the drain when idle. The
+# caller has already pushed `key` to `refreshing`. Call under `c.lock`; returns
+# `:settled` when a drain is already running (the key rides it) or `:batch_kick`
+# when the caller must spawn one outside the lock.
+function _enqueue_swr_batch!(c::BackgroundCache{K,V}, key::K) where {K,V}
+    push!(c.pending, key)
+    c.batch_running[] && return :settled
+    c.batch_running[] = true
+    :batch_kick
+end
+
+function _kick_swr_batch_drain!(c::BackgroundCache)
+    errormonitor(Threads.@spawn _run_swr_batch_drain!(c))
+    nothing
+end
+
+# Drain loop: exactly one runs per cache at a time (guarded by `batch_running`
+# under the lock). Each iteration claims up to `batch_size` wanted keys and
+# feeds them to one `build_many` call; keys arriving mid-build ride the next
+# iteration. Exits (clearing the flag) only on an empty queue observed under
+# the lock, so no wakeup is lost: an enqueue after the check finds the flag
+# clear and spawns the successor.
+function _run_swr_batch_drain!(c::BackgroundCache{K,V}) where {K,V}
+    while true
+        batch_keys = lock(c.lock) do
+            if isempty(c.pending)
+                c.batch_running[] = false
+                return nothing
+            end
+            splice!(c.pending, 1:min(c.batch_size, length(c.pending)))
+        end
+        batch_keys === nothing && return nothing
+        _run_swr_batch!(c, batch_keys)
+    end
+end
+
+# Run one batch build to completion: build OUTSIDE the lock, then settle each
+# key individually (or, on any failure, gate behind backoff and log with a
+# backtrace — never rethrow, so the background task carries nothing out). A
+# thrown call fails every key in the batch; a key missing from the result (or
+# holding a non-`V` value) fails that key alone. The builder gets a copy of the
+# claimed keys, so a builder that mutates its input cannot strand keys in
+# `refreshing`.
+function _run_swr_batch!(c::BackgroundCache{K,V}, batch_keys::Vector{K}) where {K,V}
+    local results
+    try
+        results = c.build(copy(batch_keys))::AbstractDict
+    catch e
+        bt = catch_backtrace()
+        attempts = lock(c.lock) do
+            ns = Dict{K,Int}()
+            for k in batch_keys
+                delete!(c.refreshing, k)
+                n = get(c.failures, k, 0) + 1
+                c.failures[k] = n
+                c.not_before[k] = time_ns() + _backoff_ns(c, n)
+                ns[k] = n
+            end
+            ns
+        end
+        for k in batch_keys
+            @error "BackgroundCache batch refresh failed; keeping the previous value" key = k attempt = attempts[k] exception = (e, bt)
+        end
+        return nothing
+    end
+    for k in batch_keys
+        try
+            v = results[k]::V
+            lock(c.lock) do
+                delete!(c.refreshing, k)
+                c.values[k] = v
+                c.stamps[k] = time_ns()
+                delete!(c.failures, k)
+                delete!(c.not_before, k)
+                _enforce_swr_bound!(c)
+            end
+        catch e
+            bt = catch_backtrace()
+            n = lock(c.lock) do
+                delete!(c.refreshing, k)
+                nn = get(c.failures, k, 0) + 1
+                c.failures[k] = nn
+                c.not_before[k] = time_ns() + _backoff_ns(c, nn)
+                nn
+            end
+            @error "BackgroundCache batch refresh failed; keeping the previous value" key = k attempt = n exception = (e, bt)
+        end
+    end
+    nothing
+end
+
 function Base.getindex(c::BackgroundCache{K,V}, key::K) where {K,V}
     now = time_ns()
     outcome = lock(c.lock) do
@@ -1613,6 +1724,7 @@ function Base.getindex(c::BackgroundCache{K,V}, key::K) where {K,V}
                 return (:settled, c.unbuilt)
             end
             push!(c.refreshing, key)
+            c.batched && return (_enqueue_swr_batch!(c, key), c.unbuilt)
             return (:kick, c.unbuilt)
         end
         # A missing stamp (impossible by construction — stamps track values at
@@ -1623,9 +1735,11 @@ function Base.getindex(c::BackgroundCache{K,V}, key::K) where {K,V}
             return (:settled, v)
         end
         push!(c.refreshing, key)
+        c.batched && return (_enqueue_swr_batch!(c, key), v)
         (:kick, v)
     end
     outcome[1] === :kick && _kick_swr_refresh!(c, key)
+    outcome[1] === :batch_kick && _kick_swr_batch_drain!(c)
     outcome[2]
 end
 
