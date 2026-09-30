@@ -1479,8 +1479,8 @@ end
 # sharing the implementation would couple two different policies.
 
 """
-    BackgroundCache{K,V}(build; ttl, unbuilt, maxsize=0, backoff_base=1.0, backoff_max=60.0)
-    BackgroundCache{K,V}(build_many; batch, ttl, unbuilt, maxsize=0, backoff_base=1.0, backoff_max=60.0)
+    BackgroundCache{K,V}(build; ttl, unbuilt, maxsize=0, backoff_base=1.0, backoff_max=60.0, on_settle=(key, old, new) -> nothing)
+    BackgroundCache{K,V}(build_many; batch, ttl, unbuilt, maxsize=0, backoff_base=1.0, backoff_max=60.0, on_settle=(key, old, new) -> nothing)
 
 Keyed stale-while-revalidate cache.
 
@@ -1513,10 +1513,19 @@ batch call fails every key in that batch; a key missing from the returned dict
 — or holding a value that is not a `V` — fails that key alone while present
 keys still settle. Extra keys in the result are ignored.
 
+After each successful store — once per settled key in batch mode too — the
+cache invokes `on_settle(key, old, new)` outside the lock, so a re-entrant
+read inside the callback observes the new value. `old` is the previously
+settled value, or `unbuilt` when the key had none (first build,
+post-`invalidate!`, or eviction). Failures never invoke it. It fires even when
+`new == old` — compare them to skip unchanged values. A throwing callback is
+logged with its key and backtrace and never breaks the refresh or the drain.
+
 Timestamps use the monotonic clock. Treat returned values (including `unbuilt`)
-as read-only. See also [`invalidate!`](@ref).
+as read-only, and likewise the `old`/`new` values handed to `on_settle`.
+See also [`invalidate!`](@ref).
 """
-struct BackgroundCache{K,V,F}
+struct BackgroundCache{K,V,F,S}
     lock::ReentrantLock
     values::Dict{K,V}
     stamps::Dict{K,UInt64}
@@ -1524,6 +1533,7 @@ struct BackgroundCache{K,V,F}
     failures::Dict{K,Int}
     not_before::Dict{K,UInt64}
     build::F
+    on_settle::S
     ttl_ns::UInt64
     unbuilt::V
     maxsize::Int
@@ -1535,7 +1545,8 @@ struct BackgroundCache{K,V,F}
     batch_running::Ref{Bool}
     function BackgroundCache{K,V}(build::F; ttl::Real, unbuilt::V, maxsize::Integer=0,
                                   backoff_base::Real=1.0, backoff_max::Real=60.0,
-                                  batch::Union{Nothing,Integer}=nothing) where {K,V,F}
+                                  batch::Union{Nothing,Integer}=nothing,
+                                  on_settle=(key, old, new) -> nothing) where {K,V,F}
         ttl >= 0 || throw(ArgumentError("BackgroundCache ttl must be non-negative or Inf, got $ttl"))
         maxsize >= 0 || throw(ArgumentError("BackgroundCache maxsize must be non-negative, got $maxsize"))
         backoff_base >= 0 || throw(ArgumentError("BackgroundCache backoff_base must be non-negative, got $backoff_base"))
@@ -1544,11 +1555,12 @@ struct BackgroundCache{K,V,F}
             batch >= 1 || throw(ArgumentError("BackgroundCache batch must be a positive integer, got $batch"))
         end
         ttl_ns = isinf(ttl) ? typemax(UInt64) : round(UInt64, Float64(ttl) * 1e9)
-        new{K,V,F}(ReentrantLock(), Dict{K,V}(), Dict{K,UInt64}(), Set{K}(),
-                   Dict{K,Int}(), Dict{K,UInt64}(), build, ttl_ns, unbuilt,
-                   Int(maxsize), Float64(backoff_base), Float64(backoff_max),
-                   batch !== nothing, batch === nothing ? 1 : Int(batch),
-                   K[], Ref(false))
+        S = typeof(on_settle)
+        new{K,V,F,S}(ReentrantLock(), Dict{K,V}(), Dict{K,UInt64}(), Set{K}(),
+                     Dict{K,Int}(), Dict{K,UInt64}(), build, on_settle, ttl_ns, unbuilt,
+                     Int(maxsize), Float64(backoff_base), Float64(backoff_max),
+                     batch !== nothing, batch === nothing ? 1 : Int(batch),
+                     K[], Ref(false))
     end
 end
 
@@ -1590,20 +1602,35 @@ function _enforce_swr_bound!(c::BackgroundCache)
     nothing
 end
 
-# Run one refresh to completion: build OUTSIDE the lock, then publish (or, on
-# any failure, gate behind backoff and log with a backtrace — never rethrow, so
-# the background task carries nothing out).
+# Invoke the settle callback OUTSIDE the lock, after the value is published —
+# a re-entrant read inside the callback observes the new value. A throwing
+# callback is logged, never rethrown: the store already succeeded.
+function _notify_swr_settle!(c::BackgroundCache{K,V}, key::K, old::V, new::V) where {K,V}
+    try
+        c.on_settle(key, old, new)
+    catch e
+        @error "BackgroundCache on_settle callback failed" key = key exception = (e, catch_backtrace())
+    end
+    nothing
+end
+
+# Run one refresh to completion: build OUTSIDE the lock, then publish and
+# notify the settle callback (or, on any failure, gate behind backoff and log
+# with a backtrace — never rethrow, so the background task carries nothing out).
 function _run_swr_refresh!(c::BackgroundCache{K,V}, key::K) where {K,V}
     try
         v = c.build(key)::V
-        lock(c.lock) do
+        old = lock(c.lock) do
+            prev = get(c.values, key, c.unbuilt)
             delete!(c.refreshing, key)
             c.values[key] = v
             c.stamps[key] = time_ns()
             delete!(c.failures, key)
             delete!(c.not_before, key)
             _enforce_swr_bound!(c)
+            prev
         end
+        _notify_swr_settle!(c, key, old, v)
     catch e
         n = lock(c.lock) do
             delete!(c.refreshing, key)
@@ -1659,13 +1686,14 @@ function _run_swr_batch_drain!(c::BackgroundCache{K,V}) where {K,V}
 end
 
 # Run one batch build to completion: build OUTSIDE the lock, then settle each
-# key individually (or, on any failure, gate behind backoff and log with a
-# backtrace — never rethrow, so the background task carries nothing out). A
-# thrown call fails every key in the batch but logs once for the whole batch
-# (one exception/backtrace shared by every key); a key missing from the result
-# (or holding a non-`V` value) fails that key alone and logs per key. The
-# builder gets a copy of the claimed keys, so a builder that mutates its input
-# cannot strand keys in `refreshing`.
+# key individually and notify the settle callback per settled key (or, on any
+# failure, gate behind backoff and log with a backtrace — never rethrow, so
+# the background task carries nothing out). A thrown call fails every key in
+# the batch but logs once for the whole batch (one exception/backtrace shared
+# by every key); a key missing from the result (or holding a non-`V` value)
+# fails that key alone and logs per key. The builder gets a copy of the
+# claimed keys, so a builder that mutates its input cannot strand keys in
+# `refreshing`.
 function _run_swr_batch!(c::BackgroundCache{K,V}, batch_keys::Vector{K}) where {K,V}
     local results
     try
@@ -1692,14 +1720,17 @@ function _run_swr_batch!(c::BackgroundCache{K,V}, batch_keys::Vector{K}) where {
     for k in batch_keys
         try
             v = results[k]::V
-            lock(c.lock) do
+            old = lock(c.lock) do
+                prev = get(c.values, k, c.unbuilt)
                 delete!(c.refreshing, k)
                 c.values[k] = v
                 c.stamps[k] = time_ns()
                 delete!(c.failures, k)
                 delete!(c.not_before, k)
                 _enforce_swr_bound!(c)
+                prev
             end
+            _notify_swr_settle!(c, k, old, v)
         catch e
             bt = catch_backtrace()
             n = lock(c.lock) do
