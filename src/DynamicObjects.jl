@@ -461,14 +461,30 @@ end
 _disk_format(o, ::Val) = Val(:serial)
 _disk_eltype(o, ::Val) = nothing
 
-_automatic_mmap_eligible(::Any) = false
-# Only a plain `Array`: an mmap entry densifies via `Array(x)` and always loads
-# back a bare `Array{ET,N}`, so promoting a wrapper or lazy view (`SubArray`, a
-# pooled view over other arrays) would silently hand the caller a different
-# type — the same broken promise `_check_mmap_annotation` refuses for an
-# explicit `@mmap` declaration. Other large values serialize, which keeps type.
+# Automatic mmap needs a format that reloads the value's exact type. DO's own
+# format does for a plain `Array` of a supported eltype. Any other type
+# qualifies by defining its own path-level `save(::Val{:mmap}, ::AbstractString,
+# ::T)` (TreeArrays' `TreeData`, the DataFrames extension's `DataFrame`), so a
+# format package needs no second declaration. DO's generic `AbstractArray`
+# writer does not count: it densifies via `Array(x)` and reloads a bare
+# `Array{ET,N}`, so promoting a wrapper or lazy view (`SubArray`, a pooled view
+# over other arrays) would silently hand the caller a different type — the same
+# broken promise `_check_mmap_annotation` refuses for an explicit `@mmap`. The
+# untyped fallback refuses outright. The round-trip type check on write backs
+# all of this up; anything ineligible serializes, which keeps its type.
+_automatic_mmap_eligible(value) = _has_own_mmap_save(typeof(value))
 _automatic_mmap_eligible(value::Array) =
     isbitstype(eltype(value)) && eltype(value) in _MMAP_ELTYPE_TAGS
+
+function _has_own_mmap_save(::Type{T}) where {T}
+    method = try
+        which(save, Tuple{Val{:mmap},String,T})
+    catch
+        return false   # no unique method (ambiguity): no usable format
+    end
+    method.sig != Tuple{typeof(save),Val{:mmap},AbstractString,AbstractArray} &&
+        method.sig != Tuple{typeof(save),Val{:mmap},AbstractString,Any}
+end
 
 iscached(o, ::Val) = false
 cache_version(o, ::Val) = nothing
@@ -9516,9 +9532,10 @@ function _persist_automatic_materialization!(owner, target, name, descriptor,
                 _atomic_save(Val(:mmap), cache_path, value)
                 stored = load(Val(:mmap), cache_path, nothing)
                 if typeof(stored) !== typeof(value)
-                    # The value's mmap eligibility claims a codec that does not
-                    # round-trip its type. Serialization does, so use it.
-                    @warn "Automatic mmap would reload $(typeof(value)) as $(typeof(stored)); serializing instead" cache_path
+                    # The type's mmap format does not round-trip this value's
+                    # exact type (e.g. a `TreeData` whose leaves are views).
+                    # Serialization does, so use it; warn once per type pair.
+                    @warn "Automatic mmap would reload $(typeof(value)) as $(typeof(stored)); serializing instead" cache_path _id=hash((typeof(value), typeof(stored))) maxlog=1
                     finalize(stored)   # unmap before replacing the file
                     stored = nothing
                     format = :serial
