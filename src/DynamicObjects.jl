@@ -462,7 +462,12 @@ _disk_format(o, ::Val) = Val(:serial)
 _disk_eltype(o, ::Val) = nothing
 
 _automatic_mmap_eligible(::Any) = false
-_automatic_mmap_eligible(value::AbstractArray) =
+# Only a plain `Array`: an mmap entry densifies via `Array(x)` and always loads
+# back a bare `Array{ET,N}`, so promoting a wrapper or lazy view (`SubArray`, a
+# pooled view over other arrays) would silently hand the caller a different
+# type — the same broken promise `_check_mmap_annotation` refuses for an
+# explicit `@mmap` declaration. Other large values serialize, which keeps type.
+_automatic_mmap_eligible(value::Array) =
     isbitstype(eltype(value)) && eltype(value) in _MMAP_ELTYPE_TAGS
 
 iscached(o, ::Val) = false
@@ -9520,9 +9525,15 @@ mounted object that owns `property`.
 The executor adds an active lease around the existing DO property machinery.
 For an ordinary property on a retained root it observes the actual result and
 automatically keeps small/cheap values in memory, serializes large or expensive
-values, and memory-maps supported large values. Fresh request roots recompute
-across requests. Existing `@fresh`, `@cached`, and `@mmap` declarations remain
-compatibility overrides; applications do not need them for governed execution.
+values, and memory-maps large plain `Array`s of supported isbits eltypes. Fresh
+request roots recompute across requests. Existing `@fresh`, `@cached`, and
+`@mmap` declarations remain compatibility overrides; applications do not need
+them for governed execution.
+
+Governance covers exactly the executed `property` on `target`. Properties it
+reads while computing — siblings, nested DO objects, `@struct` children — run
+through their ordinary declaration-site semantics and are never automatically
+promoted; only the executed property's own returned value is observed.
 """
 function execute_materialization(context::NamedTuple, root, target,
         name::Symbol, args...; kwargs...)
