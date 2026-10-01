@@ -9418,6 +9418,32 @@ function _drop_automatic_materialization!(cache_path)
     nothing
 end
 
+# Automatic storage may change where a value lives, never its type: a reload
+# must have exactly the computed value's type. Metadata records that type at
+# write time, and an entry that reloads as anything else is deleted so the
+# caller recomputes. A legacy mmap entry written before the type was recorded
+# may hold a densified wrapper, so it is not trusted either; legacy serialized
+# entries are, since serialization round-trips types. A usable value comes back
+# wrapped in `Some` so a stored `nothing` stays distinguishable from "unusable".
+function _read_automatic_materialization!(metadata, cache_path)
+    expected = get(metadata, :value_type, nothing)
+    value = try
+        expected === nothing && metadata.format === :mmap ? nothing :
+            Some(load(Val(metadata.format), cache_path, nothing))
+    catch e
+        _drop_automatic_materialization!(cache_path)
+        @warn "Automatic materialization cache read failed; deleting it and recomputing" cache_path exception=e
+        return nothing
+    end
+    if value === nothing ||
+            (expected !== nothing && typeof(something(value)) !== expected)
+        _drop_automatic_materialization!(cache_path)
+        @warn "Automatic materialization entry does not reload as its computed type; deleting it and recomputing" cache_path recorded_type=expected
+        return nothing
+    end
+    value
+end
+
 function _load_automatic_materialization!(owner, target, name, descriptor,
         args, kwargs::NamedTuple)
     cache_path = get_cache_path(target, name, args...; kwargs...)
@@ -9429,13 +9455,9 @@ function _load_automatic_materialization!(owner, target, name, descriptor,
         metadata = _automatic_materialization_metadata(cache_path)
         metadata === nothing && return nothing
         get_cache_status(cache_path) === :ready || return nothing
-        value = try
-            load(Val(metadata.format), cache_path, nothing)
-        catch e
-            _drop_automatic_materialization!(cache_path)
-            @warn "Automatic materialization cache read failed; deleting it and recomputing" cache_path exception=e
-            return nothing
-        end
+        read = _read_automatic_materialization!(metadata, cache_path)
+        read === nothing && return nothing
+        value = something(read)
         _set_automatic_materialization_cache!(
             target, name, descriptor, args, kwargs, value) || return nothing
         (;tier=metadata.format === :mmap ? :mmap : :serialized, value)
@@ -9451,7 +9473,11 @@ function _automatic_materialization_choice(value, elapsed_seconds)
     expensive = elapsed_seconds >= _AUTOMATIC_MATERIALIZATION_MIN_SECONDS
     (large || expensive) ||
         return (;tier=:memory, format=nothing, estimated_bytes)
-    format = _automatic_mmap_eligible(value) ? :mmap : :serial
+    # Memory-mapping pays off only for a large value: pages load lazily and are
+    # shared through the OS page cache instead of copied into the heap. A small
+    # value promoted only for being slow is read back whole either way, and a
+    # mapping per tiny file just costs mapping slots, so it serializes.
+    format = large && _automatic_mmap_eligible(value) ? :mmap : :serial
     (;tier=format === :mmap ? :mmap : :serialized, format, estimated_bytes)
 end
 
@@ -9467,15 +9493,10 @@ function _persist_automatic_materialization!(owner, target, name, descriptor,
     lock(path_lock) do
         existing = _automatic_materialization_metadata(cache_path)
         if existing !== nothing && get_cache_status(cache_path) === :ready
-            stored = try
-                load(Val(existing.format), cache_path, nothing)
-            catch e
-                _drop_automatic_materialization!(cache_path)
-                @warn "Automatic materialization cache read failed; deleting it and recomputing" cache_path exception=e
-                nothing
-            end
-            if stored !== nothing
+            read = _read_automatic_materialization!(existing, cache_path)
+            if read !== nothing
                 if existing.format === :mmap
+                    stored = something(read)
                     _set_automatic_materialization_cache!(
                         target, name, descriptor, args, kwargs, stored)
                     return stored
@@ -9489,15 +9510,29 @@ function _persist_automatic_materialization!(owner, target, name, descriptor,
         metadata_path = _automatic_materialization_path(cache_path)
         try
             mkpath(dirname(cache_path))
-            _atomic_save(Val(choice.format), cache_path, value)
+            format = choice.format
+            stored = nothing
+            if format === :mmap
+                _atomic_save(Val(:mmap), cache_path, value)
+                stored = load(Val(:mmap), cache_path, nothing)
+                if typeof(stored) !== typeof(value)
+                    # The value's mmap eligibility claims a codec that does not
+                    # round-trip its type. Serialization does, so use it.
+                    @warn "Automatic mmap would reload $(typeof(value)) as $(typeof(stored)); serializing instead" cache_path
+                    finalize(stored)   # unmap before replacing the file
+                    stored = nothing
+                    format = :serial
+                end
+            end
+            format === :serial && _atomic_save(Val(:serial), cache_path, value)
             metadata = (;
-                format=choice.format,
+                format,
                 estimated_bytes=choice.estimated_bytes,
                 compute_seconds=elapsed_seconds,
+                value_type=typeof(value),
             )
             _atomic_save(Val(:serial), metadata_path, metadata)
-            if choice.format === :mmap
-                stored = load(Val(:mmap), cache_path, nothing)
+            if format === :mmap
                 _set_automatic_materialization_cache!(
                     target, name, descriptor, args, kwargs, stored)
                 return stored

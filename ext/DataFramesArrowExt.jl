@@ -4,8 +4,10 @@ using DynamicObjects, Arrow, DataFrames
 
 # The governed executor may select mmap from the observed runtime value without
 # an @mmap declaration. Loading this extension is itself the capability signal:
-# DataFrames have a registered Arrow-backed mmap format below.
-DynamicObjects._automatic_mmap_eligible(::AbstractDataFrame) = true
+# a `DataFrame` has a registered Arrow-backed mmap format below. Only the exact
+# type that format reloads is eligible — a `SubDataFrame` has no `save` method
+# here (and would reload as a `DataFrame`), so it serializes, keeping its type.
+DynamicObjects._automatic_mmap_eligible(::DataFrame) = true
 
 # Arrow-backed `@mmap` for a `DataFrame` property. Slots under the existing
 # `:mmap` disk-format token by value-type dispatch — no new marker, no macro

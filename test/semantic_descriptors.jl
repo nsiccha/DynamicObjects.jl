@@ -9,6 +9,7 @@ export SemanticQuality, draft, final, SemanticDescriptorFixture,
     GOVERNED_MATERIALIZATION_CALLS, GOVERNED_MMAP_CALLS,
     GOVERNED_SERIAL_CALLS,
     GovernedLazyColumns, GovernedNestedFixture, GovernedScopeFixture,
+    GOVERNED_POLICY_CALLS, MisclaimedColumn, GovernedPolicyFixture,
     LegacySemanticMeta, DeduplicatedKeyFixture
 
 @enum SemanticQuality draft final
@@ -85,6 +86,33 @@ end
         scale * (sum(nested.large) + sum(nested.part.heavy) + sum(own_part.heavy))
     lazy_view(scale::Int) = nested.part.lazy
     @fresh fresh_lazy_view(scale::Int) = nested.part.lazy
+end
+
+const GOVERNED_POLICY_CALLS = Threads.Atomic{Int}(0)
+
+# An array type that wrongly claims mmap eligibility: DO's array codec densifies
+# it, so it would reload as a bare Vector.
+struct MisclaimedColumn <: AbstractVector{Float64}
+    data::Vector{Float64}
+end
+Base.size(column::MisclaimedColumn) = size(column.data)
+Base.getindex(column::MisclaimedColumn, i::Int) = column.data[i]
+DynamicObjects._automatic_mmap_eligible(::MisclaimedColumn) = true
+
+@dynamicstruct struct GovernedPolicyFixture
+    value::Int
+    __cache_base__ = GOVERNED_MATERIALIZATION_CACHE_BASE[]
+
+    slow_small(scale::Int)::Vector{Float64} = begin
+        sleep(1.1)
+        [Float64(value * scale)]
+    end
+    misclaimed(scale::Int) =
+        MisclaimedColumn(fill(Float64(value * scale), GOVERNED_LARGE_LENGTH))
+    plain(scale::Int)::Vector{Float64} = begin
+        Threads.atomic_add!(GOVERNED_POLICY_CALLS, 1)
+        fill(Float64(value * scale), GOVERNED_LARGE_LENGTH)
+    end
 end
 
 @dynamicstruct struct SemanticDescriptorFixture
@@ -472,6 +500,63 @@ the operation returns keeps its type instead of being densified into an mmap.
     @test fresh_view isa GovernedLazyColumns
     @test !materialization_observation(root, :fresh_lazy_view, 1).stored
     @test !any(entry -> startswith(entry, "fresh_lazy_view_"), automatic_entries())
+end
+
+"""
+Pins the storage policy: automatic storage may change where a value lives but
+never its type, and memory-maps only values large enough to benefit. A small
+result promoted for its compute time serializes; a codec that would reload a
+different type is never used; an entry that cannot prove its recorded type is
+recomputed rather than served.
+"""
+@testitem "governed materialization keeps types and maps only large values" tags=[:semantic] setup=[SemanticFixtures] begin
+    using Logging
+    cache_base = mktempdir()
+    GOVERNED_MATERIALIZATION_CACHE_BASE[] = cache_base
+    GOVERNED_POLICY_CALLS[] = 0
+    context = (;
+        scope=:job,
+        key=(;mount="/policy", job=:one),
+        retention=(;max_entries=1, ttl=60.0),
+    )
+    object = GovernedPolicyFixture(2)
+
+    # Slow but tiny: promoted for its compute time, serialized rather than mapped.
+    @test execute_materialization(context, object, :slow_small, 3) == [6.0]
+    small = materialization_observation(object, :slow_small, 3)
+    @test small.stored
+    @test small.tier === :serialized
+
+    # An eligibility claim whose codec changes the type is caught on write.
+    misclaimed = @test_logs (:warn, r"serializing instead") match_mode=:any execute_materialization(
+        context, object, :misclaimed, 1)
+    @test misclaimed isa MisclaimedColumn
+    @test materialization_observation(object, :misclaimed, 1).tier === :serialized
+    clear_mem_caches!(object)
+    @test execute_materialization(context, object, :misclaimed, 1) isa MisclaimedColumn
+
+    # A large plain Array still maps, and its metadata records the computed type.
+    @test execute_materialization(context, object, :plain, 1) isa Vector{Float64}
+    @test GOVERNED_POLICY_CALLS[] == 1
+    @test materialization_observation(object, :plain, 1).tier === :mmap
+    path = DynamicObjects.get_cache_path(object, :plain, 1)
+    metadata = DynamicObjects._automatic_materialization_metadata(path)
+    @test metadata.value_type === Vector{Float64}
+
+    # A legacy mmap entry (no recorded type) may hold a densified wrapper, so it
+    # is recomputed once and rewritten with its type; the rewrite is trusted.
+    legacy = Base.structdiff(metadata, NamedTuple{(:value_type,)})
+    clear_mem_caches!(object)
+    GC.gc(); GC.gc()
+    DynamicObjects._atomic_save(Val(:serial), path * ".auto", legacy)
+    @test @test_logs (:warn, r"does not reload as its computed type") match_mode=:any execute_materialization(
+        context, object, :plain, 1) isa Vector{Float64}
+    @test GOVERNED_POLICY_CALLS[] == 2
+    @test DynamicObjects._automatic_materialization_metadata(
+        path).value_type === Vector{Float64}
+    clear_mem_caches!(object)
+    @test execute_materialization(context, object, :plain, 1) isa Vector{Float64}
+    @test GOVERNED_POLICY_CALLS[] == 2
 end
 
 """
