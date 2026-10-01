@@ -2,13 +2,6 @@ module DataFramesArrowExt
 
 using DynamicObjects, Arrow, DataFrames
 
-# The governed executor may select mmap from the observed runtime value without
-# an @mmap declaration. Loading this extension is itself the capability signal:
-# a `DataFrame` has a registered Arrow-backed mmap format below. Only the exact
-# type that format reloads is eligible — a `SubDataFrame` has no `save` method
-# here (and would reload as a `DataFrame`), so it serializes, keeping its type.
-DynamicObjects._automatic_mmap_eligible(::DataFrame) = true
-
 # Arrow-backed `@mmap` for a `DataFrame` property. Slots under the existing
 # `:mmap` disk-format token by value-type dispatch — no new marker, no macro
 # change. A property declared `@mmap tbl::DataFrame = …` emits
@@ -22,6 +15,10 @@ DynamicObjects._automatic_mmap_eligible(::DataFrame) = true
 # vectors (mutation faults with ReadOnlyMemoryError) — the same PROT_READ
 # contract as the array `@mmap` path. The columns live in the OS page cache,
 # not the GC heap.
+#
+# This method is also what makes a `DataFrame` eligible for governed automatic
+# mmap: DO checks for a type's own `save` method. A `SubDataFrame` has none (and
+# would reload as a `DataFrame`), so it serializes, keeping its type.
 DynamicObjects.save(::Val{:mmap}, path::AbstractString, df::DataFrame) =
     Arrow.write(path, df)
 

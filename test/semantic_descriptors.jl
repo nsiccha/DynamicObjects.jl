@@ -9,7 +9,8 @@ export SemanticQuality, draft, final, SemanticDescriptorFixture,
     GOVERNED_MATERIALIZATION_CALLS, GOVERNED_MMAP_CALLS,
     GOVERNED_SERIAL_CALLS,
     GovernedLazyColumns, GovernedNestedFixture, GovernedScopeFixture,
-    GOVERNED_POLICY_CALLS, MisclaimedColumn, GovernedPolicyFixture,
+    GOVERNED_POLICY_CALLS, MisclaimedColumn, OwnFormatPayload,
+    GovernedPolicyFixture,
     LegacySemanticMeta, DeduplicatedKeyFixture
 
 @enum SemanticQuality draft final
@@ -90,14 +91,40 @@ end
 
 const GOVERNED_POLICY_CALLS = Threads.Atomic{Int}(0)
 
-# An array type that wrongly claims mmap eligibility: DO's array codec densifies
-# it, so it would reload as a bare Vector.
+# An array type with its own mmap `save` that does not round-trip its type: it
+# writes its backing data in DO's array format, so it reloads as a bare Vector
+# (the shape of a `TreeData` whose leaves are views).
 struct MisclaimedColumn <: AbstractVector{Float64}
     data::Vector{Float64}
 end
 Base.size(column::MisclaimedColumn) = size(column.data)
 Base.getindex(column::MisclaimedColumn, i::Int) = column.data[i]
-DynamicObjects._automatic_mmap_eligible(::MisclaimedColumn) = true
+DynamicObjects.save(::Val{:mmap}, path::AbstractString, column::MisclaimedColumn) =
+    DynamicObjects.save(Val(:mmap), path, column.data)
+
+# A non-array type with its own type-preserving mmap container, registered the
+# way TreeArrays registers `TreeData`: no eligibility declaration beyond `save`.
+struct OwnFormatPayload
+    values::Vector{Float64}
+end
+Base.:(==)(a::OwnFormatPayload, b::OwnFormatPayload) = a.values == b.values
+const OWN_FORMAT_MAGIC = collect(codeunits("DOOWNFMT"))
+function DynamicObjects.save(::Val{:mmap}, path::AbstractString, payload::OwnFormatPayload)
+    open(path, "w") do io
+        write(io, OWN_FORMAT_MAGIC)
+        DynamicObjects.save(Val(:mmap), io, payload.values)
+    end
+    nothing
+end
+DynamicObjects.load(::Val{:mmap}, path::AbstractString, ::Type{OwnFormatPayload}) =
+    open(path, "r") do io
+        read(io, length(OWN_FORMAT_MAGIC)) == OWN_FORMAT_MAGIC ||
+            error("not an OwnFormatPayload container")
+        OwnFormatPayload(DynamicObjects.load(Val(:mmap), io, nothing;
+            end_offset=filesize(io)))
+    end
+DynamicObjects.register_mmap_container!(OWN_FORMAT_MAGIC,
+    path -> DynamicObjects.load(Val(:mmap), path, OwnFormatPayload))
 
 @dynamicstruct struct GovernedPolicyFixture
     value::Int
@@ -109,6 +136,8 @@ DynamicObjects._automatic_mmap_eligible(::MisclaimedColumn) = true
     end
     misclaimed(scale::Int) =
         MisclaimedColumn(fill(Float64(value * scale), GOVERNED_LARGE_LENGTH))
+    own_format(scale::Int) =
+        OwnFormatPayload(fill(Float64(value * scale), GOVERNED_LARGE_LENGTH))
     plain(scale::Int)::Vector{Float64} = begin
         Threads.atomic_add!(GOVERNED_POLICY_CALLS, 1)
         fill(Float64(value * scale), GOVERNED_LARGE_LENGTH)
@@ -527,7 +556,22 @@ recomputed rather than served.
     @test small.stored
     @test small.tier === :serialized
 
-    # An eligibility claim whose codec changes the type is caught on write.
+    # A type's own mmap format makes it eligible with no other declaration;
+    # DO's generic array writer and the untyped fallback do not.
+    @test DynamicObjects._automatic_mmap_eligible(
+        OwnFormatPayload(Float64[]))
+    @test DynamicObjects._automatic_mmap_eligible(Float64[])
+    @test !DynamicObjects._automatic_mmap_eligible(view(Float64[1, 2], 1:1))
+    @test !DynamicObjects._automatic_mmap_eligible("not mappable")
+    own = execute_materialization(context, object, :own_format, 1)
+    @test own isa OwnFormatPayload
+    @test materialization_observation(object, :own_format, 1).tier === :mmap
+    clear_mem_caches!(object)
+    reloaded = execute_materialization(context, object, :own_format, 1)
+    @test reloaded isa OwnFormatPayload
+    @test reloaded == own
+
+    # A format that does not round-trip the value's type is caught on write.
     misclaimed = @test_logs (:warn, r"serializing instead") match_mode=:any execute_materialization(
         context, object, :misclaimed, 1)
     @test misclaimed isa MisclaimedColumn
