@@ -31,8 +31,14 @@ jobs:
           arch: ${{ matrix.julia-arch }}
       - uses: julia-actions/cache@v2
       - name: Develop unregistered dependencies
+        # Clone outside the checkout: TestItemRunner's @run_package_tests scans the
+        # package root recursively, so a dependency cloned inside it has its own
+        # @testitems swept into this suite (without that dependency's test deps).
+        # The [sources] path is written with forward slashes so it stays a valid
+        # TOML string on Windows.
+        shell: bash
         run: |
-          git clone -b dev https://github.com/nsiccha/Treebars.jl.git
-          julia --project=. -e 'using Pkg; project_path = Base.active_project(); project = read(project_path, String); remote = "Treebars = {url = \"https://github.com/nsiccha/Treebars.jl\"}"; local_path = "Treebars = {path = \"Treebars.jl\"}"; @assert occursin(remote, project); write(project_path, replace(project, remote => local_path)); Pkg.develop(path="Treebars.jl"); Pkg.instantiate()'
+          git clone -b dev https://github.com/nsiccha/Treebars.jl.git "$RUNNER_TEMP/ci-deps/Treebars.jl"
+          julia --project=. -e 'using Pkg; treebars = replace(joinpath(ENV["RUNNER_TEMP"], "ci-deps", "Treebars.jl"), "\\" => "/"); project_path = Base.active_project(); project = read(project_path, String); remote = "Treebars = {url = \"https://github.com/nsiccha/Treebars.jl\"}"; local_path = "Treebars = {path = \"$treebars\"}"; @assert occursin(remote, project); write(project_path, replace(project, remote => local_path)); Pkg.develop(path=treebars); Pkg.instantiate()'
       - name: Run tests
         run: julia --project=. --color=yes -e 'using Pkg; Pkg.test(; coverage=true)'
