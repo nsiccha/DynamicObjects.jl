@@ -1625,6 +1625,9 @@ read-only mappings plus truncated-file recovery.
     # what turns corrupt cache files into recomputation rather than false hits.
     @test Base.get_extension(DynamicObjects, :DataFramesArrowExt) !== nothing
     @test DynamicObjects._automatic_mmap_eligible(DataFrame(a=[1]))
+    # Only the exact type the Arrow format round-trips: a SubDataFrame has no
+    # mmap `save` and would reload as a DataFrame, so it is not eligible.
+    @test !DynamicObjects._automatic_mmap_eligible(view(DataFrame(a=[1, 2]), 1:1, :))
 
     short_arrow = joinpath(_mmap_base[], "short.arrow")
     write(short_arrow, UInt8[0x41])
