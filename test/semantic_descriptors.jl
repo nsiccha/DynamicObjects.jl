@@ -8,6 +8,7 @@ export SemanticQuality, draft, final, SemanticDescriptorFixture,
     GOVERNED_MATERIALIZATION_CACHE_BASE,
     GOVERNED_MATERIALIZATION_CALLS, GOVERNED_MMAP_CALLS,
     GOVERNED_SERIAL_CALLS,
+    GovernedLazyColumns, GovernedNestedFixture, GovernedScopeFixture,
     LegacySemanticMeta, DeduplicatedKeyFixture
 
 @enum SemanticQuality draft final
@@ -48,6 +49,42 @@ const GOVERNED_MATERIALIZATION_CACHE_BASE = Ref("cache")
         Threads.atomic_add!(GOVERNED_SERIAL_CALLS, 1)
         repeat(string(value * scale), 1 + 1024 * 1024)
     end
+end
+
+const GOVERNED_LARGE_LENGTH = 1 + (1024 * 1024) ÷ sizeof(Float64)
+
+# A lazy column-concatenation view over arrays it does not own — the shape of a
+# pooled view over per-chain memory-mapped matrices.
+struct GovernedLazyColumns <: AbstractMatrix{Float64}
+    columns::Vector{Vector{Float64}}
+end
+Base.size(m::GovernedLazyColumns) = (length(first(m.columns)), length(m.columns))
+Base.getindex(m::GovernedLazyColumns, i::Int, j::Int) = m.columns[j][i]
+
+@dynamicstruct struct GovernedNestedFixture
+    value::Int
+    __cache_base__ = GOVERNED_MATERIALIZATION_CACHE_BASE[]
+
+    large = fill(Float64(value), GOVERNED_LARGE_LENGTH)
+    @struct part = begin
+        heavy = fill(2.0 * value, GOVERNED_LARGE_LENGTH)
+        lazy = GovernedLazyColumns([large, heavy])
+    end
+end
+
+@dynamicstruct struct GovernedScopeFixture
+    value::Int
+    __cache_base__ = GOVERNED_MATERIALIZATION_CACHE_BASE[]
+
+    nested = GovernedNestedFixture(value)
+    @struct own_part = begin
+        heavy = fill(3.0 * value, GOVERNED_LARGE_LENGTH)
+    end
+
+    total(scale::Int) =
+        scale * (sum(nested.large) + sum(nested.part.heavy) + sum(own_part.heavy))
+    lazy_view(scale::Int) = nested.part.lazy
+    @fresh fresh_lazy_view(scale::Int) = nested.part.lazy
 end
 
 @dynamicstruct struct SemanticDescriptorFixture
@@ -378,6 +415,63 @@ directory. Identity/version and retention remain reflected in the lifecycle.
     @test abspath(unowned_path) in preserved.preserved_paths
     @test isfile(unowned_file)
     @test read(unowned_file, String) == "keep"
+end
+
+"""
+Pins the scope of automatic storage: only the executed property's own returned
+value is observed. Large unmarked properties it reads on a nested DO object or
+an `@struct` child stay in ordinary memory memoization, and a lazy array view
+the operation returns keeps its type instead of being densified into an mmap.
+"""
+@testitem "governed materialization scope and lazy views" tags=[:semantic] setup=[SemanticFixtures] begin
+    cache_base = mktempdir()
+    GOVERNED_MATERIALIZATION_CACHE_BASE[] = cache_base
+    context = (;
+        scope=:job,
+        key=(;mount="/scope", job=:one),
+        retention=(;max_entries=1, ttl=60.0),
+    )
+    automatic_entries() = sort!([basename(file)
+        for (dir, _, files) in walkdir(cache_base) for file in files
+        if endswith(file, ".auto")])
+
+    root = GovernedScopeFixture(2)
+    n = length(root.nested.large)
+    @test n * sizeof(Float64) > 1024 * 1024
+    @test execute_materialization(context, root, :total, 3) ==
+        3 * n * (2.0 + 4.0 + 6.0)
+    # Every value the operation read is over the 1 MiB promotion threshold, yet
+    # none of them was executed by the host, so none is governed.
+    for (object, name) in (
+            (root.nested, :large),
+            (root.nested.part, :heavy),
+            (root.own_part, :heavy))
+        observed = materialization_observation(object, name)
+        @test observed.tier === :memory
+        @test observed.ready
+        @test !observed.stored
+    end
+    @test all(entry -> startswith(entry, "total_"), automatic_entries())
+
+    # The executed property's own large result is promoted — but a lazy view
+    # keeps its type: it serializes rather than becoming a dense mmapped Matrix.
+    view = execute_materialization(context, root, :lazy_view, 1)
+    @test view isa GovernedLazyColumns
+    @test size(view) == (n, 2)
+    observed = materialization_observation(root, :lazy_view, 1)
+    @test observed.stored
+    @test observed.tier === :serialized
+    clear_mem_caches!(root)
+    reloaded = execute_materialization(context, root, :lazy_view, 1)
+    @test reloaded isa GovernedLazyColumns
+    @test reloaded == view
+
+    # A plain Array result still memory-maps (pinned with `large_array` above);
+    # declaration-site `@fresh` opts the executed property out entirely.
+    fresh_view = execute_materialization(context, root, :fresh_lazy_view, 1)
+    @test fresh_view isa GovernedLazyColumns
+    @test !materialization_observation(root, :fresh_lazy_view, 1).stored
+    @test !any(entry -> startswith(entry, "fresh_lazy_view_"), automatic_entries())
 end
 
 """
