@@ -5269,6 +5269,15 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             _push_if_symbol!(parent_props, a.args[2])
             continue
         end
+        # A `__self__` member method is an ordinary Julia method, not a
+        # property: forwarding its name would give each inline child a
+        # `name = __parent__.name` property that has no `compute_property`
+        # behind it, and would rewrite the child's bare `name(__parent__, …)`
+        # call onto that dead property. Unforwarded, the bare call resolves
+        # to the module-level method exactly as it does in the parent's own
+        # bodies (snag member-method-ca-f20fb4ef).
+        Meta.isexpr(a, (:(=), :function)) &&
+            !isnothing(_detect_inline_method_lhs(a.args[1])) && continue
         lhs = if Meta.isexpr(a, :(=))
             a.args[1]
         else
