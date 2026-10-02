@@ -340,7 +340,7 @@ end # @testmodule DOFixtures
 
 @testmodule DOMemberMethodFixtures begin
 using DynamicObjects
-export MemberMethods, member_middle, member_first
+export MemberMethods, member_middle, member_first, member_scaled
 
 @dynamicstruct struct MemberMethods
     value::Int
@@ -359,6 +359,14 @@ export MemberMethods, member_middle, member_first
     # Qualified names are the motivating rendering use case.
     function Base.show(io::IO, ::MIME"text/plain", __self__)
         print(io, "MemberMethods(", doubled, ")")
+    end
+
+    # An inline child reaches parent member methods by bare name with the
+    # receiver it means; the names are methods, never forwarded properties.
+    member_scaled(__self__, factor) = doubled * factor
+    @struct child(factor) = begin
+        short = member_scaled(__parent__, factor)
+        long = member_first(__parent__, factor; suffix="!")
     end
 end
 
@@ -391,6 +399,23 @@ end # @testmodule DOMemberMethodFixtures
     @test !hasproperty(object, :member_middle)
     @test !hasproperty(object, :member_first)
     @test DynamicObjects.property_descriptor(MemberMethods, :member_middle) === nothing
+end
+
+@testitem "inline children call parent member methods as methods" tags=[:core] setup=[DOImports, DOMemberMethodFixtures] begin
+    # snag member-method-ca-f20fb4ef: the inline-child auto-forward turned a
+    # short-form member method into a `__parent__.name` property, so a bare
+    # call in the child died with `no method matching compute_property`.
+    child = MemberMethods(4).child(3)
+    @test child.short == 24
+    @test child.long == "24!"
+
+    ChildType = typeof(child)
+    child_declared = first.(DynamicObjects.meta(ChildType))
+    @test :doubled in child_declared   # real parent properties still forward
+    for name in (:member_scaled, :member_first, :member_middle)
+        @test name ∉ child_declared
+        @test DynamicObjects.property_descriptor(ChildType, name) === nothing
+    end
 end
 
 @testitem "Multi-lhs assignment" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
