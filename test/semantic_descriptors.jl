@@ -41,6 +41,7 @@ const GOVERNED_MATERIALIZATION_CACHE_BASE = Ref("cache")
         sleep(0.05)
         value * scale
     end
+    @fresh fresh_compute(scale::Int) = value * scale
 
     large_array(scale::Int)::Vector{Float64} = begin
         Threads.atomic_add!(GOVERNED_MMAP_CALLS, 1)
@@ -493,6 +494,10 @@ end
         @test pending isa Pending
         @test !isready(pending)
         @test length(queue) == 1
+
+        # A fresh operation has no selector to forward. Its default call
+        # must remain keyword-free at the indexed property boundary.
+        @test execute_materialization(context, object, :fresh_compute, 5) == 35
 
         another = execute_materialization(context, object, :compute, 3;
             fetch=Deferred(d -> error("the same application key was queued twice")))

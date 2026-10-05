@@ -9343,7 +9343,9 @@ end
 function _execute_materialization_target(target, name::Symbol, descriptor,
         args, kwargs::NamedTuple, fetch)
     if descriptor.indexed
-        return getproperty(target, name)(args...; fetch, kwargs...)
+        return fetch === Base.fetch ?
+            getproperty(target, name)(args...; kwargs...) :
+            getproperty(target, name)(args...; fetch, kwargs...)
     end
     fetch === Base.fetch || error(
         "non-indexed property `$name` does not accept a fetch selector")
