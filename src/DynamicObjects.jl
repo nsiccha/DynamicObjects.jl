@@ -9341,17 +9341,19 @@ function _end_materialization!(owner::_MaterializationOwner)
 end
 
 function _execute_materialization_target(target, name::Symbol, descriptor,
-        args, kwargs::NamedTuple)
+        args, kwargs::NamedTuple, fetch)
     if descriptor.indexed
-        return getproperty(target, name)(args...; kwargs...)
+        return getproperty(target, name)(args...; fetch, kwargs...)
     end
+    fetch === Base.fetch || error(
+        "non-indexed property `$name` does not accept a fetch selector")
     (isempty(args) && isempty(kwargs)) || error(
         "non-indexed property `$name` does not accept operation arguments")
     getproperty(target, name)
 end
 
 function _timed_materialization_target(target, name::Symbol, descriptor,
-        args, kwargs::NamedTuple)
+        args, kwargs::NamedTuple, fetch)
     # This is the same compiler counter Base.@time uses. Its enable/disable
     # operations nest, so concurrent/nested governed executions do not turn
     # collection off underneath one another.
@@ -9360,7 +9362,7 @@ function _timed_materialization_target(target, name::Symbol, descriptor,
     wall_started = time_ns()
     try
         value = _execute_materialization_target(
-            target, name, descriptor, args, kwargs)
+            target, name, descriptor, args, kwargs, fetch)
         wall_ns = time_ns() - wall_started
         compile_ns =
             first(Base.cumulative_compile_time_ns()) - compile_started
@@ -9582,6 +9584,9 @@ Execute a DynamicObjects property under framework-owned storage governance.
 semantic host; ordinary applications call their operations normally and never
 construct a store. `root` is the retained application root and `target` is the
 mounted object that owns `property`.
+For indexed properties, `fetch` selects synchronous or deferred execution;
+it reaches the property cache without entering the application argument key
+or automatic storage path.
 
 The executor adds an active lease around the existing DO property machinery.
 For an ordinary property on a retained root it observes the actual result and
@@ -9597,7 +9602,7 @@ through their ordinary declaration-site semantics and are never automatically
 promoted; only the executed property's own returned value is observed.
 """
 function execute_materialization(context::NamedTuple, root, target,
-        name::Symbol, args...; kwargs...)
+        name::Symbol, args...; fetch=Base.fetch, kwargs...)
     descriptor = property_descriptor(typeof(target), name)
     descriptor === nothing && error(
         "$(typeof(target)) has no DynamicObjects property `$name`")
@@ -9608,14 +9613,14 @@ function execute_materialization(context::NamedTuple, root, target,
             owner, target, name, descriptor, args, property_kwargs)
         if automatic !== nothing
             value = _execute_materialization_target(
-                target, name, descriptor, args, property_kwargs)
+                target, name, descriptor, args, property_kwargs, fetch)
             automatic.tier === :serialized &&
                 _clear_automatic_materialization_cache!(
                     target, name, descriptor, args, property_kwargs)
             return value
         end
         timed = _timed_materialization_target(
-            target, name, descriptor, args, property_kwargs)
+            target, name, descriptor, args, property_kwargs, fetch)
         _persist_automatic_materialization!(owner, target, name, descriptor,
             args, property_kwargs, timed.value, timed.elapsed_seconds)
     finally

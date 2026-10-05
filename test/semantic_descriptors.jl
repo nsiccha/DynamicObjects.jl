@@ -474,6 +474,51 @@ directory. Identity/version and retention remain reflected in the lifecycle.
     @test read(unowned_file, String) == "keep"
 end
 
+@testitem "governed execution keeps fetch selectors out of storage keys" tags=[:semantic] setup=[SemanticFixtures] begin
+    using DynamicObjects
+
+    GOVERNED_MATERIALIZATION_CALLS[] = 0
+    GOVERNED_MATERIALIZATION_CACHE_BASE[] = mktempdir()
+    object = GovernedMaterializationFixture(1, 7)
+    context = (;scope=:session, key="deferred-execution", retention=(;max_entries=1, ttl=nothing))
+    queue = DeferredCompute[]
+    stop = Base.Event()
+    running = Threads.@spawn wait(stop)
+    try
+        @test timedwait(() -> istaskstarted(running), 5.0) === :ok
+        # A request-owned executor can close over a running Task. It must only
+        # select how the computation starts, never enter the persistent key.
+        selector = Deferred(d -> (istaskstarted(running); push!(queue, d)))
+        pending = execute_materialization(context, object, :compute, 3; fetch=selector)
+        @test pending isa Pending
+        @test !isready(pending)
+        @test length(queue) == 1
+
+        another = execute_materialization(context, object, :compute, 3;
+            fetch=Deferred(d -> error("the same application key was queued twice")))
+        @test another isa Pending
+        @test length(queue) == 1
+
+        @test DynamicObjects.run!(only(queue))
+        @test fetch(pending) == 21
+        @test fetch(another) == 21
+        @test GOVERNED_MATERIALIZATION_CALLS[] == 1
+        @test execute_materialization(context, object, :compute, 3;
+            fetch=selector) == 21
+        @test !isfile(DynamicObjects.get_cache_path(object, :compute, 3))
+
+        # HTMXObjects omits the selector for declaration-site @fresh. The
+        # corresponding direct computation returns values but queues nothing
+        # and runs again for the same application arguments.
+        @test (fresh(object.compute, 4), fresh(object.compute, 4)) == (28, 28)
+        @test GOVERNED_MATERIALIZATION_CALLS[] == 3
+        @test length(queue) == 1
+    finally
+        notify(stop)
+        wait(running)
+    end
+end
+
 """
 Pins the scope of automatic storage: only the executed property's own returned
 value is observed. Large unmarked properties it reads on a nested DO object or
