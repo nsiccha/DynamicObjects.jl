@@ -985,6 +985,110 @@ function Base.iterate(d::MountedDict, state)
     _iterate_mounted_shared(d, iterate(d.shared, inner))
 end
 
+# Opaque properties (a bare `__self__` escapes into code the static dependency
+# scan cannot follow) are context-dependent only if they actually READ request
+# context. Remount views that rebind the same context share one namespace per
+# retained cache: an opaque property computes there once, under a guarded
+# `__self__` (`_OpaqueProbe`), and its value — and its in-flight latch — serve
+# every such view. A computation that reads context through the guard is
+# context-dependent: its value goes to the requesting view alone and the key is
+# marked `tainted`, so later views compute it view-locally as before.
+struct _OpaqueNamespace
+    lock::ReentrantLock
+    cache::ThreadsafeDict{Symbol,Any}
+    subcaches::Dict{Symbol,ThreadsafeDict}
+    tainted::Set{Any}   # bare names, or `(name, (indices, kwargs))` for indexed keys
+end
+_OpaqueNamespace() = _OpaqueNamespace(ReentrantLock(),
+    ThreadsafeDict{Symbol,Any}(Dict{Symbol,Any}()), Dict{Symbol,ThreadsafeDict}(), Set{Any}())
+
+_ns_tainted(ns::_OpaqueNamespace, key) = lock(() -> key in ns.tainted, ns.lock)
+_ns_taint!(ns::_OpaqueNamespace, key) = lock(() -> (push!(ns.tainted, key); nothing), ns.lock)
+_ns_subcache(ns::_OpaqueNamespace, name::Symbol) =
+    lock(() -> get!(ThreadsafeDict, ns.subcaches, name), ns.lock)
+function Base.empty!(ns::_OpaqueNamespace)
+    subcaches = lock(ns.lock) do
+        empty!(ns.tainted)
+        collect(values(ns.subcaches))
+    end
+    empty!(ns.cache)
+    foreach(empty!, subcaches)
+    ns
+end
+
+# The namespaces of a retained cache, keyed by the context set they guard, live
+# in that cache's own status dictionary under a key no property name can take,
+# so they are collected with it. Emptying the cache empties them in place,
+# which reaches every live view holding one (`clear_mem_caches!`).
+const _REMOUNT_NAMESPACES_KEY = Symbol("#remount-namespaces")
+
+_opaque_namespace(shared::ThreadsafeDict{Symbol,Any}, context_names) = lock(shared.lock) do
+    byset = get!(Dict{Any,_OpaqueNamespace}, shared.status, _REMOUNT_NAMESPACES_KEY)
+    get!(_OpaqueNamespace, byset, Tuple(sort!(collect(context_names))))
+end
+
+function _empty_status!(status::AbstractDict)
+    namespaces = pop!(status, _REMOUNT_NAMESPACES_KEY, nothing)
+    empty!(status)
+    namespaces === nothing && return status
+    status[_REMOUNT_NAMESPACES_KEY] = namespaces
+    foreach(empty!, values(namespaces))
+    status
+end
+
+# One guarded computation of an opaque key on behalf of `requester` (a view).
+# Context reads through the guard are served from the requester and taint the
+# computation. Once sealed, an untainted computation's value is shared, so its
+# retained `__self__` must not reach any request's context afterwards.
+mutable struct _OpaqueProbe
+    const lock::ReentrantLock
+    const requester::Any
+    const property::Symbol
+    tainted::Bool
+    sealed::Bool
+end
+_OpaqueProbe(requester, property::Symbol) = _OpaqueProbe(ReentrantLock(), requester, property, false, false)
+
+"""
+    RemountSharedContextError(property, context)
+
+Thrown when request context `context` is read through the `__self__` that a
+remount-shared opaque property retained after it finished computing. The
+property read no request context while computing, so its value is shared by
+every remount view; the retained `__self__` belongs to no request.
+"""
+struct RemountSharedContextError <: Exception
+    property::Symbol
+    context::Symbol
+end
+Base.showerror(io::IO, e::RemountSharedContextError) = print(io,
+    "RemountSharedContextError: `", e.property, "` read no request context while it ",
+    "computed, so remount views share its value; the `__self__` it retained cannot ",
+    "read request context `", e.context, "` afterwards. Read `", e.context,
+    "` while computing, or pass it as an argument.")
+
+function _taint!(probe::_OpaqueProbe, context::Symbol)
+    lock(probe.lock) do
+        probe.sealed && !probe.tainted && throw(RemountSharedContextError(probe.property, context))
+        probe.tainted = true
+    end
+    nothing
+end
+_seal!(probe::_OpaqueProbe) = lock(() -> (probe.sealed = true; probe.tainted), probe.lock)
+
+# Recorded on the shared latch by a context-dependent guarded computation: every
+# accessor computes the key in its own view instead, except the requesting view
+# (`token`, its value overlay), which already holds the value — or, when the
+# computation failed, rethrows `error`.
+struct _RemountContextDependent <: Exception
+    property::Symbol
+    token::WeakRef
+    error::Any
+end
+Base.showerror(io::IO, e::_RemountContextDependent) = print(io,
+    "remount: `", e.property, "` read request context through an escaped `__self__`, ",
+    "so each remount view computes it separately")
+
 """
     MountedThreadsafeDict
 
@@ -992,7 +1096,9 @@ Internal `AbstractThreadsafeDict` view used by [`remount`](@ref). Its fields
 deliberately match the abstract cache contract (`lock`, `cache`, `status`,
 `computing`, `errors`), so the ordinary get/compute/Pending machinery operates
 unchanged. Each field is a `MountedDict` over the retained and request-local
-dictionaries.
+dictionaries. `opaque` names the view-local opaque properties that first try
+the shared `namespace`; `probe` is set only on the guarded `__self__` of one
+such computation.
 """
 struct MountedThreadsafeDict{S<:ThreadsafeDict{Symbol,Any},O} <: AbstractThreadsafeDict{Symbol,Any}
     lock::ReentrantLock
@@ -1004,6 +1110,9 @@ struct MountedThreadsafeDict{S<:ThreadsafeDict{Symbol,Any},O} <: AbstractThreads
     source::O
     invalidated::Set{Symbol}
     local_names::Set{Symbol}
+    opaque::Set{Symbol}
+    namespace::Union{Nothing,_OpaqueNamespace}
+    probe::Union{Nothing,_OpaqueProbe}
 end
 
 # Private inner-constructor discriminator emitted by `@dynamicstruct`. A public
@@ -1013,7 +1122,8 @@ struct _RemountToken end
 const _REMOUNT_TOKEN = _RemountToken()
 
 function MountedThreadsafeDict(shared::ThreadsafeDict{Symbol,Any}, source,
-                               local_names, invalidated, seed::NamedTuple)
+                               local_names, invalidated, seed::NamedTuple,
+                               opaque=(), namespace=nothing)
     names = Set{Symbol}(local_names)
     union!(names, keys(seed))
     local_cache = Dict{Symbol,Any}(pairs(seed))
@@ -1030,8 +1140,42 @@ function MountedThreadsafeDict(shared::ThreadsafeDict{Symbol,Any}, source,
         source,
         Set{Symbol}(invalidated),
         names,
+        Set{Symbol}(opaque),
+        namespace,
+        nothing,
     )
 end
+
+# The guarded `__self__` of one opaque computation shares the requester's
+# dictionaries. Reads go through `_probe_read`, which serves context from the
+# requester; any access that reaches the view-local side directly instead
+# (a cache peek, an internal helper) taints the computation the same way.
+_probe_dict(c::MountedThreadsafeDict, probe::_OpaqueProbe) = MountedThreadsafeDict(
+    c.lock, _tainting(c.cache, probe), _tainting(c.status, probe),
+    _tainting(c.computing, probe), _tainting(c.errors, probe), c.shared, c.source,
+    c.invalidated, c.local_names, c.opaque, c.namespace, probe)
+_tainting(d::MountedDict, probe::_OpaqueProbe) =
+    MountedDict(d.shared, _TaintingDict(d.overlay, probe), d.local_names)
+
+struct _TaintingDict{K,V,D<:AbstractDict{K,V}} <: AbstractDict{K,V}
+    inner::D
+    probe::_OpaqueProbe
+end
+_touch(d::_TaintingDict, key) = (key in _REMOUNT_STATUS_NAMES || _taint!(d.probe, key); d.inner)
+_touch(d::_TaintingDict) = (_taint!(d.probe, Symbol("<view-local cache>")); d.inner)
+Base.getindex(d::_TaintingDict, key) = getindex(_touch(d, key), key)
+Base.get(d::_TaintingDict, key, default) = get(_touch(d, key), key, default)
+Base.haskey(d::_TaintingDict, key) = haskey(_touch(d, key), key)
+Base.setindex!(d::_TaintingDict, value, key) = (setindex!(_touch(d, key), value, key); d)
+Base.delete!(d::_TaintingDict, key) = (delete!(_touch(d, key), key); d)
+Base.pop!(d::_TaintingDict, key) = pop!(_touch(d, key), key)
+Base.length(d::_TaintingDict) = length(_touch(d))
+Base.iterate(d::_TaintingDict, state...) = iterate(_touch(d), state...)
+Base.empty!(d::_TaintingDict) = (empty!(_touch(d)); d)
+
+_remount_probe(o) = _remount_probe(getfield(o, :cache).cache)
+_remount_probe(c::MountedThreadsafeDict) = c.probe
+_remount_probe(::AbstractDict) = nothing
 
 # An explicit store on a mounted object — remount's own nested-child seeding;
 # the public `setproperty!` is refused — is always a local shadow. Computed
@@ -1051,7 +1195,7 @@ end
 
 Base.empty!(c::MountedThreadsafeDict) = begin
     lock(c.lock) do
-        empty!(c.shared.cache); empty!(c.shared.status)
+        empty!(c.shared.cache); _empty_status!(c.shared.status)
         empty!(c.shared.computing); empty!(c.shared.errors)
         empty!(c.cache.overlay); empty!(c.status.overlay)
         empty!(c.computing.overlay); empty!(c.errors.overlay)
@@ -1072,7 +1216,7 @@ Base.get(c::AbstractThreadsafeDict, key, default) = lock(c.lock) do; get(c.cache
 # lock(c.lock) do ... end or entries(ip) which holds the lock for the full sweep.
 Base.iterate(c::AbstractThreadsafeDict) = lock(c.lock) do; iterate(c.cache); end
 Base.iterate(c::AbstractThreadsafeDict, state) = lock(c.lock) do; iterate(c.cache, state); end
-Base.empty!(c::ThreadsafeDict) = (lock(c.lock) do; empty!(c.cache); empty!(c.status); empty!(c.computing); empty!(c.errors); end; c)
+Base.empty!(c::ThreadsafeDict) = (lock(c.lock) do; empty!(c.cache); _empty_status!(c.status); empty!(c.computing); empty!(c.errors); end; c)
 n_running(c::AbstractThreadsafeDict) = lock(c.lock) do; length(c.computing); end
 Base.show(io::IO, c::ThreadsafeDict{K,V}) where {K,V} = lock(c.lock) do
     print(io, "ThreadsafeDict{", K, ",", V, "}(", length(c.cache), " cached, ", length(c.computing), " running)")
@@ -1893,6 +2037,9 @@ fetchproperty(fetch, o, name::Symbol) = begin
     if !(c isa AbstractThreadsafeDict) || is_indexed_property(o, name)
         return fetch(getproperty(o, name), nothing)
     end
+    if c isa MountedThreadsafeDict && (c.probe !== nothing || name in c.opaque)
+        return _mounted_fetchproperty(fetch, c, o, name)
+    end
     substatus_f = _bare_substatus_f(o, name)
     rv = get!(c, name; substatus=substatus_f, fetch=identity) do s
         v = _computeproperty(o, name; __status__=s)
@@ -2001,6 +2148,8 @@ function subcache(pc::PropertyCache{<:MountedThreadsafeDict}, owner, ::Val{name}
     source_ip = getproperty(mounted.source, name)
     source_ip isa IndexableProperty || error(
         "remount: intrinsic indexed property `$name` did not resolve to an IndexableProperty on the retained source")
+    name in mounted.opaque &&
+        return _OpaqueSubcache(mounted.namespace, name, owner, _ns_subcache(mounted.namespace, name), ThreadsafeDict())
     if name in mounted.invalidated
         local_cache = ThreadsafeDict()
         if _nested_struct_type(typeof(owner), Val(name)) !== nothing
@@ -2619,7 +2768,9 @@ elseif !isempty(indices) || !isempty(kwargs)
     # owns kwargs-keyed caching for indexed properties; we just hand off.
     _computeproperty(o, name, indices...; __status__, kwargs...)
 else
-    cache = getfield(o, :cache)
+    _getorcompute_bare(getfield(o, :cache), o, name)
+end
+function _getorcompute_bare(cache::PropertyCache, o, name::Symbol)
     # Fast hit path: a cached bare property returns WITHOUT building the
     # `substatus` factory or the `get!` do-block closure below — both allocate
     # on every access and were the dominant warm-access cost. Hit bookkeeping is
@@ -2641,6 +2792,16 @@ else
         # — and any IP/property accesses inside — attach to it.
         _computeproperty(o, name; __status__=s)
     end
+end
+# A remount view first tries the shared namespace for an untainted opaque
+# property; the guarded `__self__` of an opaque computation intercepts every
+# read (`_probe_read`).
+function _getorcompute_bare(cache::PropertyCache{<:MountedThreadsafeDict}, o, name::Symbol)
+    c = cache.cache
+    c.probe === nothing || return _probe_read(c, c.probe, o, name)
+    name in c.opaque && !is_indexed_property(o, name) &&
+        return _opaque_bare!(o, name, nothing)
+    invoke(_getorcompute_bare, Tuple{PropertyCache,Any,Symbol}, cache, o, name)
 end
 _bare_substatus_f(o, name) =
     if name != :__substatus__ && name != :__status__ &&
@@ -6727,12 +6888,16 @@ function _validate_remount_keys(source, changed)
     nothing
 end
 
-# Return (invalidated values, local wrapper keys). `invalidated` is the sound
-# transitive closure rooted at explicit context overrides, fresh progress state,
-# opaque self-reaches, and nested children (which retain their parent object).
-# Indexed wrapper KEYS are always local so their `o` is the mounted object; an
-# indexed property's per-argument subcache is shared only when that property is
-# absent from `invalidated` (see the mounted `subcache` method above).
+# Return (invalidated values, local wrapper keys, opaque). `invalidated` is the
+# sound transitive closure rooted at explicit context overrides, fresh progress
+# state, opaque self-reaches, and nested children (which retain their parent
+# object). `opaque` is the part of it reached only through opaque self-reaches:
+# those properties MAY read context, so they stay view-local values, but they
+# first try the remount namespace, which shares them while they provably read
+# none (`_opaque_get!`). Indexed wrapper KEYS are always local so their `o` is
+# the mounted object; an indexed property's per-argument subcache is shared only
+# when that property is absent from `invalidated` (see the mounted `subcache`
+# method above).
 function _remount_partition(source, shared::ThreadsafeDict{Symbol,Any}, changed,
                             forced_local=())
     T = typeof(source)
@@ -6760,27 +6925,38 @@ function _remount_partition(source, shared::ThreadsafeDict{Symbol,Any}, changed,
     for name in names
         _nested_struct_type(T, Val(name)) === nothing || push!(invalidated, name)
     end
-    opaque = _remount_opaque_properties(T)
-    opaque === nothing ? union!(invalidated, computed) : union!(invalidated, opaque)
-
-    changed_graph = true
-    while changed_graph
-        changed_graph = false
-        for (name, deps) in dependencies
-            name in invalidated && continue
-            if !isdisjoint(deps, invalidated)
-                push!(invalidated, name)
-                changed_graph = true
-            end
-        end
-    end
+    declared_opaque = _remount_opaque_properties(T)
+    # An older expansion carries no opacity data: every computed property is context.
+    declared_opaque === nothing && union!(invalidated, computed)
+    _close_dependents!(invalidated, dependencies)
+    opaque = declared_opaque === nothing ? Set{Symbol}() :
+        setdiff!(Set{Symbol}(declared_opaque), invalidated)
+    _close_dependents!(opaque, dependencies, invalidated)
+    union!(invalidated, opaque)
 
     local_names = copy(invalidated)
     for name in indexed
         value = get(shared, name, _missing_sentinel)
         (value === _missing_sentinel || value isa IndexableProperty) && push!(local_names, name)
     end
-    invalidated, local_names
+    invalidated, local_names, opaque
+end
+
+# Grow `names` by every property that transitively depends on one of them,
+# never adding a name in `excluded`.
+function _close_dependents!(names::Set{Symbol}, dependencies, excluded=())
+    changed_graph = true
+    while changed_graph
+        changed_graph = false
+        for (name, deps) in dependencies
+            (name in names || name in excluded) && continue
+            if !isdisjoint(deps, names)
+                push!(names, name)
+                changed_graph = true
+            end
+        end
+    end
+    names
 end
 
 _remount_invalidated(o, name::Symbol) = begin
@@ -6790,6 +6966,203 @@ _remount_invalidated(o, name::Symbol) = begin
     c = pc.cache
     c isa MountedThreadsafeDict && name in c.invalidated
 end
+
+# --- opaque remount sharing ----------------------------------------------------
+
+# Progress state is observational: reading it never makes a value context-dependent.
+const _REMOUNT_STATUS_NAMES = (:__status__, :__substatus__)
+
+# A remount view is identified by its value overlay, which only it owns.
+_requester_token(view) = getfield(view, :cache).cache.cache.overlay
+_own_failure(e::_RemountContextDependent, requester) =
+    e.error !== nothing && e.token.value === _requester_token(requester)
+
+"""
+    _OpaqueSubcache
+
+The remount-namespace latch of one opaque property as one view (`requester`)
+sees it. Its `AbstractThreadsafeDict` fields are the namespace's dictionaries,
+so the ordinary get/`Pending` machinery runs every view on one computation;
+`local_dict` holds the requester's own values for keys that read context — the
+requester's value cache for a bare property, a per-argument subcache for an
+indexed one. A `Pending` on it resolves to the requester's own value instead of
+surfacing another view's context dependence.
+"""
+struct _OpaqueSubcache{L<:AbstractThreadsafeDict} <: AbstractThreadsafeDict{Any,Any}
+    lock::ReentrantLock
+    cache::Dict
+    status::Dict
+    computing::Dict
+    errors::Dict
+    shared::ThreadsafeDict
+    local_dict::L
+    ns::_OpaqueNamespace
+    name::Symbol
+    requester::Any
+end
+_OpaqueSubcache(ns::_OpaqueNamespace, name::Symbol, requester, shared::ThreadsafeDict,
+                local_dict::AbstractThreadsafeDict) =
+    _OpaqueSubcache(shared.lock, shared.cache, shared.status, shared.computing, shared.errors,
+                    shared, local_dict, ns, name, requester)
+
+# A bare property is keyed by its name, an indexed one by `(indices, kwargs)`.
+const _OpaqueBare = _OpaqueSubcache{<:MountedThreadsafeDict}
+_taint_key(oc::_OpaqueBare, key) = oc.name
+_taint_key(oc::_OpaqueSubcache, key) = (oc.name, key)
+_opaque_compute(oc::_OpaqueBare, view, key, s) = _computeproperty(view, oc.name; __status__=s)
+_opaque_compute(oc::_OpaqueSubcache, view, key, s) =
+    _computeproperty(view, oc.name, key[1]...; __status__=s, key[2]...)
+_opaque_substatus_f(oc::_OpaqueBare, key) = _bare_substatus_f(oc.requester, oc.name)
+function _opaque_substatus_f(oc::_OpaqueSubcache, (indices, kwargs))
+    o, name = oc.requester, oc.name
+    () -> compute_property(o, Val(:__substatus__), name, indices...; __status__=o.__status__, kwargs...)
+end
+_opaque_local!(oc::_OpaqueBare, key; fetch=Base.fetch, retry_failed=true) =
+    _local_bare!(oc.requester, oc.name; fetch, retry_failed)
+_opaque_local!(oc::_OpaqueSubcache, (indices, kwargs); fetch=Base.fetch, retry_failed=true) =
+    memoize!(IndexableProperty(oc.name, oc.requester, oc.local_dict), indices...;
+             fetch, retry_failed, kwargs...)
+# Opaque names are view-local, so a bare value lands in the requester's overlay.
+_store_local!(oc::_OpaqueBare, key, value) =
+    lock(() -> get!(oc.local_dict.cache.overlay, oc.name, value), oc.local_dict.lock)
+_store_local!(oc::_OpaqueSubcache, key, value) =
+    lock(() -> get!(oc.local_dict.cache, key, value), oc.local_dict.lock)
+
+_local_bare!(o, name::Symbol; fetch=Base.fetch, retry_failed=true) =
+    get!(getfield(o, :cache).cache, name; substatus=_bare_substatus_f(o, name), fetch, retry_failed) do s
+        _computeproperty(o, name; __status__=s)
+    end
+
+# The guarded `__self__` of one opaque computation for `requester`.
+function _probe_view(requester, probe::_OpaqueProbe)
+    T = typeof(requester)
+    pc = getfield(requester, :cache)
+    args = Any[getfield(requester, name) for name in fieldnames(T)[1:end-1]]
+    T(_REMOUNT_TOKEN, PropertyCache(_probe_dict(pc.cache, probe), pc.seed), args...)
+end
+
+# Compute `key` at most once for every view on the shared latch, under a fresh
+# guard. A computation that read context taints the key, gives its value to the
+# requester alone, and fails the latch with `_RemountContextDependent`, so every
+# other accessor computes the key in its own view.
+function _opaque_shared!(oc::_OpaqueSubcache, key; fetch=Base.fetch, retry_failed=true)
+    hit = get(oc, key, _missing_sentinel)
+    hit === _missing_sentinel || return hit
+    get!(oc, key; fetch, retry_failed, substatus=_opaque_substatus_f(oc, key)) do s
+        probe = _OpaqueProbe(oc.requester, oc.name)
+        context_dependent(error) = (_ns_taint!(oc.ns, _taint_key(oc, key));
+            _RemountContextDependent(oc.name, WeakRef(_requester_token(oc.requester)), error))
+        value = try
+            _opaque_compute(oc, _probe_view(oc.requester, probe), key, s)
+        catch e
+            _seal!(probe) && throw(context_dependent(e))
+            rethrow()
+        end
+        if _seal!(probe)
+            _store_local!(oc, key, value)
+            throw(context_dependent(nothing))
+        end
+        value
+    end
+end
+
+# The latch records a context-dependent computation as a failure; its progress
+# node reflects what the computation itself did.
+_fail_substatus!(s::Treebars.ProgressNode, e::_RemountContextDependent) =
+    e.error === nothing ? _finalize_substatus!(s) : _fail_substatus!(s, e.error)
+
+# Read opaque `key` through `oc`, on behalf of `reader` — the guard of an
+# enclosing opaque computation, or `nothing` for the view itself.
+function _opaque_get!(oc::_OpaqueSubcache, key, reader; fetch=Base.fetch, retry_failed=true)
+    # A guard reads values, never handles: a handle could resolve to the
+    # requester's context-dependent value after the guard stopped watching.
+    reader === nothing || (fetch = Base.fetch)
+    if !_ns_tainted(oc.ns, _taint_key(oc, key))
+        try
+            return _opaque_shared!(oc, key; fetch, retry_failed)
+        catch e
+            e isa _RemountContextDependent || rethrow()
+            if _own_failure(e, oc.requester)
+                reader === nothing || _taint!(reader, oc.name)
+                throw(e.error)
+            end
+        end
+    end
+    # Context-dependent: the requester's own value, which is context to a guard.
+    reader === nothing || _taint!(reader, oc.name)
+    _opaque_local!(oc, key; fetch, retry_failed)
+end
+
+_opaque_bare!(requester, name::Symbol, reader; fetch=Base.fetch) = begin
+    c = getfield(requester, :cache).cache
+    _opaque_get!(_OpaqueSubcache(c.namespace, name, requester, c.namespace.cache, c), name, reader; fetch)
+end
+
+function _opaque_status(oc::_OpaqueSubcache, key)
+    c = _ns_tainted(oc.ns, _taint_key(oc, key)) ? oc.local_dict : oc
+    lock(() -> get(c.status, key, nothing), c.lock)
+end
+
+# Every read through the guard of an opaque computation. Opaque state is read
+# through the namespace on the requester's behalf. Context — anything the
+# remount routes view-locally — is served from the requester and taints the
+# computation. Everything else is provably context-independent.
+function _probe_read(c::MountedThreadsafeDict, probe::_OpaqueProbe, o, name::Symbol)
+    requester = probe.requester
+    if name in c.opaque
+        is_indexed_property(o, name) &&
+            return IndexableProperty(name, o, getproperty(requester, name).cache)
+        return _opaque_bare!(requester, name, probe)
+    end
+    name in c.invalidated && !(name in _REMOUNT_STATUS_NAMES) && _taint!(probe, name)
+    getproperty(requester, name)
+end
+
+function _mounted_fetchproperty(fetch, c::MountedThreadsafeDict, o, name::Symbol)
+    probe = c.probe
+    if probe !== nothing
+        name in c.opaque && return fetch(_opaque_bare!(probe.requester, name, probe), nothing)
+        name in c.invalidated && !(name in _REMOUNT_STATUS_NAMES) && _taint!(probe, name)
+        return fetchproperty(fetch, probe.requester, name)
+    end
+    oc = _OpaqueSubcache(c.namespace, name, o, c.namespace.cache, c)
+    rv = _opaque_get!(oc, name, nothing; fetch=identity)
+    fetch(rv, _opaque_status(oc, name))
+end
+
+memoize!(ip::IndexableProperty{name,<:Any,<:_OpaqueSubcache}, indices...;
+         fetch=Base.fetch, retry_failed=true, kwargs...) where {name} =
+    _opaque_get!(ip.cache, (indices, (;kwargs...)), _remount_probe(ip.o); fetch, retry_failed)
+
+getstatus(ip::IndexableProperty{<:Any,<:Any,<:_OpaqueSubcache}, indices...; kwargs...) =
+    _opaque_status(ip.cache, (indices, (;kwargs...)))
+
+function Base.fetch(p::Pending{<:_OpaqueSubcache})
+    try
+        invoke(Base.fetch, Tuple{Pending}, p)
+    catch e
+        e isa _RemountContextDependent || rethrow()
+        _own_failure(e, p.cache.requester) && throw(e.error)
+        _opaque_local!(p.cache, p.key)
+    end
+end
+Base.isready(p::Pending{<:_OpaqueSubcache}) = haskey(p.cache, p.key) ||
+    (_ns_tainted(p.cache.ns, _taint_key(p.cache, p.key)) && haskey(p.cache.local_dict, p.key))
+
+# Observers see each key where it lives: shared until it read context, then local.
+function entries(ip::IndexableProperty{<:Any,<:Any,<:_OpaqueSubcache})
+    oc = ip.cache
+    shared = invoke(entries, Tuple{IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}}, ip)
+    filter!(e -> !_ns_tainted(oc.ns, _taint_key(oc, e.key)), shared)
+    vcat(shared, entries(IndexableProperty(oc.name, oc.requester, oc.local_dict)))
+end
+cached_entries(ip::IndexableProperty{<:Any,<:Any,<:_OpaqueSubcache}) =
+    [e.key => e.value for e in entries(ip) if e.state === :done]
+maybepop!(oc::_OpaqueSubcache, key) = begin
+    invoke(maybepop!, Tuple{AbstractThreadsafeDict,Any}, oc, key)
+    maybepop!(oc.local_dict, key)
+end
+Base.empty!(oc::_OpaqueSubcache) = (empty!(oc.shared); empty!(oc.local_dict); oc)
 
 _is_dynamic_object(value) = hasfield(typeof(value), :cache) &&
     getfield(value, :cache) isa PropertyCache
@@ -6838,13 +7211,25 @@ identity, and indexed subcaches for every property proven independent of the
 rebound context.
 
 The keyword names are existing non-fixed properties such as `__parent__`,
-`__req__`, or `__prefix__`. They, every transitive dependent in `meta(T)`, every
-opaque self-dependent property, progress state, and nested child are routed to a
-fresh mount-local cache. Each mounted `IndexableProperty` wrapper is
-recreated with the mounted owner; its per-argument cache is shared only when the
-property is context-independent. Context-dependent `@cached`/`@mmap` properties
-bypass their intrinsic disk entry because the rebound context is intentionally
-not part of the retained disk identity.
+`__req__`, or `__prefix__`. They, every transitive dependent in `meta(T)`,
+progress state, and nested child are routed to a fresh mount-local cache. Each
+mounted `IndexableProperty` wrapper is recreated with the mounted owner; its
+per-argument cache is shared only when the property is context-independent.
+Context-dependent `@cached`/`@mmap` properties bypass their intrinsic disk entry
+because the rebound context is intentionally not part of the retained disk
+identity.
+
+An opaque property — one that hands a bare `__self__` to code the dependency
+scan cannot follow, such as `fit(key) = run(__self__, key)` — and its dependents
+are decided by what they actually read. Views that rebind the same context
+names share one computation of each such key, including an in-flight one, so a
+poll from a later view awaits the first view's work. That computation receives
+a guarded `__self__`: reading rebound context through it (or anything derived
+from that context) makes the key context-dependent, so the requesting view keeps
+the value it computed and every other view, now and later, computes the key
+itself. A shared value that retained its `__self__` cannot read request context
+through it afterwards ([`RemountSharedContextError`](@ref)). The retained
+object's own computations stay separate from its views'.
 
 Fixed fields, `@versioned` properties, and cache/hash/path dunders are rejected:
 changing any of those means the object identity changed, so use `remake`.
@@ -6860,8 +7245,12 @@ function _remount_impl(obj, nt::NamedTuple, forced_local=())
     source, shared = _remount_source(obj)
     changed = keys(nt)
     _validate_remount_keys(source, changed)
-    invalidated, local_names = _remount_partition(source, shared, changed, forced_local)
-    mounted = MountedThreadsafeDict(shared, source, local_names, invalidated, nt)
+    invalidated, local_names, opaque = _remount_partition(source, shared, changed, forced_local)
+    # Views rebinding the same context share one namespace for their opaque work.
+    namespace = isempty(opaque) ? nothing :
+        _opaque_namespace(shared, setdiff(invalidated, opaque))
+    mounted = MountedThreadsafeDict(shared, source, local_names, invalidated, nt,
+                                    opaque, namespace)
     # The request context is this view's creation input: record it as the
     # seed so `clear_mem_caches!` on the view restores it into the overlay.
     pc = PropertyCache(mounted, nt)
