@@ -2152,11 +2152,13 @@ function subcache(pc::PropertyCache{<:MountedThreadsafeDict}, owner, ::Val{name}
         return _OpaqueSubcache(mounted.namespace, name, owner, _ns_subcache(mounted.namespace, name), ThreadsafeDict())
     if name in mounted.invalidated
         local_cache = ThreadsafeDict()
-        if _nested_struct_type(typeof(owner), Val(name)) !== nothing
-            # Settled indexed children become mounted child views with the current
-            # parent. Their OWN intrinsic caches remain shared; an in-flight child
-            # constructor is deliberately not shared because it is still bound to
-            # the retained source parent.
+        # An `_inline_child` child resolves each key on the source on first access.
+        if _nested_struct_type(typeof(owner), Val(name)) !== nothing &&
+           !_source_shared_child(typeof(owner), Val(name))
+            # Other settled indexed children (external `@include`s) become mounted
+            # child views with the current parent. Their OWN intrinsic caches remain
+            # shared; an in-flight child constructor is deliberately not shared
+            # because it is still bound to the retained source parent.
             lock(source_ip.cache.lock) do
                 for (key, value) in source_ip.cache.cache
                     _is_dynamic_object(value) || continue
@@ -4629,6 +4631,16 @@ HTMXObjects' route-walking machinery.
 """
 _nested_struct_type(::Type, ::Val) = nothing
 
+"""    _source_shared_child(::Type{T}, ::Val{name})
+
+`true` when the inline child under `name` is built through [`_inline_child`],
+so a [`remount`](@ref) view resolves it on the retained source on first
+access. `@dynamicstruct` emits it for every non-`@fresh` inline `@struct`
+child; external `@include` children and older expansions keep the default
+`false` and are shared only when already settled on the source.
+"""
+_source_shared_child(::Type, ::Val) = false
+
 """    _analysis_nested_type(::Type{T}, ::Val{name})
 
 Like `_nested_struct_type`, but registered for `prop::T = rhs` typed
@@ -5456,6 +5468,10 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     # each inline `@struct` child, used to emit `_nested_struct_type` methods so
     # `print_structure` can walk the inline-child tree.
     inline_child_pairs = Pair{Symbol,Any}[]
+    # Inline children constructed through `_inline_child` (every non-`@fresh`
+    # one); emits `_source_shared_child` so `remount` resolves them lazily on
+    # the retained source instead of pre-seeding view copies.
+    source_shared_children = Symbol[]
     # Typed computed properties (`prop::T = rhs`) register T only with
     # `_analysis_nested_type` (not `_nested_struct_type`), so the analyzer's
     # tree walk follows them but HTMXObjects' route walker doesn't (typed
@@ -5702,6 +5718,20 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 Expr(:kw, :__status__, Expr(:call, substatus_args...)))
         end
         constructor = Expr(:call, gen_name, Expr(:parameters, constructor_kwargs...))
+        # A memoized child is built through `_inline_child`, which runs exactly
+        # this constructor on an ordinary object but resolves the child on the
+        # retained source for a `remount` view, so every view shares one child
+        # cache. A `@fresh` child is a new child per call by contract, so it
+        # keeps the bare constructor and stays view-local.
+        if isnothing(fresh_wrapper)
+            indexed_child = !(isempty(index_params) && isempty(index_kwargs))
+            constructor = Expr(:call, _inline_child, :__self__,
+                Expr(:call, :Val, QuoteNode(prop_name)), Val(indexed_child),
+                Expr(:tuple, index_params...),
+                Expr(:tuple, Expr(:parameters, [Expr(:kw, kn, kn) for (kn, _) in index_kwargs]...)),
+                gen_name, Expr(:tuple, Expr(:parameters, constructor_kwargs...)))
+            push!(source_shared_children, prop_name)
+        end
         # Use `index_param_exprs` (typed `:(name::T)` when annotated, bare
         # `:name` otherwise) for the method signature so downstream readers
         # of `info.indices` see the URL-segment Julia Type. Internal uses
@@ -6272,6 +6302,9 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             $([:(
                 $DynamicObjects._nested_struct_type(::Type{$type_dispatch}, ::Val{$(QuoteNode(prop_name))}) = $gen_name
             ) for (prop_name, gen_name) in inline_child_pairs]...)
+            $([:(
+                $DynamicObjects._source_shared_child(::Type{$type_dispatch}, ::Val{$(QuoteNode(prop_name))}) = true
+            ) for prop_name in unique(source_shared_children)]...)
             $([:(
                 $DynamicObjects._analysis_nested_type(::Type{$type_dispatch}, ::Val{$(QuoteNode(prop_name))}) = $gen_name
             ) for (prop_name, gen_name) in analysis_child_pairs]...)
@@ -6888,6 +6921,29 @@ function _validate_remount_keys(source, changed)
     nothing
 end
 
+# A property whose RHS is exactly `__parent__.<name>` — every name an inline
+# child forwards from its parent, and any authored equivalent — is an alias of
+# that parent property.
+_parent_alias(rhs::Expr) =
+    Meta.isexpr(rhs, :., 2) && rhs.args[1] === :__parent__ && rhs.args[2] isa QuoteNode ?
+        rhs.args[2].value : nothing
+_parent_alias(_) = nothing
+
+# Aliases that stay context-independent when `__parent__` is rebound to
+# `parent_view`, a view of this object's OWN retained parent (`_remount_child`):
+# the alias then reads the identical shared value through either parent unless
+# the parent view itself routes the target locally. No parent view (an explicit
+# `__parent__=` rebinding to an arbitrary object) proves nothing.
+_shared_parent_aliases(::Type, ::Nothing) = Set{Symbol}()
+function _shared_parent_aliases(::Type{T}, parent_view) where {T}
+    aliases = Set{Symbol}()
+    for (name, info) in meta(T)
+        target = _parent_alias(get(info, :rhs, nothing))
+        target === nothing || _remount_invalidated(parent_view, target) || push!(aliases, name)
+    end
+    aliases
+end
+
 # Return (invalidated values, local wrapper keys, opaque). `invalidated` is the
 # sound transitive closure rooted at explicit context overrides, fresh progress
 # state, opaque self-reaches, and nested children (which retain their parent
@@ -6897,9 +6953,10 @@ end
 # none (`_opaque_get!`). Indexed wrapper KEYS are always local so their `o` is
 # the mounted object; an indexed property's per-argument subcache is shared only
 # when that property is absent from `invalidated` (see the mounted `subcache`
-# method above).
+# method above). Shared parent aliases (`_shared_parent_aliases`) are likewise
+# local keys — re-read through the current parent — that join neither closure.
 function _remount_partition(source, shared::ThreadsafeDict{Symbol,Any}, changed,
-                            forced_local=())
+                            forced_local=(), parent_view=nothing)
     T = typeof(source)
     dependencies = Dict{Symbol,Set{Symbol}}()
     computed = Set{Symbol}()
@@ -6928,13 +6985,14 @@ function _remount_partition(source, shared::ThreadsafeDict{Symbol,Any}, changed,
     declared_opaque = _remount_opaque_properties(T)
     # An older expansion carries no opacity data: every computed property is context.
     declared_opaque === nothing && union!(invalidated, computed)
-    _close_dependents!(invalidated, dependencies)
+    shared_aliases = setdiff!(_shared_parent_aliases(T, parent_view), invalidated)
+    _close_dependents!(invalidated, dependencies, shared_aliases)
     opaque = declared_opaque === nothing ? Set{Symbol}() :
         setdiff!(Set{Symbol}(declared_opaque), invalidated)
-    _close_dependents!(opaque, dependencies, invalidated)
+    _close_dependents!(opaque, dependencies, union(invalidated, shared_aliases))
     union!(invalidated, opaque)
 
-    local_names = copy(invalidated)
+    local_names = union(invalidated, shared_aliases)
     for name in indexed
         value = get(shared, name, _missing_sentinel)
         (value === _missing_sentinel || value isa IndexableProperty) && push!(local_names, name)
@@ -7167,20 +7225,53 @@ Base.empty!(oc::_OpaqueSubcache) = (empty!(oc.shared); empty!(oc.local_dict); oc
 _is_dynamic_object(value) = hasfield(typeof(value), :cache) &&
     getfield(value, :cache) isa PropertyCache
 
+_retained_object(obj) = _is_dynamic_object(obj) ? first(_remount_source(obj)) : obj
+
 # Bind the context DO itself understands structurally. `__req__` is identical
 # through a routed request and can be copied from the current parent; `__prefix__`
 # is route-relative, so mask the retained value and let the child's own generated
-# property recompute it from its new `__parent__`.
-function _remount_child(child, parent)
-    pairs = Pair{Symbol,Any}[]
-    hasproperty(child, :__parent__) && push!(pairs, :__parent__ => parent)
+# property recompute it from its new `__parent__`. `seed` adds view-local
+# construction context (an inline child's request progress node). When `parent`
+# is a view of the child's own retained parent, aliases of parent properties
+# that view shares stay shared (`_shared_parent_aliases`).
+function _remount_child(child, parent, seed::NamedTuple=(;))
+    bindings = Pair{Symbol,Any}[]
+    hasproperty(child, :__parent__) && push!(bindings, :__parent__ => parent)
     if hasproperty(child, :__req__) && hasproperty(parent, :__req__)
-        push!(pairs, :__req__ => getproperty(parent, :__req__))
+        push!(bindings, :__req__ => getproperty(parent, :__req__))
     end
-    context = (; pairs...)
+    context = (; bindings...)
     forced = hasproperty(child, :__prefix__) ? (:__prefix__,) : ()
-    _remount_impl(child, context, forced)
+    retained = _retained_object(child)
+    parent_view = hasproperty(retained, :__parent__) &&
+        getproperty(retained, :__parent__) === _retained_object(parent) ? parent : nothing
+    _remount_impl(child, context, forced, parent_view, seed)
 end
+
+"""    _inline_child(owner, ::Val{name}, ::Val{indexed}, args, kwargs, C, ctor)
+
+Construct the inline `@struct` child `name` of `owner`: `C(; ctor...)` on an
+ordinary object. On a [`remount`](@ref) view the child is instead resolved on
+the retained source — `source.name` or `source.name(args...; kwargs...)`,
+realizing and memoizing it there on first access and awaiting an in-flight
+construction — and rebound to the view with `_remount_child`. Every view thus
+shares one child cache, including in-flight work, rather than each building a
+private copy. The view's own progress node from `ctor` seeds the rebound child,
+so its progress still hangs under the request.
+"""
+_inline_child(owner, name::Val, indexed::Val, args, kwargs, ::Type{C}, ctor) where {C} =
+    _inline_child(getfield(owner, :cache).cache, owner, name, indexed, args, kwargs, C, ctor)
+_inline_child(::AbstractThreadsafeDict, owner, ::Val, ::Val, args, kwargs, ::Type{C}, ctor) where {C} =
+    C(; ctor...)
+function _inline_child(c::MountedThreadsafeDict, owner, ::Val{name}, indexed::Val, args, kwargs,
+                       ::Type, ctor) where {name}
+    child = _source_child(getproperty(c.source, name), indexed, args, kwargs)
+    _remount_child(child, owner, _inline_child_seed(ctor))
+end
+_source_child(child, ::Val{false}, args, kwargs) = child
+_source_child(ip, ::Val{true}, args, kwargs) = ip(args...; kwargs...)
+_inline_child_seed(ctor::NamedTuple{names}) where {names} =
+    :__status__ in names ? (; __status__=ctor.__status__) : (;)
 
 function _seed_nested_remounts!(mounted, source, explicit)
     T = typeof(source)
@@ -7191,6 +7282,8 @@ function _seed_nested_remounts!(mounted, source, explicit)
         push!(seen, name)
         haskey(explicit, name) && continue
         _nested_struct_type(T, Val(name)) === nothing && continue
+        # Resolved lazily through `_inline_child` on first access instead.
+        _source_shared_child(T, Val(name)) && continue
         value = get(shared, name, _missing_sentinel)
         (value === _missing_sentinel || value isa Pending || value isa IndexableProperty ||
          !_is_dynamic_object(value)) && continue
@@ -7231,6 +7324,15 @@ itself. A shared value that retained its `__self__` cannot read request context
 through it afterwards ([`RemountSharedContextError`](@ref)). The retained
 object's own computations stay separate from its views'.
 
+A nested child instance is view-local because it holds its parent, but its own
+cache is shared: the view's child is the retained source's child remounted onto
+the view. A memoized inline `@struct` child read first through a view is
+realized on the retained source, so later views reuse it and its settled and
+in-flight work; a `@fresh` child stays a fresh view-local child per call. Inside
+the remounted child, a `__parent__.<name>` alias (every bare parent name an
+inline child reads) of a parent property the view shares is still shared, so
+child work built on context-independent parent state is reused too.
+
 Fixed fields, `@versioned` properties, and cache/hash/path dunders are rejected:
 changing any of those means the object identity changed, so use `remake`.
 
@@ -7241,26 +7343,32 @@ request_a = remount(routed; __req__=req_a, __parent__=parent_a, __prefix__="/a")
 request_b = remount(routed; __req__=req_b, __parent__=parent_b, __prefix__="/b")
 ```
 """
-function _remount_impl(obj, nt::NamedTuple, forced_local=())
+function _remount_impl(obj, nt::NamedTuple, forced_local=(), parent_view=nothing,
+                      local_seed::NamedTuple=(;))
     source, shared = _remount_source(obj)
     changed = keys(nt)
     _validate_remount_keys(source, changed)
-    invalidated, local_names, opaque = _remount_partition(source, shared, changed, forced_local)
+    # `local_seed` is internal view-local construction state (`_remount_child`'s
+    # progress node). It is not a declared property, so it skips validation, but
+    # like forced keys it is view-specific: local and invalidated.
+    invalidated, local_names, opaque = _remount_partition(source, shared, changed,
+        (forced_local..., keys(local_seed)...), parent_view)
     # Views rebinding the same context share one namespace for their opaque work.
     namespace = isempty(opaque) ? nothing :
         _opaque_namespace(shared, setdiff(invalidated, opaque))
-    mounted = MountedThreadsafeDict(shared, source, local_names, invalidated, nt,
+    seed = merge(nt, local_seed)
+    mounted = MountedThreadsafeDict(shared, source, local_names, invalidated, seed,
                                     opaque, namespace)
     # The request context is this view's creation input: record it as the
     # seed so `clear_mem_caches!` on the view restores it into the overlay.
-    pc = PropertyCache(mounted, nt)
+    pc = PropertyCache(mounted, seed)
     T = typeof(source)
     fixed = fieldnames(T)[1:end-1]
     args = Any[getfield(source, name) for name in fixed]
     applicable(T, _REMOUNT_TOKEN, pc, args...) || error(
         "remount: $(nameof(T)) was expanded before remount support; re-expand its @dynamicstruct/@htmx definition")
     view = T(_REMOUNT_TOKEN, pc, args...)
-    _seed_nested_remounts!(view, source, nt)
+    _seed_nested_remounts!(view, source, seed)
 end
 
 function remount(obj; kwargs...)
