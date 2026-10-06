@@ -41,6 +41,10 @@ const GOVERNED_MATERIALIZATION_CACHE_BASE = Ref("cache")
         sleep(0.05)
         value * scale
     end
+    callsite_probe(scale::Int) = begin
+        call = Threads.atomic_add!(GOVERNED_MATERIALIZATION_CALLS, 1) + 1
+        (value * scale, call)
+    end
     @fresh fresh_compute(scale::Int) = value * scale
 
     large_array(scale::Int)::Vector{Float64} = begin
@@ -522,6 +526,44 @@ end
         notify(stop)
         wait(running)
     end
+end
+
+@testitem "governed callback preserves explicit fresh execution" tags=[:semantic] setup=[SemanticFixtures] begin
+    using DynamicObjects
+
+    GOVERNED_MATERIALIZATION_CALLS[] = 0
+    GOVERNED_MATERIALIZATION_CACHE_BASE[] = mktempdir()
+    object = GovernedMaterializationFixture(1, 7)
+    context = (;scope=:session, key="callsite-fresh", retention=(;max_entries=1, ttl=nothing))
+
+    cached = object.callsite_probe(2)
+    @test cached == (14, 1)
+    @test materialization_ownership(context, object).state === :unowned
+
+    uncached = execute_materialization(context, object) do
+        ownership = materialization_ownership(context, object)
+        @test ownership.state === :active
+        @test ownership.active == 1
+        (
+            fresh(object.callsite_probe, 2),
+            maybeprogress!(nothing, object.callsite_probe, 2),
+        )
+    end
+    @test uncached == ((14, 2), (14, 3))
+
+    ownership = materialization_ownership(context, object)
+    @test ownership.state === :active
+    @test ownership.active == 0
+    @test ownership.owned_paths == [abspath(object.__cache_path__)]
+    @test object.callsite_probe(2) == cached
+    @test GOVERNED_MATERIALIZATION_CALLS[] == 3
+    @test !isfile(DynamicObjects.get_cache_path(object, :callsite_probe, 2))
+
+    @test_throws ErrorException execute_materialization(context, object) do
+        @test materialization_ownership(context, object).active == 1
+        error("callback failure")
+    end
+    @test materialization_ownership(context, object).active == 0
 end
 
 """

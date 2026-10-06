@@ -9340,6 +9340,15 @@ function _end_materialization!(owner::_MaterializationOwner)
     nothing
 end
 
+function _with_materialization_owner(f::F, context::NamedTuple, root) where {F}
+    owner = _begin_materialization!(context, root)
+    try
+        f(owner)
+    finally
+        _end_materialization!(owner)
+    end
+end
+
 function _execute_materialization_target(target, name::Symbol, descriptor,
         args, kwargs::NamedTuple, fetch)
     if descriptor.indexed
@@ -9578,6 +9587,10 @@ function _persist_automatic_materialization!(owner, target, name, descriptor,
 end
 
 """
+    execute_materialization(f, context, root)
+    execute_materialization(context, root) do
+        # explicitly selected DynamicObjects access mode
+    end
     execute_materialization(context, root, target, property, args...; kwargs...)
     execute_materialization(context, object, property, args...; kwargs...)
 
@@ -9602,14 +9615,27 @@ Governance covers exactly the executed `property` on `target`. Properties it
 reads while computing — siblings, nested DO objects, `@struct` children — run
 through their ordinary declaration-site semantics and are never automatically
 promoted; only the executed property's own returned value is observed.
+
+The callback form applies the same active lease and root ownership while
+leaving value access to the semantic host. It performs no automatic storage
+read or write itself. Hosts use it with an explicit access mode such as
+`fresh(property, args...)` or `maybeprogress!(progress, property, args...)`
+when one operation must recompute without changing the property's declaration
+or its ordinary memoized value. The callback's return value is passed through,
+and its lease is released even if the callback throws.
 """
+function execute_materialization(f::F, context::NamedTuple, root) where {F}
+    _with_materialization_owner(context, root) do _
+        f()
+    end
+end
+
 function execute_materialization(context::NamedTuple, root, target,
         name::Symbol, args...; fetch=Base.fetch, kwargs...)
     descriptor = property_descriptor(typeof(target), name)
     descriptor === nothing && error(
         "$(typeof(target)) has no DynamicObjects property `$name`")
-    owner = _begin_materialization!(context, root)
-    try
+    _with_materialization_owner(context, root) do owner
         property_kwargs = (;kwargs...)
         automatic = _load_automatic_materialization!(
             owner, target, name, descriptor, args, property_kwargs)
@@ -9625,8 +9651,6 @@ function execute_materialization(context::NamedTuple, root, target,
             target, name, descriptor, args, property_kwargs, fetch)
         _persist_automatic_materialization!(owner, target, name, descriptor,
             args, property_kwargs, timed.value, timed.elapsed_seconds)
-    finally
-        _end_materialization!(owner)
     end
 end
 
