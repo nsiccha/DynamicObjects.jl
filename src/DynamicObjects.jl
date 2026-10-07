@@ -11265,9 +11265,38 @@ function _sync!(o, visited)
     # changed slot through this object (`length(store.files)`).
     record.generation += UInt64(1)
     targets = _dependents_of(typeof(o), changed)
-    filter!(p -> !(_slot_name(first(p)) in targets), record.stamps)
+    rekey = _version_rekey(typeof(o), targets)
+    stale = rekey === nothing ? targets : union(targets, rekey)
+    filter!(p -> !(_slot_name(first(p)) in stale), record.stamps)
     dropped = Symbol[name for name in sort!(collect(targets)) if _drop_property!(o, shared, name)]
-    visited[record] = (dropped, targets)
+    # After the drops above: their disk entries live under the current cache path.
+    if rekey !== nothing
+        for name in sort!(collect(rekey))
+            _drop_property!(o, shared, name; disk=false) && push!(dropped, name)
+        end
+        maybepop!(shared, :__version_tag__)
+        maybepop!(shared, :__cache_path__)
+        sort!(dropped)
+    end
+    visited[record] = (dropped, stale)
+end
+
+# A versioned object keys its disk entries by version, and a computed `@versioned`
+# property is memoized like any other: without this, a dependent `sync!` drops is
+# recomputed and published under the version the OLD content had, so a later
+# process whose input matches that version reads the new value. So once anything
+# is dropped, drop the computed version properties and what reads them too (memory
+# only — their disk entries are valid for the old version), then the cache path:
+# the next read re-derives the version and publishes under it. A fixed `@versioned`
+# field is the caller's claim and cannot be re-derived (`remake` moves it).
+# Returns the names to drop besides `targets`, or `nothing` when there is no
+# computed version to re-derive.
+function _version_rekey(T::Type, targets)
+    (isempty(targets) || !has_versioned_fields(T)) && return nothing
+    versions = Symbol[name for (name, info) in meta(T)
+        if !isfixed(info) && Symbol("@versioned") in info.macros]
+    isempty(versions) && return nothing
+    setdiff!(union!(Set{Symbol}(versions), _dependents_of(T, versions)), targets)
 end
 
 _slot_name(slot::Symbol) = slot
@@ -11360,17 +11389,17 @@ end
 
 # Drop one property of a retained object: its memory value (every entry of an
 # indexed property, emptied in place so a mounted view or destructured handle
-# sharing the subcache sees it), its disk entries, and its shared opaque-remount
-# work. Returns whether anything was in memory.
-function _drop_property!(o, shared::ThreadsafeDict, name::Symbol)
+# sharing the subcache sees it), its disk entries unless `disk=false`, and its
+# shared opaque-remount work. Returns whether anything was in memory.
+function _drop_property!(o, shared::ThreadsafeDict, name::Symbol; disk::Bool=true)
     value = lock(shared.lock) do; get(shared.cache, name, _missing_sentinel); end
     dropped = if value isa IndexableProperty
         entry_keys = lock(value.cache.lock) do; collect(keys(value.cache.cache)); end
-        _drop_disk_entries!(o, shared, name, entry_keys)
+        disk && _drop_disk_entries!(o, shared, name, entry_keys)
         empty!(value.cache)
         !isempty(entry_keys)
     elseif value !== _missing_sentinel
-        _drop_disk_entries!(o, shared, name, (((), (;)),))
+        disk && _drop_disk_entries!(o, shared, name, (((), (;)),))
         maybepop!(shared, name)
         true
     else
