@@ -151,6 +151,9 @@ c = BackgroundCache{String,Tuple{Symbol,Int}}(build; ttl=0.05, unbuilt=(:none, 0
 @test c["a"] == (:none, 0)
 put!(gate, nothing)
 poll_value_quiet(c, "a", (:v, 1))
+# The refresh is in flight until its settle callback returns; only then can
+# the expiring TTL make the readers below kick.
+poll_quiet(c)
 sleep(0.08)
 
 results = Vector{Any}(undef, 8)
@@ -211,6 +214,9 @@ try
     @test poll_value_quiet(c, "a", (:v, 2)) == (:v, 2)
     @test counts["a"] == 2
     @test nrecords(logger) == 1
+    # A visible value is not a finished refresh: the refresh stays in flight
+    # until its settle callback returns, and a read meanwhile kicks nothing.
+    poll_quiet(c)
 
     # A failure against a settled value keeps the stale value and logs again.
     # Self-consistent (no assumed generation): the 30 s gate holds the value
@@ -579,4 +585,57 @@ output = read(out, String) * read(err, String)
 @test success(proc)
 @test occursin("BACKGROUND-CACHE-LIVENESS-OK", output)
 status === :ok && success(proc) || println(output)
+end
+
+@testitem "reads during on_settle serve the new value without kicking a refresh" setup=[BackgroundCacheFixtures] begin
+using DynamicObjects
+
+# ttl=0: every idle read is stale by construction. A refresh stays in flight
+# until its callback returns, so the callback's own re-read (which used to
+# rebuild the key forever) and an outside read made while the callback runs
+# both serve the new value and kick nothing: one build per outside demand, in
+# single-key and batch mode alike. The callback blocks on `release`, so the
+# outside read provably lands mid-callback. Only the first four settles
+# re-read, so a regression fails the counts below instead of rebuilding in
+# the background for the rest of the suite.
+for batched in (false, true)
+    builds = Threads.Atomic{Int}(0)
+    settles = Threads.Atomic{Int}(0)
+    seen = Channel{Any}(4)
+    in_callback = Channel{Nothing}(4)
+    release = Channel{Nothing}(4)
+    holder = Ref{Any}()
+    on_settle = (k, old, new) -> begin
+        Threads.atomic_add!(settles, 1) < 4 || return nothing
+        put!(seen, holder[][k])
+        put!(in_callback, nothing)
+        take!(release)
+    end
+    next_value() = (:v, Threads.atomic_add!(builds, 1) + 1)
+    c = if batched
+        BackgroundCache{String,Tuple{Symbol,Int}}(ks -> (v = next_value(); Dict(k => v for k in ks));
+                                                  batch=8, ttl=0, unbuilt=(:none, 0), on_settle)
+    else
+        BackgroundCache{String,Tuple{Symbol,Int}}(k -> next_value(); ttl=0, unbuilt=(:none, 0), on_settle)
+    end
+    holder[] = c
+
+    @test c["a"] == (:none, 0)
+    @test take!(seen) == (:v, 1)
+    take!(in_callback)
+    @test c["a"] == (:v, 1)
+    put!(release, nothing)
+    poll_quiet(c)
+    @test builds[] == 1
+
+    # Positive control: once the callback has returned, an idle read is stale
+    # again and kicks exactly one rebuild, whose callback re-read is damped too.
+    @test c["a"] == (:v, 1)
+    @test take!(seen) == (:v, 2)
+    take!(in_callback)
+    put!(release, nothing)
+    poll_quiet(c)
+    @test builds[] == 2
+    @test settles[] == 2
+end
 end

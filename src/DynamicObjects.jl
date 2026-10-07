@@ -2192,11 +2192,15 @@ settled value, or `unbuilt` when the key had none (first build,
 post-`invalidate!`, or eviction). Failures never invoke it. It fires even when
 `new == old` — compare them to skip unchanged values. A throwing callback is
 logged with its key and backtrace and never breaks the refresh or the drain.
+The refresh stays in flight until the callback returns: reads of that key
+meanwhile, the callback's own included, serve the new value without kicking
+another refresh, even at `ttl=0`. Callbacks for one key therefore never
+overlap.
 
 Every background refresh task, and the batch drain before each claim, yields
-to the scheduler, so a refresh storm (say, readers that re-request each key as
-it settles at `ttl=0`) wastes builds but never starves the other tasks, timers
-or I/O on its thread.
+to the scheduler, so a refresh storm (say, other tasks that re-request each key
+as it settles at `ttl=0`) wastes builds but never starves the other tasks,
+timers or I/O on its thread.
 
 Timestamps use the monotonic clock. Treat returned values (including `unbuilt`)
 as read-only, and likewise the `old`/`new` values handed to `on_settle`.
@@ -2291,23 +2295,37 @@ function _notify_swr_settle!(c::BackgroundCache{K,V}, key::K, old::V, new::V) wh
     nothing
 end
 
-# Run one refresh to completion: build OUTSIDE the lock, then publish and
-# notify the settle callback (or, on any failure, gate behind backoff and log
-# with a backtrace — never rethrow, so the background task carries nothing out).
+# Publish a built value, then notify the settle callback. The key's in-flight
+# marker is released only once the callback returns: until then reads — the
+# callback's own re-entrant read included — serve the new value and kick
+# nothing, even at `ttl=0`, where a callback that re-reads its key would
+# otherwise rebuild it forever.
+function _settle_swr_key!(c::BackgroundCache{K,V}, key::K, v::V) where {K,V}
+    old = lock(c.lock) do
+        prev = get(c.values, key, c.unbuilt)
+        c.values[key] = v
+        c.stamps[key] = time_ns()
+        delete!(c.failures, key)
+        delete!(c.not_before, key)
+        _enforce_swr_bound!(c)
+        prev
+    end
+    try
+        _notify_swr_settle!(c, key, old, v)
+    finally
+        lock(c.lock) do
+            delete!(c.refreshing, key)
+        end
+    end
+    nothing
+end
+
+# Run one refresh to completion: build OUTSIDE the lock, then settle (or, on
+# any failure, gate behind backoff and log with a backtrace — never rethrow, so
+# the background task carries nothing out).
 function _run_swr_refresh!(c::BackgroundCache{K,V}, key::K) where {K,V}
     try
-        v = c.build(key)::V
-        old = lock(c.lock) do
-            prev = get(c.values, key, c.unbuilt)
-            delete!(c.refreshing, key)
-            c.values[key] = v
-            c.stamps[key] = time_ns()
-            delete!(c.failures, key)
-            delete!(c.not_before, key)
-            _enforce_swr_bound!(c)
-            prev
-        end
-        _notify_swr_settle!(c, key, old, v)
+        _settle_swr_key!(c, key, c.build(key)::V)
     catch e
         n = lock(c.lock) do
             delete!(c.refreshing, key)
@@ -2375,7 +2393,7 @@ function _run_swr_batch_drain!(c::BackgroundCache{K,V}) where {K,V}
 end
 
 # Run one batch build to completion: build OUTSIDE the lock, then settle each
-# key individually and notify the settle callback per settled key (or, on any
+# key individually, notifying the settle callback per settled key (or, on any
 # failure, gate behind backoff and log with a backtrace — never rethrow, so
 # the background task carries nothing out). A thrown call fails every key in
 # the batch but logs once for the whole batch (one exception/backtrace shared
@@ -2408,18 +2426,7 @@ function _run_swr_batch!(c::BackgroundCache{K,V}, batch_keys::Vector{K}) where {
     end
     for k in batch_keys
         try
-            v = results[k]::V
-            old = lock(c.lock) do
-                prev = get(c.values, k, c.unbuilt)
-                delete!(c.refreshing, k)
-                c.values[k] = v
-                c.stamps[k] = time_ns()
-                delete!(c.failures, k)
-                delete!(c.not_before, k)
-                _enforce_swr_bound!(c)
-                prev
-            end
-            _notify_swr_settle!(c, k, old, v)
+            _settle_swr_key!(c, k, results[k]::V)
         catch e
             bt = catch_backtrace()
             n = lock(c.lock) do
