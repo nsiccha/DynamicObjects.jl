@@ -579,7 +579,9 @@ Study().fits(32)
 The queue is off by default (`max_running=0`): a queued computation then starts
 at once on a `:default` task. With `max_running=n`, at most `n` run at a time,
 each on its own `:default` task, and the rest wait in FIFO order. A waiting
-computation's progress node reads `queued · #k`. Raising the cap starts more of
+computation's progress node is pending (`·`, no elapsed time) and reads
+`queued · #k`; it starts, and its clock with it, when the computation is
+admitted. Raising the cap starts more of
 what waits, and `max_running=0` starts everything still waiting. Running
 computations are never interrupted.
 

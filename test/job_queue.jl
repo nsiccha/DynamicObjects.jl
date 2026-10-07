@@ -254,6 +254,64 @@ finally
 end
 end
 
+@testitem "a waiting @queued computation's node is pending, and its clock starts at admission" setup=[JobQueueFixtures] tags=[:core] begin
+using DynamicObjects
+using DynamicObjects.Treebars: render_text, is_pending, is_running, duration
+import DynamicObjects.Treebars
+using Dates: Millisecond
+# The progress node of the computation waiting behind `w`'s gated blocker.
+waiting_node(w) = begin
+    found = nothing
+    walk(n) = (n.impl.message == "queued · #1" && (found = n); foreach(walk, n.children))
+    walk(w.__status__)
+    found
+end
+try
+    DynamicObjects.configure_queue!(; max_running=1)
+    counts_reset!()
+    w = Jobs()
+    blocker = Threads.@spawn w.item(-7, 1)
+    @test settles(() -> DynamicObjects.queue_settings().running == 1, 10.0)
+    caller = Threads.@spawn w.listing(41, 1)
+    @test settles(() -> waiting_node(w) !== nothing, 10.0)
+    node = waiting_node(w)
+    # Waiting is not running: pending (`·`), no duration, the note kept.
+    @test is_pending(node.impl)
+    line = only(filter(contains("queued · #1"), split(render_text(w.__status__), '\n')))
+    @test contains(line, "· Synthetic heavy item — queued · #1")
+    @test !contains(line, "▶")
+    @test !contains(line, "[")
+    sleep(0.6)
+    @test duration(node.impl) == Millisecond(0)
+    release!(-7)
+    @test settles(() -> istaskdone(caller), 30.0)
+    @test fetch(caller) == 1
+    # It ran for its own ~0.05 s, not for the ~0.6 s it waited.
+    @test !is_pending(node.impl) && !is_running(node.impl)
+    @test duration(node.impl) < Millisecond(500)
+    fetch(blocker)
+
+    # A waiting fresh call of a `@queued` property is pending the same way.
+    blocker = Threads.@spawn w.item(-8, 1)
+    @test settles(() -> DynamicObjects.queue_settings().running == 1, 10.0)
+    caller = Threads.@spawn w.fresh_listing(83, 1)
+    @test settles(() -> waiting_node(w) !== nothing, 10.0)
+    node = waiting_node(w)
+    @test is_pending(node.impl)
+    sleep(0.6)
+    release!(-8)
+    @test settles(() -> istaskdone(caller), 30.0)
+    @test fetch(caller) == 1
+    @test !is_pending(node.impl) && !is_running(node.impl)
+    @test duration(node.impl) < Millisecond(500)
+    fetch(blocker)
+finally
+    release!(-7)
+    release!(-8)
+    queue_off!()
+end
+end
+
 @testitem "raising the cap admits more; switching the queue off admits everything" setup=[JobQueueFixtures] tags=[:core] begin
 using DynamicObjects
 try
