@@ -47,7 +47,7 @@ optionally disk-cached properties.
 module DynamicObjects
 export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, invalidate!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, remount, file_version, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending, Deferred, DeferredCompute, ComputeAbandoned, BackgroundCache
 
-import SHA, Serialization, Mmap, Treebars
+import SHA, Serialization, Mmap, Treebars, ScopedValues
 
 struct DiskCacheLocks
     lock::ReentrantLock
@@ -659,6 +659,8 @@ _finalize_substatus!(s) = nothing
 _finalize_substatus!(::Nothing) = nothing
 _fail_substatus!(s, e) = nothing
 _fail_substatus!(::Nothing, e) = nothing
+# Running message of a substatus (a queued computation's "queued · #k").
+_note_substatus!(s, text) = nothing
 
 # Disk-load reporting hook — the generic method is a no-op; the
 # `::Treebars.ProgressNode` specialization below sets the substatus message to
@@ -788,6 +790,7 @@ end
 # so they stay visible until retry_failed clears them).
 _finalize_substatus!(s::Treebars.ProgressNode) = Treebars.finalize_progress!(s)
 _fail_substatus!(s::Treebars.ProgressNode, e) = Treebars.fail_progress!(s, e)
+_note_substatus!(s::Treebars.ProgressNode, text) = Treebars.update_progress!(s, text)
 
 # Disk-load reporting — set the substatus message to a human-readable
 # "from disk: <size>" so big-file loads show up in the tree instead of
@@ -905,7 +908,8 @@ when you specifically need to recompute and bypass the cache entirely (no read,
 no store).
 """
 fresh(ip::IndexableProperty{name}, args...; kwargs...) where {name} =
-    _computeproperty(ip.o, name, args...; kwargs...)
+    _fresh_through(property_executor(ip.o, Val(name)),
+                   () -> _computeproperty(ip.o, name, args...; kwargs...))
 """
     AbstractThreadsafeDict{K,V}
 
@@ -1477,7 +1481,10 @@ with the same arguments share one `DeferredCompute`, whether it is queued or run
 blocking caller waits for it through [`await_deferred`](@ref DynamicObjects.await_deferred);
 when the executor runs the compute synchronously, the call returns the value without waiting.
 `@fresh` calls (declaration- or call-site) bypass the cache, its in-flight latch and hence
-the executor. See [`DeferredCompute`](@ref) for the executor contract.
+the executor — except a job queue's [`QueueExecutor`](@ref DynamicObjects.QueueExecutor)
+(`@queued`), which admits each fresh computation too, as a
+[`QueuedCall`](@ref DynamicObjects.QueuedCall) the caller waits for. See
+[`DeferredCompute`](@ref) for the executor contract.
 """
 property_executor(o, ::Val) = nothing
 
@@ -1690,6 +1697,375 @@ function _fetch_pending(p::Pending)
         step[1] === :error && throw(step[2])
         step[1] === :gone && error("Pending: key ", p.key, " has no value and no compute in flight")
     end
+end
+
+# --- Job queue: bounded admission of `@queued` computations ------------------------------
+#
+# `@queued` on an indexed, memoized property declares its `property_executor` to be a
+# `QueueExecutor` over the process-wide `job_queue()`: every memoized computation of the
+# property waits its turn there, whoever calls it. Off by default (`max_running=0`): an
+# enqueued computation starts at once. With `configure_queue!(; max_running=n)` at most `n`
+# hold a slot at a time, and the rest wait in FIFO order, their progress node reading
+# "queued · #k".
+#
+# Each admitted computation runs on its own `:default` task and holds its slot until it
+# finishes, or until it — or any task it spawned, such as a `Threads.@threads` iteration —
+# first blocks waiting on another queued computation (`await_deferred`, `fetch` of a
+# `QueuedCall`). It then gives the slot back for good: the cap counts heavy work rather than
+# the coordinators waiting on it, and coordinators that each wait on queued children cannot
+# deadlock the queue. A scoped value (`_QUEUE_HOLDER`) carries the slot into the tasks a
+# computation spawns.
+
+"""
+    DynamicObjects.QueuedItem
+
+One entry of a [`JobQueue`](@ref DynamicObjects.JobQueue), as
+[`enqueue!`](@ref DynamicObjects.enqueue!) creates it and queue observers receive it:
+
+- `work` — what runs: a [`DeferredCompute`](@ref), a
+  [`QueuedCall`](@ref DynamicObjects.QueuedCall), or any value with `run!` / `abandon!`
+  methods;
+- `property` — the name of the `@queued` property it computes, `nothing` otherwise;
+- `tag` — whatever the enqueuer attached (a [`QueueExecutor`](@ref DynamicObjects.QueueExecutor)'s
+  `tag`);
+- `enqueued_ns` — `time_ns()` when it was enqueued.
+"""
+mutable struct QueuedItem
+    const work::Any
+    const property::Union{Nothing,Symbol}
+    const tag::Any
+    const enqueued_ns::UInt64
+    note::Int   # the position its progress node shows ("queued · #k"); 0 for none
+end
+
+"""
+    DynamicObjects.JobQueue(; max_running=0)
+
+FIFO admission under `max_running` slots. Each admitted item runs on its own `:default` task
+and holds one slot until it finishes, or until it — or a task it spawned — blocks on another
+queued computation, which gives the slot back for good. `max_running=0` means unbounded:
+every item starts at once, holding no slot. `@queued` properties admit through the
+process-wide [`job_queue()`](@ref DynamicObjects.job_queue); see
+[`configure_queue!`](@ref DynamicObjects.configure_queue!).
+"""
+mutable struct JobQueue
+    const lock::ReentrantLock
+    const waiting::Vector{QueuedItem}
+    const observers::Vector{Any}
+    max_running::Int
+    running::Int    # slots held
+end
+function JobQueue(; max_running::Integer=0)
+    _check_max_running(max_running)
+    JobQueue(ReentrantLock(), QueuedItem[], Any[], Int(max_running), 0)
+end
+
+_check_max_running(n) =
+    n >= 0 || throw(ArgumentError("max_running must be non-negative, got $(n)"))
+
+# One admitted item's claim on a slot of `queue`.
+mutable struct _QueueSlot
+    const queue::JobQueue
+    @atomic held::Bool
+end
+
+# The slot of the queued computation the current task works for — set where an admitted
+# item starts and inherited by every task it spawns; `nothing` outside one, and inside one
+# admitted while its queue was off.
+const _QUEUE_HOLDER = ScopedValues.ScopedValue{Union{Nothing,_QueueSlot}}(nothing)
+
+const _JOB_QUEUE = JobQueue()
+
+"""
+    DynamicObjects.job_queue() -> JobQueue
+
+The process-wide queue that `@queued` properties admit their computations through.
+"""
+job_queue() = _JOB_QUEUE
+
+"""
+    DynamicObjects.configure_queue!(q=job_queue(); max_running=nothing) -> NamedTuple
+
+Bound how many queued computations run at once. Off by default (`max_running=0`): a
+`@queued` computation starts on `:default` at once. With `max_running=n` at most `n` run at a
+time and the rest wait in FIFO order, their progress node reading "queued · #k"; they start
+as earlier ones finish or give their slot back. Raising the cap starts more of what waits;
+`max_running=0` starts everything still waiting. Running computations are never interrupted.
+
+Returns [`queue_settings(q)`](@ref DynamicObjects.queue_settings); an omitted setting is
+unchanged.
+"""
+function configure_queue!(q::JobQueue=job_queue(); max_running=nothing)
+    if max_running !== nothing
+        _check_max_running(max_running)
+        admitted = lock(q.lock) do
+            q.max_running = Int(max_running)
+            _admit!(q)
+        end
+        foreach(_start_admitted, admitted)
+    end
+    queue_settings(q)
+end
+
+"""
+    DynamicObjects.queue_settings(q=job_queue()) -> (; max_running, queued, running)
+
+`q`'s cap, the number of items waiting, and the number of slots held.
+"""
+queue_settings(q::JobQueue=job_queue()) = lock(q.lock) do
+    (; max_running=q.max_running, queued=length(q.waiting), running=q.running)
+end
+
+"""
+    DynamicObjects.observe_queue!(f, q=job_queue()) -> f
+
+Call `f(item::QueuedItem)` for every item enqueued on `q` from now on: on the enqueuing task,
+before the item can start, with no queue lock held. A layer on top records each queued
+computation here, e.g. as a job named after `item.property`. A throwing observer is logged
+and the item is queued regardless: an enqueue runs inside a property access, and failing it
+would leave the computation in flight forever. Remove it with
+[`unobserve_queue!`](@ref DynamicObjects.unobserve_queue!).
+"""
+function observe_queue!(f, q::JobQueue=job_queue())
+    lock(() -> push!(q.observers, f), q.lock)
+    f
+end
+
+"""
+    DynamicObjects.unobserve_queue!(f, q=job_queue())
+
+Stop calling `f` for items enqueued on `q`.
+"""
+function unobserve_queue!(f, q::JobQueue=job_queue())
+    lock(() -> filter!(g -> g !== f, q.observers), q.lock)
+    nothing
+end
+
+"""
+    DynamicObjects.enqueue!(q::JobQueue, work; property=nothing, tag=nothing) -> QueuedItem
+
+Queue `work` — a [`DeferredCompute`](@ref), a [`QueuedCall`](@ref DynamicObjects.QueuedCall),
+or any value with `run!(work)` / `abandon!(work, reason)` methods (exactly one of which takes
+effect) — behind what already waits in `q`. It starts on a `:default` task as soon as a slot
+is free, at once while `q` is off. Observers see the item before it can start.
+"""
+function enqueue!(q::JobQueue, work; property::Union{Nothing,Symbol}=nothing, tag=nothing)
+    item = QueuedItem(work, property, tag, time_ns(), 0)
+    for f in lock(() -> copy(q.observers), q.lock)
+        try
+            f(item)
+        catch err
+            @error("DynamicObjects job queue: an observer threw; the item is queued regardless",
+                   observer=f, property, exception=(err, catch_backtrace()))
+        end
+    end
+    admitted = lock(q.lock) do
+        push!(q.waiting, item)
+        _admit!(q)
+    end
+    foreach(_start_admitted, admitted)
+    item
+end
+
+"""
+    DynamicObjects.queued_items(q=job_queue()) -> Vector{QueuedItem}
+
+The items waiting in `q`, oldest first: an item's index is its queue position. Admitted
+items are not listed.
+"""
+queued_items(q::JobQueue=job_queue()) = lock(() -> copy(q.waiting), q.lock)
+
+"""
+    DynamicObjects.queue_position(handle, q=job_queue()) -> Int or nothing
+
+The 1-based position in `q` of the waiting computation behind `handle` — a [`Pending`](@ref)
+(matched by its cache and key), a [`DeferredCompute`](@ref), a
+[`QueuedCall`](@ref DynamicObjects.QueuedCall) or a [`QueuedItem`](@ref DynamicObjects.QueuedItem);
+`nothing` when it is not waiting (admitted, finished, or never queued).
+"""
+queue_position(handle, q::JobQueue=job_queue()) =
+    lock(() -> findfirst(item -> _queued_for(item, handle), q.waiting), q.lock)
+
+_queued_for(item::QueuedItem, handle::QueuedItem) = item === handle
+_queued_for(item::QueuedItem, p::Pending) = _computes(item.work, p)
+_queued_for(item::QueuedItem, work) = item.work === work
+_computes(d::DeferredCompute, p::Pending) = d.cache === p.cache && isequal(d.key, p.key)
+_computes(_, ::Pending) = false
+
+"""
+    DynamicObjects.abandon_queued!(q, items, reason="abandoned") -> Int
+
+Take those of `items` (`QueuedItem`s) that still wait in `q` out of it and `abandon!` each:
+a `DeferredCompute`'s key fails with [`ComputeAbandoned`](@ref), and so does a
+`QueuedCall`'s `fetch`. Items already admitted are left alone. Returns how many were
+abandoned. Which waiting items to give up on — say, those nobody has polled for a while — is
+the caller's decision.
+"""
+function abandon_queued!(q::JobQueue, items, reason::AbstractString="abandoned")
+    chosen = Base.IdSet{Any}(items)
+    taken = lock(q.lock) do
+        taken = filter(in(chosen), q.waiting)
+        isempty(taken) && return taken
+        filter!(!in(chosen), q.waiting)
+        # The abandoned leave as if admitted; those still waiting move up.
+        _note_positions!(q, taken)
+        taken
+    end
+    for item in taken
+        abandon!(item.work, reason)
+    end
+    length(taken)
+end
+
+"""
+    DynamicObjects.QueueExecutor(queue=job_queue(); property=nothing, tag=nothing)
+
+A [`Deferred`](@ref) executor that [`enqueue!`](@ref DynamicObjects.enqueue!)s each
+`DeferredCompute` on `queue`, carrying `property` and `tag` to its
+[`QueuedItem`](@ref DynamicObjects.QueuedItem). A `@queued` property's declared
+`property_executor` is one, with its own name as `property`; pass one as
+`fetch=Deferred(QueueExecutor(...))` to queue a single call. Every blocking wait on a
+computation it started gives back the slot of the queued computation the waiting task works
+for (see [`await_deferred`](@ref DynamicObjects.await_deferred)).
+"""
+struct QueueExecutor
+    queue::JobQueue
+    property::Union{Nothing,Symbol}
+    tag::Any
+end
+QueueExecutor(queue::JobQueue=job_queue(); property=nothing, tag=nothing) =
+    QueueExecutor(queue, property, tag)
+
+(e::QueueExecutor)(d) = (enqueue!(e.queue, d; e.property, e.tag); nothing)
+
+# A task blocking on queued work is no longer doing heavy work of its own: it gives back
+# the slot of the queued computation it works for before it waits.
+function await_deferred(wait, ::QueueExecutor)
+    _release_slot!(_QUEUE_HOLDER[])
+    wait()
+end
+
+# The executor `@queued` declares for property `name`.
+_queued_executor(name::Symbol) = QueueExecutor(job_queue(), name, nothing)
+
+"""
+    DynamicObjects.QueuedCall(f)
+
+A queueable call with no cache cell behind it: [`enqueue!`](@ref DynamicObjects.enqueue!) it,
+then `fetch` it for `f()`'s value (rethrowing its failure, or [`ComputeAbandoned`](@ref) if it
+was abandoned before it started) and `isready` it to poll. It follows the
+[`DeferredCompute`](@ref) contract: exactly one of `run!(call)` and `abandon!(call, reason)`
+takes effect. A blocking `fetch` from inside a queued computation first gives that
+computation's slot back, as a wait on a `@queued` property does. `status`, a progress node,
+reads "queued · #k" while the call waits.
+
+A fresh computation of a `@queued` property (declaration-site `@fresh`, or a call-site
+`fresh`) runs as one: the caller waits for its turn and its value.
+"""
+mutable struct QueuedCall
+    const f::Any
+    const status::Any                         # progress node for the "queued · #k" note
+    const outcome::Channel{Tuple{Bool,Any}}   # (true, value) | (false, exception)
+    @atomic claimed::Bool
+end
+QueuedCall(f; status=nothing) = QueuedCall(f, status, Channel{Tuple{Bool,Any}}(1), false)
+
+_claim!(c::QueuedCall) = (@atomicswap c.claimed = true) === false
+
+function run!(c::QueuedCall)
+    _claim!(c) || return false
+    outcome = try
+        (true, c.f())
+    catch err
+        (false, err)
+    end
+    put!(c.outcome, outcome)
+    true
+end
+
+function abandon!(c::QueuedCall, reason::AbstractString="abandoned")
+    _claim!(c) || return false
+    put!(c.outcome, (false, ComputeAbandoned(String(reason))))
+    true
+end
+
+Base.isready(c::QueuedCall) = isready(c.outcome)
+
+function Base.fetch(c::QueuedCall)
+    isready(c) || _release_slot!(_QUEUE_HOLDER[])
+    ok, value = fetch(c.outcome)
+    ok ? value : throw(value)
+end
+
+# An admitted item and the slot it holds (`nothing` while its queue is off).
+const _Admitted = Tuple{QueuedItem,Union{Nothing,_QueueSlot}}
+
+# Admit waiting items, oldest first, while slots are free — every one while the queue is
+# off. The caller holds `q.lock` and starts what this returns once it has let go of it.
+function _admit!(q::JobQueue)
+    admitted = _Admitted[]
+    while !isempty(q.waiting) && (q.max_running == 0 || q.running < q.max_running)
+        item = popfirst!(q.waiting)
+        slot = q.max_running == 0 ? nothing : _QueueSlot(q, true)
+        slot === nothing || (q.running += 1)
+        push!(admitted, (item, slot))
+    end
+    _note_positions!(q, map(first, admitted))
+    admitted
+end
+
+# A waiting computation's progress node reads "queued · #k"; one that leaves the queue has
+# its note cleared before it starts. The caller holds `q.lock`, which orders the notes of
+# concurrent admissions.
+function _note_positions!(q::JobQueue, left)
+    foreach(item -> _note_position!(item, 0), left)
+    for (k, item) in enumerate(q.waiting)
+        _note_position!(item, k)
+    end
+end
+
+function _note_position!(item::QueuedItem, k::Int)
+    item.note == k && return
+    item.note = k
+    _note_substatus!(_queued_status(item.work), k == 0 ? "" : "queued · #$(k)")
+end
+
+_queued_status(d::DeferredCompute) = d.status
+_queued_status(c::QueuedCall) = c.status
+_queued_status(_) = nothing
+
+# A fresh computation of a property whose declared executor is a job queue's (`@queued`)
+# waits its turn there as a `QueuedCall`, and the caller waits for its value; any other
+# executor starts memoized computations only, so a fresh one runs inline.
+_fresh_through(executor, compute, status=nothing) = compute()
+_fresh_through(e::QueueExecutor, compute, status=nothing) =
+    fetch(enqueue!(e.queue, QueuedCall(compute; status); e.property, e.tag).work)
+
+# Literal pool symbol: `@spawn` accepts a computed pool only on newer Julia.
+_start_admitted((item, slot)::_Admitted) =
+    errormonitor(Threads.@spawn :default _run_admitted(item, slot))
+
+# Run an admitted item as `slot`'s holder — whatever scope its admitting task had — then
+# give the slot back unless a wait already did.
+function _run_admitted(item::QueuedItem, slot::Union{Nothing,_QueueSlot})
+    try
+        ScopedValues.with(() -> run!(item.work), _QUEUE_HOLDER => slot)
+    finally
+        _release_slot!(slot)
+    end
+end
+
+# Give `slot` back, at most once, and start what that admits.
+_release_slot!(::Nothing) = false
+function _release_slot!(slot::_QueueSlot)
+    (@atomicswap slot.held = false) || return false
+    q = slot.queue
+    admitted = lock(q.lock) do
+        q.running -= 1
+        _admit!(q)
+    end
+    foreach(_start_admitted, admitted)
+    true
 end
 
 # `_on_hit!` / `_on_store!` are ThreadsafeDict-layer bookkeeping hooks — no-ops.
@@ -3538,7 +3914,8 @@ maybeprogress!(progress, ip::IndexableProperty{name}, indices...; kwargs...) whe
     # `_default_substatus` (gated on the property's docstring).
     s = _default_substatus(progress, o, name, indices...; kwargs...)
     try
-        rv = _computeproperty(o, name, indices...; __status__=s, kwargs...)
+        rv = _fresh_through(property_executor(o, Val(name)),
+                            () -> _computeproperty(o, name, indices...; __status__=s, kwargs...), s)
         _finalize_substatus!(s)
         rv
     catch e
@@ -6382,6 +6759,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     # must still be emitted.
     _never_cache_emitted = Set{Symbol}()
     _self_named_emitted = Set{Symbol}()
+    _queued_emitted = Set{Symbol}()
     # Docstring precedence — without emitting two `@doc` calls (which would
     # warn "Replacing docs" on every Revise reload and, worse, cause
     # `Core.@__doc__` to copy the parent's user docstring onto hoisted
@@ -6471,6 +6849,13 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 if Symbol("@fresh") in info.macros
                     info.indexed || error("@fresh on property `$name`: the never-cache marker applies only to call-form / indexed properties (`@fresh $name() = …`). A bare scalar property `$name = …` memoizes via PropertyCache (a different mechanism) — use the call form, or drop @fresh.")
                     (Symbol("@cached") in info.macros || Symbol("@mmap") in info.macros) && error("@fresh on property `$name`: cannot combine with @cached/@mmap. `@fresh` declares the property never caches; @cached/@mmap declare a disk cache — these are contradictory. Drop one.")
+                end
+                # `@queued` marker validation (macro-time). The marker admits every
+                # computation of the property through the job queue — memoized ones through
+                # its declared executor, fresh ones as `QueuedCall`s — and DO declares an
+                # executor only for call-form properties.
+                if Symbol("@queued") in info.macros
+                    info.indexed || error("@queued on property `$name`: the marker admits the memoized computations of a call-form / indexed property through the job queue (`@queued $name() = …`). A bare property `$name = …` memoizes via PropertyCache, never through an executor — use the call form, or drop @queued.")
                 end
                 # `@struct` inline-child validation (macro-time). The inline-child
                 # rewrite that turns `@struct $name(…) = begin … end` into a child
@@ -6701,6 +7086,19 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                     )
                     nc_expr = (_lnn, Expr(:(=), nc_method, Expr(:block, _lnn, true)))
                     push!(block.args, nc_expr...)
+                end
+                # `@queued`-marked: emit `property_executor(__self__::T, ::Val{name})`
+                # returning the job queue's executor, so every computation of the
+                # property — memoized or fresh — waits its turn in `job_queue()`, whoever
+                # calls it. First declaration wins, as with `_never_cache` above.
+                if Symbol("@queued") in info.macros && name ∉ _queued_emitted
+                    push!(_queued_emitted, name)
+                    pe_method = Expr(:call,
+                        Expr(:., DynamicObjects, QuoteNode(:property_executor)),
+                        :(__self__::$type), :(::Val{$(Meta.quot(name))}),
+                    )
+                    pe_body = :($DynamicObjects._queued_executor($(Meta.quot(name))))
+                    push!(block.args, _lnn, Expr(:(=), pe_method, Expr(:block, _lnn, pe_body)))
                 end
                 # See the suppression above: this property has no kwarg named
                 # after itself, so the disk-cache resume value must not be passed.
