@@ -19,7 +19,7 @@ optionally disk-cached properties.
 - [`remount`](@ref): Bind fresh request/context properties while retaining unrelated cache identity.
 - [`fetchindex`](@ref): Non-blocking access to `ThreadsafeDict`-backed properties with `(rv, status)` callback.
 - [`getstatus`](@ref): Read the status object for an in-flight computation.
-- [`@clear_cache!`](@ref): Clear the disk and in-memory cache for a property.
+- [`@clear_cache!`](@ref): Drop a property and everything derived from it (or one indexed entry) from memory and disk.
 - [`invalidate!`](@ref): Drop one indexed-property entry (memory + disk) so the next access recomputes.
 - [`@persist`](@ref): Manually persist a property value to disk cache.
 - [`PropertyComputationError`](@ref): Exception wrapper for errors during property computation.
@@ -4058,7 +4058,7 @@ The function behind [`@clear_cache!`](@ref), for a property name only known at
 run time (`DynamicObjects.clear_cache!(prep, stage_root)`). Not exported.
 
 With a name alone it drops the whole property **and everything derived from
-it**: `name` and its transitive [`dependents`](@ref) — the memory value (every
+it**: `name` and its transitive `dependents` — the memory value (every
 entry of an indexed property), every disk entry of a `@cached` / `@mmap` one
 (including entries an earlier process wrote), and shared remount work — so the
 next read of any of them recomputes. Every other property keeps its value.
@@ -4091,7 +4091,7 @@ Drop a property, or one entry of an indexed property, from memory and disk so
 the next read recomputes it.
 
 Without indices, drops the whole property **and every property derived from
-it** (its transitive [`dependents`](@ref)), and leaves every other property
+it** (its transitive `dependents`), and leaves every other property
 cached — a "force this stage" action for one branch of an object's dependency
 graph:
 
@@ -4117,10 +4117,10 @@ end
   for [`clear_mem_caches!`](@ref) (a fixed field `name` is an error; move it
   with [`remake`](@ref)).
 - On an object with a computed `@versioned` property, the version and cache path
-  are re-derived on the next read, as for [`sync!`](@ref).
+  are re-derived on the next read, as for `sync!`.
 - A holder that derived from this object (a parent reading one of its children)
-  drops its own dependents on its next [`sync!`](@ref): the object's
-  [`object_version`](@ref) moves. HTMXObjects calls `sync!` on every request root.
+  drops its own dependents on its next `sync!`: the object's
+  `object_version` moves. HTMXObjects calls `sync!` on every request root.
 - In flight: as for [`invalidate!`](@ref), there is no cancellation. A compute of
   a dropped property that is running at the time still lands if its slot is
   empty when it finishes — including a dependent that read the old value.
