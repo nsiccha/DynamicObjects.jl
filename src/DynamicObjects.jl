@@ -1246,7 +1246,7 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
     end
     args_key = (indices, (;kwargs...))
     fetch = _declared_fetch(fetch, o, Val(name))
-    rv = get!(cache, args_key; fetch, substatus=substatus_f, retry_failed) do s
+    compute = _Settling(o, name, indices, args_key[2]) do s
         # Call `_computeproperty` directly, NOT `getorcomputeproperty`:
         # the latter, when `indices` and `kwargs` are both empty AND
         # `is_indexed_property(o, name)` (we're already inside the IP wrapper,
@@ -1259,7 +1259,7 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
         v = _computeproperty(o, name, indices...; __status__=s, kwargs...)
         v
     end
-    rv
+    get!(compute, cache, args_key; fetch, substatus=substatus_f, retry_failed)
 end
 # The substatus is created pending and started by `_run_cache_compute!` when the compute
 # runs, so a compute waiting in an executor, a job queue or for a `:default` thread does not
@@ -1532,6 +1532,86 @@ An overload must call `wait()` exactly once, on the calling task, and return its
 """
 await_deferred(wait, executor) = wait()
 
+"""
+    DynamicObjects.property_settled(o, ::Val{name}, value, args...; kwargs...)
+
+Settlement hook of memoized property `name`. DO calls it each time a computation of the
+property stores its result in memory: the body ran, or an explicit `@cached` / `@mmap` entry
+was read from disk. `value` is the stored value; for an indexed property, `args` and `kwargs`
+are the call's. The default does nothing.
+
+Define it as an ordinary method, or as a member method in the struct body, where sibling
+names read as they do in a property body:
+
+```julia
+@dynamicstruct struct Table
+    root::String
+    subscriptions::KeySubscriptions
+    runs = TrackedDirectory(root)
+    snapshot = build_snapshot(runs)
+    DynamicObjects.property_settled(__self__, ::Val{:snapshot}, value) =
+        foreach(key -> invalidate_key!(subscriptions, key), value.changed_keys)
+end
+```
+
+It runs once per stored value: after the store, after every caller waiting for that
+computation has been released, outside every cache lock, on the task that ran the
+computation, which returns only after the hook does. Reading the property inside the hook
+returns `value` unless something dropped it meanwhile. It does not run for a cache hit, for a
+caller that waited for the computation, for a failed computation, for a `@fresh` call (it
+stores nothing), or for a value seeded by a constructor, `remake` or `clear_mem_caches!`. A
+governed host's automatic storage, which may swap the stored value for its persisted copy or
+reload it later, does not call it either. A throwing hook is logged with its backtrace; the
+value stays stored and is returned to the caller.
+
+`o` is the object whose read ran the computation: a `remount` view when one did. A view
+whose computation reads request context reports its own value.
+
+Notify from here, not from the property's body: inside the body the value is not stored
+yet, the computation can still fail, and reading the property waits for itself. Keep the
+hook short and start heavy work on another task. Unlike `BackgroundCache`'s `on_settle`
+there is no `old` value, because a dropped value is gone before its replacement is computed:
+carry whatever a consumer compares in the value itself.
+"""
+property_settled(o, ::Val, value, args...; kwargs...) = nothing
+
+# A compute closure that reports what it stores to `property_settled`.
+# `_run_cache_compute!` calls `_settled!` only when this computation stored its value.
+# `local_value` (a `Ref`, else `nothing`) holds the requester's own value of an opaque
+# remount computation that read request context: it is stored view-locally while the
+# shared computation fails, and is reported from `_failed!` once the failure is recorded.
+struct _Settling{F,O,A<:Tuple,K<:NamedTuple,L<:Union{Nothing,Base.RefValue{Any}}} <: Function
+    f::F
+    o::O
+    name::Symbol
+    args::A
+    kwargs::K
+    local_value::L
+end
+_Settling(f, o, name::Symbol, args::Tuple=(), kwargs::NamedTuple=(;)) =
+    _Settling(f, o, name, args, kwargs, nothing)
+(s::_Settling)(status) = s.f(status)
+
+_settled!(f, value) = nothing
+_settled!(s::_Settling, value) = _property_settled!(s.o, s.name, value, s.args, s.kwargs)
+_failed!(f) = nothing
+_failed!(s::_Settling) = _settled_local!(s, s.local_value)
+_settled_local!(s::_Settling, ::Nothing) = nothing
+function _settled_local!(s::_Settling, local_value::Base.RefValue{Any})
+    value = local_value[]
+    value === _missing_sentinel || _property_settled!(s.o, s.name, value, s.args, s.kwargs)
+    nothing
+end
+
+function _property_settled!(o, name::Symbol, value, args, kwargs)
+    try
+        property_settled(o, Val(name), value, args...; kwargs...)
+    catch e
+        @error "property_settled hook threw; the computed value stays stored" type = typeof(o) property = name exception = (e, catch_backtrace())
+    end
+    nothing
+end
+
 # Internal selectors whose compute starts through `executor`, chosen for a call of a
 # property with a declared executor: `_DeferredSelect` applies the caller's asynchronous
 # selector to the handle (`identity` for a poll), `_BlockingDeferred` blocks for the value
@@ -1576,7 +1656,9 @@ const _missing_sentinel = _Missing()
 # latch + notify; on failure record the exception in `c.errors` + drop the latch + notify,
 # and rethrow. Used inline (blocking first-arriver) and inside the fire-and-forget spawn
 # (poller first-arriver) alike — the value/error both reach every other accessor through
-# `cache`/`errors` + the latch, so the compute Task is never retained.
+# `cache`/`errors` + the latch, so the compute Task is never retained. A value this
+# computation stored is then reported to `property_settled` (`f` a `_Settling`), with waiters
+# already released and no lock held.
 function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condition, f, s)
     local v
     _start_substatus!(s)
@@ -1589,11 +1671,13 @@ function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condit
             notify(cnd)
         end
         !isnothing(s) && _fail_substatus!(s, e)
+        _failed!(f)
         rethrow()
     end
-    stored = lock(c.lock) do
+    stored, published = lock(c.lock) do
         existing = get(c.cache, key, _missing_sentinel)
-        if existing === _missing_sentinel
+        published = existing === _missing_sentinel
+        if published
             c.cache[key] = v
             _on_store!(c, key)
             existing = v
@@ -1602,9 +1686,10 @@ function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condit
         end
         get(c.computing, key, nothing) === cnd && delete!(c.computing, key)
         notify(cnd)                    # leave c.status[key] finalized — getstatus / "(cached)" relabel rely on it
-        existing
+        (existing, published)
     end
     !isnothing(s) && _finalize_substatus!(s)
+    published && _settled!(f, stored)
     stored
 end
 
@@ -2596,10 +2681,7 @@ fetchproperty(fetch, o, name::Symbol) = begin
         return _mounted_fetchproperty(fetch, c, o, name)
     end
     substatus_f = _bare_substatus_f(o, name)
-    rv = get!(c, name; substatus=substatus_f, fetch=identity) do s
-        v = _computeproperty(o, name; __status__=s)
-        v
-    end
+    rv = get!(_bare_compute(o, name), c, name; substatus=substatus_f, fetch=identity)
     s = lock(c.lock) do; get(c.status, name, nothing); end
     fetch(rv, s)
 end
@@ -3338,19 +3420,19 @@ function _getorcompute_bare(cache::PropertyCache, o, name::Symbol)
     hit = _peek_hit(cache, name)
     hit === _missing_sentinel || return hit
     substatus_f = _bare_substatus_f(o, name)
-    get!(cache, name; substatus=substatus_f) do s
-        # When called with no indices on an indexed property (declared with
-        # call/ref syntax, e.g. `x() = ...` or `x[i] = ...`), return an
-        # IndexableProperty wrapper instead of calling compute_property.
-        if is_indexed_property(o, name)
-            return IndexableProperty(name, o, subcache(cache, o, Val(name)))
-        end
-        # `s` is the substatus the spawn wrapper passed (or `nothing` when
-        # `substatus_f` was nothing). Pass it as `__status__` so the body
-        # — and any IP/property accesses inside — attach to it.
-        _computeproperty(o, name; __status__=s)
+    # When called with no indices on an indexed property (declared with
+    # call/ref syntax, e.g. `x() = ...` or `x[i] = ...`), return an
+    # IndexableProperty wrapper instead of calling compute_property. The
+    # wrapper is not a computed value: only its entries settle (`memoize!`).
+    is_indexed_property(o, name) && return get!(cache, name; substatus=substatus_f) do s
+        IndexableProperty(name, o, subcache(cache, o, Val(name)))
     end
+    get!(_bare_compute(o, name), cache, name; substatus=substatus_f)
 end
+# The computation of bare property `name`, reported to `property_settled` when it stores.
+# `s` is the substatus the spawn wrapper passed (or `nothing` when there is none). It is
+# passed as `__status__` so the body — and any IP/property accesses inside — attach to it.
+_bare_compute(o, name::Symbol) = _Settling(s -> _computeproperty(o, name; __status__=s), o, name)
 # A remount view first tries the shared namespace for an untainted opaque
 # property; the guarded `__self__` of an opaque computation intercepts every
 # read (`_probe_read`).
@@ -7699,15 +7781,24 @@ _opaque_local!(oc::_OpaqueSubcache, (indices, kwargs); fetch=Base.fetch, retry_f
     memoize!(IndexableProperty(oc.name, oc.requester, oc.local_dict), indices...;
              fetch, retry_failed, kwargs...)
 # Opaque names are view-local, so a bare value lands in the requester's overlay.
+# Returns whether it stored `value` (a value already there is kept).
 _store_local!(oc::_OpaqueBare, key, value) =
-    lock(() -> get!(oc.local_dict.cache.overlay, oc.name, value), oc.local_dict.lock)
+    _store_new!(oc.local_dict.cache.overlay, oc.name, value, oc.local_dict.lock)
 _store_local!(oc::_OpaqueSubcache, key, value) =
-    lock(() -> get!(oc.local_dict.cache, key, value), oc.local_dict.lock)
+    _store_new!(oc.local_dict.cache, key, value, oc.local_dict.lock)
+_store_new!(dict, key, value, dict_lock) = lock(dict_lock) do
+    haskey(dict, key) && return false
+    dict[key] = value
+    true
+end
 
 _local_bare!(o, name::Symbol; fetch=Base.fetch, retry_failed=true) =
-    get!(getfield(o, :cache).cache, name; substatus=_bare_substatus_f(o, name), fetch, retry_failed) do s
-        _computeproperty(o, name; __status__=s)
-    end
+    get!(_bare_compute(o, name), getfield(o, :cache).cache, name;
+         substatus=_bare_substatus_f(o, name), fetch, retry_failed)
+
+# The call an opaque key stands for, as `property_settled` reports it.
+_opaque_call(oc::_OpaqueBare, key) = ((), (;))
+_opaque_call(oc::_OpaqueSubcache, (indices, kwargs)) = (indices, kwargs)
 
 # The guarded `__self__` of one opaque computation for `requester`.
 function _probe_view(requester, probe::_OpaqueProbe)
@@ -7724,7 +7815,9 @@ end
 function _opaque_shared!(oc::_OpaqueSubcache, key; fetch=Base.fetch, retry_failed=true)
     hit = get(oc, key, _missing_sentinel)
     hit === _missing_sentinel || return hit
-    get!(oc, key; fetch, retry_failed, substatus=_opaque_substatus_f(oc, key)) do s
+    args, kwargs = _opaque_call(oc, key)
+    local_value = Ref{Any}(_missing_sentinel)
+    compute = _Settling(oc.requester, oc.name, args, kwargs, local_value) do s
         probe = _OpaqueProbe(oc.requester, oc.name)
         context_dependent(error) = (_ns_taint!(oc.ns, _taint_key(oc, key));
             _RemountContextDependent(oc.name, WeakRef(_requester_token(oc.requester)), error))
@@ -7735,11 +7828,13 @@ function _opaque_shared!(oc::_OpaqueSubcache, key; fetch=Base.fetch, retry_faile
             rethrow()
         end
         if _seal!(probe)
-            _store_local!(oc, key, value)
+            # The requester's own value; reported once the latch has failed (`_failed!`).
+            _store_local!(oc, key, value) && (local_value[] = value)
             throw(context_dependent(nothing))
         end
         value
     end
+    get!(compute, oc, key; fetch, retry_failed, substatus=_opaque_substatus_f(oc, key))
 end
 
 # The latch records a context-dependent computation as a failure; its progress
