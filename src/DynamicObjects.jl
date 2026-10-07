@@ -2193,6 +2193,11 @@ post-`invalidate!`, or eviction). Failures never invoke it. It fires even when
 `new == old` — compare them to skip unchanged values. A throwing callback is
 logged with its key and backtrace and never breaks the refresh or the drain.
 
+Every background refresh task, and the batch drain before each claim, yields
+to the scheduler, so a refresh storm (say, readers that re-request each key as
+it settles at `ttl=0`) wastes builds but never starves the other tasks, timers
+or I/O on its thread.
+
 Timestamps use the monotonic clock. Treat returned values (including `unbuilt`)
 as read-only, and likewise the `old`/`new` values handed to `on_settle`.
 See also [`invalidate!`](@ref).
@@ -2316,8 +2321,17 @@ function _run_swr_refresh!(c::BackgroundCache{K,V}, key::K) where {K,V}
     nothing
 end
 
+# Every background refresh unit (this task, each drain iteration) yields before
+# building. A task started from another task's exit never polls libuv, so a
+# chain of refreshes that each kick the next — e.g. an `on_settle` feedback
+# loop at `ttl=0` — would otherwise keep the run queue non-empty forever and
+# starve its thread's timers, I/O and other tasks. The resumed yield processes
+# pending events, so such a storm costs CPU, never the thread.
 function _kick_swr_refresh!(c::BackgroundCache{K,V}, key::K) where {K,V}
-    errormonitor(Threads.@spawn _run_swr_refresh!(c, key))
+    errormonitor(Threads.@spawn begin
+        yield()
+        _run_swr_refresh!(c, key)
+    end)
     nothing
 end
 
@@ -2342,9 +2356,12 @@ end
 # feeds them to one `build_many` call; keys arriving mid-build ride the next
 # iteration. Exits (clearing the flag) only on an empty queue observed under
 # the lock, so no wakeup is lost: an enqueue after the check finds the flag
-# clear and spawns the successor.
+# clear and spawns the successor. Yields before every claim (see
+# `_kick_swr_refresh!`): a drain kept busy by its own settles never pins its
+# thread, and same-thread readers get to enqueue before the next claim.
 function _run_swr_batch_drain!(c::BackgroundCache{K,V}) where {K,V}
     while true
+        yield()
         batch_keys = lock(c.lock) do
             if isempty(c.pending)
                 c.batch_running[] = false

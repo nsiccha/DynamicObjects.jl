@@ -558,3 +558,25 @@ finally
     global_logger(old)
 end
 end
+
+@testitem "a refresh feedback loop never starves its thread" setup=[BackgroundCacheFixtures] begin
+using DynamicObjects
+
+# Cold process at one default thread: there the run queue and the event loop
+# share the only thread, so a refresh chain that never yields starves the
+# main task's timers outright (on more threads its peers would mask it). A
+# regression hangs the child, so the timeout below turns it into a failure.
+script = normpath(joinpath(dirname(pathof(DynamicObjects)), "..", "test", "fixtures", "background_cache_liveness.jl"))
+project = dirname(Base.active_project())
+out = tempname()
+err = tempname()
+proc = run(pipeline(`$(Base.julia_cmd()) --startup-file=no --threads=1 --project=$project $script`;
+                    stdout=out, stderr=err); wait=false)
+status = timedwait(() -> process_exited(proc), 300.0)
+status === :ok || kill(proc)
+output = read(out, String) * read(err, String)
+@test status === :ok
+@test success(proc)
+@test occursin("BACKGROUND-CACHE-LIVENESS-OK", output)
+status === :ok && success(proc) || println(output)
+end
