@@ -380,7 +380,7 @@ the callee to be an `IndexableProperty`. See
 | `@cache_status obj.result`         | `:unstarted` / `:started` / `:ready`                |
 | `@is_cached obj.result`            | `true` if the disk cache file is `:ready`           |
 | `@cache_path obj.result`           | The on-disk path                                    |
-| `@clear_cache! obj.result`         | Drop in-memory + delete all on-disk files           |
+| `@clear_cache! obj.result`         | Drop `result` and every property derived from it, in memory and on disk |
 | `@clear_cache! obj.result(key)`    | Drop a single index                                 |
 | `invalidate!(obj.result, key)`     | Drop a single index (function form)                 |
 | `clear_mem_caches!(obj)`           | Drop every in-memory entry on `obj`                 |

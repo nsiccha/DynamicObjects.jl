@@ -30,6 +30,7 @@ a body, drop the object prefix and use the bare property name.
 @is_cached
 @cache_path
 @clear_cache!
+DynamicObjects.clear_cache!
 @persist
 ```
 
