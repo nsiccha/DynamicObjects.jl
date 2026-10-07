@@ -1632,9 +1632,8 @@ now branch on `rv isa Pending` (still computing) vs. the value (done). The progr
 node stays optional and is never relied on for readiness.
 
 A handle for a computation started through an executor (a `Deferred` selector, or the
-property's [`property_executor`](@ref DynamicObjects.property_executor)) carries that
-executor, and a blocking `fetch` on it waits through
-[`await_deferred`](@ref DynamicObjects.await_deferred).
+property's `DynamicObjects.property_executor`) carries that executor, and a blocking
+`fetch` on it waits through `DynamicObjects.await_deferred`.
 """
 struct Pending{C<:AbstractThreadsafeDict, K, S, E}
     cache::C
