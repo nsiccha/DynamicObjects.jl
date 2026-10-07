@@ -258,7 +258,9 @@ end
 using DynamicObjects
 using DynamicObjects.Treebars: render_text, is_pending, is_running, duration
 import DynamicObjects.Treebars
-using Dates: Millisecond
+# `duration` is a `Dates.Millisecond`; compare in its own unit, since `Dates` is not a
+# test dependency (`Pkg.test` cannot load it).
+ms(n, d) = n * oneunit(d)
 # The progress node of the computation waiting behind `w`'s gated blocker.
 waiting_node(w) = begin
     found = nothing
@@ -282,13 +284,13 @@ try
     @test !contains(line, "▶")
     @test !contains(line, "[")
     sleep(0.6)
-    @test duration(node.impl) == Millisecond(0)
+    @test iszero(duration(node.impl))
     release!(-7)
     @test settles(() -> istaskdone(caller), 30.0)
     @test fetch(caller) == 1
     # It ran for its own ~0.05 s, not for the ~0.6 s it waited.
     @test !is_pending(node.impl) && !is_running(node.impl)
-    @test duration(node.impl) < Millisecond(500)
+    @test duration(node.impl) < ms(500, duration(node.impl))
     fetch(blocker)
 
     # A waiting fresh call of a `@queued` property is pending the same way.
@@ -303,7 +305,7 @@ try
     @test settles(() -> istaskdone(caller), 30.0)
     @test fetch(caller) == 1
     @test !is_pending(node.impl) && !is_running(node.impl)
-    @test duration(node.impl) < Millisecond(500)
+    @test duration(node.impl) < ms(500, duration(node.impl))
     fetch(blocker)
 finally
     release!(-7)
