@@ -10,7 +10,7 @@ export SemanticQuality, draft, final, SemanticDescriptorFixture,
     GOVERNED_SERIAL_CALLS,
     GovernedLazyColumns, GovernedNestedFixture, GovernedScopeFixture,
     GOVERNED_POLICY_CALLS, MisclaimedColumn, OwnFormatPayload,
-    GovernedPolicyFixture,
+    GovernedPolicyFixture, GovernedDefaultBaseFixture,
     LegacySemanticMeta, DeduplicatedKeyFixture
 
 @enum SemanticQuality draft final
@@ -59,6 +59,15 @@ const GOVERNED_MATERIALIZATION_CACHE_BASE = Ref("cache")
 end
 
 const GOVERNED_LARGE_LENGTH = 1 + (1024 * 1024) ÷ sizeof(Float64)
+
+# Declares no `__cache_base__`, so its cache path is DO's cwd-relative default.
+@dynamicstruct struct GovernedDefaultBaseFixture
+    value::Int
+
+    compute(scale::Int) = value * scale
+    large(scale::Int)::Vector{Float64} =
+        fill(Float64(value * scale), GOVERNED_LARGE_LENGTH)
+end
 
 # A lazy column-concatenation view over arrays it does not own — the shape of a
 # pooled view over per-chain memory-mapped matrices.
@@ -376,8 +385,10 @@ directory. Identity/version and retention remain reflected in the lifecycle.
         @test ownership.retention == (;max_entries=1, ttl=60.0)
         @test ownership.active == 0
         @test ownership.reachable
-        @test ownership.owned_paths == [abspath(path)]
-        @test !isfile(joinpath(path, "compute_3.sjl"))
+        # A result kept in memory stores nothing, so the root's directory is
+        # not claimed (or created) yet.
+        @test ownership.owned_paths == String[]
+        @test !ispath(path)
         @test property_descriptor(
             GovernedMaterializationFixture,
             :compute).output.materialization.tier === :automatic
@@ -400,6 +411,9 @@ directory. Identity/version and retention remain reflected in the lifecycle.
         @test isfile(mapped_path * ".auto")
         @test materialization_observation(
             object, :large_array, 2).tier === :mmap
+        # The first disk write claimed the root's directory.
+        @test materialization_ownership(context, object).owned_paths ==
+            [abspath(path)]
 
         text = execute_materialization(context, object, :large_text, 2)
         @test startswith(text, "14")
@@ -461,6 +475,15 @@ directory. Identity/version and retention remain reflected in the lifecycle.
         write(user_file, "keep")
         @test execute_materialization(
             unowned_context, object, :compute, 2) == 22
+        # Nothing was stored, so no claim was attempted yet.
+        @test materialization_ownership(
+            unowned_context, object).unowned_paths == String[]
+        # A promotion attempt finds the pre-existing directory and leaves it
+        # alone: the large value stays in memory and nothing is written there.
+        @test all(==(22.0), execute_materialization(
+            unowned_context, object, :large_array, 2))
+        @test !isfile(DynamicObjects.get_cache_path(object, :large_array, 2))
+        @test !ispath(joinpath(path, ".dynamicobjects-owner"))
         ownership = materialization_ownership(unowned_context, object)
         @test ownership.owned_paths == String[]
         @test ownership.unowned_paths == [abspath(path)]
@@ -554,7 +577,9 @@ end
     ownership = materialization_ownership(context, object)
     @test ownership.state === :active
     @test ownership.active == 0
-    @test ownership.owned_paths == [abspath(object.__cache_path__)]
+    # The callback form stores nothing, so it claims no directory.
+    @test ownership.owned_paths == String[]
+    @test !ispath(object.__cache_path__)
     @test object.callsite_probe(2) == cached
     @test GOVERNED_MATERIALIZATION_CALLS[] == 3
     @test !isfile(DynamicObjects.get_cache_path(object, :callsite_probe, 2))
@@ -564,6 +589,50 @@ end
         error("callback failure")
     end
     @test materialization_ownership(context, object).active == 0
+end
+
+"""
+DO's default `__cache_base__` is relative to the process cwd, so a service whose
+cwd is its deployment checkout must not gain a `cache/` directory from governed
+executions that store nothing (snag `run-an-htmxobjec-9153c247`). Such an
+owner must not contest the directory either: a later owner that does store
+still claims it and promotes.
+"""
+@testitem "governed execution that stores nothing writes no files" tags=[:semantic] setup=[SemanticFixtures] begin
+    using DynamicObjects
+
+    cwd = mktempdir()
+    cd(cwd) do
+        object = GovernedDefaultBaseFixture(7)
+        @test !isabspath(object.__cache_path__)
+
+        # HTMXObjects' default provider: a fresh root per request, which never
+        # stores — not even a large value.
+        request = (;scope=:request, key="", retention=nothing)
+        @test execute_materialization(request, object, :compute, 3) == 21
+        @test all(==(7.0), execute_materialization(request, object, :large, 1))
+        @test execute_materialization(request, object) do
+            fresh(object.compute, 4)
+        end == 28
+        retained = (;
+            scope=:session, key="default-base",
+            retention=(;max_entries=1, ttl=nothing),
+        )
+        @test execute_materialization(retained, object, :compute, 5) == 35
+        @test isempty(readdir(cwd))
+        @test materialization_ownership(request, object).owned_paths == String[]
+        @test materialization_ownership(retained, object).owned_paths == String[]
+
+        @test all(==(14.0), execute_materialization(retained, object, :large, 2))
+        path = abspath(object.__cache_path__)
+        large_path = abspath(DynamicObjects.get_cache_path(object, :large, 2))
+        @test isfile(large_path)
+        @test isfile(large_path * ".auto")
+        ownership = materialization_ownership(retained, object)
+        @test ownership.owned_paths == [path]
+        @test strip(read(joinpath(path, ".dynamicobjects-owner"), String)) ==
+            ownership.owner
+    end
 end
 
 """
