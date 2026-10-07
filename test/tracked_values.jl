@@ -3,6 +3,7 @@ using TestItemRunner
 @testmodule TrackedValueFixtures begin
 using DynamicObjects
 export Library, Shelf, ShelfReader, ShelfApp, RunTable, Page, CachedSummary, KeyedDocs,
+    VersionedSummary, VersionedThroughSource,
     TV_CALLS, TV_CACHE_BASE, write_doc, write_status, write_shelf_item
 
 const TV_CALLS = Dict{Any,Int}()
@@ -93,6 +94,26 @@ const TV_CACHE_BASE = Ref("")
     __cache_base__ = TV_CACHE_BASE[]
     source = TrackedFile(joinpath(root, "input.txt"); read = path -> read(path, String))
     @cached summary = (_tv_count!(:cached_summary); uppercase(read(source)))
+end
+
+# A versioned disk cache over a tracked input: the version probes the file, the
+# cached properties read the tracked value and the version.
+@dynamicstruct struct VersionedSummary
+    root::String
+    __cache_base__ = TV_CACHE_BASE[]
+    source = TrackedFile(joinpath(root, "input.txt"); read = path -> read(path, String))
+    @versioned content_version = file_version(joinpath(root, "input.txt"); by = :hash)
+    @cached summary = (_tv_count!(:versioned_summary); uppercase(read(source)))
+    @cached tag = string("v=", content_version)
+end
+
+# The version is derived through the tracked input, so `sync!` sees it as a dependent.
+@dynamicstruct struct VersionedThroughSource
+    root::String
+    __cache_base__ = TV_CACHE_BASE[]
+    source = TrackedFile(joinpath(root, "input.txt"); read = path -> read(path, String))
+    @versioned content_version = file_version(tracked_path(source); by = :hash)
+    @cached summary = uppercase(read(source))
 end
 
 # An indexed property whose entries are tracked values, and one derived from it.
@@ -425,4 +446,51 @@ elapsed = minimum(@elapsed(sync!(runs)) for _ in 1:5)
 write_status(root, "run150", "done!")
 @test sync!(runs) == [:table]
 @test runs.table[150] == "DONE!"
+end
+
+@testitem "sync! re-derives a computed @versioned version before republishing" setup=[TrackedValueFixtures] begin
+using DynamicObjects
+
+TV_CACHE_BASE[] = mktempdir()
+root = mktempdir()
+input = joinpath(root, "input.txt")
+write(input, "first")
+empty!(TV_CALLS)
+s = VersionedSummary(root; __hold_recent_version__ = false)
+@test s.summary == "FIRST"
+@test s.tag == "v=" * file_version(input; by = :hash)
+old_path = s.__cache_path__
+@test sync!(s) == Symbol[]
+
+write(input, "second")
+# The version is not a dependent of `source`, but a dropped property must not be
+# republished under the version the old content had.
+@test sync!(s) == [:content_version, :summary, :tag]
+@test s.summary == "SECOND"
+@test s.tag == "v=" * file_version(input; by = :hash)
+@test s.__cache_path__ != old_path
+@test dirname(s.__cache_path__) == dirname(old_path)    # same identity, new version
+@test TV_CALLS[:versioned_summary] == 2
+# Only the tracked input's dependent is removed from the old version; `tag` is
+# dropped from memory alone, its old entry still correct for the old version.
+@test !isfile(joinpath(old_path, "summary.sjl"))
+@test isfile(joinpath(old_path, "tag.sjl"))
+@test sync!(s) == Symbol[]
+
+# A later process whose file matches the first version reads the first value.
+write(input, "first")
+@test VersionedSummary(root; __hold_recent_version__ = false).summary == "FIRST"
+@test TV_CALLS[:versioned_summary] == 3
+
+# Same when the version itself reads the tracked input.
+write(input, "alpha")
+t = VersionedThroughSource(root)
+@test t.summary == "ALPHA"
+alpha_path = t.__cache_path__
+write(input, "beta")
+@test sync!(t) == [:content_version, :summary]
+@test t.summary == "BETA"
+@test t.__cache_path__ != alpha_path
+write(input, "alpha")
+@test VersionedThroughSource(root).summary == "ALPHA"
 end
