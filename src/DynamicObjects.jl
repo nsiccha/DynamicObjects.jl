@@ -10396,10 +10396,22 @@ function _begin_materialization!(context, root)
         identity = _materialization_identity(root)
         (owner.identity == identity.identity && owner.version == identity.version) ||
             error("materialization cache identity/version changed for a retained root")
-        _claim_materialization_path!(owner, identity.path)
         owner.active += 1
         owner.last_access = time()
         owner
+    end
+end
+
+# The root's cache directory is claimed only when an automatic value is about
+# to be written into it. An execution that stores nothing — a fresh request
+# root, a callback-form operation, a memory-tier result — must not create the
+# directory or its marker: the default `__cache_base__` is relative to the
+# process cwd, and a claim made by an owner that never stores would contest the
+# directory against a later owner that does.
+function _claim_materialization_root!(owner::_MaterializationOwner, root)
+    path = _materialization_identity(root).path
+    lock(_MATERIALIZATION_OWNERS_LOCK) do
+        _claim_materialization_path!(owner, path)
     end
 end
 
@@ -10472,17 +10484,25 @@ function _materialization_path_within(root::AbstractString, path::AbstractString
     isempty(parts) || first(parts) != ".."
 end
 
-function _automatic_materialization_allowed(owner::_MaterializationOwner,
-        target, name::Symbol, descriptor, path::AbstractString)
+function _automatic_materialization_eligible(owner::_MaterializationOwner,
+        target, name::Symbol, descriptor)
     owner.retention === nothing && return false
     descriptor.fixed && return false
     descriptor.output.materialization.tier === :automatic || return false
-    _remount_invalidated(target, name) && return false
+    !_remount_invalidated(target, name)
+end
+
+_automatic_materialization_owned(owner::_MaterializationOwner,
+        path::AbstractString) =
     any(owner.owned_paths) do (root, marker)
         _read_materialization_marker(marker) == owner.id &&
             _materialization_path_within(root, path)
     end
-end
+
+_automatic_materialization_allowed(owner::_MaterializationOwner,
+        target, name::Symbol, descriptor, path::AbstractString) =
+    _automatic_materialization_eligible(owner, target, name, descriptor) &&
+        _automatic_materialization_owned(owner, path)
 
 function _automatic_materialization_slot(target, name::Symbol, descriptor,
         args, kwargs::NamedTuple)
@@ -10597,13 +10617,15 @@ function _automatic_materialization_choice(value, elapsed_seconds)
     (;tier=format === :mmap ? :mmap : :serialized, format, estimated_bytes)
 end
 
-function _persist_automatic_materialization!(owner, target, name, descriptor,
-        args, kwargs::NamedTuple, value, elapsed_seconds)
-    cache_path = get_cache_path(target, name, args...; kwargs...)
-    _automatic_materialization_allowed(
-        owner, target, name, descriptor, cache_path) || return value
+function _persist_automatic_materialization!(owner, root, target, name,
+        descriptor, args, kwargs::NamedTuple, value, elapsed_seconds)
+    _automatic_materialization_eligible(owner, target, name, descriptor) ||
+        return value
     choice = _automatic_materialization_choice(value, elapsed_seconds)
     choice.format === nothing && return value
+    cache_path = get_cache_path(target, name, args...; kwargs...)
+    _claim_materialization_root!(owner, root)
+    _automatic_materialization_owned(owner, cache_path) || return value
     path_lock = get_path_lock!(
         _AUTOMATIC_MATERIALIZATION_DISK_LOCKS, cache_path)
     lock(path_lock) do
@@ -10685,7 +10707,10 @@ The executor adds an active lease around the existing DO property machinery.
 For an ordinary property on a retained root it observes the actual result and
 automatically keeps small/cheap values in memory, serializes large or expensive
 values, and memory-maps large plain `Array`s of supported isbits eltypes. Fresh
-request roots recompute across requests. Existing `@fresh`, `@cached`, and
+request roots recompute across requests. The root's cache directory and its
+ownership marker are created only when a value is actually written to disk, so
+an execution that stores nothing — any fresh request root, the callback form, a
+result kept in memory — touches no files. Existing `@fresh`, `@cached`, and
 `@mmap` declarations remain compatibility overrides; applications do not need
 them for governed execution.
 
@@ -10727,8 +10752,9 @@ function execute_materialization(context::NamedTuple, root, target,
         end
         timed = _timed_materialization_target(
             target, name, descriptor, args, property_kwargs, fetch)
-        _persist_automatic_materialization!(owner, target, name, descriptor,
-            args, property_kwargs, timed.value, timed.elapsed_seconds)
+        _persist_automatic_materialization!(owner, root, target, name,
+            descriptor, args, property_kwargs, timed.value,
+            timed.elapsed_seconds)
     end
 end
 
