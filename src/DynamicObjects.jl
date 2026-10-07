@@ -11207,6 +11207,11 @@ all its entries. A file changing under one entry of `@struct run(id) = …` drop
 only that child's own derived properties, plus whatever the parent derived from
 `run`.
 
+On an object with a computed `@versioned` property, dropping anything also drops
+that property, what reads it (memory only) and the cache path, so the next read
+re-derives the version and publishes recomputed values under it. A fixed
+`@versioned` field is kept: move it with [`remake`](@ref).
+
 A slot `sync!` has not stamped yet compares against the version its value had
 when it was first read, so a change between a dependent's computation and the
 first `sync!` is still a change.
