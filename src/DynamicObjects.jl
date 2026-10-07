@@ -659,6 +659,8 @@ _finalize_substatus!(s) = nothing
 _finalize_substatus!(::Nothing) = nothing
 _fail_substatus!(s, e) = nothing
 _fail_substatus!(::Nothing, e) = nothing
+# Start a substatus created pending (`__pending__=true`) when its computation begins.
+_start_substatus!(s) = nothing
 # Running message of a substatus (a queued computation's "queued · #k").
 _note_substatus!(s, text) = nothing
 
@@ -755,7 +757,12 @@ end
 # `transient` is consumed here (default true → substatus auto-detaches on finalize);
 # it does not reach the property body. Pass transient=false to keep finished substatuses
 # pinned to the parent tree (e.g. for historical "N finished" pill display).
-function _default_substatus(status::Treebars.ProgressNode, o, name, args...; transient=true, kwargs...)
+#
+# `__pending__` is consumed here too: `true` creates the node pending (`·`, no clock), for a
+# node made before its computation runs — DO's compute paths pass it and start the node
+# (`_start_substatus!`) when the body begins, so a computation waiting for an executor or a
+# job-queue slot does not look like running work. The default creates a running node.
+function _default_substatus(status::Treebars.ProgressNode, o, name, args...; transient=true, __pending__=false, kwargs...)
     # Gate the label PER CALL SIGNATURE: `_is_property_documented` dispatches on
     # `args...` (one method emitted per declaration — `true` if documented,
     # `false` if not), so a property with multiple signatures resolves its OWN
@@ -781,7 +788,8 @@ function _default_substatus(status::Treebars.ProgressNode, o, name, args...; tra
     else
         ""
     end
-    Treebars.initialize_progress!(status; description=desc, transient)
+    __pending__ ? Treebars.prepare_progress!(status; description=desc, transient) :
+                  Treebars.initialize_progress!(status; description=desc, transient)
 end
 
 # Lifecycle hooks — give DO's ThreadsafeDict-spawned substatuses the with_progress
@@ -791,6 +799,7 @@ end
 _finalize_substatus!(s::Treebars.ProgressNode) = Treebars.finalize_progress!(s)
 _fail_substatus!(s::Treebars.ProgressNode, e) = Treebars.fail_progress!(s, e)
 _note_substatus!(s::Treebars.ProgressNode, text) = Treebars.update_progress!(s, text)
+_start_substatus!(s::Treebars.ProgressNode) = (Treebars.start_progress!(s); nothing)
 
 # Disk-load reporting — set the substatus message to a human-readable
 # "from disk: <size>" so big-file loads show up in the tree instead of
@@ -1230,7 +1239,7 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
     substatus_f = if name != :__substatus__ && name != :__status__
         () -> begin
             root = o.__status__
-            compute_property(o, Val(:__substatus__), name, indices...; __status__=root, kwargs...)
+            compute_property(o, Val(:__substatus__), name, indices...; __status__=root, __pending__=true, kwargs...)
         end
     else
         nothing
@@ -1252,6 +1261,10 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
     end
     rv
 end
+# The substatus is created pending and started by `_run_cache_compute!` when the compute
+# runs, so a compute waiting in an executor, a job queue or for a `:default` thread does not
+# render as running work and its clock covers only its run.
+#
 # `substatus()` is invoked OUTSIDE the cache lock. Calling it under the lock is unsafe:
 # substatus factories can recurse into other DO properties (e.g. a user-defined
 # `_property_description` reads `o.foo`) which re-enter this cache; building `s` under
@@ -1356,7 +1369,7 @@ Base.showerror(io::IO, e::ComputeAbandoned) =
 One first-arriving compute, handed to a [`Deferred`](@ref) executor. Its in-flight latch is
 already registered, so concurrent accessors of the same key already dedupe onto it — blocking
 callers wait for it, pollers receive a `Pending` — for as long as it sits in the executor's
-queue.
+queue. Its progress node stays pending (`·`, no elapsed time) until `run!` starts it.
 
 The executor must eventually call exactly one of:
 
@@ -1566,6 +1579,7 @@ const _missing_sentinel = _Missing()
 # `cache`/`errors` + the latch, so the compute Task is never retained.
 function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condition, f, s)
     local v
+    _start_substatus!(s)
     try
         v = f(s)
     catch e
@@ -1705,8 +1719,8 @@ end
 # `QueueExecutor` over the process-wide `job_queue()`: every memoized computation of the
 # property waits its turn there, whoever calls it. Off by default (`max_running=0`): an
 # enqueued computation starts at once. With `configure_queue!(; max_running=n)` at most `n`
-# hold a slot at a time, and the rest wait in FIFO order, their progress node reading
-# "queued · #k".
+# hold a slot at a time, and the rest wait in FIFO order, their progress node pending and
+# reading "queued · #k" until it starts when the computation runs.
 #
 # Each admitted computation runs on its own `:default` task and holds its slot until it
 # finishes, or until it — or any task it spawned, such as a `Threads.@threads` iteration —
@@ -1788,7 +1802,8 @@ job_queue() = _JOB_QUEUE
 
 Bound how many queued computations run at once. Off by default (`max_running=0`): a
 `@queued` computation starts on `:default` at once. With `max_running=n` at most `n` run at a
-time and the rest wait in FIFO order, their progress node reading "queued · #k"; they start
+time and the rest wait in FIFO order, their progress node pending (`·`, no clock) and reading
+"queued · #k"; they start
 as earlier ones finish or give their slot back. Raising the cap starts more of what waits;
 `max_running=0` starts everything still waiting. Running computations are never interrupted.
 
@@ -1957,7 +1972,8 @@ was abandoned before it started) and `isready` it to poll. It follows the
 [`DeferredCompute`](@ref) contract: exactly one of `run!(call)` and `abandon!(call, reason)`
 takes effect. A blocking `fetch` from inside a queued computation first gives that
 computation's slot back, as a wait on a `@queued` property does. `status`, a progress node,
-reads "queued · #k" while the call waits.
+reads "queued · #k" while the call waits and is started when the call runs: create it with
+`Treebars.prepare_progress!` to show the call as waiting rather than running.
 
 A fresh computation of a `@queued` property (declaration-site `@fresh`, or a call-site
 `fresh`) runs as one: the caller waits for its turn and its value.
@@ -1974,6 +1990,7 @@ _claim!(c::QueuedCall) = (@atomicswap c.claimed = true) === false
 
 function run!(c::QueuedCall)
     _claim!(c) || return false
+    _start_substatus!(c.status)
     outcome = try
         (true, c.f())
     catch err
@@ -2036,8 +2053,9 @@ _queued_status(_) = nothing
 
 # A fresh computation of a property whose declared executor is a job queue's (`@queued`)
 # waits its turn there as a `QueuedCall`, and the caller waits for its value; any other
-# executor starts memoized computations only, so a fresh one runs inline.
-_fresh_through(executor, compute, status=nothing) = compute()
+# executor starts memoized computations only, so a fresh one runs inline. `status` is the
+# call's pending progress node; it starts when the computation runs.
+_fresh_through(executor, compute, status=nothing) = (_start_substatus!(status); compute())
 _fresh_through(e::QueueExecutor, compute, status=nothing) =
     fetch(enqueue!(e.queue, QueuedCall(compute; status); e.property, e.tag).work)
 
@@ -3349,7 +3367,7 @@ _bare_substatus_f(o, name) =
        is_generated_property(o, name) && !is_indexed_property(o, name)
         () -> begin
             root = o.__status__
-            compute_property(o, Val(:__substatus__), name; __status__=root)
+            compute_property(o, Val(:__substatus__), name; __status__=root, __pending__=true)
         end
     else
         nothing
@@ -3941,8 +3959,10 @@ maybeprogress!(progress, ip::IndexableProperty{name}, indices...; kwargs...) whe
     # `o.__status__`). When `progress === nothing` this returns `nothing` and
     # everything downstream falls back to the standard `o.__status__` flow
     # inside `_computeproperty`. The label/inline decision lives in
-    # `_default_substatus` (gated on the property's docstring).
-    s = _default_substatus(progress, o, name, indices...; kwargs...)
+    # `_default_substatus` (gated on the property's docstring). The node is created
+    # pending and started by `_fresh_through` when the computation runs, so a call
+    # waiting for a job-queue slot does not render as running.
+    s = _default_substatus(progress, o, name, indices...; __pending__=true, kwargs...)
     try
         rv = _fresh_through(property_executor(o, Val(name)),
                             () -> _computeproperty(o, name, indices...; __status__=s, kwargs...), s)
@@ -7633,7 +7653,7 @@ _opaque_compute(oc::_OpaqueSubcache, view, key, s) =
 _opaque_substatus_f(oc::_OpaqueBare, key) = _bare_substatus_f(oc.requester, oc.name)
 function _opaque_substatus_f(oc::_OpaqueSubcache, (indices, kwargs))
     o, name = oc.requester, oc.name
-    () -> compute_property(o, Val(:__substatus__), name, indices...; __status__=o.__status__, kwargs...)
+    () -> compute_property(o, Val(:__substatus__), name, indices...; __status__=o.__status__, __pending__=true, kwargs...)
 end
 _opaque_local!(oc::_OpaqueBare, key; fetch=Base.fetch, retry_failed=true) =
     _local_bare!(oc.requester, oc.name; fetch, retry_failed)

@@ -63,10 +63,13 @@ blocking = Threads.@spawn o.work(1)
 sleep(0.05)
 @test !istaskdone(blocking)
 
-# The executor runs it; everyone gets the one value.
+# The executor runs it; everyone gets the one value. Its progress node stays pending
+# while the executor holds it and starts when it runs.
 d = only(queue)
+@test DynamicObjects.Treebars.is_pending(d.status)
 runner = Threads.@spawn run!(d)
 @test timedwait(() -> DEFERRED_RUNS == [1], 5.0; pollint=0.01) === :ok
+@test DynamicObjects.Treebars.is_running(d.status)
 release_deferred!(1)
 @test fetch(runner) === true
 @test fetch(p) == 10
