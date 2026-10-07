@@ -34,17 +34,26 @@ function check(mode)
     end
     holder[] = c
     c["x"]
+    # Warm-up: every iteration is itself a timer sleep that only returns if
+    # the loop yields, so a regression hangs here (the parent's timeout fails
+    # it). Waiting for a warmed, demonstrably live loop keeps first-call
+    # compilation (slow under CI's coverage instrumentation) out of the
+    # measured window below.
     t0 = time()
-    sleep(0.3)
-    slept = time() - t0
+    while builds[] < 100
+        sleep(0.05)
+        time() - t0 > 60 && error("feedback loop never got going: ", builds[], " builds in 60 s")
+    end
     b1 = builds[]
+    t1 = time()
     sleep(0.3)
+    slept = time() - t1
     b2 = builds[]
     stop[] = true
     quiesce(c, builds)
-    # Positive control: the loop was live across both sleeps, so they returned
-    # despite it rather than because it had already died out.
-    b1 > 1 && b2 > b1 || error("feedback loop not live during the sleeps: builds ", b1, " -> ", b2)
+    # Positive control: the loop kept building across the measured sleep, so
+    # the sleep returned despite it rather than because it had died out.
+    b2 > b1 || error("feedback loop not live during the measured sleep: builds ", b1, " -> ", b2)
     println("mode=", mode, " slept=", round(slept; digits=2), "s builds=", b1, "->", b2); flush(stdout)
 end
 
