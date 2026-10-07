@@ -1232,6 +1232,7 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
         nothing
     end
     args_key = (indices, (;kwargs...))
+    fetch = _declared_fetch(fetch, o, Val(name))
     rv = get!(cache, args_key; fetch, substatus=substatus_f, retry_failed) do s
         # Call `_computeproperty` directly, NOT `getorcomputeproperty`:
         # the latter, when `indices` and `kwargs` are both empty AND
@@ -1252,6 +1253,11 @@ end
 # `_property_description` reads `o.foo`) which re-enter this cache; building `s` under
 # `c.lock` would deadlock. So we fast-path first, then build `s` outside the lock and
 # re-take it to arbitrate; if we lose the arbitration we discard `s` via finalize.
+#
+# A selector carrying an executor (`Deferred`, or `_BlockingDeferred` for a blocking call
+# of a property with a declared executor) starts a first-arriving compute through it
+# instead of inline / `Threads.@spawn`; a blocking caller then waits for it, as for an
+# already in-flight compute, through `await_deferred`.
 Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substatus=nothing, retry_failed=true) = begin
     # Fast path: a ready value returns immediately, no substatus cost. (`_missing_sentinel`
     # distinguishes "absent" from a legitimately-cached `nothing`.)
@@ -1264,7 +1270,8 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     # Build the substatus OUTSIDE the lock — factories recurse into DO props on the SAME
     # lock, so building under it would deadlock.
     s = isnothing(substatus) ? nothing : substatus()
-    sync = fetch === Base.fetch
+    sync = _is_blocking(fetch)
+    executor = _selector_executor(fetch)
     action = lock(c.lock) do
         v = get(c.cache, key, _missing_sentinel)
         v !== _missing_sentinel && (_on_hit!(c, key); return (:value, v))
@@ -1285,7 +1292,7 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
         cnd = Threads.Condition(c.lock)
         c.computing[key] = cnd
         !isnothing(s) && (c.status[key] = s)
-        return sync ? (:inline, cnd) : (:spawn, cnd)
+        return sync && executor === nothing ? (:inline, cnd) : (:start, cnd)
     end
     kind = action[1]
     kind === :value && (!isnothing(s) && _finalize_substatus!(s); return action[2])
@@ -1302,22 +1309,25 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     if kind === :pending
         # Poller, compute already in flight elsewhere — hand back a cheap Pending, no spawn.
         !isnothing(s) && _finalize_substatus!(s)
-        return fetch(Pending(c, key, nothing))
+        return fetch(Pending(c, key, nothing, executor))
     end
     if kind === :inline
         # Blocking first-arriver: compute on THIS thread (no spawn), publish, return value.
         return _run_cache_compute!(c, key, action[2]::Threads.Condition, f, s)
     end
-    # :spawn — poller first-arriver: kick the REAL compute off fire-and-forget (it writes
-    # the cache, or records a failure in `c.errors`), and hand back a Pending. The Task is
-    # NOT retained — its value/error both reach us through the cache/errors + the latch.
-    # `_start_compute` dispatches on the selector: `identity` spawns on the `:default`
-    # pool; a `Deferred` hands the compute to its executor (queue, bounded pool, …).
+    # :start — first-arriver of a poller, or of any caller with an executor: kick the
+    # REAL compute off (it writes the cache, or records a failure in `c.errors`). The Task
+    # is NOT retained — its value/error both reach us through the cache/errors + the
+    # latch. Without an executor it spawns on the `:default` pool; the selector's
+    # executor (a caller's `Deferred`, or a declared `property_executor`) receives it
+    # instead.
     cnd = action[2]::Threads.Condition
-    _start_compute(fetch, DeferredCompute(c, key, cnd, f, s))
-    p = Pending(c, key, nothing)
-    # A `Deferred` executor may have run the compute synchronously: hand back the value.
-    fetch isa Deferred && isready(p) && return Base.fetch(p)
+    _start_compute(executor, DeferredCompute(c, key, cnd, f, s))
+    # A blocking caller waits for the compute it started, as for one already in flight.
+    sync && return _await_cache_value!(c, key, cnd, f; fetch, substatus, retry_failed)
+    p = Pending(c, key, nothing, executor)
+    # An executor may have run the compute synchronously: hand back the value.
+    executor !== nothing && isready(p) && return Base.fetch(p)
     return fetch(p)
 end
 
@@ -1433,7 +1443,10 @@ rv = ip(args...; fetch=Deferred(bounded_executor(2)))   # Pending while queued o
 
 The executor is called with the key's in-flight latch registered and no cache lock held; it
 should return promptly (enqueue, don't compute) unless it deliberately runs inline. See
-[`DeferredCompute`](@ref) for the contract.
+[`DeferredCompute`](@ref) for the contract. To choose the executor once at a property's
+declaration, for every caller, see
+[`property_executor`](@ref DynamicObjects.property_executor); blocking waits on the
+computation go through [`await_deferred`](@ref DynamicObjects.await_deferred).
 """
 struct Deferred{E}
     executor::E
@@ -1442,8 +1455,95 @@ end
 # As a selector a `Deferred` is `identity`: the handle it is applied to is returned as is.
 (::Deferred)(x) = x
 
-_start_compute(::Any, d::DeferredCompute) = (Threads.@spawn run!(d); nothing)
-_start_compute(sel::Deferred, d::DeferredCompute) = (sel.executor(d); nothing)
+"""
+    DynamicObjects.property_executor(o, ::Val{name}) -> executor or nothing
+
+Declaration-site executor of indexed property `name`. When it returns an executor, every
+memoized computation of the property starts through `executor(d::DeferredCompute)`, whichever
+task triggers it and however it is called: a blocking call `o.name(args...)` (computed
+inline otherwise), a poll (`fetchindex`, `fetch=identity`), or a progress-threaded call
+under `@progress` / `@fetch!` (spawned otherwise). It is `fetch=Deferred(executor)` chosen
+by the declaration instead of by each caller; a caller's own `fetch=Deferred(other)` takes
+precedence. The default, `nothing`, keeps the per-call behavior.
+
+A macro layered on `@dynamicstruct` declares it next to the property:
+
+```julia
+DynamicObjects.property_executor(::Jobs, ::Val{:item}) = JOB_QUEUE
+```
+
+Memoization is unchanged: a cached value never reaches the executor, and concurrent callers
+with the same arguments share one `DeferredCompute`, whether it is queued or running. A
+blocking caller waits for it through [`await_deferred`](@ref DynamicObjects.await_deferred);
+when the executor runs the compute synchronously, the call returns the value without waiting.
+`@fresh` calls (declaration- or call-site) bypass the cache, its in-flight latch and hence
+the executor. See [`DeferredCompute`](@ref) for the executor contract.
+"""
+property_executor(o, ::Val) = nothing
+
+"""
+    DynamicObjects.await_deferred(wait, executor)
+
+Wraps every blocking wait of a call that carries `executor` (any call of a property whose
+[`property_executor`](@ref DynamicObjects.property_executor) returns it, or a call with
+`fetch=Deferred(executor)`), including a blocking `fetch` of a [`Pending`](@ref) such a call
+returned, as `fetchindex!` and `@progress` / `@fetch!` call sites do. For a property with a
+declared executor that is every blocking wait on it: a caller waiting for the compute it
+handed to the executor, and a caller that finds the computation already queued or running.
+Waits that would not block (the value or failure is already recorded) do not call it.
+
+`wait()` blocks the calling task until the computation settles and returns its value or
+throws its failure. The default just calls `wait()`. An executor's owner overloads it for
+its executor type to learn when a task starts and stops blocking, for example to give a
+job's runner slot back while that job waits:
+
+```julia
+function DynamicObjects.await_deferred(wait, q::JobQueue)
+    release_slot!(q)
+    try
+        wait()
+    finally
+        reacquire_slot!(q)
+    end
+end
+```
+
+An overload must call `wait()` exactly once, on the calling task, and return its result.
+"""
+await_deferred(wait, executor) = wait()
+
+# Internal selectors whose compute starts through `executor`, chosen for a call of a
+# property with a declared executor: `_DeferredSelect` applies the caller's asynchronous
+# selector to the handle (`identity` for a poll), `_BlockingDeferred` blocks for the value
+# in place of `Base.fetch`.
+struct _DeferredSelect{E,F}
+    executor::E
+    select::F
+end
+(sel::_DeferredSelect)(x) = sel.select(x)
+struct _BlockingDeferred{E}
+    executor::E
+end
+const _ExecutorSelector = Union{Deferred,_DeferredSelect,_BlockingDeferred}
+
+_is_blocking(fetch) = fetch === Base.fetch || fetch isa _BlockingDeferred
+_selector_executor(sel::_ExecutorSelector) = sel.executor
+_selector_executor(_) = nothing
+# The blocking form of a selector (an opaque remount guard reads values, never handles).
+_blocking_selector(sel::_ExecutorSelector) = _BlockingDeferred(sel.executor)
+_blocking_selector(_) = Base.fetch
+
+# The selector a call of property `name` runs with: a caller's executor selector as is;
+# otherwise the declared `property_executor`, if any, starts the compute.
+_declared_fetch(fetch, o, name::Val) = _declared_fetch(property_executor(o, name), fetch)
+_declared_fetch(::Nothing, fetch) = fetch
+_declared_fetch(executor, fetch) = _executor_fetch(executor, fetch)
+_executor_fetch(executor, fetch::_ExecutorSelector) = fetch
+_executor_fetch(executor, ::typeof(Base.fetch)) = _BlockingDeferred(executor)
+_executor_fetch(executor, fetch) = _DeferredSelect(executor, fetch)
+
+_start_compute(::Nothing, d::DeferredCompute) = (Threads.@spawn run!(d); nothing)
+_start_compute(executor, d::DeferredCompute) = (executor(d); nothing)
 
 # Singleton sentinel so a single `get` lookup distinguishes "key absent" from
 # "key present with value === nothing" without allowing collision with any
@@ -1489,21 +1589,36 @@ end
 
 # Blocking waiter: block on `cnd` until the value lands (return it) or the compute fails
 # (rethrow the recorded exception). If the computer vanished with neither (evicted mid
-# flight), recompute from scratch OUTSIDE the lock.
+# flight), recompute from scratch OUTSIDE the lock. With an executor the blocking part
+# runs inside `await_deferred`.
 function _await_cache_value!(c::AbstractThreadsafeDict, key, cnd::Threads.Condition, f; fetch=Base.fetch, substatus=nothing, retry_failed=true)
-    outcome = lock(c.lock) do
-        while true
-            v = get(c.cache, key, _missing_sentinel)
-            v !== _missing_sentinel && (_on_hit!(c, key); return (:value, v))
-            haskey(c.errors, key) && return (:error, c.errors[key])
-            get(c.computing, key, nothing) === cnd || return (:gone, nothing)
-            wait(cnd)
+    outcome = _latch_outcome(c, key, cnd, false)
+    if outcome[1] === :pending
+        outcome = _blocking(_selector_executor(fetch)) do
+            _latch_outcome(c, key, cnd, true)
         end
     end
     outcome[1] === :value && return outcome[2]
     outcome[1] === :error && throw(outcome[2])
     return get!(f, c, key; fetch, substatus, retry_failed)   # :gone → recompute
 end
+
+# The state of `key` behind latch `cnd`: `:value`, `:error`, `:gone` (the latch was
+# retracted with neither), or — without `block` — `:pending` while it is still in flight.
+_latch_outcome(c::AbstractThreadsafeDict, key, cnd::Threads.Condition, block::Bool) =
+    lock(c.lock) do
+        while true
+            v = get(c.cache, key, _missing_sentinel)
+            v !== _missing_sentinel && (_on_hit!(c, key); return (:value, v))
+            haskey(c.errors, key) && return (:error, c.errors[key])
+            get(c.computing, key, nothing) === cnd || return (:gone, nothing)
+            block || return (:pending, nothing)
+            wait(cnd)
+        end
+    end
+
+_blocking(wait, ::Nothing) = wait()
+_blocking(wait, executor) = await_deferred(wait, executor)
 
 """
     Pending
@@ -1515,19 +1630,36 @@ gets back while a value is still being computed. It points at where the value wi
 again later. Replaces the former "`rv` is a `Task` while in-flight" poll contract: callers
 now branch on `rv isa Pending` (still computing) vs. the value (done). The progress/status
 node stays optional and is never relied on for readiness.
+
+A handle for a computation started through an executor (a `Deferred` selector, or the
+property's [`property_executor`](@ref DynamicObjects.property_executor)) carries that
+executor, and a blocking `fetch` on it waits through
+[`await_deferred`](@ref DynamicObjects.await_deferred).
 """
-struct Pending{C<:AbstractThreadsafeDict, K, S}
+struct Pending{C<:AbstractThreadsafeDict, K, S, E}
     cache::C
     key::K
-    slot::S   # a `Slot{T}` for slotted bare props; `nothing` for `cache`-backed keys
+    slot::S       # a `Slot{T}` for slotted bare props; `nothing` for `cache`-backed keys
+    executor::E   # the executor a blocking `fetch` waits through; `nothing` for none
 end
+Pending(cache, key, slot) = Pending(cache, key, slot, nothing)
+# The selector that blocks for `p`'s computation through its executor.
+_blocking_selector(p::Pending) = p.executor === nothing ? Base.fetch : _BlockingDeferred(p.executor)
 
 # Non-blocking readiness probe — a `Task`-like surface for callers migrating off `rv isa Task`.
 Base.isready(p::Pending) = p.slot === nothing ? haskey(p.cache, p.key) : (@atomic :acquire p.slot.set)
 
+# Would `fetch(p)` return or throw without waiting?
+_settled(p::Pending) = isready(p) || lock(p.cache.lock) do
+    haskey(p.cache.errors, p.key) || !haskey(p.cache.computing, p.key)
+end
+
 # Block until the value lands (return it) or the compute fails (rethrow). Mirrors
 # `fetch(::Task)` so `fetch=Base.fetch` and an explicit `fetch(::Pending)` behave alike.
-function Base.fetch(p::Pending)
+Base.fetch(p::Pending) = p.executor === nothing || _settled(p) ? _fetch_pending(p) :
+    await_deferred(() -> _fetch_pending(p), p.executor)
+
+function _fetch_pending(p::Pending)
     c = p.cache
     if p.slot !== nothing
         slot = p.slot
@@ -2345,16 +2477,17 @@ Return a vector of `(; key, state, status, value)` for all entries in a
 handle (for `:running`), or the captured exception (for `:failed`). `status` is
 the substatus object or `nothing`.
 """
-function entries(ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict})
+function entries(ip::IndexableProperty{N,<:Any,<:AbstractThreadsafeDict}) where {N}
     result = NamedTuple{(:key, :state, :status, :value), Tuple{Any, Symbol, Any, Any}}[]
     c = ip.cache
+    executor = property_executor(ip.o, Val(N))
     lock(c.lock) do
         for (k, v) in c.cache
             push!(result, (; key=k, state=:done, status=nothing, value=v))
         end
         for (k, _cnd) in c.computing
             haskey(c.cache, k) && continue
-            push!(result, (; key=k, state=:running, status=get(c.status, k, nothing), value=Pending(c, k, nothing)))
+            push!(result, (; key=k, state=:running, status=get(c.status, k, nothing), value=Pending(c, k, nothing, executor)))
         end
         for (k, e) in c.errors
             haskey(c.cache, k) && continue
@@ -7134,7 +7267,7 @@ _fail_substatus!(s::Treebars.ProgressNode, e::_RemountContextDependent) =
 function _opaque_get!(oc::_OpaqueSubcache, key, reader; fetch=Base.fetch, retry_failed=true)
     # A guard reads values, never handles: a handle could resolve to the
     # requester's context-dependent value after the guard stopped watching.
-    reader === nothing || (fetch = Base.fetch)
+    reader === nothing || (fetch = _blocking_selector(fetch))
     if !_ns_tainted(oc.ns, _taint_key(oc, key))
         try
             return _opaque_shared!(oc, key; fetch, retry_failed)
@@ -7190,7 +7323,8 @@ end
 
 memoize!(ip::IndexableProperty{name,<:Any,<:_OpaqueSubcache}, indices...;
          fetch=Base.fetch, retry_failed=true, kwargs...) where {name} =
-    _opaque_get!(ip.cache, (indices, (;kwargs...)), _remount_probe(ip.o); fetch, retry_failed)
+    _opaque_get!(ip.cache, (indices, (;kwargs...)), _remount_probe(ip.o);
+                 fetch=_declared_fetch(fetch, ip.o, Val(name)), retry_failed)
 
 getstatus(ip::IndexableProperty{<:Any,<:Any,<:_OpaqueSubcache}, indices...; kwargs...) =
     _opaque_status(ip.cache, (indices, (;kwargs...)))
@@ -7201,7 +7335,7 @@ function Base.fetch(p::Pending{<:_OpaqueSubcache})
     catch e
         e isa _RemountContextDependent || rethrow()
         _own_failure(e, p.cache.requester) && throw(e.error)
-        _opaque_local!(p.cache, p.key)
+        _opaque_local!(p.cache, p.key; fetch=_blocking_selector(p))
     end
 end
 Base.isready(p::Pending{<:_OpaqueSubcache}) = haskey(p.cache, p.key) ||
