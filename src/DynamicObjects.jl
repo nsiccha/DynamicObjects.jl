@@ -4050,33 +4050,36 @@ persist(v, args...; kwargs...) = begin
     )
 end
 
-clear_cache!(o, name::Symbol, indices...; kwargs...) = begin
-    cache = getfield(o, :cache).cache
-    if isempty(indices) && isempty(kwargs)
-        # Clear in-memory (whole property, including IndexableProperty wrapper)
-        delete!(cache, name)
-        # Clear all disk cache files for this property
-        cp = o.__cache_path__
-        if isdir(cp)
-            prefix = string(name)
-            for f in readdir(cp)
-                if endswith(f, ".sjl") && (f == prefix * ".sjl" || startswith(f, prefix * "_"))
-                    rm(joinpath(cp, f))
-                end
-            end
-        end
+"""
+    DynamicObjects.clear_cache!(o, name::Symbol) -> Vector{Symbol}
+    DynamicObjects.clear_cache!(o, name::Symbol, indices...; kwargs...)
+
+The function behind [`@clear_cache!`](@ref), for a property name only known at
+run time (`DynamicObjects.clear_cache!(prep, stage_root)`). Not exported.
+
+With a name alone it drops the whole property **and everything derived from
+it**: `name` and its transitive [`dependents`](@ref) — the memory value (every
+entry of an indexed property), every disk entry of a `@cached` / `@mmap` one
+(including entries an earlier process wrote), and shared remount work — so the
+next read of any of them recomputes. Every other property keeps its value.
+Returns the names that held a value in memory or on disk, sorted.
+
+With indices or kwargs it drops exactly that one entry, as
+[`invalidate!`](@ref) does, and returns `nothing`.
+"""
+clear_cache!(o, name::Symbol; kwargs...) =
+    isempty(kwargs) ? _invalidate_property!(o, name) : _clear_cache_entry!(o, name; kwargs...)
+clear_cache!(o, name::Symbol, index, indices...; kwargs...) =
+    _clear_cache_entry!(o, name, index, indices...; kwargs...)
+
+# Clear one indexed entry — the shared per-entry primitive when the wrapper is
+# resident; disk files alone when it is not.
+function _clear_cache_entry!(o, name::Symbol, indices...; kwargs...)
+    v = get(getfield(o, :cache).cache, name, nothing)
+    if v isa IndexableProperty
+        invalidate!(v, indices...; kwargs...)
     else
-        # Clear one indexed entry — the shared per-entry primitive when the
-        # wrapper is resident; disk files alone when it is not.
-        v = get(cache, name, nothing)
-        if v isa IndexableProperty
-            invalidate!(v, indices...; kwargs...)
-        else
-            path = get_cache_path(o, name, indices...; kwargs...)
-            isfile(path) && rm(path)
-            metadata_path = _automatic_materialization_path(path)
-            isfile(metadata_path) && rm(metadata_path)
-        end
+        _remove_disk_entry!(o, name, indices...; kwargs...)
     end
     nothing
 end
@@ -4084,18 +4087,53 @@ end
     @clear_cache! o.prop
     @clear_cache! o.prop(indices...)
 
-Clear the disk cache (and in-memory cache) for a `@cached` property.
+Drop a property, or one entry of an indexed property, from memory and disk so
+the next read recomputes it.
 
-Without indices, clears **all** cached entries for the property (both the
-in-memory value and all `.sjl` files for that property on disk).
-With indices, clears only the specific entry.
+Without indices, drops the whole property **and every property derived from
+it** (its transitive [`dependents`](@ref)), and leaves every other property
+cached — a "force this stage" action for one branch of an object's dependency
+graph:
 
 ```julia
-@clear_cache! e.result        # clear all cached entries for `result`
+@dynamicstruct struct Prep
+    model::String
+    sb = emit_sb(model)
+    stan_source = stan_code(sb)
+    native_build = build(model)
+    native_query = prepare_query(native_build)
+end
+
+@clear_cache! p.native_build   # drops native_build and native_query;
+                               # sb and stan_source stay cached
+```
+
+- Memory: the value, every entry of an indexed property (emptied in place, so
+  a remount view or destructured handle sees it), and the shared remount work.
+- Disk: every entry of a `@cached` / `@mmap` property, including entries an
+  earlier process wrote; governed automatic entries once the object's cache path
+  is known.
+- Kept: fixed fields and constructor/`remake` overrides — they are inputs, as
+  for [`clear_mem_caches!`](@ref) (a fixed field `name` is an error; move it
+  with [`remake`](@ref)).
+- On an object with a computed `@versioned` property, the version and cache path
+  are re-derived on the next read, as for [`sync!`](@ref).
+- A holder that derived from this object (a parent reading one of its children)
+  drops its own dependents on its next [`sync!`](@ref): the object's
+  [`object_version`](@ref) moves. HTMXObjects calls `sync!` on every request root.
+- In flight: as for [`invalidate!`](@ref), there is no cancellation. A compute of
+  a dropped property that is running at the time still lands if its slot is
+  empty when it finishes — including a dependent that read the old value.
+
+With indices (or kwargs), drops exactly that one entry, like
+[`invalidate!`](@ref); dependents are not dropped.
+
+```julia
 @clear_cache! e.ci(3)         # clear only the (3,) entry
 ```
 
-The legacy bracket form is still accepted but discouraged.
+The function form is [`DynamicObjects.clear_cache!`](@ref). The legacy bracket
+form is still accepted but discouraged.
 """
 macro clear_cache!(x)
     cache_f_expr(x; f=clear_cache!) |> esc
@@ -10852,9 +10890,10 @@ mutable struct _TrackedState
     observers::Vector{Any}
 end
 
-# Set when the first tracked value is constructed. Until then no `sync!` can
-# observe anything (object versions move only through `sync!` drops), so it
-# returns at once and an application that never builds one pays nothing.
+# Set when the first tracked value is constructed, or when `clear_cache!` first
+# moves an object's version. Until then no `sync!` can observe anything (object
+# versions move only through those drops), so it returns at once and an
+# application that uses neither pays nothing.
 const _TRACKED_IN_USE = Threads.Atomic{Bool}(false)
 
 function _TrackedState()
@@ -11295,7 +11334,13 @@ function _sync!(o, visited)
     # Bump even when nothing here was cached: a holder may have derived from the
     # changed slot through this object (`length(store.files)`).
     record.generation += UInt64(1)
-    targets = _dependents_of(typeof(o), changed)
+    visited[record] = _drop_targets!(o, shared, record, _dependents_of(typeof(o), changed))
+end
+
+# Drop `targets` from a retained object (`_drop_property!`), forget their sync
+# stamps, and re-key a computed `@versioned` version. Returns `(dropped, stale)`:
+# the names that held a memory value, and every name now unset.
+function _drop_targets!(o, shared::ThreadsafeDict, record::_SyncRecord, targets)
     rekey = _version_rekey(typeof(o), targets)
     stale = rekey === nothing ? targets : union(targets, rekey)
     filter!(p -> !(_slot_name(first(p)) in stale), record.stamps)
@@ -11309,7 +11354,92 @@ function _sync!(o, visited)
         maybepop!(shared, :__cache_path__)
         sort!(dropped)
     end
-    visited[record] = (dropped, stale)
+    (dropped, stale)
+end
+
+# `clear_cache!(o, name)`: drop `name` and its transitive dependents, keeping the
+# object's inputs (fixed fields, construction/`remake` overrides). Unlike `sync!`,
+# the drop reaches disk entries that are not in memory — a forced property must
+# not reload what an earlier process stored — and `name` itself goes too. The
+# version moves only when something was dropped, so holders drop their own
+# dependents of this object on their next `sync!`.
+function _invalidate_property!(o, name::Symbol)
+    source, shared = _remount_source(o)
+    T = typeof(source)
+    _check_invalidatable(T, name)
+    inputs = keys(getfield(source, :cache).seed)
+    targets = setdiff!(push!(_dependents_of(T, (name,)), name), inputs)
+    lock(_SYNC_LOCK) do
+        stored = Symbol[n for n in sort!(collect(targets)) if _drop_stored_entries!(source, shared, n)]
+        record = _sync_record(shared)
+        dropped, stale = _drop_targets!(source, shared, record, targets)
+        source === o || append!(dropped, _drop_view_copies!(o, stale))
+        result = sort!(unique!(append!(dropped, stored)))
+        if !isempty(result)
+            record.generation += UInt64(1)
+            _TRACKED_IN_USE[] = true
+        end
+        result
+    end
+end
+
+function _check_invalidatable(T::Type, name::Symbol)
+    infos = [info for (n, info) in meta(T) if n === name]
+    isempty(infos) &&
+        throw(ArgumentError("clear_cache!: $(nameof(T)) declares no property `$name`"))
+    all(isfixed, infos) && throw(ArgumentError(
+        "clear_cache!: `$name` is a fixed field of $(nameof(T)) — an input, not a cached value; " *
+        "construct the object with a new value via `remake(obj; $name=…)`"))
+    nothing
+end
+
+# Every disk entry `name` has — in memory or not, every indexed key — wherever
+# `name` is stored on disk at all. Returns whether a file was removed.
+function _drop_stored_entries!(o, shared::ThreadsafeDict, name::Symbol)
+    _stored_on_disk(o, shared, name) || return false
+    T = typeof(o)
+    if any(((n, info),) -> n === name && get(info, :indexed, false), meta(T))
+        dir = o.__cache_path__
+        isdir(dir) || return false
+        owners = _disk_owner_names(T)
+        removed = false
+        for file in readdir(dir)
+            stem = _cache_file_stem(file)
+            (stem === nothing || _disk_owner(owners, stem) !== name) && continue
+            path = joinpath(dir, file)
+            isfile(path) || continue
+            rm(path; force=true)
+            removed = true
+        end
+        removed
+    else
+        path = get_cache_path(o, name)
+        removed = isfile(path) || isfile(_automatic_materialization_path(path))
+        _remove_disk_entry!(o, name)
+        removed
+    end
+end
+
+# A cache file's stem: `name` for a bare property, `name_<args>` for an indexed
+# entry (`cache_segment`). Temporary files of an in-flight write are not entries.
+function _cache_file_stem(file::AbstractString)
+    endswith(file, ".sjl") && return chop(file; tail=4)
+    auto = ".sjl" * _AUTOMATIC_MATERIALIZATION_SUFFIX
+    endswith(file, auto) && return chop(file; tail=ncodeunits(auto))
+    nothing
+end
+
+# Declared names, longest first: `fit_summary.sjl` belongs to `fit_summary`, not
+# to an entry of `fit`.
+_disk_owner_names(T::Type) =
+    sort!(unique!(Symbol[n for (n, _) in meta(T)]); by=n -> ncodeunits(string(n)), rev=true)
+
+function _disk_owner(owners, stem::AbstractString)
+    for n in owners
+        s = string(n)
+        (stem == s || startswith(stem, s * "_")) && return n
+    end
+    nothing
 end
 
 # A versioned object keys its disk entries by version, and a computed `@versioned`
@@ -11338,6 +11468,10 @@ _slot_name(slot::Tuple) = first(slot)
 # lives only in the view, never on the retained object.
 function _sync_view!(view, source, visited)
     dropped, targets = _sync!(source, visited)
+    (sort!(union(dropped, _drop_view_copies!(view, targets))), targets)
+end
+
+function _drop_view_copies!(view, targets)
     c = getfield(view, :cache).cache
     local_dropped = Symbol[]
     for name in targets
@@ -11351,7 +11485,7 @@ function _sync_view!(view, source, visited)
             push!(local_dropped, name)
         end
     end
-    (sort!(union(dropped, local_dropped)), targets)
+    local_dropped
 end
 
 function _observe_slot!(changed, record, slot, name, value, visited)
@@ -11441,11 +11575,13 @@ end
 
 # Disk entries exist only for an explicit `@cached`/`@mmap` property, or for an
 # object whose cache path is already computed (governed automatic storage).
+_stored_on_disk(o, shared::ThreadsafeDict, name::Symbol) =
+    any(((n, info),) -> n === name &&
+        !isdisjoint(get(info, :macros, ()), (Symbol("@cached"), Symbol("@mmap"))), meta(typeof(o))) ||
+    haskey(shared, :__cache_path__)
+
 function _drop_disk_entries!(o, shared::ThreadsafeDict, name::Symbol, entry_keys)
-    T = typeof(o)
-    disk = any(((n, info),) -> n === name &&
-        !isdisjoint(get(info, :macros, ()), (Symbol("@cached"), Symbol("@mmap"))), meta(T))
-    (disk || haskey(shared, :__cache_path__)) || return nothing
+    _stored_on_disk(o, shared, name) || return nothing
     for (indices, kwargs) in entry_keys
         _remove_disk_entry!(o, name, indices...; kwargs...)
     end
