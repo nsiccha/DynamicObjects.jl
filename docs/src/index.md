@@ -552,6 +552,62 @@ via the `progress=` kwarg of whatever long-running API you call.
 (`obj.prop(key)` or `@memo! obj.prop(key)`). Explicit `@fresh` access and
 scalar property access don't trigger it.
 
+### Bounded execution: `@queued`
+
+`@queued` marks an indexed property's computations as heavy work. Every
+computation of it, whoever triggers it, waits its turn in the process-wide job
+queue: a plain call from any task, a `Threads.@threads` iteration, a
+progress-threaded call, or another property's body. Cached values never queue,
+and callers with the same arguments share one queued computation.
+
+```julia
+@dynamicstruct struct Study
+    @queued fit(seed::Int) = run_fit(seed)       # heavy: admitted through the queue
+    fits(n::Int) = begin
+        out = Vector{Any}(undef, n)
+        Threads.@threads for i in 1:n
+            out[i] = fit(i)                      # waits its turn
+        end
+        out
+    end
+end
+
+DynamicObjects.configure_queue!(; max_running=4)   # at most 4 fits at once
+Study().fits(32)
+```
+
+The queue is off by default (`max_running=0`): a queued computation then starts
+at once on a `:default` task. With `max_running=n`, at most `n` run at a time,
+each on its own `:default` task, and the rest wait in FIFO order. A waiting
+computation's progress node reads `queued · #k`. Raising the cap starts more of
+what waits, and `max_running=0` starts everything still waiting. Running
+computations are never interrupted.
+
+A queued computation that blocks on another queued computation gives its slot
+back for the rest of its run. This also applies when a task it spawned blocks,
+such as one of its `Threads.@threads` iterations. The cap therefore counts
+heavy work rather than the coordinators waiting on it, and coordinators that
+each wait on queued children cannot deadlock the queue. A wait the queue cannot
+see does deadlock it, for example polling `isready` in a loop: block with
+`fetch` instead.
+
+`@queued @fresh` admits each fresh call, and so does a call-site
+`fresh(obj.prop, ...)` of a `@queued` property; the caller waits for its turn
+and its value. `@queued` on a bare (non-call-form) property is a macro-time
+error.
+
+A layer on top (a web framework's job board, say) can watch and steer the queue:
+
+| Function | Purpose |
+|---|---|
+| `DynamicObjects.configure_queue!(; max_running)` | Set the cap; returns `queue_settings()` |
+| `DynamicObjects.queue_settings()` | `(; max_running, queued, running)` |
+| `DynamicObjects.observe_queue!(f)` | Call `f(item)` for every enqueued `QueuedItem` (`work`, `property`, `tag`, `enqueued_ns`) |
+| `DynamicObjects.queued_items()` | Waiting items, oldest first |
+| `DynamicObjects.queue_position(handle)` | Position of a `Pending`, `DeferredCompute`, `QueuedCall` or item |
+| `DynamicObjects.abandon_queued!(q, items, reason)` | Give up on waiting items; their callers get `ComputeAbandoned` |
+| `DynamicObjects.QueuedCall(f)` | Queue work with no cache cell: `enqueue!(job_queue(), call)`, then `fetch(call)` |
+
 ## Construction and `remake`
 
 ```julia
