@@ -201,8 +201,8 @@ that take the object: `@cache_path(__self__.result)`,
 ### Scoping rules
 
 `let`-bindings, lambda parameters, comprehension/`for`-loop iterators,
-`function` argument names, `try`/`catch` variables, and `local`-declared
-names are all left alone:
+`function` argument names, `try`/`catch` variables, `local`-declared
+names, and local method names are all left alone:
 
 ```julia
 evens = let items = filter(iseven, items)   # outer `items` → __self__.items
@@ -210,7 +210,18 @@ evens = let items = filter(iseven, items)   # outer `items` → __self__.items
 end
 mapped = map(x -> x * 2, items)              # `x` is local; `items` rewrites
 totals = [sum(row) for row in items]         # `row` local; `items` rewrites
+rows = begin
+    source(path) = string("row:", path)      # local method, even if the struct
+    [source(p) for p in paths]               # has a `source` property
+end
 ```
+
+As in plain Julia, a local method definition (`f(x) = …`, `function f(x) … end`,
+with any return type or `where` clause) makes `f` local in the enclosing scope,
+and its parameters local in its body. `let`, `while`, `try`, `for`,
+comprehensions and closures keep what they bind inside them; `if` and `begin`
+open no scope. Names resolve in order, so define a local method before its
+first use.
 
 ### "Assignment shadows property" error
 
