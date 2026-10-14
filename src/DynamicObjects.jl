@@ -3035,6 +3035,11 @@ child could never recompute: an undeclared `__parent__` has no
 is restored into the view-local overlay (and the retained object's own inputs
 back into the shared cache).
 
+`@state` properties are kept too: they hold per-instance state, not derived
+values, so a settled `@state` value (every computed entry of an indexed one)
+survives the clear, including through a [`remount`](@ref) view. Reset one with
+`DynamicObjects.clear_cache!(obj, :name)`.
+
 Indexed-property entries are dropped from the per-argument subcaches
 themselves, not merely by dropping the top-level wrapper: a live
 [`remount`](@ref) request view (or any destructured wrapper handle) shares
@@ -3052,18 +3057,39 @@ clear time still lands if its slot is empty when it finishes.
 function clear_mem_caches!(obj)
     pc = getfield(obj, :cache)
     c = pc.cache
+    state = _state_names(typeof(obj))
     # Snapshot the wrapper subcaches under the top lock, then empty each under
     # its own lock. A per-argument subcache object outlives the top-level
     # wrapper entry through every alias — a mounted request view shares it by
-    # design — so `empty!(c)` alone would leave those aliases stale.
-    subcaches = lock(c.lock) do
-        [ip.cache for ip in values(c.cache) if ip isa IndexableProperty]
+    # design — so `empty!(c)` alone would leave those aliases stale. `@state`
+    # values (an indexed one's wrapper with its subcache) are snapshotted
+    # instead and put back.
+    kept, subcaches = lock(c.lock) do
+        (Pair{Symbol,Any}[name => value for (name, value) in c.cache
+                if name in state && !(value isa Pending)],
+         [value.cache for (name, value) in c.cache
+                if value isa IndexableProperty && !(name in state)])
     end
     empty!(c)
     foreach(empty!, subcaches)
+    lock(c.lock) do
+        for (name, value) in kept
+            c.cache[name] = value
+        end
+    end
     _restore_seeds!(pc)
     nothing
 end
+
+# Names of `T`'s `@state` properties: per-instance state that whole-object
+# clears keep and `sync!` never drops. `@dynamicstruct` emits a method for each
+# type that declares one.
+_state_names(::Type) = ()
+
+# Markers whose meaning contradicts state kept in memory for the instance's life.
+const _STATE_CONFLICTING_MARKERS = (
+    Symbol("@cached"), Symbol("@mmap"), Symbol("@fresh"), Symbol("@versioned"), Symbol("@queued"),
+)
 
 # Internal unconditional store into a cache dict, for seed restoration and
 # `remake` carry-over writes. The public `setproperty!` stays refused; these
@@ -4197,7 +4223,9 @@ end
   is known.
 - Kept: fixed fields and constructor/`remake` overrides — they are inputs, as
   for [`clear_mem_caches!`](@ref) (a fixed field `name` is an error; move it
-  with [`remake`](@ref)).
+  with [`remake`](@ref)). A `@state` property is never derived from another
+  property, so it is never among the dependents; naming it (`@clear_cache!
+  o.state`) resets it, and the next read re-runs its initializer.
 - On an object with a computed `@versioned` property, the version and cache path
   are re-derived on the next read, as for `sync!`.
 - A holder that derived from this object (a parent reading one of its children)
@@ -6857,6 +6885,26 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             end
         end
     end
+    # ── @state: per-instance state, never derived ────────────────────────────
+    # `@state name = init` memoizes like any property, but whole-object clears
+    # keep it and `sync!` never drops it (`_state_names`). That is safe only
+    # because the initializer derives from nothing a clear or `sync!` could
+    # move: it may read fixed fields and other `@state` properties, never a
+    # computed property, and never hand `__self__` to other code. A disk or
+    # never-cache marker contradicts in-memory state kept for the instance's
+    # life (snag `in-invoices-jl-a-6b1221ee`, decision `1oc1ssr`).
+    state_names = Symbol[name for (name, info) in oproperties if Symbol("@state") in info.macros]
+    for (name, info) in oproperties
+        Symbol("@state") in info.macros || continue
+        conflicts = intersect(info.macros, _STATE_CONFLICTING_MARKERS)
+        isempty(conflicts) || error("@state on property `$name`: cannot combine with $(join(sort!(string.(collect(conflicts))), ", ")). `@state` declares in-memory state kept for the instance's life; disk persistence, never-cache, version and queue markers contradict that. Drop one.")
+        name in opaque_props && error("@state on property `$name`: the initializer hands `__self__` to other code, so DO cannot prove it derives from no computed property. A `@state` initializer may read fixed fields and other `@state` properties only.")
+        derived = sort!(collect(setdiff(info.dependson, fixed_names, state_names)))
+        isempty(derived) || error("@state on property `$name`: the initializer reads computed $(length(derived) == 1 ? "property" : "properties") $(join(("`$d`" for d in derived), ", ")). State is never derived, which is what lets clears and `sync!` keep it; a `@state` initializer may read fixed fields and other `@state` properties only. Pass the value in as a fixed field, or make it an ordinary property.")
+    end
+    state_defs = isempty(state_names) ? Any[] : Any[
+        :($DynamicObjects._state_names(::Type{$type_dispatch}) = $(Tuple(unique!(state_names)))),
+    ]
     # ── `remake` carry-over bake (decision yf4z8x) ───────────────────────────
     # A memoized bare property may be reused verbatim by `remake` when NONE of
     # the names it (transitively) depends on — fixed fields AND rhs-declared
@@ -7012,6 +7060,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             $DynamicObjects.is_indexed_property(::$type, name::Symbol) = name in $indexed_names
             $DynamicObjects._hash_replace(__self__::$type) = __self__.__hash__
             $(versioned_defs...)
+            $(state_defs...)
             $([:(
                 $DynamicObjects._disk_cache(::$type, ::Val{$(QuoteNode(name))}) = $varname
             ) for (name, varname) in cached_names]...)
@@ -7445,6 +7494,14 @@ Properties marked `@cached` are additionally persisted to disk under
 
 Keyword arguments passed to the constructor pre-populate the cache, so they act
 as overrides for any computed property.
+
+`@state name = init` (or indexed `@state name(args...) = init`) declares
+per-instance state rather than a derived value: a lock, a rate limiter, an
+attempt log. It is computed on first read and memoized like any property, but
+[`clear_mem_caches!`](@ref) keeps it and `sync!` never drops it;
+`DynamicObjects.clear_cache!(obj, :name)` resets it. `init` may read fixed
+fields and other `@state` properties only, and cannot combine with `@cached`,
+`@mmap`, `@fresh`, `@versioned` or `@queued`.
 
 # Examples
 ```julia
@@ -9441,6 +9498,7 @@ function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
     indexed = get(info, :indexed, !isempty(get(info, :indices, ())))
     macros = get(info, :macros, Set{Symbol}())
     fresh = Symbol("@fresh") in macros
+    state = Symbol("@state") in macros
     cached = Symbol("@cached") in macros
     mmap = Symbol("@mmap") in macros
     declared_versioned = Symbol("@versioned") in macros
@@ -9472,7 +9530,8 @@ function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
     context_inputs = fixed ? NamedTuple[] :
         _semantic_dependency_inputs(T, dependencies)
     inputs = _merge_semantic_dependency_inputs(context_inputs, inferred_inputs)
-    tier = _materialization_tier(Val(fixed), Val(fresh), Val(mmap), Val(cached))
+    # `@state` lives in memory for the instance's life: never promoted to disk.
+    tier = state ? :memory : _materialization_tier(Val(fixed), Val(fresh), Val(mmap), Val(cached))
     cache_version = get(info, :cache_version, nothing)
     # `@versioned` is an object-wide cache-path dimension: a marker on one
     # field/property invalidates every persisted output of T. Keep the local
@@ -9480,6 +9539,7 @@ function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
     # version" from "is governed by the version" without an annotation shim.
     semantics = (;
         fresh,
+        state,
         memoized,
         versioned,
         declared_versioned,
@@ -11410,7 +11470,9 @@ next read recomputes them. The changed slot itself is kept: it is the same
 container (or object) that observed the change. A dropped indexed property loses
 all its entries. A file changing under one entry of `@struct run(id) = …` drops
 only that child's own derived properties, plus whatever the parent derived from
-`run`.
+`run`. A `@state` property is never dropped, even when a fixed field its
+initializer read moved; what reads the state still drops when the state's own
+value observes a change.
 
 On an object with a computed `@versioned` property, dropping anything also drops
 that property, what reads it (memory only) and the cache path, so the next read
@@ -11474,7 +11536,10 @@ function _sync!(o, visited)
     # Bump even when nothing here was cached: a holder may have derived from the
     # changed slot through this object (`length(store.files)`).
     record.generation += UInt64(1)
-    visited[record] = _drop_targets!(o, shared, record, _dependents_of(typeof(o), changed))
+    # `@state` is never derived, so no observed change makes it stale; its
+    # ordinary dependents still drop.
+    targets = setdiff!(_dependents_of(typeof(o), changed), _state_names(typeof(o)))
+    visited[record] = _drop_targets!(o, shared, record, targets)
 end
 
 # Drop `targets` from a retained object (`_drop_property!`), forget their sync
