@@ -7,7 +7,7 @@ using TestItemRunner
 # a test decides which in-flight computation finishes when.
 @testmodule InflightInvalidationFixtures begin
 using DynamicObjects
-export Book, DiskBook, GovernedBook, GOVERNED_BASE, gate_open!, reset_gates!, next_read
+export Book, DiskBook, GovernedBook, StateBook, GOVERNED_BASE, gate_open!, reset_gates!, next_read
 
 const GATES = Dict{String,Channel{Nothing}}()
 const GATES_LOCK = ReentrantLock()
@@ -46,6 +46,12 @@ end
     path::String
     __cache_path__::String
     @cached rates = gated_read(path)
+end
+
+@dynamicstruct struct StateBook
+    path::String
+    # Per-instance state: its initializer reads only a fixed field.
+    @state log = (gated_read(path); String[])
 end
 
 const GOVERNED_BASE = Ref("")
@@ -204,4 +210,20 @@ gate_open!("n")
 @test isfile(entry)
 @test isfile(entry * ".auto")
 @test next_read() == "n"
+end
+
+@testitem "clear_mem_caches! keeps a @state computation in flight" setup=[InflightInvalidationFixtures] begin
+using DynamicObjects
+reset_gates!()
+path = tempname(); write(path, "s")
+book = StateBook(path)
+initializing = Threads.@spawn book.log
+@test next_read() == "s"
+clear_mem_caches!(book)
+reader = Threads.@spawn book.log                # joins the kept computation
+gate_open!("s"); gate_open!("s")                # a second initializer would not block
+state = fetch(initializing)
+@test fetch(reader) === state
+@test book.log === state                        # stored: one state object, one init
+@test next_read(1) === nothing                  # the initializer ran once
 end

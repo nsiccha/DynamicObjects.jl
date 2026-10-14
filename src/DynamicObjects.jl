@@ -1567,7 +1567,8 @@ computation has been released, outside every cache lock, on the task that ran th
 computation, which returns only after the hook does. Reading the property inside the hook
 returns `value` unless something dropped it meanwhile. It does not run for a cache hit, for a
 caller that waited for the computation, for a failed computation, for a `@fresh` call (it
-stores nothing), or for a value seeded by a constructor, `remake` or `clear_mem_caches!`. A
+stores nothing), for a computation an invalidation retracted while it ran (it stores nothing
+either), or for a value seeded by a constructor, `remake` or `clear_mem_caches!`. A
 governed host's automatic storage, which may swap the stored value for its persisted copy or
 reload it later, does not call it either. A throwing hook is logged with its backtrace; the
 value stays stored and is returned to the caller.
@@ -2295,13 +2296,14 @@ This is the same primitive `fetchindex(...; force=true)` runs before
 recomputing, also reachable as `@clear_cache! obj.prop(indices...)`.
 
 In-flight semantics (there is no cancellation — DynamicObjects retains no
-compute handle): invalidating while a compute runs does not stop it. Its value
-still lands if the slot is empty when it finishes, so a bare `invalidate!`
-followed by a re-access can serve the pre-invalidation result; `force=true`
-spawns a second compute and the two race, first-published-wins. Blocking
-waiters migrate onto the new compute; a `Pending` handle `fetch`ed in the gap
-between the drop and the new compute's registration throws an
-`ErrorException` ("no value and no compute in flight").
+compute handle): invalidating while a compute runs does not stop it, and its
+caller gets its value. But the value may derive from what was invalidated, so
+the compute stores nothing — no memory value, no `@cached`/`@mmap` entry, no
+automatic entry. Blocking waiters and a [`Pending`](@ref) handle taken before
+re-resolve: they wait for a compute started since, or start one. So a re-access
+after `invalidate!`, and `force=true`, always serve a post-invalidation value.
+This holds wherever the invalidation is issued from, including the body of a
+computation of the same object.
 """
 function invalidate!(ip::IndexableProperty, indices...; kwargs...)
     maybepop!(ip.cache, (indices, (;kwargs...)))
@@ -3119,7 +3121,11 @@ old method definitions stay memoized until the process restarts or this function
 is called.
 
 In-flight semantics: as with [`invalidate!`](@ref), a compute running at
-clear time still lands if its slot is empty when it finishes.
+clear time stores nothing; its caller gets its value, and waiters re-resolve.
+A `@state` computation in flight is kept, like a settled `@state` value. This
+also drops the object's progress root (`__status__`) unless it was passed in;
+from inside a computation, prefer the narrower `sync!` after `notify_change!`,
+or `DynamicObjects.clear_cache!(obj, name)`.
 """
 function clear_mem_caches!(obj)
     pc = getfield(obj, :cache)
@@ -3130,20 +3136,29 @@ function clear_mem_caches!(obj)
     # wrapper entry through every alias — a mounted request view shares it by
     # design — so `empty!(c)` alone would leave those aliases stale. `@state`
     # values (an indexed one's wrapper with its subcache) are snapshotted
-    # instead and put back.
-    kept, subcaches = lock(c.lock) do
-        (Pair{Symbol,Any}[name => value for (name, value) in c.cache
-                if name in state && !(value isa Pending)],
-         [value.cache for (name, value) in c.cache
-                if value isa IndexableProperty && !(name in state)])
-    end
-    empty!(c)
-    foreach(empty!, subcaches)
-    lock(c.lock) do
+    # instead and put back, within the same critical section so no reader finds
+    # them missing. So is a `@state` computation in flight: its initializer reads
+    # no derived value, so nothing it computes is stale, and its caller already
+    # holds the object it is about to store (a retracted computation would store
+    # nothing, `_run_cache_compute!`).
+    subcaches = lock(c.lock) do
+        kept = Pair{Symbol,Any}[name => value for (name, value) in c.cache
+                if name in state && !(value isa Pending)]
+        running = [(name, c.computing[name], get(c.status, name, nothing))
+                   for name in state if haskey(c.computing, name)]
+        subcaches = [value.cache for (name, value) in c.cache
+                if value isa IndexableProperty && !(name in state)]
+        empty!(c)
         for (name, value) in kept
             c.cache[name] = value
         end
+        for (name, latch, status) in running
+            c.computing[name] = latch
+            status === nothing || (c.status[name] = status)
+        end
+        subcaches
     end
+    foreach(empty!, subcaches)
     _restore_seeds!(pc)
     nothing
 end
@@ -4315,9 +4330,10 @@ end
 - A holder that derived from this object (a parent reading one of its children)
   drops its own dependents on its next `sync!`: the object's
   `object_version` moves. HTMXObjects calls `sync!` on every request root.
-- In flight: as for [`invalidate!`](@ref), there is no cancellation. A compute of
-  a dropped property that is running at the time still lands if its slot is
-  empty when it finishes — including a dependent that read the old value.
+- In flight: as for [`invalidate!`](@ref), there is no cancellation, but a
+  compute of a dropped property running at the time — including a dependent that
+  read the old value — stores nothing; its caller gets its value, and waiters
+  re-resolve.
 
 With indices (or kwargs), drops exactly that one entry, like
 [`invalidate!`](@ref); dependents are not dropped.
@@ -11618,8 +11634,8 @@ a `@dynamicstruct` object returns `Symbol[]`: it holds no property cache.
 
 Call it where a host decides what to serve. HTMXObjects' root provider calls it
 on every request root. In-flight semantics follow [`invalidate!`](@ref): a
-compute running when its entry is dropped still lands if the slot is empty when
-it finishes.
+compute running when its entry is dropped stores nothing, and the next read
+recomputes.
 """
 function sync!(o)
     (_TRACKED_IN_USE[] && _is_dynamic_object(o)) || return Symbol[]
