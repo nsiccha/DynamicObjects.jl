@@ -252,6 +252,50 @@ p  = Point(3.0, 4.0; r=10.0)   # p.r returns 10.0 without computing
 p2 = remake(p; r=99.0)         # same fields, override r
 ```
 
+### Per-instance state: `@state`
+
+`@state name = init` declares state the instance owns rather than a value it
+derives: a lock, a rate limiter, a record of the last refresh attempt. It is
+computed on first read and memoized like any property, but
+`clear_mem_caches!` keeps it and `sync!` never drops it, so a process-lifetime
+object that is cleared after every write keeps its state:
+
+```julia
+mutable struct Throttle
+    lock::ReentrantLock
+    last_attempt::Union{Nothing,Float64}
+    Throttle() = new(ReentrantLock(), nothing)
+end
+
+@dynamicstruct struct AppData
+    root::String
+    @state refresh = Throttle()          # kept by clear_mem_caches!
+    @state limiter(source) = Throttle()  # one per source, every entry kept
+    listing = readdir(root)              # derived: recomputed after a clear
+end
+
+app = AppData("data")
+app.refresh.last_attempt = time()
+clear_mem_caches!(app)
+app.refresh.last_attempt                 # unchanged
+
+DynamicObjects.clear_cache!(app, :refresh)   # explicit reset; what reads it recomputes
+```
+
+- `init` may read fixed fields and other `@state` properties only. Reading a
+  computed property, or handing `__self__` to other code, is a definition-time
+  error: state is never derived, which is what makes keeping it safe.
+- `@state` cannot combine with `@cached`, `@mmap`, `@fresh`, `@versioned` or
+  `@queued`; it lives in memory (descriptor tier `:memory`, never promoted to
+  disk by governed execution).
+- `remake` carries a non-indexed state object unless a fixed field `init` reads
+  changed. Indexed entries start empty in the remade object, as for every
+  indexed property. A constructor kwarg overrides it like any property.
+- `remount` views share the retained object's state.
+- State declared inside an inline `@struct` child lives as long as that child
+  instance; clearing the parent rebuilds the child. Declare state on the object
+  you clear.
+
 ### Disk caching: `@cached`
 
 `@cached prop = expr` persists the value to disk under
@@ -383,7 +427,7 @@ the callee to be an `IndexableProperty`. See
 | `@clear_cache! obj.result`         | Drop `result` and every property derived from it, in memory and on disk |
 | `@clear_cache! obj.result(key)`    | Drop a single index                                 |
 | `invalidate!(obj.result, key)`     | Drop a single index (function form)                 |
-| `clear_mem_caches!(obj)`           | Drop every in-memory entry on `obj`                 |
+| `clear_mem_caches!(obj)`           | Drop every in-memory entry on `obj` except constructor kwargs and `@state` |
 | `clear_disk_caches!(obj)`          | Delete every `@cached` file under `obj.cache_path`  |
 | `clear_all_caches!(obj)`           | Both                                                |
 
