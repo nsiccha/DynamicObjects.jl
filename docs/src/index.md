@@ -223,6 +223,11 @@ comprehensions and closures keep what they bind inside them; `if` and `begin`
 open no scope. Names resolve in order, so define a local method before its
 first use.
 
+Reads inside an assignment target resolve like any other read: the object of a
+field or index target and a type annotation, at any depth of a destructuring.
+With `@state attempt = Attempt()`, `attempt.day, attempt.at = day, now()`
+updates that `@state` value; `x::eltype(vals) = 0` reads the `vals` property.
+
 ### "Assignment shadows property" error
 
 An assignment to a name that is also a property of the surrounding struct is
