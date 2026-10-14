@@ -4533,8 +4533,8 @@ elseif e.head in (:kw, :(=))
                 error("Assignment to `$s` in a property RHS shadows property `$s`$loc. This writes to the property cache, not a local variable. Declare it with `local $s` (or `local $s = ...`) or use `let $s = ...` to make it a local.")
             end
         end
-        walked_lhs = Meta.isexpr(lhs, (:ref, :.)) ? walk_rhs(lhs; locals, properties, lnn) : lhs
-        Expr(e.head, walked_lhs, walk_rhs.(e.args[2:end]; locals, properties, lnn)...)
+        Expr(e.head, _walk_assign_target(lhs; locals, properties, lnn),
+            walk_rhs.(e.args[2:end]; locals, properties, lnn)...)
     end
 elseif e.head == :local
     # `local x`, `local x, y, z`, or `local x = expr` — add names to the local
@@ -5885,6 +5885,19 @@ function _shadowed_lhs(lhs::Expr, properties, locals)
     end
     out
 end
+
+# An assignment target with its reads walked. A bound name stays as it is; the
+# container of a field or index target (`a.b = …`, `a[i] = …`) and a type
+# annotation (`x::T = …`) are reads, walked at any depth of a destructuring
+# (`a.b, c[i] = …`, `(a.b, (c, d...)) = …`).
+_walk_assign_target(lhs; kwargs...) = lhs
+_walk_assign_target(lhs::Expr; kwargs...) = _walk_assign_target(Val(lhs.head), lhs; kwargs...)
+_walk_assign_target(::Val, lhs; kwargs...) = lhs
+_walk_assign_target(::Union{Val{:.}, Val{:ref}}, lhs; kwargs...) = walk_rhs(lhs; kwargs...)
+_walk_assign_target(::Union{Val{:tuple}, Val{:...}}, lhs; kwargs...) =
+    Expr(lhs.head, Any[_walk_assign_target(a; kwargs...) for a in lhs.args]...)
+_walk_assign_target(::Val{:(::)}, lhs; kwargs...) = length(lhs.args) == 2 ?
+    Expr(:(::), _walk_assign_target(lhs.args[1]; kwargs...), walk_rhs(lhs.args[2]; kwargs...)) : lhs
 
 _collect_leaves(e) = error("unsupported destructuring element: $e")
 _collect_leaves(e::Symbol) = Symbol[e]
