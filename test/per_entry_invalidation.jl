@@ -92,7 +92,7 @@ invalidate!(o.plain, 5)
 @test INV_CALLS[(:plain, 5, 1)] == 3
 end
 
-@testitem "in-flight invalidation is not cancellation" setup=[PerEntryInvalidationFixtures] begin
+@testitem "in-flight invalidation is not cancellation, and its value is not stored" setup=[PerEntryInvalidationFixtures] begin
 using DynamicObjects
 
 empty!(INV_CALLS)
@@ -105,7 +105,9 @@ started(key) = begin
     false
 end
 
-# Mid-flight clear: the compute is not stopped; its value lands and is served.
+# Mid-flight invalidation: the compute is not stopped, but it may have read what was
+# invalidated, so its value is not stored. A handle taken before the invalidation
+# re-resolves: with nothing in flight any more, its fetch starts a new compute.
 t = Threads.@spawn fetchindex(o.slow, 1) do rv, status
     rv
 end
@@ -113,21 +115,15 @@ end
 pend = Base.fetch(t)
 @test pend isa Pending
 invalidate!(o.slow, 1)
-# The old handle fetched in the gap errors: latch dropped, nothing registered.
-gap_err = try
-    fetch(pend)
-    nothing
-catch e
-    e
-end
-@test gap_err isa ErrorException
-@test occursin("no compute in flight", gap_err.msg)
+gap = fetch(pend)
+@test gap isa Tuple
 sleep(3.5)
-@test INV_CALLS[(:slow, 1)] == 1
-@test o.slow(1) == (1, 1)
-@test INV_CALLS[(:slow, 1)] == 1
+@test INV_CALLS[(:slow, 1)] == 2      # the invalidated compute ran to completion too
+@test o.slow(1) == gap                 # but only the re-resolved one is stored
+@test INV_CALLS[(:slow, 1)] == 2
 
-# force=true mid-flight spawns a second compute; both run, one value wins.
+# force=true mid-flight starts a second compute; the superseded one is not stored,
+# so the forced value is the one served.
 t2 = Threads.@spawn fetchindex(o.slow, 2) do rv, status
     rv
 end
@@ -138,6 +134,7 @@ forced2 = fetchindex(o.slow, 2; force=true) do rv, status
     rv isa Pending ? fetch(rv) : rv
 end
 @test forced2 isa Tuple
+@test fetch(pend2) == forced2          # the old handle resolves to the forced compute
 sleep(3.5)
 @test INV_CALLS[(:slow, 2)] == 2
 @test o.slow(2) == forced2

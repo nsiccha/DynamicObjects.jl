@@ -1326,7 +1326,7 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     if kind === :pending
         # Poller, compute already in flight elsewhere — hand back a cheap Pending, no spawn.
         !isnothing(s) && _finalize_substatus!(s)
-        return fetch(Pending(c, key, nothing, executor))
+        return fetch(Pending(c, key, nothing, executor, _resolver(f, c, key, fetch, substatus, retry_failed)))
     end
     if kind === :inline
         # Blocking first-arriver: compute on THIS thread (no spawn), publish, return value.
@@ -1342,11 +1342,16 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     _start_compute(executor, DeferredCompute(c, key, cnd, f, s))
     # A blocking caller waits for the compute it started, as for one already in flight.
     sync && return _await_cache_value!(c, key, cnd, f; fetch, substatus, retry_failed)
-    p = Pending(c, key, nothing, executor)
+    p = Pending(c, key, nothing, executor, _resolver(f, c, key, fetch, substatus, retry_failed))
     # An executor may have run the compute synchronously: hand back the value.
     executor !== nothing && isready(p) && return Base.fetch(p)
     return fetch(p)
 end
+
+# What a `Pending` handle runs when its computation was retracted mid-flight: the same
+# access, blocking.
+_resolver(f, c, key, fetch, substatus, retry_failed) =
+    () -> get!(f, c, key; fetch=_blocking_selector(fetch), substatus, retry_failed)
 
 # --- Deferred compute starts -------------------------------------------------------------
 
@@ -1425,8 +1430,11 @@ function abandon!(d::DeferredCompute, reason::AbstractString="abandoned")
     err = ComputeAbandoned(String(reason))
     c = d.cache
     lock(c.lock) do
-        get(c.computing, d.key, nothing) === d.latch && delete!(c.computing, d.key)
-        c.errors[d.key] = err
+        # A latch an invalidation retracted is not this key's failure (`_run_cache_compute!`).
+        if get(c.computing, d.key, nothing) === d.latch
+            delete!(c.computing, d.key)
+            c.errors[d.key] = err
+        end
         notify(d.latch)
     end
     !isnothing(d.status) && _fail_substatus!(d.status, err)
@@ -1559,7 +1567,8 @@ computation has been released, outside every cache lock, on the task that ran th
 computation, which returns only after the hook does. Reading the property inside the hook
 returns `value` unless something dropped it meanwhile. It does not run for a cache hit, for a
 caller that waited for the computation, for a failed computation, for a `@fresh` call (it
-stores nothing), or for a value seeded by a constructor, `remake` or `clear_mem_caches!`. A
+stores nothing), for a computation an invalidation retracted while it ran (it stores nothing
+either), or for a value seeded by a constructor, `remake` or `clear_mem_caches!`. A
 governed host's automatic storage, which may swap the stored value for its persisted copy or
 reload it later, does not call it either. A throwing hook is logged with its backtrace; the
 value stays stored and is returned to the caller.
@@ -1651,6 +1660,45 @@ _start_compute(executor, d::DeferredCompute) = (executor(d); nothing)
 struct _Missing end
 const _missing_sentinel = _Missing()
 
+# The publish guard of a running memoized computation: its latch. What the computation
+# publishes besides its value — a disk entry, an opaque requester's own value — checks the
+# guard first, so an invalidation that retracted the latch meanwhile is not undone. It lives
+# in the computing task's local storage, set by `_run_cache_compute!` and taken by the
+# computation's own `_computeproperty`, so nested computations never see it: a memoized one
+# sets its own, an uncached one (`fresh`) has none.
+struct _PublishGuard{C<:AbstractThreadsafeDict,K}
+    cache::C
+    key::K
+    latch::Threads.Condition
+end
+const _PUBLISH_GUARD = :__dynamicobjects_publish_guard__
+
+# Whether the computation behind `guard` may still publish (`nothing`: no guard).
+_publishable(::Nothing) = true
+_publishable(g::_PublishGuard) = lock(g.cache.lock) do
+    get(g.cache.computing, g.key, nothing) === g.latch
+end
+
+_with_publish_guard(compute, f, c, key, cnd) = compute()
+function _with_publish_guard(compute, ::_Settling, c, key, cnd)
+    storage = task_local_storage()
+    previous = get(storage, _PUBLISH_GUARD, nothing)
+    storage[_PUBLISH_GUARD] = _PublishGuard(c, key, cnd)
+    try
+        compute()
+    finally
+        previous === nothing ? delete!(storage, _PUBLISH_GUARD) : (storage[_PUBLISH_GUARD] = previous)
+    end
+end
+
+# The guard of the computation starting on this task (`take`: none is left for what it
+# nests), without creating task-local storage where there is none.
+function _publish_guard(; take::Bool=false)
+    storage = current_task().storage
+    storage === nothing && return nothing
+    take ? pop!(storage, _PUBLISH_GUARD, nothing) : get(storage, _PUBLISH_GUARD, nothing)
+end
+
 # Run a `c.cache`-backed compute to completion under the `cnd` latch. Compute OUTSIDE the
 # lock (the RHS recurses into siblings on the same lock), then publish the value + drop the
 # latch + notify; on failure record the exception in `c.errors` + drop the latch + notify,
@@ -1659,15 +1707,22 @@ const _missing_sentinel = _Missing()
 # `cache`/`errors` + the latch, so the compute Task is never retained. A value this
 # computation stored is then reported to `property_settled` (`f` a `_Settling`), with waiters
 # already released and no lock held.
+#
+# An invalidation (`clear_mem_caches!`, `clear_cache!`, `sync!`, `invalidate!`, `force=true`)
+# retracts the latch of a compute in flight. Such a compute may have read what was
+# invalidated, so it publishes nothing: its value (or failure) goes to its own caller only,
+# and the waiters it releases find the latch gone and re-resolve against the current state.
 function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condition, f, s)
     local v
     _start_substatus!(s)
     try
-        v = f(s)
+        v = _with_publish_guard(() -> f(s), f, c, key, cnd)
     catch e
         lock(c.lock) do
-            get(c.computing, key, nothing) === cnd && delete!(c.computing, key)
-            c.errors[key] = e
+            if get(c.computing, key, nothing) === cnd
+                delete!(c.computing, key)
+                c.errors[key] = e
+            end
             notify(cnd)
         end
         !isnothing(s) && _fail_substatus!(s, e)
@@ -1675,6 +1730,10 @@ function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condit
         rethrow()
     end
     stored, published = lock(c.lock) do
+        if get(c.computing, key, nothing) !== cnd
+            notify(cnd)                # retracted mid-flight: waiters re-resolve
+            return (v, false)
+        end
         existing = get(c.cache, key, _missing_sentinel)
         published = existing === _missing_sentinel
         if published
@@ -1684,7 +1743,7 @@ function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condit
         else
             _on_hit!(c, key)          # defensive: someone published first
         end
-        get(c.computing, key, nothing) === cnd && delete!(c.computing, key)
+        delete!(c.computing, key)
         notify(cnd)                    # leave c.status[key] finalized — getstatus / "(cached)" relabel rely on it
         (existing, published)
     end
@@ -1740,14 +1799,20 @@ node stays optional and is never relied on for readiness.
 A handle for a computation started through an executor (a `Deferred` selector, or the
 property's `DynamicObjects.property_executor`) carries that executor, and a blocking
 `fetch` on it waits through `DynamicObjects.await_deferred`.
+
+If the computation is invalidated while in flight (`clear_mem_caches!`, `clear_cache!`,
+`sync!`, `invalidate!`, `force=true`), its value is not stored, and `fetch` re-resolves the
+access: it waits for a computation started since, or starts one.
 """
-struct Pending{C<:AbstractThreadsafeDict, K, S, E}
+struct Pending{C<:AbstractThreadsafeDict, K, S, E, R}
     cache::C
     key::K
     slot::S       # a `Slot{T}` for slotted bare props; `nothing` for `cache`-backed keys
     executor::E   # the executor a blocking `fetch` waits through; `nothing` for none
+    resolve::R    # re-runs the access once its computation was retracted; `nothing` for none
 end
-Pending(cache, key, slot) = Pending(cache, key, slot, nothing)
+Pending(cache, key, slot) = Pending(cache, key, slot, nothing, nothing)
+Pending(cache, key, slot, executor) = Pending(cache, key, slot, executor, nothing)
 # The selector that blocks for `p`'s computation through its executor.
 _blocking_selector(p::Pending) = p.executor === nothing ? Base.fetch : _BlockingDeferred(p.executor)
 
@@ -1794,7 +1859,10 @@ function _fetch_pending(p::Pending)
         end
         step[1] === :value && return step[2]
         step[1] === :error && throw(step[2])
-        step[1] === :gone && error("Pending: key ", p.key, " has no value and no compute in flight")
+        if step[1] === :gone
+            p.resolve === nothing && error("Pending: key ", p.key, " has no value and no compute in flight")
+            return p.resolve()
+        end
     end
 end
 
@@ -2228,13 +2296,14 @@ This is the same primitive `fetchindex(...; force=true)` runs before
 recomputing, also reachable as `@clear_cache! obj.prop(indices...)`.
 
 In-flight semantics (there is no cancellation — DynamicObjects retains no
-compute handle): invalidating while a compute runs does not stop it. Its value
-still lands if the slot is empty when it finishes, so a bare `invalidate!`
-followed by a re-access can serve the pre-invalidation result; `force=true`
-spawns a second compute and the two race, first-published-wins. Blocking
-waiters migrate onto the new compute; a `Pending` handle `fetch`ed in the gap
-between the drop and the new compute's registration throws an
-`ErrorException` ("no value and no compute in flight").
+compute handle): invalidating while a compute runs does not stop it, and its
+caller gets its value. But the value may derive from what was invalidated, so
+the compute stores nothing — no memory value, no `@cached`/`@mmap` entry, no
+automatic entry. Blocking waiters and a [`Pending`](@ref) handle taken before
+re-resolve: they wait for a compute started since, or start one. So a re-access
+after `invalidate!`, and `force=true`, always serve a post-invalidation value.
+This holds wherever the invalidation is issued from, including the body of a
+computation of the same object.
 """
 function invalidate!(ip::IndexableProperty, indices...; kwargs...)
     maybepop!(ip.cache, (indices, (;kwargs...)))
@@ -3052,7 +3121,11 @@ old method definitions stay memoized until the process restarts or this function
 is called.
 
 In-flight semantics: as with [`invalidate!`](@ref), a compute running at
-clear time still lands if its slot is empty when it finishes.
+clear time stores nothing; its caller gets its value, and waiters re-resolve.
+A `@state` computation in flight is kept, like a settled `@state` value. This
+also drops the object's progress root (`__status__`) unless it was passed in;
+from inside a computation, prefer the narrower `sync!` after `notify_change!`,
+or `DynamicObjects.clear_cache!(obj, name)`.
 """
 function clear_mem_caches!(obj)
     pc = getfield(obj, :cache)
@@ -3063,20 +3136,29 @@ function clear_mem_caches!(obj)
     # wrapper entry through every alias — a mounted request view shares it by
     # design — so `empty!(c)` alone would leave those aliases stale. `@state`
     # values (an indexed one's wrapper with its subcache) are snapshotted
-    # instead and put back.
-    kept, subcaches = lock(c.lock) do
-        (Pair{Symbol,Any}[name => value for (name, value) in c.cache
-                if name in state && !(value isa Pending)],
-         [value.cache for (name, value) in c.cache
-                if value isa IndexableProperty && !(name in state)])
-    end
-    empty!(c)
-    foreach(empty!, subcaches)
-    lock(c.lock) do
+    # instead and put back, within the same critical section so no reader finds
+    # them missing. So is a `@state` computation in flight: its initializer reads
+    # no derived value, so nothing it computes is stale, and its caller already
+    # holds the object it is about to store (a retracted computation would store
+    # nothing, `_run_cache_compute!`).
+    subcaches = lock(c.lock) do
+        kept = Pair{Symbol,Any}[name => value for (name, value) in c.cache
+                if name in state && !(value isa Pending)]
+        running = [(name, c.computing[name], get(c.status, name, nothing))
+                   for name in state if haskey(c.computing, name)]
+        subcaches = [value.cache for (name, value) in c.cache
+                if value isa IndexableProperty && !(name in state)]
+        empty!(c)
         for (name, value) in kept
             c.cache[name] = value
         end
+        for (name, latch, status) in running
+            c.computing[name] = latch
+            status === nothing || (c.status[name] = status)
+        end
+        subcaches
     end
+    foreach(empty!, subcaches)
     _restore_seeds!(pc)
     nothing
 end
@@ -3270,8 +3352,25 @@ function _record_accessed_key(o, name::Symbol, indices, kwargs)
     nothing
 end
 
+# Publish a computed disk entry unless an invalidation retracted the computation (`guard`):
+# not before the save, and if one lands during it, the entry is removed again — invalidations
+# retract the latch before removing disk entries, so either side sees the other. Returns
+# whether the entry stands; if not, the caller keeps the computed value itself.
+function _save_if_publishable!(guard, fmt::Val, path::AbstractString, value)
+    if !_publishable(guard)
+        # The non-strict flow's empty placeholder would read as an interrupted write.
+        get_cache_status(path) === :started && rm(path; force=true)
+        return false
+    end
+    _atomic_save(fmt, path, value)
+    _publishable(guard) && return true
+    rm(path; force=true)
+    false
+end
+
 _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
     vname = Val(name)
+    guard = _publish_guard(; take=true)   # this computation's own, if memoized
     isnothing(__status__) && name != :__status__ && (__status__ = getorcomputeproperty(o, :__status__))
     _status_kw = is_generated_property(o, name) ? (; __status__) : (;)
     try
@@ -3345,8 +3444,8 @@ $_cache_context""")
                     if isnothing(rv) || resumes(o, vname, indices...; kwargs...)
                         @debug "Generating $cache_path...\n$_cache_context"
                         rv = compute_property(o, vname, indices...; _status_kw..., _resume_kw(o, vname, rv)..., kwargs...)
-                        _atomic_save(_disk_format(o, vname), cache_path, rv)
-                        if _disk_format(o, vname) == Val(:mmap)
+                        if _save_if_publishable!(guard, _disk_format(o, vname), cache_path, rv) &&
+                                _disk_format(o, vname) == Val(:mmap)
                             rv = load(Val(:mmap), cache_path, _disk_eltype(o, vname))
                         end
                     end
@@ -3378,8 +3477,8 @@ $_cache_context""")
                 if cache_status != :ready || resumes(o, vname, indices...; kwargs...)
                     @debug "Generating $cache_path...\n$_cache_context"
                     rv = compute_property(o, vname, indices...; _status_kw..., _resume_kw(o, vname, rv)..., kwargs...)
-                    _atomic_save(_disk_format(o, vname), cache_path, rv)
-                    if _disk_format(o, vname) == Val(:mmap)
+                    if _save_if_publishable!(guard, _disk_format(o, vname), cache_path, rv) &&
+                            _disk_format(o, vname) == Val(:mmap)
                         rv = load(Val(:mmap), cache_path, _disk_eltype(o, vname))
                     end
                 end
@@ -4231,9 +4330,10 @@ end
 - A holder that derived from this object (a parent reading one of its children)
   drops its own dependents on its next `sync!`: the object's
   `object_version` moves. HTMXObjects calls `sync!` on every request root.
-- In flight: as for [`invalidate!`](@ref), there is no cancellation. A compute of
-  a dropped property that is running at the time still lands if its slot is
-  empty when it finishes — including a dependent that read the old value.
+- In flight: as for [`invalidate!`](@ref), there is no cancellation, but a
+  compute of a dropped property running at the time — including a dependent that
+  read the old value — stores nothing; its caller gets its value, and waiters
+  re-resolve.
 
 With indices (or kwargs), drops exactly that one entry, like
 [`invalidate!`](@ref); dependents are not dropped.
@@ -7933,6 +8033,7 @@ function _opaque_shared!(oc::_OpaqueSubcache, key; fetch=Base.fetch, retry_faile
     args, kwargs = _opaque_call(oc, key)
     local_value = Ref{Any}(_missing_sentinel)
     compute = _Settling(oc.requester, oc.name, args, kwargs, local_value) do s
+        guard = _publish_guard()   # read before `_opaque_compute` takes it
         probe = _OpaqueProbe(oc.requester, oc.name)
         context_dependent(error) = (_ns_taint!(oc.ns, _taint_key(oc, key));
             _RemountContextDependent(oc.name, WeakRef(_requester_token(oc.requester)), error))
@@ -7944,7 +8045,8 @@ function _opaque_shared!(oc::_OpaqueSubcache, key; fetch=Base.fetch, retry_faile
         end
         if _seal!(probe)
             # The requester's own value; reported once the latch has failed (`_failed!`).
-            _store_local!(oc, key, value) && (local_value[] = value)
+            # Not stored if an invalidation retracted the computation meanwhile.
+            _publishable(guard) && _store_local!(oc, key, value) && (local_value[] = value)
             throw(context_dependent(nothing))
         end
         value
@@ -10789,6 +10891,40 @@ function _set_automatic_materialization_cache!(target, name, descriptor,
     true
 end
 
+# Replace the memory value of `name(args...; kwargs...)` with `replacement` — or drop it
+# (`_missing_sentinel`) so it reloads from disk — only while it still holds `value`.
+# Returns whether it did (`true` when the slot cannot be located: nothing to guard).
+function _swap_automatic_slot!(target, name, descriptor, args, kwargs, value, replacement)
+    slot = _automatic_materialization_slot(target, name, descriptor, args, kwargs)
+    slot === nothing && return true
+    cache, key = slot
+    swap() = begin
+        _holds_value(cache, key, value) || return false
+        if replacement === _missing_sentinel
+            maybepop!(cache, key)
+        elseif replacement !== value
+            if cache isa AbstractThreadsafeDict
+                cache.cache[key] = replacement
+                _on_store!(cache, key)
+            else
+                cache[key] = replacement
+            end
+        end
+        true
+    end
+    cache isa AbstractThreadsafeDict ? lock(swap, cache.lock) : swap()
+end
+
+_holds_value(cache, key, value) = get(cache, key, _missing_sentinel) === value
+_holds_value(cache::AbstractThreadsafeDict, key, value) =
+    get(cache.cache, key, _missing_sentinel) === value
+# On a remount view a bare opaque value is shared through the view's namespace, not the
+# retained object's cache (a context-dependent one, held by the view alone, is not shared).
+_holds_value(cache::MountedThreadsafeDict, key::Symbol, value) =
+    key in cache.opaque && cache.namespace !== nothing ?
+        get(cache.namespace.cache, key, _missing_sentinel) === value :
+        get(cache.cache, key, _missing_sentinel) === value
+
 function _clear_automatic_materialization_cache!(target, name, descriptor,
         args, kwargs)
     slot = _automatic_materialization_slot(
@@ -10874,6 +11010,10 @@ function _persist_automatic_materialization!(owner, root, target, name,
         return value
     choice = _automatic_materialization_choice(value, elapsed_seconds)
     choice.format === nothing && return value
+    # A value an invalidation dropped, or whose computation it retracted, is stale: not
+    # persisted, and the memory slot is replaced or dropped only while it still holds it.
+    holds() = _swap_automatic_slot!(target, name, descriptor, args, kwargs, value, value)
+    holds() || return value
     cache_path = get_cache_path(target, name, args...; kwargs...)
     _claim_materialization_root!(owner, root)
     _automatic_materialization_owned(owner, cache_path) || return value
@@ -10886,18 +11026,19 @@ function _persist_automatic_materialization!(owner, root, target, name,
             if read !== nothing
                 if existing.format === :mmap
                     stored = something(read)
-                    _set_automatic_materialization_cache!(
-                        target, name, descriptor, args, kwargs, stored)
+                    _swap_automatic_slot!(
+                        target, name, descriptor, args, kwargs, value, stored) || return value
                     return stored
                 end
-                _clear_automatic_materialization_cache!(
-                    target, name, descriptor, args, kwargs)
+                _swap_automatic_slot!(
+                    target, name, descriptor, args, kwargs, value, _missing_sentinel)
                 return value
             end
         end
 
         metadata_path = _automatic_materialization_path(cache_path)
         try
+            holds() || return value
             mkpath(dirname(cache_path))
             format = choice.format
             stored = nothing
@@ -10922,13 +11063,14 @@ function _persist_automatic_materialization!(owner, root, target, name,
                 value_type=typeof(value),
             )
             _atomic_save(Val(:serial), metadata_path, metadata)
-            if format === :mmap
-                _set_automatic_materialization_cache!(
-                    target, name, descriptor, args, kwargs, stored)
-                return stored
+            # Invalidated while saving: the entry would outlive the invalidation.
+            if !_swap_automatic_slot!(target, name, descriptor, args, kwargs, value,
+                    format === :mmap ? stored : _missing_sentinel)
+                stored === nothing || finalize(stored)   # unmap before removing the file
+                _drop_automatic_materialization!(cache_path)
+                return value
             end
-            _clear_automatic_materialization_cache!(
-                target, name, descriptor, args, kwargs)
+            format === :mmap && return stored
         catch e
             _drop_automatic_materialization!(cache_path)
             @warn "Automatic materialization persistence failed; keeping the computed value in memory" cache_path exception=e
@@ -11505,8 +11647,8 @@ a `@dynamicstruct` object returns `Symbol[]`: it holds no property cache.
 
 Call it where a host decides what to serve. HTMXObjects' root provider calls it
 on every request root. In-flight semantics follow [`invalidate!`](@ref): a
-compute running when its entry is dropped still lands if the slot is empty when
-it finishes.
+compute running when its entry is dropped stores nothing, and the next read
+recomputes.
 """
 function sync!(o)
     (_TRACKED_IN_USE[] && _is_dynamic_object(o)) || return Symbol[]
@@ -11694,13 +11836,15 @@ function _drop_view_copies!(view, targets)
     local_dropped = Symbol[]
     for name in targets
         name in c.local_names || continue
-        value = lock(c.lock) do; get(c.cache.overlay, name, _missing_sentinel); end
+        value, in_flight = lock(c.lock) do
+            (get(c.cache.overlay, name, _missing_sentinel), haskey(c.computing.overlay, name))
+        end
         if value isa IndexableProperty
             length(value.cache) > 0 && push!(local_dropped, name)
             empty!(value.cache)
-        elseif value !== _missing_sentinel
-            maybepop!(c, name)
-            push!(local_dropped, name)
+        elseif value !== _missing_sentinel || in_flight
+            maybepop!(c, name)   # a computation in flight publishes nothing
+            value !== _missing_sentinel && push!(local_dropped, name)
         end
     end
     local_dropped
@@ -11772,19 +11916,27 @@ end
 
 # Drop one property of a retained object: its memory value (every entry of an
 # indexed property, emptied in place so a mounted view or destructured handle
-# sharing the subcache sees it), its disk entries unless `disk=false`, and its
-# shared opaque-remount work. Returns whether anything was in memory.
+# sharing the subcache sees it) and any computation of it in flight, its disk
+# entries unless `disk=false`, and its shared opaque-remount work. Memory goes
+# first: a computation in flight then publishes nothing, and a disk entry it
+# saved before noticing is removed here (`_save_if_publishable!`). Returns
+# whether anything was in memory.
 function _drop_property!(o, shared::ThreadsafeDict, name::Symbol; disk::Bool=true)
-    value = lock(shared.lock) do; get(shared.cache, name, _missing_sentinel); end
+    value, in_flight = lock(shared.lock) do
+        (get(shared.cache, name, _missing_sentinel), haskey(shared.computing, name))
+    end
     dropped = if value isa IndexableProperty
-        entry_keys = lock(value.cache.lock) do; collect(keys(value.cache.cache)); end
-        disk && _drop_disk_entries!(o, shared, name, entry_keys)
+        held, entry_keys = lock(value.cache.lock) do
+            held = collect(keys(value.cache.cache))
+            (held, union(held, keys(value.cache.computing)))
+        end
         empty!(value.cache)
-        !isempty(entry_keys)
-    elseif value !== _missing_sentinel
-        disk && _drop_disk_entries!(o, shared, name, (((), (;)),))
+        disk && _drop_disk_entries!(o, shared, name, entry_keys)
+        !isempty(held)
+    elseif value !== _missing_sentinel || in_flight
         maybepop!(shared, name)
-        true
+        disk && _drop_disk_entries!(o, shared, name, (((), (;)),))
+        value !== _missing_sentinel
     else
         false
     end
