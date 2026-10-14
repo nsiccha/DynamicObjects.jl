@@ -4245,6 +4245,42 @@ _walk_local_assign!(_, arg, locals, properties, lnn) = walk_rhs(arg; locals, pro
 _push_if_symbol!(locals, s::Symbol) = (push!(locals, s); nothing)
 _push_if_symbol!(_, _) = nothing
 
+# A local method definition is an ordinary Julia binding: `name(args) = …` and
+# `function name(args) … end` make `name` local in the ENCLOSING scope, and the
+# parameters (plus `where` type parameters) local in the body. Returns
+# `(; name, params)` — `name === nothing` for an anonymous `function (x) … end`
+# or a qualified / callable-object name, which binds nothing — or `nothing` when
+# `sig` is not a method signature (a plain, typed or destructuring assignment
+# LHS). Only `function` admits the `:tuple` (anonymous) signature: in an
+# assignment a tuple LHS destructures.
+_method_signature(sig; anonymous=false) = nothing
+function _method_signature(sig::Expr; anonymous=false)
+    if Meta.isexpr(sig, :where)
+        inner = _method_signature(sig.args[1]; anonymous)
+        isnothing(inner) && return nothing
+        return (; inner.name, params=union(inner.params, _where_names(sig.args[2:end])))
+    elseif Meta.isexpr(sig, :(::)) && length(sig.args) == 2
+        return _method_signature(sig.args[1]; anonymous)   # return-type annotation
+    elseif Meta.isexpr(sig, :call)
+        return (; name=_local_method_name(sig.args[1]), params=extractnames(sig.args[2:end]))
+    elseif anonymous && Meta.isexpr(sig, :tuple)
+        return (; name=nothing, params=extractnames(sig.args))
+    end
+    nothing
+end
+_local_method_name(name::Symbol) = name
+_local_method_name(_) = nothing
+_where_names(args) = mapreduce(_where_name, union, args; init=Set{Symbol}())
+_where_name(T::Symbol) = Set((T,))
+_where_name(T::Expr) = Meta.isexpr(T, (:<:, :>:)) && T.args[1] isa Symbol ? Set((T.args[1],)) : Set{Symbol}()
+_where_name(_) = Set{Symbol}()
+# Bind a local method's name in the enclosing scope (mutating `locals`, as
+# `local name` does) and return its body's scope.
+function _bind_local_method!(locals, sig)
+    _push_if_symbol!(locals, sig.name)
+    union(locals, sig.params)
+end
+
 # Per-element handler for the trailing-else branch of `walk_rhs(::Expr)`.
 # LineNumberNode arms record the LNN into a Ref so subsequent siblings
 # pick it up; everything else recurses with the most recent LNN. Avoids
@@ -4255,22 +4291,29 @@ _walk_with_lnn_tracking!(arg, ref, locals, properties) =
 
 walk_rhs(e; kwargs...) = e
 walk_rhs(e::Expr; locals, properties, lnn=nothing) = if e.head == :let
-    # locals = properties[dependent].locals
-    ls = Set{Symbol}()
+    # `let` opens a new scope: its bindings, and whatever its body binds
+    # (`local x`, a local method), stay inside it.
+    inner = copy(locals)
     !Meta.isexpr(e.args[1], :block) && (e.args[1] = Expr(:block, e.args[1]))
     map!(e.args[1].args, e.args[1].args) do arg
         arg = _normalize_let_binding(arg)
         @assert Meta.isexpr(arg, :(=))
-        name, rhs = arg.args[1], walk_rhs(arg.args[2]; locals, properties, lnn)
-        name in locals || push!(ls, name)
-        push!(locals, name)
+        name = arg.args[1]
+        sig = _method_signature(name)
+        rhs = if isnothing(sig)
+            walk_rhs(arg.args[2]; locals=inner, properties, lnn)
+        else
+            walk_rhs(arg.args[2]; locals=_bind_local_method!(inner, sig), properties, lnn)
+        end
+        isnothing(sig) && union!(inner, extractnames([name]))   # `x`, `x::T`, `(a, b)`
         Expr(:(=), name, rhs)
     end
-    e.args[2] = walk_rhs(e.args[2]; locals, properties, lnn)
-    for l in ls
-        delete!(locals, l)
-    end
+    e.args[2] = walk_rhs(e.args[2]; locals=inner, properties, lnn)
     e
+elseif e.head == :while
+    # A `while` body is a new scope; its condition is evaluated outside it.
+    Expr(:while, walk_rhs(e.args[1]; locals, properties, lnn),
+        walk_rhs(e.args[2]; locals=copy(locals), properties, lnn))
 elseif e.head == :(->)
     # Lambda: first arg is parameter(s), second is body.
     # Add lambda params to locals so they are not rewritten.
@@ -4322,34 +4365,36 @@ elseif e.head == :generator
     end
     Expr(:generator, walked_body, walked_iters...)
 elseif e.head == :function
-    # function g(x); body; end — func name and params are local in body
-    sig = e.args[1]
-    if Meta.isexpr(sig, :call)
-        ls = extractnames(sig.args)  # includes func name + params
-        new_locals = union(locals, ls)
-        Expr(:function, sig, walk_rhs(e.args[2]; locals=new_locals, properties, lnn))
+    # `function g(x) … end` (any signature shape): `g` is local in the enclosing
+    # scope, `g` and the params in the body. `function g end` declares a local
+    # generic function; an anonymous `function (x) … end` binds only `x`.
+    sig = _method_signature(e.args[1]; anonymous=true)
+    if length(e.args) == 1
+        _push_if_symbol!(locals, e.args[1])
+        e
+    elseif isnothing(sig)
+        Expr(:function, e.args[1], walk_rhs(e.args[2]; locals, properties, lnn))
     else
-        Expr(:function, sig, walk_rhs(e.args[2]; locals, properties, lnn))
+        Expr(:function, e.args[1], walk_rhs(e.args[2]; locals=_bind_local_method!(locals, sig), properties, lnn))
     end
 elseif e.head == :try
-    # try; body; catch e; catch_body; [finally; finally_body;] end
-    # args: [try_body, catch_var, catch_body, [finally_body]]
-    walked_try = walk_rhs(e.args[1]; locals, properties, lnn)
+    # try; body; catch e; catch_body; [finally; finally_body;] [else; else_body;] end
+    # args: [try_body, catch_var, catch_body, [finally_body or false, [else_body]]]
+    # Every block is its own scope; the catch variable is local to the catch block.
     catch_var = e.args[2]  # Symbol or false
-    catch_locals = catch_var === false ? locals : union(locals, Set([catch_var]))
-    walked_catch = walk_rhs(e.args[3]; locals=catch_locals, properties, lnn)
-    if length(e.args) >= 4
-        walked_finally = walk_rhs(e.args[4]; locals, properties, lnn)
-        Expr(:try, walked_try, catch_var, walked_catch, walked_finally)
-    else
-        Expr(:try, walked_try, catch_var, walked_catch)
+    catch_locals = catch_var === false ? copy(locals) : union(locals, Set([catch_var]))
+    walked = Any[walk_rhs(e.args[1]; locals=copy(locals), properties, lnn), catch_var,
+        walk_rhs(e.args[3]; locals=catch_locals, properties, lnn)]
+    for block in e.args[4:end]
+        push!(walked, walk_rhs(block; locals=copy(locals), properties, lnn))
     end
+    Expr(:try, walked...)
 elseif e.head in (:kw, :(=))
-    # For local function defs like f(x) = x + 1, add func name + params as locals in body
-    if Meta.isexpr(e.args[1], :call)
-        ls = extractnames(e.args[1].args)  # includes func name + params
-        new_locals = union(locals, ls)
-        Expr(e.head, e.args[1], walk_rhs.(e.args[2:end]; locals=new_locals, properties, lnn)...)
+    sig = _method_signature(e.args[1])
+    if !isnothing(sig)
+        # Local method definition `f(x) = …` (also `f(x)::T = …`, `f(x) where T = …`):
+        # `f` is local in the enclosing scope, `f` and the params in the body.
+        Expr(e.head, e.args[1], walk_rhs.(e.args[2:end]; locals=_bind_local_method!(locals, sig), properties, lnn)...)
     else
         # Warn if assigning to a property name inside a block — likely intended as local
         lhs = e.args[1]
