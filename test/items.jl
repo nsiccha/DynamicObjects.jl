@@ -1002,7 +1002,9 @@ end
     # those files back into the in-memory PropertyCache.
     @test haskey(app.cache.cache, :a)
     clear_mem_caches!(app)
-    @test isempty(app.cache.cache)
+    # No memoized value is left: only the indexed wrapper stays, its entries dropped.
+    @test collect(keys(app.cache.cache)) == [:b]
+    @test isempty(app.b.cache)
     @test isfile(a_path)
     @test isfile(b_path)
     @test app.a == 42

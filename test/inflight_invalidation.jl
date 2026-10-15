@@ -7,7 +7,7 @@ using TestItemRunner
 # a test decides which in-flight computation finishes when.
 @testmodule InflightInvalidationFixtures begin
 using DynamicObjects
-export Book, DiskBook, GovernedBook, StateBook, GOVERNED_BASE, gate_open!, reset_gates!, next_read
+export Book, DiskBook, GovernedBook, StateBook, GOVERNED_BASE, gate_open!, reset_gates!, next_read, waiting
 
 const GATES = Dict{String,Channel{Nothing}}()
 const GATES_LOCK = ReentrantLock()
@@ -16,6 +16,13 @@ gate(content) = lock(() -> get!(() -> Channel{Nothing}(Inf), GATES, content), GA
 gate_open!(content) = put!(gate(content), nothing)
 reset_gates!() = (lock(() -> empty!(GATES), GATES_LOCK); while isready(READS); take!(READS); end)
 next_read(seconds=10) = timedwait(() -> isready(READS), seconds) === :ok ? take!(READS) : nothing
+
+# How many tasks are parked on the in-flight latch of `key` in cache `c` (blocking
+# waiters, `fetch`es of a `Pending`), so a test invalidates only once they wait there.
+waiting(c, key) = lock(c.lock) do
+    cnd = get(c.computing, key, nothing)
+    cnd === nothing ? 0 : length(cnd.waitq)
+end
 
 gated_read(path) = begin
     content = read(path, String)
@@ -29,6 +36,7 @@ end
     source = TrackedFile(path; read = p -> read(p, String))
     rates = gated_read(path)
     summary = "summary of " * rates
+    chapter(i) = gated_read(path) * string(i)
     tracked_summary = "tracked " * read(source)
     # Refreshers that write the data file and invalidate from inside their own compute.
     @fresh refresh_all(new) = (write(path, new); clear_mem_caches!(__self__); new)
@@ -226,4 +234,69 @@ state = fetch(initializing)
 @test fetch(reader) === state
 @test book.log === state                        # stored: one state object, one init
 @test next_read(1) === nothing                  # the initializer ran once
+end
+
+@testitem "waiters of a retracted computation re-resolve at the invalidation" setup=[InflightInvalidationFixtures] begin
+using DynamicObjects
+# The retracted computation stays blocked until the end: its waiters, blocking ones and
+# `fetch`es of a poll handle taken before, must not wait for it.
+bare = (; access = b -> b.rates, cache = b -> getfield(b, :cache).cache, key = :rates,
+          handle = b -> DynamicObjects.fetchproperty((value, status) -> value, b, :rates),
+          old = "old", new = "new")
+indexed = (; access = b -> b.chapter(1), cache = b -> b.chapter.cache, key = ((1,), (;)),
+             handle = b -> fetchindex((value, status) -> value, b.chapter, 1),
+             old = "old1", new = "new1")
+invalidations = (("clear_mem_caches!", b -> clear_mem_caches!(b), (bare, indexed)),
+                 ("clear_cache!", b -> DynamicObjects.clear_cache!(b, :rates), (bare,)),
+                 ("clear_cache! indexed", b -> DynamicObjects.clear_cache!(b, :chapter), (indexed,)),
+                 ("invalidate!", b -> invalidate!(b.chapter, 1), (indexed,)))
+for (label, invalidate, shapes) in invalidations, shape in shapes
+    reset_gates!()
+    path = tempname(); write(path, "old")
+    book = Book(path)
+    computer = Threads.@spawn shape.access(book)
+    @test next_read() == "old"
+    waiter = Threads.@spawn shape.access(book)
+    handle = shape.handle(book)
+    @test handle isa Pending
+    fetched = Threads.@spawn fetch(handle)
+    @test timedwait(() -> waiting(shape.cache(book), shape.key) == 2, 10) === :ok
+    write(path, "new")
+    invalidate(book)
+    # Re-resolving, the waiters start one current computation and share it; nothing else
+    # accesses the property meanwhile, and the retracted computation is still blocked.
+    @test next_read() == "new"
+    gate_open!("new")
+    released = timedwait(() -> istaskdone(waiter) && istaskdone(fetched), 10) === :ok
+    @test released
+    @test !istaskdone(computer)
+    # The object reads the value they computed.
+    released && @test shape.access(book) == shape.new
+    @test next_read(0.5) === nothing
+    # Unblock everything, including what a regression would leave waiting.
+    gate_open!("old"); gate_open!("new"); gate_open!("new")
+    @test fetch(computer) == shape.old
+    @test fetch(waiter) == shape.new
+    @test fetch(fetched) == shape.new
+    @test shape.access(book) == shape.new          # the retracted computation never landed
+end
+end
+
+@testitem "clear_mem_caches! keeps every holder of an indexed subcache attached" setup=[InflightInvalidationFixtures] begin
+using DynamicObjects
+reset_gates!()
+path = tempname(); write(path, "a")
+book = Book(path)
+held = book.chapter                             # a destructured wrapper handle
+for content in ("a", "b", "c")
+    write(path, content)
+    clear_mem_caches!(book)
+    gate_open!(content); gate_open!(content)    # a detached subcache would compute twice
+    @test held(1) == content * "1"
+    @test next_read() == content
+    # The object and the handle share one computation per clear, however many clears
+    # came before.
+    @test book.chapter(1) == content * "1"
+    @test next_read(0.5) === nothing
+end
 end
