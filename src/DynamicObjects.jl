@@ -953,6 +953,25 @@ struct ThreadsafeDict{K,V} <: AbstractThreadsafeDict{K,V}
     ThreadsafeDict() = new{Any,Any}(ReentrantLock(), Dict{Any,Any}(), Dict{Any,Any}(), Dict{Any,Threads.Condition}(), Dict{Any,Any}())
 end
 
+# An invalidation retracts the in-flight latch of `key` from a `computing` dict, under
+# the latch's lock. The retracted computation publishes nothing (`_run_cache_compute!`),
+# so the latch is notified here rather than when that computation ends: waiters parked
+# on it wake now, find it gone, and re-resolve — they join a computation started since,
+# or start one — however long the retracted computation still runs.
+function _retract!(computing::AbstractDict, key)
+    cnd = get(computing, key, nothing)
+    cnd === nothing && return nothing
+    delete!(computing, key)
+    notify(cnd)
+    nothing
+end
+function _retract_all!(computing::AbstractDict)
+    latches = collect(values(computing))
+    empty!(computing)
+    foreach(notify, latches)
+    nothing
+end
+
 # A remounted object needs two cache namespaces under one lock: intrinsic keys
 # continue to address the retained object's dictionaries, while rebound keys and
 # every property derived from them address request-local dictionaries. Keeping the
@@ -1200,7 +1219,7 @@ function Base.setindex!(c::MountedThreadsafeDict, value, key::Symbol)
         push!(c.local_names, key)
         c.cache.overlay[key] = value
         delete!(c.status.overlay, key)
-        delete!(c.computing.overlay, key)
+        _retract!(c.computing.overlay, key)
         delete!(c.errors.overlay, key)
     end
     value
@@ -1209,9 +1228,9 @@ end
 Base.empty!(c::MountedThreadsafeDict) = begin
     lock(c.lock) do
         empty!(c.shared.cache); _empty_status!(c.shared.status)
-        empty!(c.shared.computing); empty!(c.shared.errors)
+        _retract_all!(c.shared.computing); empty!(c.shared.errors)
         empty!(c.cache.overlay); empty!(c.status.overlay)
-        empty!(c.computing.overlay); empty!(c.errors.overlay)
+        _retract_all!(c.computing.overlay); empty!(c.errors.overlay)
     end
     c
 end
@@ -1229,7 +1248,7 @@ Base.get(c::AbstractThreadsafeDict, key, default) = lock(c.lock) do; get(c.cache
 # lock(c.lock) do ... end or entries(ip) which holds the lock for the full sweep.
 Base.iterate(c::AbstractThreadsafeDict) = lock(c.lock) do; iterate(c.cache); end
 Base.iterate(c::AbstractThreadsafeDict, state) = lock(c.lock) do; iterate(c.cache, state); end
-Base.empty!(c::ThreadsafeDict) = (lock(c.lock) do; empty!(c.cache); _empty_status!(c.status); empty!(c.computing); empty!(c.errors); end; c)
+Base.empty!(c::ThreadsafeDict) = (lock(c.lock) do; empty!(c.cache); _empty_status!(c.status); _retract_all!(c.computing); empty!(c.errors); end; c)
 n_running(c::AbstractThreadsafeDict) = lock(c.lock) do; length(c.computing); end
 Base.show(io::IO, c::ThreadsafeDict{K,V}) where {K,V} = lock(c.lock) do
     print(io, "ThreadsafeDict{", K, ",", V, "}(", length(c.cache), " cached, ", length(c.computing), " running)")
@@ -1709,9 +1728,9 @@ end
 # already released and no lock held.
 #
 # An invalidation (`clear_mem_caches!`, `clear_cache!`, `sync!`, `invalidate!`, `force=true`)
-# retracts the latch of a compute in flight. Such a compute may have read what was
-# invalidated, so it publishes nothing: its value (or failure) goes to its own caller only,
-# and the waiters it releases find the latch gone and re-resolve against the current state.
+# retracts the latch of a compute in flight and wakes its waiters (`_retract!`), which find
+# the latch gone and re-resolve against the current state. Such a compute may have read what
+# was invalidated, so it publishes nothing: its value (or failure) goes to its own caller only.
 function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condition, f, s)
     local v
     _start_substatus!(s)
@@ -1731,7 +1750,7 @@ function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condit
     end
     stored, published = lock(c.lock) do
         if get(c.computing, key, nothing) !== cnd
-            notify(cnd)                # retracted mid-flight: waiters re-resolve
+            notify(cnd)                # retracted mid-flight (its waiters already woke then)
             return (v, false)
         end
         existing = get(c.cache, key, _missing_sentinel)
@@ -1802,7 +1821,8 @@ property's `DynamicObjects.property_executor`) carries that executor, and a bloc
 
 If the computation is invalidated while in flight (`clear_mem_caches!`, `clear_cache!`,
 `sync!`, `invalidate!`, `force=true`), its value is not stored, and `fetch` re-resolves the
-access: it waits for a computation started since, or starts one.
+access: it waits for a computation started since, or starts one. A `fetch` already waiting
+re-resolves at the invalidation, not when the invalidated computation ends.
 """
 struct Pending{C<:AbstractThreadsafeDict, K, S, E, R}
     cache::C
@@ -2254,7 +2274,7 @@ end
 Base.delete!(c::AbstractThreadsafeDict, key) = begin
     lock(c.lock) do
         delete!(c.status, key)
-        delete!(c.computing, key)
+        _retract!(c.computing, key)
         delete!(c.errors, key)
         _drop_order!(c, key)
         delete!(c.cache, key)
@@ -2300,7 +2320,9 @@ compute handle): invalidating while a compute runs does not stop it, and its
 caller gets its value. But the value may derive from what was invalidated, so
 the compute stores nothing — no memory value, no `@cached`/`@mmap` entry, no
 automatic entry. Blocking waiters and a [`Pending`](@ref) handle taken before
-re-resolve: they wait for a compute started since, or start one. So a re-access
+re-resolve: they wait for a compute started since, or start one. They do so at
+the invalidation, not when the invalidated compute ends, so one that never
+finishes holds up nobody but its own caller. So a re-access
 after `invalidate!`, and `force=true`, always serve a post-invalidation value.
 This holds wherever the invalidation is issued from, including the body of a
 computation of the same object.
@@ -2835,7 +2857,7 @@ maybepop!(c::AbstractDict, key) = haskey(c, key) && pop!(c, key)
 maybepop!(c::AbstractThreadsafeDict, key) = begin
     lock(c.lock) do
         maybepop!(c.cache, key)
-        maybepop!(c.computing, key)
+        _retract!(c.computing, key)
         maybepop!(c.errors, key)
         maybepop!(c.status, key)
         _drop_order!(c, key)
@@ -3110,18 +3132,19 @@ survives the clear, including through a [`remount`](@ref) view. Reset one with
 `DynamicObjects.clear_cache!(obj, :name)`.
 
 Indexed-property entries are dropped from the per-argument subcaches
-themselves, not merely by dropping the top-level wrapper: a live
-[`remount`](@ref) request view (or any destructured wrapper handle) shares
-the retained subcache object, so dropping only the wrapper would leave a
-same-request render serving pre-clear values while later requests
-recompute. After this call every holder re-reads from scratch.
+themselves, which stay attached to the object: a live [`remount`](@ref)
+request view, a destructured wrapper handle, and a waiter or `Pending` of a
+dropped computation all share the retained subcache object, so they re-read
+from scratch and share what the object computes afterwards, across any
+number of later clears.
 
 This is useful after hot-reloading code via Revise: property values computed by
 old method definitions stay memoized until the process restarts or this function
 is called.
 
 In-flight semantics: as with [`invalidate!`](@ref), a compute running at
-clear time stores nothing; its caller gets its value, and waiters re-resolve.
+clear time stores nothing; its caller gets its value, and waiters re-resolve
+at once, without waiting for it to finish.
 A `@state` computation in flight is kept, like a settled `@state` value. This
 also drops the object's progress root (`__status__`) unless it was passed in;
 from inside a computation, prefer the narrower `sync!` after `notify_change!`,
@@ -3131,30 +3154,34 @@ function clear_mem_caches!(obj)
     pc = getfield(obj, :cache)
     c = pc.cache
     state = _state_names(typeof(obj))
-    # Snapshot the wrapper subcaches under the top lock, then empty each under
-    # its own lock. A per-argument subcache object outlives the top-level
-    # wrapper entry through every alias — a mounted request view shares it by
-    # design — so `empty!(c)` alone would leave those aliases stale. `@state`
-    # values (an indexed one's wrapper with its subcache) are snapshotted
-    # instead and put back, within the same critical section so no reader finds
-    # them missing. So is a `@state` computation in flight: its initializer reads
+    # The object's indexed-property wrappers are kept, their subcaches emptied in place,
+    # as `clear_cache!`/`sync!` do: a per-argument subcache outlives the
+    # top-level entry through every alias — a mounted request view shares it by
+    # design, a destructured handle holds it, and so does a waiter or `Pending`
+    # of a computation the clear retracts — so a wrapper dropped here would
+    # leave those holders on a detached subcache that later reads and clears
+    # never reach. `@state` values (an indexed one's subcache too) are kept
+    # untouched. So is a `@state` computation in flight: its initializer reads
     # no derived value, so nothing it computes is stale, and its caller already
     # holds the object it is about to store (a retracted computation would store
-    # nothing, `_run_cache_compute!`).
+    # nothing, `_run_cache_compute!`). Everything kept is put back within the
+    # same critical section, so no reader finds it missing, and each subcache
+    # is then emptied under its own lock.
     subcaches = lock(c.lock) do
-        kept = Pair{Symbol,Any}[name => value for (name, value) in c.cache
-                if name in state && !(value isa Pending)]
-        running = [(name, c.computing[name], get(c.status, name, nothing))
-                   for name in state if haskey(c.computing, name)]
-        subcaches = [value.cache for (name, value) in c.cache
-                if value isa IndexableProperty && !(name in state)]
+        parts = _clear_parts(c)
+        kept = [(cache, name, value) for (cache, _, _) in parts for (name, value) in cache
+                if !(value isa Pending) && (name in state || _own_wrapper(obj, name, value))]
+        running = [(status, computing, name, computing[name], get(status, name, nothing))
+                   for (_, status, computing) in parts for name in state if haskey(computing, name)]
+        subcaches = [value.cache for (cache, _, _) in parts for (name, value) in cache
+                     if value isa IndexableProperty && !(name in state)]
         empty!(c)
-        for (name, value) in kept
-            c.cache[name] = value
+        for (cache, name, value) in kept
+            cache[name] = value
         end
-        for (name, latch, status) in running
-            c.computing[name] = latch
-            status === nothing || (c.status[name] = status)
+        for (status, computing, name, latch, node) in running
+            computing[name] = latch
+            node === nothing || (status[name] = node)
         end
         subcaches
     end
@@ -3162,6 +3189,18 @@ function clear_mem_caches!(obj)
     _restore_seeds!(pc)
     nothing
 end
+
+# The raw `(values, status, computing)` dictionaries a whole-object clear
+# empties: a remount view's own and those of its retained object, including
+# entries the view's routing masks (`empty!` of a view clears both).
+_clear_parts(c::ThreadsafeDict) = ((c.cache, c.status, c.computing),)
+_clear_parts(c::MountedThreadsafeDict) = ((c.shared.cache, c.shared.status, c.shared.computing),
+    (c.cache.overlay, c.status.overlay, c.computing.overlay))
+
+# Whether `value`, cached under `name`, is the wrapper of `obj`'s own indexed property
+# `name` — not a value that a bare property computed, which a clear drops.
+_own_wrapper(obj, name::Symbol, value) =
+    value isa IndexableProperty{name} && is_indexed_property(obj, name)
 
 # Names of `T`'s `@state` properties: per-instance state that whole-object
 # clears keep and `sync!` never drops. `@dynamicstruct` emits a method for each
