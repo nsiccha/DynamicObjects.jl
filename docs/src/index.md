@@ -121,6 +121,17 @@ Two access forms:
 | `obj.prop(args...)`        | Look up `(args, kwargs)` in the per-property dict (cached access). |
 | `@fresh obj.prop(args...)` | Recompute, bypassing the in-memory cache.                          |
 
+Two calls share an entry when their arguments are `isequal`: an equal but
+distinct `Dict`, a new literal `[1, 2]`, or `1:2` in place of `[1, 2]` all
+find the same entry. A mutable argument (a `Dict`, `Vector`, `Set`, or mutable
+struct) is content-hashed the first time a call passes that object and is
+remembered by identity afterwards. So a helper called once per row with one
+shared context pays for hashing that context once, not once per call. Never
+mutate an argument after passing it: a later call with the mutated object
+finds the entry stored for its old contents. A memoized call still stores its
+result, so a helper whose arguments never repeat (a per-row render helper, for
+instance) is better declared `@fresh name(args...) = …`.
+
 `@memo! obj.prop(args...)` is an explicit equivalent of the bare cached call.
 It is useful when code wants to emphasize caching, or when wrapping an
 expression whose callees may or may not be `IndexableProperty` values.
