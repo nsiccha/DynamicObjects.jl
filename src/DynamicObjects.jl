@@ -1381,12 +1381,16 @@ end
 Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substatus=nothing, retry_failed=true) = begin
     # Fast path: a ready value returns immediately, no substatus cost. (`_missing_sentinel`
     # distinguishes "absent" from a legitimately-cached `nothing`.)
+    t0 = _trace_clock()
     hit = lock(c.lock) do
         v = get(c.cache, key, _missing_sentinel)
         v !== _missing_sentinel && (_on_hit!(c, key); return v)
         _missing_sentinel
     end
-    hit === _missing_sentinel || return hit
+    if hit !== _missing_sentinel
+        t0 == 0 || _trace_read!(f, :hit, t0)
+        return hit
+    end
     # Build the substatus OUTSIDE the lock — factories recurse into DO props on the SAME
     # lock, so building under it would deadlock.
     s = isnothing(substatus) ? nothing : substatus()
@@ -1415,9 +1419,14 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
         return sync && executor === nothing ? (:inline, cnd) : (:start, cnd)
     end
     kind = action[1]
-    kind === :value && (!isnothing(s) && _finalize_substatus!(s); return action[2])
+    if kind === :value
+        !isnothing(s) && _finalize_substatus!(s)
+        t0 == 0 || _trace_read!(f, :hit, t0)
+        return action[2]
+    end
     if kind === :error
         !isnothing(s) && _finalize_substatus!(s)
+        t0 == 0 || _trace_read!(f, :failed, t0)
         throw(action[2])
     end
     if kind === :wait
@@ -1429,6 +1438,7 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     if kind === :pending
         # Poller, compute already in flight elsewhere — hand back a cheap Pending, no spawn.
         !isnothing(s) && _finalize_substatus!(s)
+        t0 == 0 || _trace_read!(f, :pending, t0)
         return fetch(Pending(c, key, nothing, executor, _resolver(f, c, key, fetch, substatus, retry_failed)))
     end
     if kind === :inline
@@ -1448,6 +1458,7 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     p = Pending(c, key, nothing, executor, _resolver(f, c, key, fetch, substatus, retry_failed))
     # An executor may have run the compute synchronously: hand back the value.
     executor !== nothing && isready(p) && return Base.fetch(p)
+    t0 == 0 || _trace_read!(f, :pending, t0)
     return fetch(p)
 end
 
@@ -1499,8 +1510,9 @@ mutable struct DeferredCompute
     const f::Any
     const status::Any
     @atomic claimed::Bool
+    const trace_scope::Any   # the compute trace scope it was started in (`with_compute_trace`)
 end
-DeferredCompute(c, key, cnd, f, s) = DeferredCompute(c, key, cnd, f, s, false)
+DeferredCompute(c, key, cnd, f, s) = DeferredCompute(c, key, cnd, f, s, false, _trace_scope())
 
 _claim!(d::DeferredCompute) = (@atomicswap d.claimed = true) === false
 
@@ -1514,7 +1526,9 @@ run or abandoned. Failures are recorded for waiters/pollers, not rethrown.
 function run!(d::DeferredCompute)
     _claim!(d) || return false
     try
-        _run_cache_compute!(d.cache, d.key, d.latch, d.f, d.status)
+        _in_trace_scope(d.trace_scope) do
+            _run_cache_compute!(d.cache, d.key, d.latch, d.f, d.status)
+        end
     catch
         # recorded in `d.cache.errors` and the substatus by `_run_cache_compute!`
     end
@@ -1763,6 +1777,435 @@ _start_compute(executor, d::DeferredCompute) = (executor(d); nothing)
 struct _Missing end
 const _missing_sentinel = _Missing()
 
+# --- Compute trace -----------------------------------------------------------------------
+#
+# An opt-in, scoped record of what property reads did (snag `no-trace-of-what-e8f9d53e`).
+# `with_compute_trace(f)` collects, per `(type, property)`, the reads that hit memory, waited
+# for a computation running elsewhere, computed (memoized), ran uncached (`@fresh`), loaded a
+# disk entry or threw, with their times, plus a log of the invalidations issued meanwhile.
+#
+# The trace follows the calling task into tasks it spawns (a `ScopedValue`), and into deferred
+# work: a `DeferredCompute` or `QueuedCall` captures the trace scope it was created in and
+# re-enters it when it runs, because executor workers and job-queue admissions run it on a
+# task whose own scope belongs to someone else.
+#
+# With no trace active anywhere, each hook costs one atomic load (`_ACTIVE_TRACES`).
+
+mutable struct _TraceStats
+    calls::Int
+    hits::Int
+    computed::Int
+    fresh::Int
+    disk::Int
+    waits::Int
+    pending::Int
+    errors::Int
+    hit_ns::UInt64
+    wait_ns::UInt64
+    total_ns::UInt64
+    self_ns::UInt64
+    max_ns::UInt64
+end
+_TraceStats() = _TraceStats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+"""
+    ComputeTraceEvent
+
+One read a [`ComputeTrace`](@ref) kept (`with_compute_trace(f; events=n)`): `at` (seconds
+since the trace started), `type`, `property`, `args` (the `(indices, kwargs)` of an indexed
+read, held by reference, or `nothing` for a bare read), `outcome` (`:hit`, `:wait`,
+`:pending`, `:computed`, `:disk`, `:fresh`, `:error` or `:failed`) and `duration` (seconds).
+"""
+struct ComputeTraceEvent
+    at::Float64
+    type::DataType
+    property::Symbol
+    args::Any
+    outcome::Symbol
+    duration::Float64
+end
+
+"""
+    ComputeTraceInvalidation
+
+One invalidation a [`ComputeTrace`](@ref) logged: `at` (seconds since the trace started),
+`verb` (`:clear_mem_caches!`, `:clear_cache!`, `:invalidate!`, `:sync!` or
+`:clear_disk_caches!`), the object's `type`, the property names it `dropped` (that held a
+value), the entry `key` `(indices, kwargs)` of a per-entry `invalidate!` (else `nothing`), and
+`issued_from`: `(type, property)` of the traced computation running on the issuing task, or
+`nothing` when it was issued outside one.
+"""
+struct ComputeTraceInvalidation
+    at::Float64
+    verb::Symbol
+    type::DataType
+    dropped::Vector{Symbol}
+    key::Any
+    issued_from::Union{Nothing,Tuple{DataType,Symbol}}
+end
+
+"""
+    ComputeTrace(; events=0, invalidations=1000)
+
+What property reads did while a [`with_compute_trace`](@ref) scope using it was active. Show
+it for a per-property table and the invalidation log; [`compute_trace_rows`](@ref) returns the
+table as data. Fields:
+
+- `events::Vector{ComputeTraceEvent}`: the first `events` reads (none by default), and
+  `events_dropped`, how many more were not kept;
+- `invalidations::Vector{ComputeTraceInvalidation}`: the first `invalidations` invalidations,
+  and `invalidations_dropped`.
+
+A trace records only while one of its scopes is active, so a trace whose scopes have all
+ended never changes, even when a task spawned inside one of them outlives it.
+"""
+mutable struct ComputeTrace
+    const lock::ReentrantLock
+    const stats::Dict{Tuple{DataType,Symbol},_TraceStats}
+    const events::Vector{ComputeTraceEvent}
+    const invalidations::Vector{ComputeTraceInvalidation}
+    const max_events::Int
+    const max_invalidations::Int
+    events_dropped::Int
+    invalidations_dropped::Int
+    first_ns::UInt64        # first activation; 0 before
+    active::Int             # active `with_compute_trace` scopes using this trace
+    active_since_ns::UInt64
+    traced_ns::UInt64       # wall time of the ended activations
+end
+ComputeTrace(; events::Integer=0, invalidations::Integer=1000) =
+    ComputeTrace(ReentrantLock(), Dict{Tuple{DataType,Symbol},_TraceStats}(),
+                 ComputeTraceEvent[], ComputeTraceInvalidation[],
+                 max(0, Int(events)), max(0, Int(invalidations)), 0, 0, 0, 0, 0, 0)
+
+# The traces a task records into: the innermost scope's trace, then each enclosing one.
+struct _TraceScope
+    trace::ComputeTrace
+    outer::Union{Nothing,_TraceScope}
+end
+const _TRACE = ScopedValues.ScopedValue{Union{Nothing,_TraceScope}}(nothing)
+# Active `with_compute_trace` scopes in the process: the gate every hook reads first.
+const _ACTIVE_TRACES = Threads.Atomic{Int}(0)
+
+_trace_scope() = _ACTIVE_TRACES[] == 0 ? nothing : _TRACE[]
+# A start time for a read that may be traced; 0 when no trace is active anywhere.
+_trace_clock() = _ACTIVE_TRACES[] == 0 ? UInt64(0) : time_ns()
+
+_scope_has(::Nothing, ::ComputeTrace) = false
+_scope_has(s::_TraceScope, t::ComputeTrace) = s.trace === t || _scope_has(s.outer, t)
+
+"""
+    with_compute_trace(f; events=0, invalidations=1000) -> (value, trace::ComputeTrace)
+    with_compute_trace(f, trace::ComputeTrace) -> value
+
+Run `f()` and record what DynamicObjects property reads did meanwhile: on this task, on tasks
+it spawns, and in computations it hands to an executor or the `@queued` job queue. Show the
+returned [`ComputeTrace`](@ref) for a per-property table, sorted by own time, plus the
+invalidations issued:
+
+```julia
+value, trace = DynamicObjects.with_compute_trace() do
+    render_page(app)
+end
+trace
+```
+
+Per `(type, property)` the table counts:
+
+- `calls`: recorded reads. A blocking read of a property with a declared executor records
+  both its computation (on the worker) and its wait;
+- `hits`: reads served from memory; `hit s` is their time, including the hashing of the key;
+- `computed`: memoized computations; `disk`: those served from a `@cached`/`@mmap` entry;
+- `fresh`: uncached computations (`@fresh`, `fresh`);
+- `waits`: reads that blocked on a computation running on another task, or in an executor;
+  `wait s` is the time blocked. A blocking `fetch` of a [`Pending`](@ref) handle is not a
+  read and is not recorded;
+- `pending`: polls that got a [`Pending`](@ref);
+- `errors`: computations that threw, and reads that surfaced a recorded failure.
+
+`total s` is the wall time of the property's computations, including nested reads, and
+`max s` the slowest one. `self s` is `total s` minus the nested reads recorded on the
+computing task, so `self s`, `hit s` and `wait s` partition the traced time of one task. Time
+a computation spends blocked on tasks it spawned counts as its own.
+
+The second form records into an existing `trace`, which is still filled in when `f` throws,
+and can be reused to collect several calls. Traces nest: an inner scope also records into
+the enclosing traces. Properties named `__name__` (status, hashes, cache paths) are not
+recorded: their cost counts as the self time of the property that read them. Invalidations
+are logged in order: `clear_mem_caches!`, `clear_cache!`, `invalidate!` (also behind
+`fetchindex(…; force=true)`), `sync!` (per object whose memory values it dropped) and
+`clear_disk_caches!`.
+
+With no trace active, tracing costs one atomic load per property read.
+"""
+function with_compute_trace(f; events::Integer=0, invalidations::Integer=1000)
+    trace = ComputeTrace(; events, invalidations)
+    value = with_compute_trace(f, trace)
+    (value, trace)
+end
+function with_compute_trace(f, trace::ComputeTrace)
+    _trace_activate!(trace)
+    Threads.atomic_add!(_ACTIVE_TRACES, 1)
+    try
+        outer = _TRACE[]
+        _scope_has(outer, trace) ? f() : ScopedValues.with(f, _TRACE => _TraceScope(trace, outer))
+    finally
+        Threads.atomic_sub!(_ACTIVE_TRACES, 1)
+        _trace_deactivate!(trace)
+    end
+end
+
+_trace_activate!(t::ComputeTrace) = lock(t.lock) do
+    t.active += 1
+    if t.active == 1
+        now = time_ns()
+        t.first_ns == 0 && (t.first_ns = now)
+        t.active_since_ns = now
+    end
+    nothing
+end
+_trace_deactivate!(t::ComputeTrace) = lock(t.lock) do
+    t.active -= 1
+    t.active == 0 && (t.traced_ns += time_ns() - t.active_since_ns)
+    nothing
+end
+
+# Seconds since `t` first started (the caller holds `t.lock`).
+_trace_at(t::ComputeTrace) = (time_ns() - t.first_ns) / 1e9
+
+# DynamicObjects' own `__name__` properties are not recorded.
+_traced_name(name::Symbol) = !_is_dunder_name(name)
+function _is_dunder_name(name::Symbol)
+    s = String(name)
+    ncodeunits(s) > 4 && startswith(s, "__") && endswith(s, "__")
+end
+
+# The arguments a read is recorded with: `nothing` for a bare read.
+_trace_args(indices::Tuple, kwargs::NamedTuple) =
+    isempty(indices) && isempty(kwargs) ? nothing : (indices, kwargs)
+
+# A traced computation running on this task. Reads nested in it add their time to
+# `child_ns`; a disk load marks it `disk`.
+mutable struct _TraceFrame
+    const scope::_TraceScope
+    const type::DataType
+    const name::Symbol
+    const args::Any
+    const start_ns::UInt64
+    child_ns::UInt64
+    disk::Bool
+end
+const _TRACE_FRAMES = :__dynamicobjects_trace_frames__
+
+_trace_frames() = get!(() -> _TraceFrame[], task_local_storage(), _TRACE_FRAMES)::Vector{_TraceFrame}
+# The innermost traced computation on this task, without creating task-local storage.
+function _trace_top()
+    storage = current_task().storage
+    storage === nothing && return nothing
+    frames = get(storage, _TRACE_FRAMES, nothing)
+    frames === nothing || isempty(frames) ? nothing : last(frames)::_TraceFrame
+end
+
+# Record one outcome of a read of `o.name` in every trace of `scope`.
+function _trace_record!(scope::_TraceScope, T::DataType, name::Symbol, args, outcome::Symbol,
+                        dt::UInt64, self::UInt64)
+    s = scope
+    while s !== nothing
+        _trace_add!(s.trace, T, name, args, outcome, dt, self)
+        s = s.outer
+    end
+    nothing
+end
+function _trace_add!(t::ComputeTrace, T::DataType, name::Symbol, args, outcome::Symbol,
+                     dt::UInt64, self::UInt64)
+    lock(t.lock) do
+        t.active > 0 || return nothing
+        st = get!(_TraceStats, t.stats, (T, name))
+        st.calls += 1
+        _trace_count!(st, Val(outcome), dt, self)
+        if length(t.events) < t.max_events
+            push!(t.events, ComputeTraceEvent(_trace_at(t), T, name, args, outcome, dt / 1e9))
+        elseif t.max_events > 0
+            t.events_dropped += 1
+        end
+        nothing
+    end
+end
+_trace_count!(st::_TraceStats, ::Val{:hit}, dt, self) = (st.hits += 1; st.hit_ns += dt)
+_trace_count!(st::_TraceStats, ::Val{:wait}, dt, self) = (st.waits += 1; st.wait_ns += dt)
+_trace_count!(st::_TraceStats, ::Val{:pending}, dt, self) = (st.pending += 1)
+_trace_count!(st::_TraceStats, ::Val{:failed}, dt, self) = (st.errors += 1)
+_trace_count!(st::_TraceStats, ::Val{:computed}, dt, self) = (st.computed += 1; _trace_time!(st, dt, self))
+_trace_count!(st::_TraceStats, ::Val{:disk}, dt, self) = (st.disk += 1; _trace_time!(st, dt, self))
+_trace_count!(st::_TraceStats, ::Val{:fresh}, dt, self) = (st.fresh += 1; _trace_time!(st, dt, self))
+_trace_count!(st::_TraceStats, ::Val{:error}, dt, self) = (st.errors += 1; _trace_time!(st, dt, self))
+_trace_time!(st::_TraceStats, dt, self) =
+    (st.total_ns += dt; st.self_ns += self; st.max_ns = max(st.max_ns, dt))
+
+# Record a read of `o.name` started at `t0` (`_trace_clock()`, nonzero) that did not run a
+# computation on this task (a hit, a wait, a poll); its time is nested work of the
+# computation running on this task.
+function _trace_read!(o, name::Symbol, args, outcome::Symbol, t0::UInt64)
+    scope = _TRACE[]
+    (scope === nothing || !_traced_name(name)) && return nothing
+    dt = time_ns() - t0
+    top = _trace_top()
+    top === nothing || (top.child_ns += dt)
+    _trace_record!(scope, typeof(o), name, args, outcome, dt, UInt64(0))
+end
+# The same for a read through a cache `get!`, which knows the property from its compute.
+_trace_read!(f, outcome::Symbol, t0::UInt64) = nothing
+_trace_read!(s::_Settling, outcome::Symbol, t0::UInt64) =
+    _trace_read!(s.o, s.name, _trace_args(s.args, s.kwargs), outcome, t0)
+
+# Run `compute()` (a computation of `o.name`) as a traced computation. `memoized`: whether
+# it publishes into a cache (a memoized computation) rather than computing fresh.
+function _traced_compute(compute, scope::_TraceScope, o, name::Symbol, indices, kwargs, memoized::Bool)
+    frames = _trace_frames()
+    frame = _TraceFrame(scope, typeof(o), name, _trace_args(indices, kwargs), time_ns(), 0, false)
+    push!(frames, frame)
+    outcome = :error
+    try
+        v = compute()
+        outcome = frame.disk ? :disk : memoized ? :computed : :fresh
+        v
+    finally
+        last(frames) === frame && pop!(frames)
+        dt = time_ns() - frame.start_ns
+        parent = _trace_top()
+        parent === nothing || (parent.child_ns += dt)
+        _trace_record!(scope, frame.type, name, frame.args, outcome, dt, dt - min(dt, frame.child_ns))
+    end
+end
+
+# Mark the traced computation of `o.name` running on this task as served from (`true`) or
+# not from (`false`) its disk entry.
+function _trace_disk!(o, name::Symbol, disk::Bool)
+    _ACTIVE_TRACES[] == 0 && return nothing
+    top = _trace_top()
+    top !== nothing && top.type === typeof(o) && top.name === name && (top.disk = disk)
+    nothing
+end
+
+# Run `f()` in the trace scope `scope` captured when deferred work was created.
+_in_trace_scope(f, scope) = scope === _TRACE[] ? f() : ScopedValues.with(f, _TRACE => scope)
+
+# Log an invalidation of `o` in every trace of the current scope.
+function _trace_invalidation!(verb::Symbol, o, dropped, key=nothing)
+    scope = _trace_scope()
+    scope === nothing && return nothing
+    top = _trace_top()
+    from = top === nothing ? nothing : (top.type, top.name)
+    names = sort!(unique!(Symbol[n for n in dropped if _traced_name(n)]))
+    s = scope
+    while s !== nothing
+        t = s.trace
+        lock(t.lock) do
+            t.active > 0 || return
+            if length(t.invalidations) < t.max_invalidations
+                push!(t.invalidations, ComputeTraceInvalidation(_trace_at(t), verb, typeof(o), names, key, from))
+            else
+                t.invalidations_dropped += 1
+            end
+        end
+        s = s.outer
+    end
+    nothing
+end
+
+"""
+    compute_trace_rows(trace::ComputeTrace) -> Vector{NamedTuple}
+
+The per-property table of a [`ComputeTrace`](@ref) as data, one row per `(type, property)`
+with `type`, `property`, `calls`, `hits`, `computed`, `fresh`, `disk`, `waits`, `pending`,
+`errors` and the times in seconds `self_s`, `total_s`, `max_s`, `hit_s`, `wait_s` (see
+[`with_compute_trace`](@ref)). Sorted by own time, `self_s + hit_s`, then by `calls`.
+"""
+function compute_trace_rows(t::ComputeTrace)
+    rows = lock(t.lock) do
+        [(; type=T, property=name, st.calls, st.hits, st.computed, st.fresh, st.disk, st.waits,
+            st.pending, st.errors, self_s=st.self_ns / 1e9, total_s=st.total_ns / 1e9,
+            max_s=st.max_ns / 1e9, hit_s=st.hit_ns / 1e9, wait_s=st.wait_ns / 1e9)
+         for ((T, name), st) in t.stats]
+    end
+    sort!(rows; by=r -> (-(r.self_s + r.hit_s), -r.calls, string(r.type), string(r.property)))
+end
+
+# Wall time of `t`'s activations, including one still running.
+_trace_wall_s(t::ComputeTrace) = lock(t.lock) do
+    (t.traced_ns + (t.active > 0 ? time_ns() - t.active_since_ns : UInt64(0))) / 1e9
+end
+
+# Seconds with three decimals.
+function _trace_seconds(x::Real)
+    ms = round(Int, 1000 * x)
+    string(div(ms, 1000), ".", lpad(rem(ms, 1000), 3, '0'))
+end
+
+# A type as the report names it: unqualified, with its parameters (`View{:qt}`).
+_trace_type_label(T::DataType) =
+    isempty(T.parameters) ? string(nameof(T)) : string(nameof(T), "{", join(map(repr, T.parameters), ", "), "}")
+_trace_label(T::DataType, name::Symbol) = string(_trace_type_label(T), ".", name)
+
+# The table columns, in print order: header, row field, formatter, always shown.
+const _TRACE_COLUMNS = (
+    ("self s", :self_s, _trace_seconds, true),
+    ("total s", :total_s, _trace_seconds, false),
+    ("max s", :max_s, _trace_seconds, false),
+    ("hit s", :hit_s, _trace_seconds, false),
+    ("wait s", :wait_s, _trace_seconds, false),
+    ("calls", :calls, string, true),
+    ("hits", :hits, string, false),
+    ("computed", :computed, string, false),
+    ("fresh", :fresh, string, false),
+    ("disk", :disk, string, false),
+    ("waits", :waits, string, false),
+    ("pending", :pending, string, false),
+    ("errors", :errors, string, false),
+)
+
+Base.show(io::IO, t::ComputeTrace) = lock(t.lock) do
+    print(io, "ComputeTrace(", length(t.stats), " properties, ",
+          sum((st.calls for st in values(t.stats)); init=0), " reads, ",
+          length(t.invalidations) + t.invalidations_dropped, " invalidations)")
+end
+
+function Base.show(io::IO, ::MIME"text/plain", t::ComputeTrace)
+    rows = compute_trace_rows(t)
+    invalidations, inv_dropped, events, ev_dropped = lock(t.lock) do
+        (copy(t.invalidations), t.invalidations_dropped, length(t.events), t.events_dropped)
+    end
+    total(f) = sum((getfield(r, f) for r in rows); init=0)
+    print(io, "ComputeTrace: ", _trace_seconds(_trace_wall_s(t)), " s traced · ",
+          total(:calls), " reads · ", total(:hits), " hits · ", total(:computed), " computed · ",
+          total(:fresh), " fresh · ", total(:disk), " disk · ",
+          length(invalidations) + inv_dropped, " invalidations")
+    if !isempty(rows)
+        columns = [c for c in _TRACE_COLUMNS if c[4] || any(r -> getfield(r, c[2]) != 0, rows)]
+        cells = [[c[3](getfield(r, c[2])) for c in columns] for r in rows]
+        widths = [maximum(length, (c[1], (row[i] for row in cells)...)) for (i, c) in enumerate(columns)]
+        print(io, "\n ", join((lpad(c[1], w) for (c, w) in zip(columns, widths)), "  "), "  property")
+        for (r, row) in zip(rows, cells)
+            print(io, "\n ", join((lpad(x, w) for (x, w) in zip(row, widths)), "  "), "  ",
+                  _trace_label(r.type, r.property))
+        end
+    end
+    if !isempty(invalidations)
+        print(io, "\nInvalidations:")
+        for inv in invalidations
+            print(io, "\n  +", _trace_seconds(inv.at), " s  ", inv.verb, "(", _trace_type_label(inv.type), ")  ",
+                  inv.issued_from === nothing ? "issued outside a traced computation" :
+                      "issued from " * _trace_label(inv.issued_from...),
+                  "  dropped ", isempty(inv.dropped) ? "nothing" : join(inv.dropped, ", "))
+            inv.key === nothing || print(io, "  key ", repr(inv.key; context=:limit => true))
+        end
+        inv_dropped > 0 && print(io, "\n  … ", inv_dropped, " more not kept (invalidations=)")
+    end
+    events > 0 && print(io, "\n", events, " events kept in `trace.events`",
+                        ev_dropped > 0 ? ", $(ev_dropped) more not kept" : "")
+    nothing
+end
+
 # The publish guard of a running memoized computation: its latch. What the computation
 # publishes besides its value — a disk entry, an opaque requester's own value — checks the
 # guard first, so an invalidation that retracted the latch meanwhile is not undone. It lives
@@ -1860,12 +2303,14 @@ end
 # flight), recompute from scratch OUTSIDE the lock. With an executor the blocking part
 # runs inside `await_deferred`.
 function _await_cache_value!(c::AbstractThreadsafeDict, key, cnd::Threads.Condition, f; fetch=Base.fetch, substatus=nothing, retry_failed=true)
+    t0 = _trace_clock()
     outcome = _latch_outcome(c, key, cnd, false)
     if outcome[1] === :pending
         outcome = _blocking(_selector_executor(fetch)) do
             _latch_outcome(c, key, cnd, true)
         end
     end
+    t0 == 0 || _trace_read!(f, :wait, t0)
     outcome[1] === :value && return outcome[2]
     outcome[1] === :error && throw(outcome[2])
     return get!(f, c, key; fetch, substatus, retry_failed)   # :gone → recompute
@@ -2240,8 +2685,10 @@ mutable struct QueuedCall
     const status::Any                         # progress node for the "queued · #k" note
     const outcome::Channel{Tuple{Bool,Any}}   # (true, value) | (false, exception)
     @atomic claimed::Bool
+    const trace_scope::Any                    # the compute trace scope it was created in
 end
-QueuedCall(f; status=nothing) = QueuedCall(f, status, Channel{Tuple{Bool,Any}}(1), false)
+QueuedCall(f; status=nothing) =
+    QueuedCall(f, status, Channel{Tuple{Bool,Any}}(1), false, _trace_scope())
 
 _claim!(c::QueuedCall) = (@atomicswap c.claimed = true) === false
 
@@ -2249,7 +2696,7 @@ function run!(c::QueuedCall)
     _claim!(c) || return false
     _start_substatus!(c.status)
     outcome = try
-        (true, c.f())
+        (true, _in_trace_scope(c.f, c.trace_scope))
     catch err
         (false, err)
     end
@@ -2412,18 +2859,24 @@ This holds wherever the invalidation is issued from, including the body of a
 computation of the same object.
 """
 function invalidate!(ip::IndexableProperty, indices...; kwargs...)
-    maybepop!(ip.cache, _memo_key(indices, (;kwargs...)))
-    _remove_disk_entry!(ip.o, name(ip), indices...; kwargs...)
+    key = _memo_key(indices, (;kwargs...))
+    traced = _trace_scope() !== nothing
+    held = traced && haskey(ip.cache, key)
+    maybepop!(ip.cache, key)
+    on_disk = _remove_disk_entry!(ip.o, name(ip), indices...; kwargs...)
+    traced && _trace_invalidation!(:invalidate!, ip.o, held || on_disk ? (name(ip),) : (), _plain_key(key))
+    nothing
 end
 
 # Remove one entry's disk payload (explicit `@cached`/`@mmap` or automatic) and
-# its automatic-materialization metadata, if present.
+# its automatic-materialization metadata, if present. Returns whether a payload was removed.
 function _remove_disk_entry!(o, name::Symbol, indices...; kwargs...)
     path = get_cache_path(o, name, indices...; kwargs...)
-    isfile(path) && rm(path)
+    removed = isfile(path)
+    removed && rm(path)
     metadata_path = _automatic_materialization_path(path)
     isfile(metadata_path) && rm(metadata_path)
-    nothing
+    removed
 end
 
 # --- Stale-while-revalidate background cache -------------------------------------------
@@ -3243,6 +3696,7 @@ function clear_mem_caches!(obj)
     pc = getfield(obj, :cache)
     c = pc.cache
     state = _state_names(typeof(obj))
+    held = _trace_scope() === nothing ? nothing : _trace_held(c, state)
     # The object's indexed-property wrappers are kept, their subcaches emptied in place,
     # as `clear_cache!`/`sync!` do: a per-argument subcache outlives the
     # top-level entry through every alias — a mounted request view shares it by
@@ -3276,8 +3730,22 @@ function clear_mem_caches!(obj)
     end
     foreach(empty!, subcaches)
     _restore_seeds!(pc)
+    held === nothing || _trace_invalidation!(:clear_mem_caches!, obj, _trace_cleared(held, c, state))
     nothing
 end
+
+# What a whole-object clear finds, for a compute trace: the names holding a value, and the
+# indexed ones whose wrapper holds entries (a clear empties those, except `@state` ones).
+function _trace_held(c, state)
+    entries = lock(c.lock) do
+        [(name, value) for (cache, _, _) in _clear_parts(c) for (name, value) in cache]
+    end
+    (Set{Symbol}(first(e) for e in entries),
+     Symbol[name for (name, value) in entries
+            if value isa IndexableProperty && !(name in state) && length(value.cache) > 0])
+end
+# The names a clear dropped: gone afterwards (seeds come back), or emptied wrappers.
+_trace_cleared((names, filled), c, state) = union(setdiff(names, first(_trace_held(c, state))), filled)
 
 # The raw `(values, status, computing)` dictionaries a whole-object clear
 # empties: a remount view's own and those of its retained object, including
@@ -3343,8 +3811,8 @@ instance. In-memory values are left intact (they'll be stale until
 function clear_disk_caches!(obj)
     m = meta(typeof(obj))
     cp = obj.__cache_path__
-    isdir(cp) || return nothing
-    for (name, info) in m
+    removed = Symbol[]
+    isdir(cp) && for (name, info) in m
         isfixed(info) && continue
         prefix = string(name)
         for f in readdir(cp)
@@ -3355,9 +3823,11 @@ function clear_disk_caches!(obj)
                      f == prefix * ".sjl" * _AUTOMATIC_MATERIALIZATION_SUFFIX ||
                      startswith(f, prefix * "_"))
                 rm(joinpath(cp, f))
+                push!(removed, name)
             end
         end
     end
+    _trace_invalidation!(:clear_disk_caches!, obj, removed)
     nothing
 end
 
@@ -3496,7 +3966,18 @@ function _save_if_publishable!(guard, fmt::Val, path::AbstractString, value)
     false
 end
 
+# Every computation of a property goes through here: memoized, fresh, or loaded from disk.
+# Under an active compute trace it runs as a traced computation (`_traced_compute`); a
+# publish guard on this task means a memoized computation.
 _computeproperty(o, name, indices...; __status__=nothing, kwargs...) = begin
+    scope = _trace_scope()
+    (scope === nothing || !_traced_name(name)) &&
+        return _computeproperty_body(o, name, indices...; __status__, kwargs...)
+    _traced_compute(scope, o, name, indices, (;kwargs...), _publish_guard() !== nothing) do
+        _computeproperty_body(o, name, indices...; __status__, kwargs...)
+    end
+end
+_computeproperty_body(o, name, indices...; __status__=nothing, kwargs...) = begin
     vname = Val(name)
     guard = _publish_guard(; take=true)   # this computation's own, if memoized
     isnothing(__status__) && name != :__status__ && (__status__ = getorcomputeproperty(o, :__status__))
@@ -3557,6 +4038,7 @@ $_cache_context""")
                     cache_status = get_cache_status(cache_path)
                     rv = if cache_status == :ready
                         _report_disk_load!(__status__, cache_path, filesize(cache_path))
+                        _trace_disk!(o, name, true)
                         try
                             load(_disk_format(o, vname), cache_path, _disk_eltype(o, vname))
                         catch e
@@ -3571,6 +4053,7 @@ $_cache_context""")
                     end
                     if isnothing(rv) || resumes(o, vname, indices...; kwargs...)
                         @debug "Generating $cache_path...\n$_cache_context"
+                        _trace_disk!(o, name, false)
                         rv = compute_property(o, vname, indices...; _status_kw..., _resume_kw(o, vname, rv)..., kwargs...)
                         if _save_if_publishable!(guard, _disk_format(o, vname), cache_path, rv) &&
                                 _disk_format(o, vname) == Val(:mmap)
@@ -3586,6 +4069,7 @@ $_cache_context""")
                 cache_status = get_cache_status(cache_path)
                 rv = if cache_status == :ready
                     _report_disk_load!(__status__, cache_path, filesize(cache_path))
+                    _trace_disk!(o, name, true)
                     try
                         load(_disk_format(o, vname), cache_path, _disk_eltype(o, vname))
                     catch e
@@ -3604,6 +4088,7 @@ $_cache_context""")
                 end
                 if cache_status != :ready || resumes(o, vname, indices...; kwargs...)
                     @debug "Generating $cache_path...\n$_cache_context"
+                    _trace_disk!(o, name, false)
                     rv = compute_property(o, vname, indices...; _status_kw..., _resume_kw(o, vname, rv)..., kwargs...)
                     if _save_if_publishable!(guard, _disk_format(o, vname), cache_path, rv) &&
                             _disk_format(o, vname) == Val(:mmap)
@@ -3670,8 +4155,13 @@ function _getorcompute_bare(cache::PropertyCache, o, name::Symbol)
     # a no-op (`_on_hit!`), so returning the cached value
     # directly is behaviourally identical to routing through `get!`. Only misses
     # pay the closures.
+    t0 = _trace_clock()
     hit = _peek_hit(cache, name)
-    hit === _missing_sentinel || return hit
+    if hit !== _missing_sentinel
+        # Reading an indexed property's wrapper is not a read of its value.
+        t0 == 0 || _own_wrapper(o, name, hit) || _trace_read!(o, name, nothing, :hit, t0)
+        return hit
+    end
     substatus_f = _bare_substatus_f(o, name)
     # When called with no indices on an indexed property (declared with
     # call/ref syntax, e.g. `x() = ...` or `x[i] = ...`), return an
@@ -4414,7 +4904,8 @@ function _clear_cache_entry!(o, name::Symbol, indices...; kwargs...)
     if v isa IndexableProperty
         invalidate!(v, indices...; kwargs...)
     else
-        _remove_disk_entry!(o, name, indices...; kwargs...)
+        on_disk = _remove_disk_entry!(o, name, indices...; kwargs...)
+        _trace_invalidation!(:invalidate!, o, on_disk ? (name,) : (), (indices, (;kwargs...)))
     end
     nothing
 end
@@ -8156,9 +8647,13 @@ end
 # requester alone, and fails the latch with `_RemountContextDependent`, so every
 # other accessor computes the key in its own view.
 function _opaque_shared!(oc::_OpaqueSubcache, key; fetch=Base.fetch, retry_failed=true)
+    t0 = _trace_clock()
     hit = get(oc, key, _missing_sentinel)
-    hit === _missing_sentinel || return hit
     args, kwargs = _opaque_call(oc, key)
+    if hit !== _missing_sentinel
+        t0 == 0 || _trace_read!(oc.requester, oc.name, _trace_args(args, kwargs), :hit, t0)
+        return hit
+    end
     local_value = Ref{Any}(_missing_sentinel)
     compute = _Settling(oc.requester, oc.name, args, kwargs, local_value) do s
         guard = _publish_guard()   # read before `_opaque_compute` takes it
@@ -11822,7 +12317,9 @@ function _sync!(o, visited)
     # `@state` is never derived, so no observed change makes it stale; its
     # ordinary dependents still drop.
     targets = setdiff!(_dependents_of(typeof(o), changed), _state_names(typeof(o)))
-    visited[record] = _drop_targets!(o, shared, record, targets)
+    result = _drop_targets!(o, shared, record, targets)
+    isempty(first(result)) || _trace_invalidation!(:sync!, o, first(result))
+    visited[record] = result
 end
 
 # Drop `targets` from a retained object (`_drop_property!`), forget their sync
@@ -11857,7 +12354,7 @@ function _invalidate_property!(o, name::Symbol)
     _check_invalidatable(T, name)
     inputs = keys(getfield(source, :cache).seed)
     targets = setdiff!(push!(_dependents_of(T, (name,)), name), inputs)
-    lock(_SYNC_LOCK) do
+    result = lock(_SYNC_LOCK) do
         stored = Symbol[n for n in sort!(collect(targets)) if _drop_stored_entries!(source, shared, n)]
         record = _sync_record(shared)
         dropped, stale = _drop_targets!(source, shared, record, targets)
@@ -11869,6 +12366,8 @@ function _invalidate_property!(o, name::Symbol)
         end
         result
     end
+    _trace_invalidation!(:clear_cache!, o, result)
+    result
 end
 
 function _check_invalidatable(T::Type, name::Symbol)
@@ -11956,7 +12455,9 @@ _slot_name(slot::Tuple) = first(slot)
 # lives only in the view, never on the retained object.
 function _sync_view!(view, source, visited)
     dropped, targets = _sync!(source, visited)
-    (sort!(union(dropped, _drop_view_copies!(view, targets))), targets)
+    local_dropped = _drop_view_copies!(view, targets)
+    isempty(local_dropped) || _trace_invalidation!(:sync!, view, local_dropped)
+    (sort!(union(dropped, local_dropped)), targets)
 end
 
 function _drop_view_copies!(view, targets)
@@ -12115,6 +12616,7 @@ export static_domain, property_descriptor, property_descriptors, type_descriptor
 export declaration_metadata, declaration_graph, declaration_node_id,
     declaration_observations
 export materialization_observation
+export with_compute_trace, ComputeTrace, compute_trace_rows
 export execute_materialization, release_materialization!, materialization_ownership, materialization_gc!
 export TrackedFile, TrackedDirectory, tracked_version, tracked_path, tracked_paths,
     on_change!, notify_change!, sync!, object_version, dependents
