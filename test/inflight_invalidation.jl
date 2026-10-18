@@ -243,7 +243,8 @@ using DynamicObjects
 bare = (; access = b -> b.rates, cache = b -> getfield(b, :cache).cache, key = :rates,
           handle = b -> DynamicObjects.fetchproperty((value, status) -> value, b, :rates),
           old = "old", new = "new")
-indexed = (; access = b -> b.chapter(1), cache = b -> b.chapter.cache, key = ((1,), (;)),
+# `key` peeks at the subcache's in-flight latch, which is keyed by the memo key.
+indexed = (; access = b -> b.chapter(1), cache = b -> b.chapter.cache, key = DynamicObjects._memo_key((1,), (;)),
              handle = b -> fetchindex((value, status) -> value, b.chapter, 1),
              old = "old1", new = "new1")
 invalidations = (("clear_mem_caches!", b -> clear_mem_caches!(b), (bare, indexed)),
