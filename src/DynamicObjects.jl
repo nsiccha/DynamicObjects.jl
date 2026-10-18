@@ -1388,7 +1388,7 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
         _missing_sentinel
     end
     if hit !== _missing_sentinel
-        t0 == 0 || _trace_read!(f, :hit, t0)
+        t0 == 0 || _trace_read!(f, Val(:hit), t0)
         return hit
     end
     # Build the substatus OUTSIDE the lock — factories recurse into DO props on the SAME
@@ -1421,12 +1421,12 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     kind = action[1]
     if kind === :value
         !isnothing(s) && _finalize_substatus!(s)
-        t0 == 0 || _trace_read!(f, :hit, t0)
+        t0 == 0 || _trace_read!(f, Val(:hit), t0)
         return action[2]
     end
     if kind === :error
         !isnothing(s) && _finalize_substatus!(s)
-        t0 == 0 || _trace_read!(f, :failed, t0)
+        t0 == 0 || _trace_read!(f, Val(:failed), t0)
         throw(action[2])
     end
     if kind === :wait
@@ -1438,7 +1438,7 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     if kind === :pending
         # Poller, compute already in flight elsewhere — hand back a cheap Pending, no spawn.
         !isnothing(s) && _finalize_substatus!(s)
-        t0 == 0 || _trace_read!(f, :pending, t0)
+        t0 == 0 || _trace_read!(f, Val(:pending), t0)
         return fetch(Pending(c, key, nothing, executor, _resolver(f, c, key, fetch, substatus, retry_failed)))
     end
     if kind === :inline
@@ -1458,7 +1458,7 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     p = Pending(c, key, nothing, executor, _resolver(f, c, key, fetch, substatus, retry_failed))
     # An executor may have run the compute synchronously: hand back the value.
     executor !== nothing && isready(p) && return Base.fetch(p)
-    t0 == 0 || _trace_read!(f, :pending, t0)
+    t0 == 0 || _trace_read!(f, Val(:pending), t0)
     return fetch(p)
 end
 
@@ -1975,9 +1975,12 @@ _trace_at(t::ComputeTrace) = (time_ns() - t.first_ns) / 1e9
 
 # DynamicObjects' own `__name__` properties are not recorded.
 _traced_name(name::Symbol) = !_is_dunder_name(name)
+# Read the Symbol's bytes in place (no `String` allocation); a Symbol is never freed.
 function _is_dunder_name(name::Symbol)
-    s = String(name)
-    ncodeunits(s) > 4 && startswith(s, "__") && endswith(s, "__")
+    n = sizeof(name)
+    p = Base.unsafe_convert(Ptr{UInt8}, name)
+    n > 4 && unsafe_load(p, 1) == UInt8('_') && unsafe_load(p, 2) == UInt8('_') &&
+        unsafe_load(p, n - 1) == UInt8('_') && unsafe_load(p, n) == UInt8('_')
 end
 
 # The arguments a read is recorded with: `nothing` for a bare read.
@@ -2006,8 +2009,8 @@ function _trace_top()
     frames === nothing || isempty(frames) ? nothing : last(frames)::_TraceFrame
 end
 
-# Record one outcome of a read of `o.name` in every trace of `scope`.
-function _trace_record!(scope::_TraceScope, T::DataType, name::Symbol, args, outcome::Symbol,
+# Record one outcome (a `Val`) of a read of `o.name` in every trace of `scope`.
+function _trace_record!(scope::_TraceScope, T::DataType, name::Symbol, args, outcome::Val,
                         dt::UInt64, self::UInt64)
     s = scope
     while s !== nothing
@@ -2016,15 +2019,15 @@ function _trace_record!(scope::_TraceScope, T::DataType, name::Symbol, args, out
     end
     nothing
 end
-function _trace_add!(t::ComputeTrace, T::DataType, name::Symbol, args, outcome::Symbol,
-                     dt::UInt64, self::UInt64)
+function _trace_add!(t::ComputeTrace, T::DataType, name::Symbol, args, outcome::Val{O},
+                     dt::UInt64, self::UInt64) where {O}
     lock(t.lock) do
         t.active > 0 || return nothing
         st = get!(_TraceStats, t.stats, (T, name))
         st.calls += 1
-        _trace_count!(st, Val(outcome), dt, self)
+        _trace_count!(st, outcome, dt, self)
         if length(t.events) < t.max_events
-            push!(t.events, ComputeTraceEvent(_trace_at(t), T, name, args, outcome, dt / 1e9))
+            push!(t.events, ComputeTraceEvent(_trace_at(t), T, name, args, O, dt / 1e9))
         elseif t.max_events > 0
             t.events_dropped += 1
         end
@@ -2043,20 +2046,23 @@ _trace_time!(st::_TraceStats, dt, self) =
     (st.total_ns += dt; st.self_ns += self; st.max_ns = max(st.max_ns, dt))
 
 # Record a read of `o.name` started at `t0` (`_trace_clock()`, nonzero) that did not run a
-# computation on this task (a hit, a wait, a poll); its time is nested work of the
-# computation running on this task.
-function _trace_read!(o, name::Symbol, args, outcome::Symbol, t0::UInt64)
+# computation on this task (a hit, a wait, a poll; `outcome` a `Val`). Its time, taken before
+# any bookkeeping, is nested work of the computation running on this task.
+_trace_read!(o, name::Symbol, args, outcome::Val, t0::UInt64) =
+    _trace_read_dt!(o, name, args, outcome, time_ns() - t0)
+# The same for a read through a cache `get!`, which knows the property from its compute.
+_trace_read!(f, outcome::Val, t0::UInt64) = nothing
+function _trace_read!(s::_Settling, outcome::Val, t0::UInt64)
+    dt = time_ns() - t0
+    _trace_read_dt!(s.o, s.name, _trace_args(s.args, s.kwargs), outcome, dt)
+end
+function _trace_read_dt!(o, name::Symbol, args, outcome::Val, dt::UInt64)
     scope = _TRACE[]
     (scope === nothing || !_traced_name(name)) && return nothing
-    dt = time_ns() - t0
     top = _trace_top()
     top === nothing || (top.child_ns += dt)
     _trace_record!(scope, typeof(o), name, args, outcome, dt, UInt64(0))
 end
-# The same for a read through a cache `get!`, which knows the property from its compute.
-_trace_read!(f, outcome::Symbol, t0::UInt64) = nothing
-_trace_read!(s::_Settling, outcome::Symbol, t0::UInt64) =
-    _trace_read!(s.o, s.name, _trace_args(s.args, s.kwargs), outcome, t0)
 
 # Run `compute()` (a computation of `o.name`) as a traced computation. `memoized`: whether
 # it publishes into a cache (a memoized computation) rather than computing fresh.
@@ -2074,7 +2080,7 @@ function _traced_compute(compute, scope::_TraceScope, o, name::Symbol, indices, 
         dt = time_ns() - frame.start_ns
         parent = _trace_top()
         parent === nothing || (parent.child_ns += dt)
-        _trace_record!(scope, frame.type, name, frame.args, outcome, dt, dt - min(dt, frame.child_ns))
+        _trace_record!(scope, frame.type, name, frame.args, Val(outcome), dt, dt - min(dt, frame.child_ns))
     end
 end
 
@@ -2310,7 +2316,7 @@ function _await_cache_value!(c::AbstractThreadsafeDict, key, cnd::Threads.Condit
             _latch_outcome(c, key, cnd, true)
         end
     end
-    t0 == 0 || _trace_read!(f, :wait, t0)
+    t0 == 0 || _trace_read!(f, Val(:wait), t0)
     outcome[1] === :value && return outcome[2]
     outcome[1] === :error && throw(outcome[2])
     return get!(f, c, key; fetch, substatus, retry_failed)   # :gone → recompute
@@ -4159,7 +4165,7 @@ function _getorcompute_bare(cache::PropertyCache, o, name::Symbol)
     hit = _peek_hit(cache, name)
     if hit !== _missing_sentinel
         # Reading an indexed property's wrapper is not a read of its value.
-        t0 == 0 || _own_wrapper(o, name, hit) || _trace_read!(o, name, nothing, :hit, t0)
+        t0 == 0 || _own_wrapper(o, name, hit) || _trace_read!(o, name, nothing, Val(:hit), t0)
         return hit
     end
     substatus_f = _bare_substatus_f(o, name)
@@ -8651,7 +8657,7 @@ function _opaque_shared!(oc::_OpaqueSubcache, key; fetch=Base.fetch, retry_faile
     hit = get(oc, key, _missing_sentinel)
     args, kwargs = _opaque_call(oc, key)
     if hit !== _missing_sentinel
-        t0 == 0 || _trace_read!(oc.requester, oc.name, _trace_args(args, kwargs), :hit, t0)
+        t0 == 0 || _trace_read!(oc.requester, oc.name, _trace_args(args, kwargs), Val(:hit), t0)
         return hit
     end
     local_value = Ref{Any}(_missing_sentinel)
