@@ -861,6 +861,85 @@ struct IndexableProperty{N,O,D<:AbstractDict}
 end
 name(::IndexableProperty{N}) where {N} = N
 Base.show(io::IO, ip::IndexableProperty{N}) where {N} = print(io, "IndexableProperty :", N, " (", ip.cache, ")")
+
+# --- Memo keys ---------------------------------------------------------------------------
+#
+# An indexed property memoizes per `(args, kwargs)`: two calls share an entry exactly when
+# their arguments are `isequal`. Hashing that tuple directly hashes every container argument
+# by its full contents, and a cache miss touches the key several times (lookup, latch,
+# status, publish), so a large shared argument — a context `Dict` passed to a per-row render
+# helper — cost several full content hashes per call (snag `memo-key-hashing-28c8f3be`).
+#
+# `_MemoKey` carries the hash, computed once per call, and computes each mutable argument's
+# content hash once per object: `_content_hash` remembers it by identity in a weak table, so
+# later calls passing the same object pay a table lookup. Equality is unchanged (`===`, then
+# `isequal`), so equal but distinct containers still share an entry. A remembered hash goes
+# stale only if its object is mutated after it was passed as an argument, which do-use §0
+# already rules out (and which already corrupted a content-hashed memo dict).
+#
+# A key iterates and indexes as the tuple `(args, kwargs)`, so `(indices, kwargs) = key`
+# keeps working; public surfaces (`entries`, `cached_entries`) report `_plain_key(key)`.
+struct _MemoKey{A<:Tuple,K<:NamedTuple}
+    args::A
+    kwargs::K
+    hash::UInt
+end
+_memo_key(args::Tuple, kwargs::NamedTuple) =
+    _MemoKey(args, kwargs, _key_hash(kwargs, _key_hash(args, 0x6d656d6f5f6b6579 % UInt)))
+Base.hash(k::_MemoKey, h::UInt) = hash(k.hash, h)
+Base.isequal(a::_MemoKey, b::_MemoKey) =
+    a.hash == b.hash && _key_isequal(a.args, b.args) && _key_isequal(a.kwargs, b.kwargs)
+Base.length(::_MemoKey) = 2
+Base.iterate(k::_MemoKey, state::Int=1) =
+    state == 1 ? (k.args, 2) : state == 2 ? (k.kwargs, 3) : nothing
+Base.getindex(k::_MemoKey, i::Int) =
+    i == 1 ? k.args : i == 2 ? k.kwargs : throw(BoundsError(k, i))
+Base.show(io::IO, k::_MemoKey) = show(io, _plain_key(k))
+_plain_key(k::_MemoKey) = (k.args, k.kwargs)
+_plain_key(key) = key
+
+# Tuples and named tuples are walked, so a container inside them is hashed once per object
+# too; every other argument contributes `hash(_content_hash(x))`, uniformly, so `isequal`
+# arguments of different types (a `Vector` and a range) still hash alike.
+_key_hash(t::Tuple, h::UInt) = _key_hash_elements(t, hash(length(t), h))
+_key_hash_elements(::Tuple{}, h::UInt) = h
+_key_hash_elements(t::Tuple, h::UInt) = _key_hash_elements(Base.tail(t), _key_hash(first(t), h))
+_key_hash(nt::NamedTuple, h::UInt) = _key_hash(values(nt), hash(keys(nt), h))
+_key_hash(x, h::UInt) = hash(_content_hash(x), h)
+
+_key_isequal(a::Tuple, b::Tuple) = length(a) == length(b) && _key_isequal_elements(a, b)
+_key_isequal_elements(::Tuple{}, ::Tuple{}) = true
+_key_isequal_elements(a::Tuple, b::Tuple) =
+    _key_isequal(first(a), first(b)) && _key_isequal_elements(Base.tail(a), Base.tail(b))
+_key_isequal(a::NamedTuple, b::NamedTuple) = keys(a) == keys(b) && _key_isequal(values(a), values(b))
+_key_isequal(a, b) = a === b || isequal(a, b)
+
+# `hash(x)`, remembered per mutable object. Strings and symbols compare by content (`===`
+# included), so an identity table cannot help them. The table holds weak references, never
+# keeps an object alive, and checks `===` before trusting an entry; dead entries are swept
+# whenever it doubles.
+const _CONTENT_HASHES = Dict{UInt,Tuple{WeakRef,UInt}}()
+const _CONTENT_HASHES_LOCK = ReentrantLock()
+const _CONTENT_HASHES_SWEEP_AT = Ref(1024)
+_content_hash(x) = ismutable(x) && !(x isa Union{AbstractString,Symbol}) ? _remembered_hash(x) : hash(x)
+function _remembered_hash(x)
+    id = objectid(x)
+    known = lock(_CONTENT_HASHES_LOCK) do
+        entry = get(_CONTENT_HASHES, id, nothing)
+        entry !== nothing && entry[1].value === x ? entry[2] : nothing
+    end
+    known === nothing || return known
+    h = hash(x)   # outside the lock: a large container takes a while
+    lock(_CONTENT_HASHES_LOCK) do
+        _CONTENT_HASHES[id] = (WeakRef(x), h)
+        if length(_CONTENT_HASHES) >= _CONTENT_HASHES_SWEEP_AT[]
+            filter!(entry -> last(entry)[1].value !== nothing, _CONTENT_HASHES)
+            _CONTENT_HASHES_SWEEP_AT[] = max(1024, 2 * length(_CONTENT_HASHES))
+        end
+    end
+    h
+end
+
 # The bare call form memoizes by default (the `4c71ccf` flip), UNLESS the
 # property carries the declaration-site `@fresh` marker — `_never_cache`
 # (default `false`, emitted `true` per `@fresh` prop) routes it to the uncached
@@ -876,6 +955,11 @@ Cached call into an `IndexableProperty`'s per-key dict. Returns the cached
 value if `(args, kwargs)` was seen before; otherwise computes the value
 (via `_computeproperty`), stores the result, and returns it.
 
+Calls share an entry when their arguments are `isequal`. A mutable argument is
+content-hashed once per object and remembered by identity, so repeated calls
+passing the same large container do not re-hash it; never mutate an argument
+after passing it.
+
 The bare call form `o.prop(args...; kwargs...)` now routes through `memoize!`
 (caching by default), so `memoize!` is the explicit, exported equivalent of a
 bare indexed-property call — and the form to use whenever you'd previously have
@@ -890,7 +974,7 @@ call-site in `maybememoize!(callee, args...; kwargs...)` so cached IPs and
 plain functions can share the same syntax.
 """
 memoize!(ip::IndexableProperty{name}, args...; fetch=Base.fetch, kwargs...) where {name} = begin
-    args_key = (args, (;kwargs...))
+    args_key = _memo_key(args, (;kwargs...))
     rv = get!(ip.cache, args_key) do
         # Compute via `_computeproperty` directly, NOT the call form `ip(args...)`:
         # the bare call form `o.prop(args)` now routes THROUGH `memoize!` (cached by
@@ -1263,9 +1347,9 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
     else
         nothing
     end
-    args_key = (indices, (;kwargs...))
+    args_key = _memo_key(indices, (;kwargs...))
     fetch = _declared_fetch(fetch, o, Val(name))
-    compute = _Settling(o, name, indices, args_key[2]) do s
+    compute = _Settling(o, name, indices, args_key.kwargs) do s
         # Call `_computeproperty` directly, NOT `getorcomputeproperty`:
         # the latter, when `indices` and `kwargs` are both empty AND
         # `is_indexed_property(o, name)` (we're already inside the IP wrapper,
@@ -2293,7 +2377,7 @@ Only meaningful for `IndexableProperty` backed by a `ThreadsafeDict`.
 """
 getstatus(ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}, indices...; kwargs...) = begin
     lock(ip.cache.lock) do
-        get(ip.cache.status, (indices, (;kwargs...)), nothing)
+        get(ip.cache.status, _memo_key(indices, (;kwargs...)), nothing)
     end
 end
 getstatus(::IndexableProperty, indices...; kwargs...) = nothing
@@ -2328,7 +2412,7 @@ This holds wherever the invalidation is issued from, including the body of a
 computation of the same object.
 """
 function invalidate!(ip::IndexableProperty, indices...; kwargs...)
-    maybepop!(ip.cache, (indices, (;kwargs...)))
+    maybepop!(ip.cache, _memo_key(indices, (;kwargs...)))
     _remove_disk_entry!(ip.o, name(ip), indices...; kwargs...)
 end
 
@@ -3064,6 +3148,8 @@ end
 
 # --- entries / cached_entries for IndexableProperty ---
 
+const _Entry = NamedTuple{(:key, :state, :status, :value), Tuple{Any, Symbol, Any, Any}}
+
 """
     entries(ip::IndexableProperty)
 
@@ -3073,8 +3159,11 @@ Return a vector of `(; key, state, status, value)` for all entries in a
 handle (for `:running`), or the captured exception (for `:failed`). `status` is
 the substatus object or `nothing`.
 """
-function entries(ip::IndexableProperty{N,<:Any,<:AbstractThreadsafeDict}) where {N}
-    result = NamedTuple{(:key, :state, :status, :value), Tuple{Any, Symbol, Any, Any}}[]
+entries(ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}) =
+    _Entry[(; key=_plain_key(e.key), e.state, e.status, e.value) for e in _raw_entries(ip)]
+# The entries keyed as the subcache stores them (`_MemoKey`s).
+function _raw_entries(ip::IndexableProperty{N,<:Any,<:AbstractThreadsafeDict}) where {N}
+    result = _Entry[]
     c = ip.cache
     executor = property_executor(ip.o, Val(N))
     lock(c.lock) do
@@ -3100,11 +3189,11 @@ Return a vector of `(key, value)` pairs for completed entries only.
 """
 function cached_entries(ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict})
     lock(ip.cache.lock) do
-        collect(ip.cache.cache)
+        Pair{Any,Any}[_plain_key(k) => v for (k, v) in ip.cache.cache]
     end
 end
 function cached_entries(ip::IndexableProperty)
-    collect(ip.cache)
+    Pair{Any,Any}[_plain_key(k) => v for (k, v) in ip.cache]
 end
 
 # --- cache clearing ---
@@ -8159,11 +8248,11 @@ end
 
 memoize!(ip::IndexableProperty{name,<:Any,<:_OpaqueSubcache}, indices...;
          fetch=Base.fetch, retry_failed=true, kwargs...) where {name} =
-    _opaque_get!(ip.cache, (indices, (;kwargs...)), _remount_probe(ip.o);
+    _opaque_get!(ip.cache, _memo_key(indices, (;kwargs...)), _remount_probe(ip.o);
                  fetch=_declared_fetch(fetch, ip.o, Val(name)), retry_failed)
 
 getstatus(ip::IndexableProperty{<:Any,<:Any,<:_OpaqueSubcache}, indices...; kwargs...) =
-    _opaque_status(ip.cache, (indices, (;kwargs...)))
+    _opaque_status(ip.cache, _memo_key(indices, (;kwargs...)))
 
 function Base.fetch(p::Pending{<:_OpaqueSubcache})
     try
@@ -8178,11 +8267,11 @@ Base.isready(p::Pending{<:_OpaqueSubcache}) = haskey(p.cache, p.key) ||
     (_ns_tainted(p.cache.ns, _taint_key(p.cache, p.key)) && haskey(p.cache.local_dict, p.key))
 
 # Observers see each key where it lives: shared until it read context, then local.
-function entries(ip::IndexableProperty{<:Any,<:Any,<:_OpaqueSubcache})
+function _raw_entries(ip::IndexableProperty{<:Any,<:Any,<:_OpaqueSubcache})
     oc = ip.cache
-    shared = invoke(entries, Tuple{IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}}, ip)
+    shared = invoke(_raw_entries, Tuple{IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}}, ip)
     filter!(e -> !_ns_tainted(oc.ns, _taint_key(oc, e.key)), shared)
-    vcat(shared, entries(IndexableProperty(oc.name, oc.requester, oc.local_dict)))
+    vcat(shared, _raw_entries(IndexableProperty(oc.name, oc.requester, oc.local_dict)))
 end
 cached_entries(ip::IndexableProperty{<:Any,<:Any,<:_OpaqueSubcache}) =
     [e.key => e.value for e in entries(ip) if e.state === :done]
@@ -10431,7 +10520,7 @@ function _memory_observation(o, descriptor::NamedTuple, name::Symbol, args, kwar
         outer = _cache_snapshot(property_cache.cache, name)
         outer.state === :ready || return outer
         outer.value isa IndexableProperty || return outer
-        return _cache_snapshot(outer.value.cache, (args, kwargs))
+        return _cache_snapshot(outer.value.cache, _memo_key(Tuple(args), kwargs))
     end
     (isempty(args) && isempty(kwargs)) || error("scalar property `$name` does not accept arguments")
     _cache_snapshot(property_cache.cache, name)
@@ -10901,7 +10990,7 @@ function _automatic_materialization_slot(target, name::Symbol, descriptor,
     if descriptor.indexed
         property = getproperty(target, name)
         property isa IndexableProperty || return nothing
-        return property.cache, (args, kwargs)
+        return property.cache, _memo_key(Tuple(args), kwargs)
     end
     hasfield(typeof(target), :cache) || return nothing
     property_cache = getfield(target, :cache)
