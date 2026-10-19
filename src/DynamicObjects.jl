@@ -12931,10 +12931,9 @@ Eviction frees memory and changes no meaning:
 
 - an evicted value is recomputed on its next read (an explicit `@cached`/`@mmap` entry
   reloads from disk), and that recompute settles again
-  ([`DynamicObjects.property_settled`](@ref) runs for it);
+  (`DynamicObjects.property_settled` runs for it);
 - nothing that derived from an evicted value is dropped, no disk entry is touched, and
-  [`object_version`](@ref) does not move, so holders see no change on their next
-  [`sync!`](@ref);
+  `object_version` does not move, so holders see no change on their next `sync!`;
 - objects held by an evicted entry are still walked and pruned: another holder may keep them.
 
 Safe at any time: each object is pruned under its own cache lock, a computation in flight is
