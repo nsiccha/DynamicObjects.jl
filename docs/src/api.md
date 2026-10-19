@@ -75,6 +75,9 @@ cached_entries
 clear_all_caches!
 clear_mem_caches!
 clear_disk_caches!
+mem_cache_entries
+prune_mem_caches!
+DynamicObjects.MemCacheEntry
 invalidate!
 ```
 
