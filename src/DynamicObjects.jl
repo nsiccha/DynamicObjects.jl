@@ -1347,6 +1347,7 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
     else
         nothing
     end
+    t0 = _trace_clock()   # before the key, so a traced hit's time includes hashing it
     args_key = _memo_key(indices, (;kwargs...))
     fetch = _declared_fetch(fetch, o, Val(name))
     compute = _Settling(o, name, indices, args_key.kwargs) do s
@@ -1362,7 +1363,7 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
         v = _computeproperty(o, name, indices...; __status__=s, kwargs...)
         v
     end
-    get!(compute, cache, args_key; fetch, substatus=substatus_f, retry_failed)
+    get!(compute, cache, args_key; fetch, substatus=substatus_f, retry_failed, trace_t0=t0)
 end
 # The substatus is created pending and started by `_run_cache_compute!` when the compute
 # runs, so a compute waiting in an executor, a job queue or for a `:default` thread does not
@@ -1378,10 +1379,15 @@ end
 # of a property with a declared executor) starts a first-arriving compute through it
 # instead of inline / `Threads.@spawn`; a blocking caller then waits for it, as for an
 # already in-flight compute, through `await_deferred`.
-Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substatus=nothing, retry_failed=true) = begin
+#
+# `trace_t0` is when a traced read began (`_trace_clock()`, `0` untraced). A caller that
+# builds `key` first (`memoize!` hashes it in `_memo_key`) passes the clock from before, so
+# a traced hit's time includes hashing the key.
+Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substatus=nothing, retry_failed=true,
+          trace_t0=_trace_clock()) = begin
     # Fast path: a ready value returns immediately, no substatus cost. (`_missing_sentinel`
     # distinguishes "absent" from a legitimately-cached `nothing`.)
-    t0 = _trace_clock()
+    t0 = trace_t0
     hit = lock(c.lock) do
         v = get(c.cache, key, _missing_sentinel)
         v !== _missing_sentinel && (_on_hit!(c, key); return v)
@@ -8652,8 +8658,8 @@ end
 # guard. A computation that read context taints the key, gives its value to the
 # requester alone, and fails the latch with `_RemountContextDependent`, so every
 # other accessor computes the key in its own view.
-function _opaque_shared!(oc::_OpaqueSubcache, key; fetch=Base.fetch, retry_failed=true)
-    t0 = _trace_clock()
+function _opaque_shared!(oc::_OpaqueSubcache, key; fetch=Base.fetch, retry_failed=true, trace_t0=_trace_clock())
+    t0 = trace_t0
     hit = get(oc, key, _missing_sentinel)
     args, kwargs = _opaque_call(oc, key)
     if hit !== _missing_sentinel
@@ -8680,7 +8686,7 @@ function _opaque_shared!(oc::_OpaqueSubcache, key; fetch=Base.fetch, retry_faile
         end
         value
     end
-    get!(compute, oc, key; fetch, retry_failed, substatus=_opaque_substatus_f(oc, key))
+    get!(compute, oc, key; fetch, retry_failed, substatus=_opaque_substatus_f(oc, key), trace_t0=t0)
 end
 
 # The latch records a context-dependent computation as a failure; its progress
@@ -8690,13 +8696,14 @@ _fail_substatus!(s::Treebars.ProgressNode, e::_RemountContextDependent) =
 
 # Read opaque `key` through `oc`, on behalf of `reader` — the guard of an
 # enclosing opaque computation, or `nothing` for the view itself.
-function _opaque_get!(oc::_OpaqueSubcache, key, reader; fetch=Base.fetch, retry_failed=true)
+function _opaque_get!(oc::_OpaqueSubcache, key, reader; fetch=Base.fetch, retry_failed=true,
+                      trace_t0=_trace_clock())
     # A guard reads values, never handles: a handle could resolve to the
     # requester's context-dependent value after the guard stopped watching.
     reader === nothing || (fetch = _blocking_selector(fetch))
     if !_ns_tainted(oc.ns, _taint_key(oc, key))
         try
-            return _opaque_shared!(oc, key; fetch, retry_failed)
+            return _opaque_shared!(oc, key; fetch, retry_failed, trace_t0)
         catch e
             e isa _RemountContextDependent || rethrow()
             if _own_failure(e, oc.requester)
@@ -8748,9 +8755,11 @@ function _mounted_fetchproperty(fetch, c::MountedThreadsafeDict, o, name::Symbol
 end
 
 memoize!(ip::IndexableProperty{name,<:Any,<:_OpaqueSubcache}, indices...;
-         fetch=Base.fetch, retry_failed=true, kwargs...) where {name} =
+         fetch=Base.fetch, retry_failed=true, kwargs...) where {name} = begin
+    t0 = _trace_clock()   # before the key, so a traced hit's time includes hashing it
     _opaque_get!(ip.cache, _memo_key(indices, (;kwargs...)), _remount_probe(ip.o);
-                 fetch=_declared_fetch(fetch, ip.o, Val(name)), retry_failed)
+                 fetch=_declared_fetch(fetch, ip.o, Val(name)), retry_failed, trace_t0=t0)
+end
 
 getstatus(ip::IndexableProperty{<:Any,<:Any,<:_OpaqueSubcache}, indices...; kwargs...) =
     _opaque_status(ip.cache, _memo_key(indices, (;kwargs...)))

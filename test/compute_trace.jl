@@ -8,6 +8,7 @@ using TestItemRunner
 @testmodule ComputeTraceFixtures begin
 using DynamicObjects
 export CTApp, CTSlow, CTDisk, CTGated, CTClearer, CTTracked, CTQueue, CTView,
+       CTHashed, CTHashView, SlowHash, SLOW_HASH_S,
        CT_CACHE_BASE, CT_STARTED, CT_GATE, row, hasrow, settles, gate_reset!
 
 const CT_CACHE_BASE = Ref("")
@@ -68,6 +69,24 @@ _opaque(app, n) = Ref(n)
 @dynamicstruct struct CTView
     ctx = nothing
     shares(n::Int) = _opaque(__self__, n)
+end
+
+# An argument that takes `SLOW_HASH_S` to hash; equal values are distinct objects, so each
+# one is hashed when it is first passed.
+const SLOW_HASH_S = 0.05
+mutable struct SlowHash
+    v::Int
+end
+Base.hash(x::SlowHash, h::UInt) = (sleep(SLOW_HASH_S); hash(x.v, h))
+Base.:(==)(a::SlowHash, b::SlowHash) = a.v == b.v
+
+@dynamicstruct struct CTHashed
+    keyed(k::SlowHash) = k.v
+end
+
+@dynamicstruct struct CTHashView
+    ctx = nothing
+    shares(k::SlowHash) = _opaque(__self__, k.v)
 end
 end
 
@@ -307,4 +326,35 @@ _, trace = with_compute_trace() do
 end
 r = row(trace, CTView, :shares)
 @test (r.calls, r.computed, r.hits) == (2, 1, 1)
+end
+
+@testitem "a traced hit's time includes hashing its key" setup=[ComputeTraceFixtures] begin
+using DynamicObjects
+# `memoize!` hashes the key (`_memo_key`) before it looks the entry up. A hit passing an
+# equal but distinct argument hashes it anew, and that is part of the read's time. Each
+# traced path is warmed first with the argument already passed (its hash is remembered),
+# so first-call compilation is not what crosses the bound.
+app = CTHashed()
+k = SlowHash(1)
+app.keyed(k)
+with_compute_trace(() -> app.keyed(k))
+_, trace = with_compute_trace() do
+    app.keyed(SlowHash(1))
+end
+r = row(trace, CTHashed, :keyed)
+@test (r.calls, r.hits) == (1, 1)
+@test r.hit_s >= SLOW_HASH_S
+
+# The same for a remount view's read of opaque work another view computed.
+source = CTHashView()
+views = [remount(source; ctx=i) for i in 1:2]
+k = SlowHash(2)
+views[1].shares(k)
+with_compute_trace(() -> views[2].shares(k))
+_, trace = with_compute_trace() do
+    views[2].shares(SlowHash(2))[]
+end
+r = row(trace, CTHashView, :shares)
+@test (r.calls, r.hits) == (1, 1)
+@test r.hit_s >= SLOW_HASH_S
 end
