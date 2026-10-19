@@ -489,14 +489,42 @@ end
 iscached(o, ::Val) = false
 cache_version(o, ::Val) = nothing
 compute_property(o, ::Val{:__hash_fields__}) = ntuple(Base.Fix1(getfield, o), fieldcount(typeof(o))-1)
-compute_property(o, ::Val{:__hash__}) = persistent_hash((typeof(o), _hash_replace(o.__hash_fields__)))
-# Shallow walker used only by the :__hash__ compute. Leaves non-DO values
+compute_property(o, ::Val{:__hash__}) = canonical_hash((typeof(o), o.__hash_fields__))
+# Shallow walker behind `canonical_hash`. Leaves non-DO values
 # structurally identical so hashes stay stable for DOs that don't nest DOs,
 # and substitutes any DO with its own (stable) `.__hash__` string. Per-type
 # `_hash_replace(::MyType) = x.__hash__` overloads are emitted by @dynamicstruct.
 _hash_replace(x::Tuple) = map(_hash_replace, x)
 _hash_replace(x::NamedTuple) = map(_hash_replace, x)
 _hash_replace(x) = x
+
+"""
+    DynamicObjects.canonical_hash(x)::String
+
+The content digest DynamicObjects uses for cache identity: a SHA-1 hex string of `x`,
+serialized after every `@dynamicstruct` value inside it is replaced by that value's own
+`__hash__` (and, with DataFrames and Arrow loaded, every `DataFrame` by its column names
+and columns). It names an object's cache directory and keys its disk-cache entries, so
+equal content gives the same digest in every process, however much an object has memoized.
+
+Every default `__hash__` is `canonical_hash((typeof(o), o.__hash_fields__))`. To choose
+what an object's identity covers, override `__hash_fields__`; to also mix in constants such
+as a cache-format version, override `__hash__` through `canonical_hash`:
+
+```julia
+@dynamicstruct struct Draws
+    stan_code
+    draws
+    stripped_code = replace(stan_code, r"\\s+" => "")
+    __hash__ = DynamicObjects.canonical_hash((typeof(__self__), REPLAY_VERSION, (stripped_code, draws)))
+end
+```
+
+Replacement recurses through `Tuple`s and `NamedTuple`s only. A `@dynamicstruct` value or
+`DataFrame` inside an array, a `Dict` or any other container is serialized whole, including
+what it has memoized, so pass such values as tuple elements.
+"""
+canonical_hash(x) = persistent_hash(_hash_replace(x))
 
 # ── @versioned: identity/version split of the disk-cache path ───────────────
 # A `@versioned name::T` fixed field is the *version dimension*: excluded from
@@ -512,10 +540,10 @@ has_versioned_fields(::Type) = false
 _identity_hash_fields(o) = o.__hash_fields__   # non-versioned: identity = all fixed fields
 _version_hash_fields(o) = ()                   # non-versioned: no version segment
 compute_property(o, ::Val{:__identity_hash__}) =
-    persistent_hash((typeof(o), _hash_replace(_identity_hash_fields(o))))
+    canonical_hash((typeof(o), _identity_hash_fields(o)))
 compute_property(o, ::Val{:__version_tag__}) = begin
     vhf = _version_hash_fields(o)
-    isempty(vhf) ? "" : persistent_hash(_hash_replace(vhf))
+    isempty(vhf) ? "" : canonical_hash(vhf)
 end
 compute_property(o, ::Val{:__cache_base__}) = "cache"
 compute_property(o, ::Val{:__cache_path__}) =
@@ -3710,15 +3738,15 @@ _bare_substatus_f(o, name) =
 
 maybehash(x::Number) = x
 maybehash(x::Symbol) = x
-# Route through the `_hash_replace` canonicalization seam — the same one the
-# `__hash__` compute uses — so a `@dynamicstruct` argument hashes by its stable
-# `__hash__` (per-type overloads emitted by the macro) instead of serializing
-# the whole object including its PropertyCache. Without this the segment grew
-# with whatever was memoized on the argument and changed across restarts, so a
-# disk cache written with a cold argument never hit with a warm one. Plain
-# values are unaffected: `_hash_replace` is the identity there (modulo
-# rebuilding an equal Tuple/NamedTuple, which serializes identically).
-maybehash(x) = persistent_hash(_hash_replace(x))
+# Route through `canonical_hash` — the same digest the `__hash__` compute uses —
+# so a `@dynamicstruct` argument hashes by its stable `__hash__` (per-type
+# overloads emitted by the macro) instead of serializing the whole object
+# including its PropertyCache. Without this the segment grew with whatever was
+# memoized on the argument and changed across restarts, so a disk cache written
+# with a cold argument never hit with a warm one. Plain values are unaffected:
+# `_hash_replace` is the identity there (modulo rebuilding an equal
+# Tuple/NamedTuple, which serializes identically).
+maybehash(x) = canonical_hash(x)
 
 # POSIX per-path-component byte limit. A single file or directory name longer
 # than this fails with ENAMETOOLONG on `mkpath`/`open`, no matter how short
