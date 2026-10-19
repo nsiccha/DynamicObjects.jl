@@ -29,6 +29,7 @@ a body, drop the object prefix and use the bare property name.
 @cache_status
 @is_cached
 @cache_path
+DynamicObjects.canonical_hash
 @clear_cache!
 DynamicObjects.clear_cache!
 @persist
