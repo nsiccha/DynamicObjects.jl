@@ -457,6 +457,8 @@ the callee to be an `IndexableProperty`. See
 | `clear_mem_caches!(obj)`           | Drop every in-memory entry on `obj` except constructor kwargs and `@state` |
 | `clear_disk_caches!(obj)`          | Delete every `@cached` file under `obj.cache_path`  |
 | `clear_all_caches!(obj)`           | Both                                                |
+| `mem_cache_entries(obj)`           | Every in-memory entry of `obj` and the objects it derived (computes nothing) |
+| `prune_mem_caches!(keep, obj)`     | Evict the derived in-memory entries `keep` rejects; disk untouched |
 
 Indexed forms use call syntax too: `@is_cached obj.result(key)`,
 `@cache_path obj.fit(2; seed=42)`, `@clear_cache! obj.result(key)`. The
@@ -472,6 +474,33 @@ object prefix:
     summary(key) = @is_cached(result(key)) ? "done" : "pending"
 end
 ```
+
+### Walking and pruning memory
+
+Nothing evicts a memoized value on its own: it lives as long as the object
+holding it. A long-running process bounds its memory with
+`prune_mem_caches!`, and inspects it with `mem_cache_entries`:
+
+```julia
+for entry in mem_cache_entries(app)   # lazy; computes nothing
+    entry.object, entry.property, entry.key, entry.value, entry.path, entry.role
+end
+
+prune_mem_caches!(app) do entry       # keep small results, evict the rest
+    entry.value isa Number || entry.value isa Array{Float64}
+end                                   # → (; objects, kept, evicted)
+```
+
+The walk covers `app` and every object it derived (inline children, indexed
+entries, objects in a vector or dict value), each once. It never follows
+constructor inputs such as `__parent__`. Indexed properties are listed entry by
+entry. `role` says what an entry is: `:derived`, `:input` (constructor kwargs,
+inline-child index arguments), `:state` (`@state`) or `:internal` (DO's own
+`__…__` entries and computed `@versioned` properties). The prune evicts only
+`:derived` entries. An evicted value is recomputed on its next read, and an
+explicit `@cached`/`@mmap` entry reloads from disk. Eviction is not
+invalidation: nothing derived from an evicted value is dropped, no disk file is
+touched, and computations in flight are left alone.
 
 ## Inline nested structs
 

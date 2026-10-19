@@ -29,6 +29,8 @@ optionally disk-cached properties.
 - [`clear_mem_caches!`](@ref): Clear in-memory memoized values (disk caches untouched).
 - [`clear_disk_caches!`](@ref): Delete on-disk cache files (in-memory values untouched).
 - [`clear_all_caches!`](@ref): Clear both in-memory and disk caches.
+- [`mem_cache_entries`](@ref): Walk the in-memory cache entries of an object graph, computing nothing.
+- [`prune_mem_caches!`](@ref): Evict the derived in-memory entries a predicate rejects (disk untouched).
 - [`PersistentSet`](@ref): Thread-safe, disk-persisted `Set`.
 - [`LazyPersistentDict`](@ref): Thread-safe, lazily-loaded, disk-persisted `Dict`.
 - [`KeyTracker`](@ref): Abstract type for pluggable accessed-keys persistence strategies.
@@ -45,7 +47,7 @@ optionally disk-cached properties.
 - [`materialization_gc!`](@ref): Collect only unreachable, provider-released storage with proven ownership.
 """
 module DynamicObjects
-export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, invalidate!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, remount, file_version, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending, Deferred, DeferredCompute, ComputeAbandoned, BackgroundCache
+export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, invalidate!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, remount, file_version, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, mem_cache_entries, prune_mem_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending, Deferred, DeferredCompute, ComputeAbandoned, BackgroundCache
 
 import SHA, Serialization, Mmap, Treebars, ScopedValues
 
@@ -11941,12 +11943,17 @@ end
 # Returns the names to drop besides `targets`, or `nothing` when there is no
 # computed version to re-derive.
 function _version_rekey(T::Type, targets)
-    (isempty(targets) || !has_versioned_fields(T)) && return nothing
-    versions = Symbol[name for (name, info) in meta(T)
-        if !isfixed(info) && Symbol("@versioned") in info.macros]
+    isempty(targets) && return nothing
+    versions = _computed_version_names(T)
     isempty(versions) && return nothing
     setdiff!(union!(Set{Symbol}(versions), _dependents_of(T, versions)), targets)
 end
+
+# `T`'s computed `@versioned` properties: what its cache path derives from besides the
+# fixed fields. A fixed `@versioned` field is an input and not among them.
+_computed_version_names(T::Type) = has_versioned_fields(T) ?
+    Symbol[name for (name, info) in meta(T) if !isfixed(info) && Symbol("@versioned") in info.macros] :
+    Symbol[]
 
 _slot_name(slot::Symbol) = slot
 _slot_name(slot::Tuple) = first(slot)
@@ -12020,13 +12027,21 @@ function _observe_tracked(d::TrackedDirectory, visited)
     (UInt64(hash(version, UInt(first(children)))), UInt64(hash(baseline, UInt(last(children)))))
 end
 
-# One level only: elements that are themselves objects or tracked values. Deep
-# data (parsed JSON trees, tables) is never walked.
-_observe_container(value::Union{AbstractArray,Tuple}, visited) =
-    _may_hold_observable(eltype(value)) ? _observe_elements(value, visited) : nothing
-_observe_container(value::AbstractDict, visited) =
-    _may_hold_observable(valtype(value)) ? _observe_elements(values(value), visited) : nothing
-_observe_container(::Any, visited) = nothing
+function _observe_container(value, visited)
+    elements = _container_elements(value)
+    isempty(elements) ? nothing : _observe_elements(elements, visited)
+end
+
+# One level only: the elements of an array, tuple or dict that may be objects or
+# tracked values. Deep data (parsed JSON trees, tables) is never walked, and a
+# `TrackedDirectory` is observed as a tracked value, never iterated (iterating it
+# reads its entries).
+_container_elements(value::Union{AbstractArray,Tuple}) =
+    _may_hold_observable(eltype(value)) ? value : ()
+_container_elements(value::AbstractDict) =
+    _may_hold_observable(valtype(value)) ? values(value) : ()
+_container_elements(::TrackedDirectory) = ()
+_container_elements(::Any) = ()
 
 _may_hold_observable(::Type{T}) where {T} = !isconcretetype(T) || T <: TrackedValue ||
     (hasfield(T, :cache) && fieldtype(T, :cache) <: PropertyCache)
@@ -12086,13 +12101,15 @@ function _drop_disk_entries!(o, shared::ThreadsafeDict, name::Symbol, entry_keys
     nothing
 end
 
+# The opaque-work namespaces a retained cache holds for its remount views.
+_remount_namespaces(shared::ThreadsafeDict) = lock(shared.lock) do
+    byset = get(shared.status, _REMOUNT_NAMESPACES_KEY, nothing)
+    byset === nothing ? _OpaqueNamespace[] : collect(values(byset))
+end
+
 function _drop_opaque_work!(shared::ThreadsafeDict, name::Symbol)
-    namespaces = lock(shared.lock) do
-        byset = get(shared.status, _REMOUNT_NAMESPACES_KEY, nothing)
-        byset === nothing ? _OpaqueNamespace[] : collect(values(byset))
-    end
     dropped = false
-    for ns in namespaces
+    for ns in _remount_namespaces(shared)
         sub = lock(() -> get(ns.subcaches, name, nothing), ns.lock)
         if sub !== nothing && length(sub) > 0
             empty!(sub)
@@ -12104,6 +12121,296 @@ function _drop_opaque_work!(shared::ThreadsafeDict, name::Symbol)
         end
     end
     dropped
+end
+
+# --- Walking and pruning in-memory caches --------------------------------------------------
+#
+# `mem_cache_entries` lists what a graph of objects holds in memory; `prune_mem_caches!` evicts
+# the derived entries a caller does not want kept. Eviction is not invalidation: an evicted
+# value is still correct, so nothing derived from it is dropped, no disk entry is touched and
+# `object_version` does not move. The next read recomputes it, or reloads an explicit
+# `@cached`/`@mmap` entry from disk.
+
+"""
+    DynamicObjects.MemCacheEntry
+
+The element type of [`mem_cache_entries`](@ref): a `NamedTuple`
+`(; object, property, key, value, path, role)`.
+"""
+const MemCacheEntry = NamedTuple{(:object, :property, :key, :value, :path, :role),
+                                 Tuple{Any,Symbol,Any,Any,Tuple,Symbol}}
+
+# Where a listed entry is stored: the dictionaries `lock` guards (a `ThreadsafeDict`'s own,
+# or a remount view's overlay) and the key the entry is stored under there.
+struct _MemSlot
+    lock::ReentrantLock
+    cache::AbstractDict
+    computing::AbstractDict
+    status::AbstractDict
+    key::Any
+end
+
+# The walk: objects still to visit (each queued once, with its path), the entries of the one
+# being listed, and every property cache and subcache already queued or listed.
+mutable struct _MemWalk
+    const queue::Vector{Tuple{Any,Tuple}}
+    head::Int
+    const entries::Vector{Tuple{MemCacheEntry,_MemSlot}}
+    next::Int
+    const seen::Base.IdSet{Any}
+    objects::Int
+end
+
+function _mem_walk(root, caller::Symbol)
+    _is_dynamic_object(root) ||
+        throw(ArgumentError("$caller: $(typeof(root)) is not a @dynamicstruct object"))
+    walk = _MemWalk(Tuple{Any,Tuple}[], 1, Tuple{MemCacheEntry,_MemSlot}[], 1, Base.IdSet{Any}(), 0)
+    _enqueue!(walk, root, ())
+    walk
+end
+
+function _enqueue!(walk::_MemWalk, o, path::Tuple)
+    pc = getfield(o, :cache)
+    pc in walk.seen && return nothing
+    push!(walk.seen, pc)
+    push!(walk.queue, (o, path))
+    nothing
+end
+
+# The next `(entry, slot)`, listing the next queued object when the current one is done.
+function _next_entry!(walk::_MemWalk)
+    while walk.next > length(walk.entries)
+        walk.head > length(walk.queue) && return nothing
+        o, path = walk.queue[walk.head]
+        walk.queue[walk.head] = (nothing, ())
+        walk.head += 1
+        empty!(walk.entries)
+        walk.next = 1
+        _visit!(walk, o, path)
+    end
+    item = walk.entries[walk.next]
+    walk.next += 1
+    item
+end
+
+function _visit!(walk::_MemWalk, o, path::Tuple)
+    walk.objects += 1
+    pc = getfield(o, :cache)
+    c = pc.cache
+    T = typeof(o)
+    roles = (; inputs=keys(pc.seed), state=_state_names(T), versions=_computed_version_names(T))
+    if c isa MountedThreadsafeDict
+        # A view serves its retained object's entries, except the ones it holds itself.
+        _enqueue!(walk, c.source, path)
+        _visit_store!(walk, o, path, (c.lock, c.cache.overlay, c.computing.overlay, c.status.overlay), roles)
+    elseif c isa ThreadsafeDict
+        _visit_store!(walk, o, path, (c.lock, c.cache, c.computing, c.status), roles)
+        # The opaque work this object's remount views share is held here.
+        for ns in _remount_namespaces(c)
+            shared = ns.cache
+            _visit_store!(walk, o, path, (shared.lock, shared.cache, shared.computing, shared.status), roles)
+            for (name, sub) in lock(() -> collect(ns.subcaches), ns.lock)
+                _visit_subcache!(walk, o, path, name, sub, _indexed_role(roles, name))
+            end
+        end
+    else
+        throw(ArgumentError("mem_cache_entries: $T uses unsupported cache $(typeof(c))"))
+    end
+    nothing
+end
+
+# A computation in flight is not an entry: its key is skipped until it settles.
+function _visit_store!(walk::_MemWalk, o, path::Tuple, (lk, cache, computing, status), roles)
+    settled = lock(lk) do
+        Pair{Any,Any}[name => value for (name, value) in cache if !haskey(computing, name)]
+    end
+    for (name, value) in settled
+        if _own_wrapper(o, name, value)
+            # The wrapper stays: holders share its subcache. Its entries are listed instead.
+            _visit_subcache!(walk, o, path, name, value.cache, _indexed_role(roles, name))
+        else
+            entry = MemCacheEntry((o, name, nothing, value, path, _bare_role(roles, name)))
+            _push_entry!(walk, entry, _MemSlot(lk, cache, computing, status, name))
+        end
+    end
+    nothing
+end
+
+function _visit_subcache!(walk::_MemWalk, o, path::Tuple, name::Symbol, sub, role::Symbol)
+    # A view's opaque subcache: its shared half is the retained object's namespace subcache.
+    sub isa _OpaqueSubcache && return _visit_subcache!(walk, o, path, name, sub.local_dict, role)
+    sub isa ThreadsafeDict || throw(ArgumentError(
+        "mem_cache_entries: indexed property `$name` of $(typeof(o)) uses unsupported subcache $(typeof(sub))"))
+    sub in walk.seen && return nothing
+    push!(walk.seen, sub)
+    settled = lock(sub.lock) do
+        Pair{Any,Any}[key => value for (key, value) in sub.cache if !haskey(sub.computing, key)]
+    end
+    for (key, value) in settled
+        entry = MemCacheEntry((o, name, _plain_key(key), value, path, role))
+        _push_entry!(walk, entry, _MemSlot(sub.lock, sub.cache, sub.computing, sub.status, key))
+    end
+    nothing
+end
+
+# Objects held by derived values and state are walked next; inputs (`__parent__` among them)
+# and DO's own entries are not followed.
+function _push_entry!(walk::_MemWalk, entry::MemCacheEntry, slot::_MemSlot)
+    push!(walk.entries, (entry, slot))
+    entry.role in (:derived, :state) || return nothing
+    path = (entry.path..., (entry.property, entry.key))
+    _foreach_held_object(held -> _enqueue!(walk, held, path), entry.value)
+    nothing
+end
+
+function _bare_role(roles, name::Symbol)
+    name in roles.inputs && return :input
+    _indexed_role(roles, name)
+end
+function _indexed_role(roles, name::Symbol)
+    name in roles.state && return :state
+    (_is_dunder(name) || name in roles.versions) && return :internal
+    :derived
+end
+
+_is_dunder(name::Symbol) = (s = String(name); ncodeunits(s) > 4 && startswith(s, "__") && endswith(s, "__"))
+
+# The objects a cached value holds, by the rule `sync!` reaches nested objects with: the value
+# itself, the memoized values of a `TrackedDirectory`, or either as an element of an array,
+# tuple or dict (one level). A `TrackedFile`'s memoized read is data and is not followed.
+function _foreach_held_object(f, value)
+    if _is_dynamic_object(value) || value isa TrackedValue
+        _foreach_held_element(f, value)
+    else
+        foreach(element -> _foreach_held_element(f, element), _container_elements(value))
+    end
+    nothing
+end
+_foreach_held_element(f, value) = (_is_dynamic_object(value) && f(value); nothing)
+function _foreach_held_element(f, d::TrackedDirectory)
+    memoized = lock(() -> collect(values(d.values)), d.state.lock)
+    foreach(value -> _is_dynamic_object(value) && f(value), memoized)
+    nothing
+end
+
+# Evict `value` from its slot unless the slot moved on since it was listed: a computation
+# started there, or it now holds a different value.
+function _evict!(slot::_MemSlot, value)
+    lock(slot.lock) do
+        haskey(slot.computing, slot.key) && return false
+        get(slot.cache, slot.key, _missing_sentinel) === value || return false
+        delete!(slot.cache, slot.key)
+        delete!(slot.status, slot.key)
+        true
+    end
+end
+
+"""
+    mem_cache_entries(root)
+
+Iterate the settled in-memory cache entries of `root` and of every `@dynamicstruct` object it
+derived, without computing anything. Each element is a [`DynamicObjects.MemCacheEntry`](@ref)
+`(; object, property, key, value, path, role)`:
+
+- `object`: the object holding the entry, `property` its property name, `value` the
+  memoized value;
+- `key`: `nothing` for a bare property, `(args, kwargs)` for an indexed-property entry (as
+  [`cached_entries`](@ref) reports it);
+- `path`: how the walk reached `object` from `root`, one `(property, key)` step per entry that
+  held the next object; `()` for `root`'s own entries;
+- `role`, what the entry is to its object:
+  - `:derived`: a memoized derivation, which [`prune_mem_caches!`](@ref) may evict;
+  - `:input`: a constructor input (`__parent__` wiring, an inline child's index arguments, a
+    constructor or [`remake`](@ref) override, a [`remount`](@ref) view's request context);
+  - `:state`: an `@state` value;
+  - `:internal`: DO's own `__…__` entries (progress root, hash, cache path, `@options`
+    domains, …) and computed `@versioned` properties, from which the disk cache path derives.
+
+An indexed property is listed entry by entry, never as its wrapper.
+
+Which objects are walked: `root`, then every `@dynamicstruct` object held by a `:derived` or
+`:state` entry, recursively. An entry holds an object directly, as a memoized
+`TrackedDirectory` value, or as an element of an array, tuple or dict (one level; deep data
+is never walked). Constructor inputs and fixed fields are not followed, so neither
+`__parent__` back-references nor objects an object was merely given are walked. Each object
+is listed once, so aliases and cycles terminate. `root`'s own entries come first, then
+breadth-first.
+
+A [`remount`](@ref) view lists its own entries and walks its retained object, which also
+lists the opaque work its views share.
+
+The walk is lazy: each object's entries are read under that object's cache lock when the walk
+reaches it, so `first`, `Iterators.take` or a `break` stop it early. A computation in flight
+is not an entry.
+"""
+function mem_cache_entries(root)
+    _is_dynamic_object(root) ||
+        throw(ArgumentError("mem_cache_entries: $(typeof(root)) is not a @dynamicstruct object"))
+    MemCacheEntries(root)
+end
+
+# The lazy iterator `mem_cache_entries` returns; each `iterate` from the start walks afresh.
+struct MemCacheEntries
+    root::Any
+end
+Base.IteratorSize(::Type{MemCacheEntries}) = Base.SizeUnknown()
+Base.eltype(::Type{MemCacheEntries}) = MemCacheEntry
+function Base.iterate(entries::MemCacheEntries, walk::_MemWalk=_mem_walk(entries.root, :mem_cache_entries))
+    item = _next_entry!(walk)
+    item === nothing ? nothing : (first(item), walk)
+end
+Base.show(io::IO, entries::MemCacheEntries) =
+    print(io, "mem_cache_entries(::", typeof(entries.root), ")")
+
+"""
+    prune_mem_caches!(keep, root) -> (; objects, kept, evicted)
+
+Evict from memory every `:derived` entry of [`mem_cache_entries(root)`](@ref mem_cache_entries)
+for which `keep(entry)` is `false`, to bound what a long-running process retains:
+
+```julia
+prune_mem_caches!(app) do entry
+    entry.value isa Number || entry.value isa Array{Float64} || entry.value isa DataFrame
+end
+```
+
+`keep` sees each derived entry `(; object, property, key, value, path, role)` and must return
+a `Bool`. Everything else stays: constructor inputs, fixed fields, `@state`, DO's own
+`__…__` entries, computed `@versioned` properties, and each indexed property's wrapper,
+whose entries are pruned one by one in place. So held handles and remount views stay
+attached, as with [`clear_mem_caches!`](@ref).
+
+Eviction frees memory and changes no meaning:
+
+- an evicted value is recomputed on its next read (an explicit `@cached`/`@mmap` entry
+  reloads from disk), and that recompute settles again
+  ([`DynamicObjects.property_settled`](@ref) runs for it);
+- nothing that derived from an evicted value is dropped, no disk entry is touched, and
+  [`object_version`](@ref) does not move, so holders see no change on their next
+  [`sync!`](@ref);
+- objects held by an evicted entry are still walked and pruned: another holder may keep them.
+
+Safe at any time: each object is pruned under its own cache lock, a computation in flight is
+left alone (it is not an entry yet), and an entry recomputed or replaced since the walk
+listed it is not evicted. A `keep` that throws stops the prune; what it evicted so far stays
+evicted.
+
+Returns how many objects were walked, and how many derived entries `keep` kept and the prune
+evicted.
+"""
+function prune_mem_caches!(keep, root)
+    walk = _mem_walk(root, :prune_mem_caches!)
+    kept = evicted = 0
+    while (item = _next_entry!(walk)) !== nothing
+        entry, slot = item
+        entry.role === :derived || continue
+        if keep(entry)
+            kept += 1
+        elseif _evict!(slot, entry.value)
+            evicted += 1
+        end
+    end
+    (; objects=walk.objects, kept, evicted)
 end
 
 export print_structure, structure
