@@ -781,6 +781,50 @@ end
 
 This is exactly what you want when surfacing errors in a UI: the `PropertyComputationError` headers tell the user where the failure happened in the data dependency tree, while `unwrap_error(err)` gives the underlying cause for log/diagnostic display.
 
+### What did this computation do? `with_compute_trace`
+
+A slow page or job usually means some property computes more often than it should: an uncached `@fresh` property re-runs per call, or a clear forces recomputation of everything downstream. `with_compute_trace(f)` runs `f()` and records, per `(type, property)`, what every read did, plus every invalidation issued meanwhile:
+
+```julia
+@dynamicstruct struct Report
+    path::String
+    @fresh rows() = parse_rows(path)          # parses the file on every call
+    total = sum(r.amount for r in rows())
+    by_month(m::Int) = filter(r -> r.month == m, rows())
+    page = [length(by_month(m)) for m in 1:3]
+end
+
+value, trace = with_compute_trace() do
+    report.page, report.total, report.page
+end
+trace
+```
+
+```
+ComputeTrace: 0.211 s traced · 10 reads · 1 hits · 5 computed · 4 fresh · 0 disk · 0 invalidations
+ self s  total s  max s  hit s  calls  hits  computed  fresh  property
+  0.204    0.204  0.051  0.000      4     0         0      4  Report.rows
+  0.000    0.154  0.154  0.000      2     1         1      0  Report.page
+  0.000    0.153  0.051  0.000      3     0         3      0  Report.by_month
+  0.000    0.051  0.051  0.000      1     0         1      0  Report.total
+```
+
+`rows` ran four times and owns nearly all the time. Memoizing it (dropping `@fresh`, or reading the file through a `TrackedFile`) removes three parses. The columns:
+
+- `calls`: recorded reads; `hits`: reads served from memory, with `hit s` their time (including hashing the memo key);
+- `computed`: memoized computations; `disk`: those served from a `@cached`/`@mmap` entry; `fresh`: uncached computations;
+- `waits`: reads that blocked on a computation running on another task (or in an executor), with `wait s` the time blocked; `pending`: polls that got a `Pending`; `errors`: failures;
+- `total s`: wall time of the property's computations including nested reads, `max s` the slowest; `self s`: `total s` minus the nested reads recorded on the computing task.
+
+Rows are sorted by own time (`self s + hit s`); all-zero columns are omitted. Invalidations print below the table, with what they dropped and the traced computation that issued them:
+
+```
+Invalidations:
+  +0.002 s  clear_mem_caches!(Report)  issued outside a traced computation  dropped by_month, page, total
+```
+
+The trace follows the calling task into tasks it spawns, and into computations handed to an executor or the `@queued` job queue, even when another task admits them. Reads in a different request are not mixed in: a read that waits on a computation another request started counts as a `wait` here and as a computation there. `compute_trace_rows(trace)` returns the table as `NamedTuple`s and `trace.invalidations` the log, for a web layer to render; `with_compute_trace(f; events=n)` also keeps the first `n` reads with their arguments in `trace.events`. To keep what was recorded when `f` throws, or to collect several calls, pass a `ComputeTrace()` of your own: `with_compute_trace(f, trace)`. With no trace active, each property read pays one atomic load.
+
 ### Cycle detection (or rather: the lack of it)
 
 A property cycle (`b = c + 1; c = b - 1`) is **not** detected — it stack-overflows on access. The Julia trace ends with deeply repeated frames in `compute_property`. If you see this:

@@ -81,6 +81,16 @@ DynamicObjects.MemCacheEntry
 invalidate!
 ```
 
+## Diagnosing computations
+
+```@docs
+with_compute_trace
+ComputeTrace
+compute_trace_rows
+DynamicObjects.ComputeTraceEvent
+DynamicObjects.ComputeTraceInvalidation
+```
+
 ## Error handling
 
 ```@docs
