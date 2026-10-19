@@ -1538,6 +1538,9 @@ The executor must eventually call exactly one of:
 
 Only the first of the two takes effect. Dropping a `DeferredCompute` without calling either
 leaves the key in flight forever.
+
+Whichever task calls `run!`, the compute logs to the logger current where it was started, as
+an undeferred compute would.
 """
 mutable struct DeferredCompute
     const cache::AbstractThreadsafeDict
@@ -1547,8 +1550,10 @@ mutable struct DeferredCompute
     const status::Any
     @atomic claimed::Bool
     const trace_scope::Any   # the compute trace scope it was started in (`with_compute_trace`)
+    const logger::Any        # the logger it was started under
 end
-DeferredCompute(c, key, cnd, f, s) = DeferredCompute(c, key, cnd, f, s, false, _trace_scope())
+DeferredCompute(c, key, cnd, f, s) =
+    DeferredCompute(c, key, cnd, f, s, false, _trace_scope(), _requester_logger())
 
 _claim!(d::DeferredCompute) = (@atomicswap d.claimed = true) === false
 
@@ -1562,7 +1567,7 @@ run or abandoned. Failures are recorded for waiters/pollers, not rethrown.
 function run!(d::DeferredCompute)
     _claim!(d) || return false
     try
-        _in_trace_scope(d.trace_scope) do
+        _as_requested(d.logger, d.trace_scope) do
             _run_cache_compute!(d.cache, d.key, d.latch, d.f, d.status)
         end
     catch
@@ -2131,6 +2136,17 @@ end
 
 # Run `f()` in the trace scope `scope` captured when deferred work was created.
 _in_trace_scope(f, scope) = scope === _TRACE[] ? f() : ScopedValues.with(f, _TRACE => scope)
+
+# The logger deferred work is requested under. A task inherits its logger from the task that
+# spawns it, so work run by an executor's worker or admitted by another job would log to that
+# task's logger. On Julia 1.10 the task's logger also carries its scoped values; unwrapping it
+# keeps those (a job's queue slot) with the task that runs the work.
+_requester_logger() = ScopedValues.current_logger()
+_in_logger(f, logger) =
+    logger === ScopedValues.current_logger() ? f() : ScopedValues.with_logger(f, logger)
+
+# Run `f()` under the logger and in the trace scope captured when deferred work was created.
+_as_requested(f, logger, trace_scope) = _in_logger(() -> _in_trace_scope(f, trace_scope), logger)
 
 # Log an invalidation of `o` in every trace of the current scope.
 function _trace_invalidation!(verb::Symbol, o, dropped, key=nothing)
@@ -2717,7 +2733,8 @@ was abandoned before it started) and `isready` it to poll. It follows the
 takes effect. A blocking `fetch` from inside a queued computation first gives that
 computation's slot back, as a wait on a `@queued` property does. `status`, a progress node,
 reads "queued · #k" while the call waits and is started when the call runs: create it with
-`Treebars.prepare_progress!` to show the call as waiting rather than running.
+`Treebars.prepare_progress!` to show the call as waiting rather than running. Whichever task
+runs the call, `f` logs to the logger current where the call was created.
 
 A fresh computation of a `@queued` property (declaration-site `@fresh`, or a call-site
 `fresh`) runs as one: the caller waits for its turn and its value.
@@ -2728,9 +2745,10 @@ mutable struct QueuedCall
     const outcome::Channel{Tuple{Bool,Any}}   # (true, value) | (false, exception)
     @atomic claimed::Bool
     const trace_scope::Any                    # the compute trace scope it was created in
+    const logger::Any                         # the logger it was created under
 end
 QueuedCall(f; status=nothing) =
-    QueuedCall(f, status, Channel{Tuple{Bool,Any}}(1), false, _trace_scope())
+    QueuedCall(f, status, Channel{Tuple{Bool,Any}}(1), false, _trace_scope(), _requester_logger())
 
 _claim!(c::QueuedCall) = (@atomicswap c.claimed = true) === false
 
@@ -2738,7 +2756,7 @@ function run!(c::QueuedCall)
     _claim!(c) || return false
     _start_substatus!(c.status)
     outcome = try
-        (true, _in_trace_scope(c.f, c.trace_scope))
+        (true, _as_requested(c.f, c.logger, c.trace_scope))
     catch err
         (false, err)
     end

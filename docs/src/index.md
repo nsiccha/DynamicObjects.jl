@@ -698,6 +698,10 @@ see does deadlock it, for example polling `isready` in a loop: block with
 and its value. `@queued` on a bare (non-call-form) property is a macro-time
 error.
 
+A queued computation logs where the call that started it logs, including a
+`with_logger` around that call, whichever task admits and runs it. The same
+holds for a computation an executor's worker runs.
+
 A layer on top (a web framework's job board, say) can watch and steer the queue:
 
 | Function | Purpose |
