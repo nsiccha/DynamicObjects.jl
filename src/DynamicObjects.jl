@@ -6477,8 +6477,11 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         else
             a  # fixed field: bare symbol or typed symbol
         end
-        Meta.isexpr(lhs, (:call, :ref)) && (lhs = lhs.args[1])
+        # The return annotation wraps the call (`name(args)::T`), so peel it
+        # before the index; peeling the call first left `name(args)` and
+        # dropped every typed indexed property from the forward.
         Meta.isexpr(lhs, :(::)) && (lhs = lhs.args[1])
+        Meta.isexpr(lhs, (:call, :ref)) && (lhs = lhs.args[1])
         # `_collect_lhs_names` dispatches: bare Symbol → (sym,), tuple
         # destructure → recursive name collection, anything else → ().
         # Each new shape is a method, not another `if` arm.
