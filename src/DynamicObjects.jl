@@ -6979,9 +6979,8 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         # qt/fit: `ppc_view`'s body calls `dense_view(…)`). The
         # `prop = struct …` / `prop(idx) = struct …` forms carry the name
         # on the LHS and fall through to the generic collector below; the
-        # bare `struct Name … end` form carries it as the struct name.
-        # (A child never forwards its OWN name — guarded at the `forwarded`
-        # comprehension below, not here.)
+        # bare `struct Name … end` form carries it as the struct name. Each
+        # child also forwards its OWN name, like every other parent property.
         if Meta.isexpr(a, :struct)
             _push_if_symbol!(parent_props, a.args[2])
             continue
@@ -7150,17 +7149,19 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         nonforwardable = Set{Symbol}([:__hash_fields__, :__hash__, :__cache_path__, :cache])
         # Forward parent properties that (a) aren't overridden in the child,
         # (b) aren't __status__ (scoped separately), (c) aren't DO-internal
-        # cache/identity names, (d) aren't one of the names we're about
-        # to prepend ourselves, and (e) aren't this child's OWN
-        # parent-property name. Inline-struct names are now in `parent_props`
-        # (so a sibling can forward them), but a child must never forward
-        # itself into its own scope — that would prepend a self-referential
-        # `name = __parent__.name` (the parent IP of this very child) and
-        # recurse.
+        # cache/identity names, and (d) aren't one of the names we're about
+        # to prepend ourselves. The child's OWN name forwards too, so a bare
+        # `fit(:other)` in `@struct fit(dataset)` and a struct `@include`d
+        # into it that destructures `(; fit) = __self__.__parent__` both reach
+        # the parent's property (snag inline-struct-ow-3f55b471). Nothing
+        # recurses: `__parent__.fit` is the parent's IndexableProperty, and a
+        # plain child's `__parent__.name` is the parent's memoized child, i.e.
+        # the child itself. An index param or kwarg of the same name, or a
+        # child declaration of it, still wins.
         # Dedupe: a parent can declare the same property name multiple times
         # (indexed properties with multi-method dispatch on the index type).
         # We only want one forwarding extractor per name.
-        forwarded = unique!(Symbol[pp for pp in parent_props if pp != prop_name && !(pp in child_props) && pp != :__status__ && !(pp in nonforwardable) && !(pp in prepend_names)])
+        forwarded = unique!(Symbol[pp for pp in parent_props if !(pp in child_props) && pp != :__status__ && !(pp in nonforwardable) && !(pp in prepend_names)])
         prepend = Expr[]
         push!(prepend, :(__parent__ = nothing))
         for ip in index_params
