@@ -1323,11 +1323,10 @@ _remount_probe(o) = _remount_probe(getfield(o, :cache).cache)
 _remount_probe(c::MountedThreadsafeDict) = c.probe
 _remount_probe(::AbstractDict) = nothing
 
-# An explicit store on a mounted object — remount's own nested-child seeding;
-# the public `setproperty!` is refused — is always a local shadow. Computed
-# stores bypass this method and write through `c.cache`, whose static routing
-# set sends only proven-invalidated keys local and intrinsic keys to the
-# retained cache.
+# An explicit store on a mounted object (the public `setproperty!` is refused)
+# is always a local shadow. Computed stores bypass this method and write through
+# `c.cache`, whose static routing set sends only proven-invalidated keys local
+# and intrinsic keys to the retained cache.
 function Base.setindex!(c::MountedThreadsafeDict, value, key::Symbol)
     lock(c.lock) do
         push!(c.local_names, key)
@@ -1391,7 +1390,7 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
         # compute anything. `_computeproperty` skips the wrapper short-circuit
         # and goes straight to the body.
         v = _computeproperty(o, name, indices...; __status__=s, kwargs...)
-        v
+        _adopt_source_child(o, name, args_key, v)
     end
     get!(compute, cache, args_key; fetch, substatus=substatus_f, retry_failed, trace_t0=t0)
 end
@@ -3475,24 +3474,9 @@ function subcache(pc::PropertyCache{<:MountedThreadsafeDict}, owner, ::Val{name}
         "remount: intrinsic indexed property `$name` did not resolve to an IndexableProperty on the retained source")
     name in mounted.opaque &&
         return _OpaqueSubcache(mounted.namespace, name, owner, _ns_subcache(mounted.namespace, name), ThreadsafeDict())
-    if name in mounted.invalidated
-        local_cache = ThreadsafeDict()
-        # An `_inline_child` child resolves each key on the source on first access.
-        if _nested_struct_type(typeof(owner), Val(name)) !== nothing &&
-           !_source_shared_child(typeof(owner), Val(name))
-            # Other settled indexed children (external `@include`s) become mounted
-            # child views with the current parent. Their OWN intrinsic caches remain
-            # shared; an in-flight child constructor is deliberately not shared
-            # because it is still bound to the retained source parent.
-            lock(source_ip.cache.lock) do
-                for (key, value) in source_ip.cache.cache
-                    _is_dynamic_object(value) || continue
-                    local_cache.cache[key] = _remount_child(value, owner)
-                end
-            end
-        end
-        return local_cache
-    end
+    # A nested child's key is resolved on first access: by `_inline_child` on the
+    # source, or by the view's own constructor call (`_adopt_source_child`).
+    name in mounted.invalidated && return ThreadsafeDict()
     source_ip.cache
 end
 
@@ -4235,7 +4219,10 @@ end
 # The computation of bare property `name`, reported to `property_settled` when it stores.
 # `s` is the substatus the spawn wrapper passed (or `nothing` when there is none). It is
 # passed as `__status__` so the body — and any IP/property accesses inside — attach to it.
-_bare_compute(o, name::Symbol) = _Settling(s -> _computeproperty(o, name; __status__=s), o, name)
+# On a remount view a nested child it builds may be the retained source's (`_adopt_source_child`).
+_bare_compute(o, name::Symbol) = _Settling(o, name) do s
+    _adopt_source_child(o, name, nothing, _computeproperty(o, name; __status__=s))
+end
 # A remount view first tries the shared namespace for an untainted opaque
 # property; the guarded `__self__` of an opaque computation intercepts every
 # read (`_probe_read`).
@@ -6168,7 +6155,9 @@ _nested_struct_type(::Type, ::Val) = nothing
 so a [`remount`](@ref) view resolves it on the retained source on first
 access. `@dynamicstruct` emits it for every non-`@fresh` inline `@struct`
 child; external `@include` children and older expansions keep the default
-`false` and are shared only when already settled on the source.
+`false`: a view builds them with its own constructor call and reuses a child
+already settled on the source only when that call constructs it alike
+(`_adopt_source_child`).
 """
 _source_shared_child(::Type, ::Val) = false
 
@@ -8894,24 +8883,85 @@ _source_child(ip, ::Val{true}, args, kwargs) = ip(args...; kwargs...)
 _inline_child_seed(ctor::NamedTuple{names}) where {names} =
     :__status__ in names ? (; __status__=ctor.__status__) : (;)
 
-function _seed_nested_remounts!(mounted, source, explicit)
-    T = typeof(source)
-    shared = _remount_source(source)[2]
-    seen = Set{Symbol}()
-    for (name, _) in meta(T)
-        name in seen && continue
-        push!(seen, name)
-        haskey(explicit, name) && continue
-        _nested_struct_type(T, Val(name)) === nothing && continue
-        # Resolved lazily through `_inline_child` on first access instead.
-        _source_shared_child(T, Val(name)) && continue
-        value = get(shared, name, _missing_sentinel)
-        (value === _missing_sentinel || value isa Pending || value isa IndexableProperty ||
-         !_is_dynamic_object(value)) && continue
-        getfield(mounted, :cache)[name] = _remount_child(value, mounted)
-    end
-    mounted
+"""    _adopt_source_child(o, name, key, child)
+
+The nested child `o` stores for property `name` (memo `key` for an indexed one,
+`nothing` for a bare one), given the `child` its own constructor call just
+built. On an ordinary object that is `child`. On a `remount` view, a child
+registered through `_nested_struct_type` (an external `@include`) is the
+retained source's settled child for the same key, rebound to the view with
+`_remount_child`, when the two were constructed alike (`_same_construction`):
+the view then shares that child's caches. A child that the view's context
+constructs differently — a constructor argument read rebound context — stays
+the view's own. Inline `@struct` children are resolved on the source by
+`_inline_child` instead.
+"""
+_adopt_source_child(o, name, key, child) = hasfield(typeof(o), :cache) ?
+    _adopt_source_child(getfield(o, :cache), o, name, key, child) : child
+_adopt_source_child(_, o, name, key, child) = child
+_adopt_source_child(pc::PropertyCache{<:MountedThreadsafeDict}, o, name::Symbol, key, child) =
+    _adopt_source_child(pc, o, Val(name), key, child)
+function _adopt_source_child(pc::PropertyCache{<:MountedThreadsafeDict}, o, ::Val{name}, key,
+                             child) where {name}
+    T = typeof(o)
+    (_nested_struct_type(T, Val(name)) === nothing || _source_shared_child(T, Val(name))) &&
+        return child
+    c = pc.cache
+    settled = _settled_source_child(c, name, key)
+    settled === _missing_sentinel && return child
+    _same_construction(child, settled, o, c.source) || return child
+    _discard_progress!(child, settled)
+    _remount_child(settled, o, _child_context_seed(child))
 end
+
+# The retained source's settled child for `name`: a value, never an in-flight
+# construction, which is still bound to the source parent.
+function _settled_source_child(c::MountedThreadsafeDict, name::Symbol, key)
+    value = _source_entry(c, name, key)
+    _is_dynamic_object(value) ? value : _missing_sentinel
+end
+_source_entry(c::MountedThreadsafeDict, name::Symbol, ::Nothing) = get(c.shared, name, _missing_sentinel)
+function _source_entry(c::MountedThreadsafeDict, name::Symbol, key::_MemoKey)
+    ip = get(c.shared, name, _missing_sentinel)
+    ip isa IndexableProperty ? get(ip.cache, key, _missing_sentinel) : _missing_sentinel
+end
+
+# Request-scoped creation kwargs, which are not part of a child's construction
+# identity. `_remount_child` routes `__req__` and `__prefix__` view-locally
+# together with everything derived from them, and an adopted child keeps the
+# view's own. Progress stays the source child's, as for any view reading it.
+const _CHILD_CONTEXT_SEEDS = (:__status__, :__req__, :__prefix__)
+_child_context_seed(child) = let seed = getfield(child, :cache).seed
+    (; (name => seed[name] for name in (:__req__, :__prefix__) if haskey(seed, name))...)
+end
+
+# Detach the progress node the view's constructor call made for the child it
+# adopts in place of `fresh`: a view whose progress tree is the retained root's
+# would otherwise leave one running node there per request.
+_discard_progress!(fresh, settled) = begin
+    node = get(getfield(fresh, :cache).seed, :__status__, nothing)
+    node === get(getfield(settled, :cache).seed, :__status__, nothing) || _finalize_substatus!(node)
+    nothing
+end
+
+# Whether `fresh`, built by a view's own constructor call, and the source's
+# `settled` child were constructed alike: the same type, fixed fields and
+# creation kwargs, where `__parent__` names the view and the source respectively.
+function _same_construction(fresh, settled, view, source)
+    T = typeof(fresh)
+    typeof(settled) === T || return false
+    for name in fieldnames(T)[1:end-1]
+        _same_input(getfield(fresh, name), getfield(settled, name)) || return false
+    end
+    a, b = getfield(fresh, :cache).seed, getfield(settled, :cache).seed
+    names = Set{Symbol}(name for name in keys(a) if !(name in _CHILD_CONTEXT_SEEDS))
+    names == Set{Symbol}(name for name in keys(b) if !(name in _CHILD_CONTEXT_SEEDS)) ||
+        return false
+    all(names) do name
+        name === :__parent__ ? a[name] === view && b[name] === source : _same_input(a[name], b[name])
+    end
+end
+_same_input(a, b) = a === b || isequal(a, b)
 
 """
     remount(obj; context...)
@@ -8949,10 +8999,15 @@ A nested child instance is view-local because it holds its parent, but its own
 cache is shared: the view's child is the retained source's child remounted onto
 the view. A memoized inline `@struct` child read first through a view is
 realized on the retained source, so later views reuse it and its settled and
-in-flight work; a `@fresh` child stays a fresh view-local child per call. Inside
-the remounted child, a `__parent__.<name>` alias (every bare parent name an
-inline child reads) of a parent property the view shares is still shared, so
-child work built on context-independent parent state is reused too.
+in-flight work; a `@fresh` child stays a fresh view-local child per call. An
+external `@include` child is what its constructor call builds under the view:
+the view runs that call on first access and reuses the retained source's
+settled child only when both calls passed the same arguments (the parent and
+request-scoped `__status__`, `__req__` and `__prefix__` aside), so a constructor
+argument derived from rebound context gives the view its own child. Inside the remounted
+child, a `__parent__.<name>` alias (every bare parent name an inline child
+reads) of a parent property the view shares is still shared, so child work
+built on context-independent parent state is reused too.
 
 Fixed fields, `@versioned` properties, and cache/hash/path dunders are rejected:
 changing any of those means the object identity changed, so use `remake`.
@@ -8988,8 +9043,7 @@ function _remount_impl(obj, nt::NamedTuple, forced_local=(), parent_view=nothing
     args = Any[getfield(source, name) for name in fixed]
     applicable(T, _REMOUNT_TOKEN, pc, args...) || error(
         "remount: $(nameof(T)) was expanded before remount support; re-expand its @dynamicstruct/@htmx definition")
-    view = T(_REMOUNT_TOKEN, pc, args...)
-    _seed_nested_remounts!(view, source, seed)
+    T(_REMOUNT_TOKEN, pc, args...)
 end
 
 function remount(obj; kwargs...)
