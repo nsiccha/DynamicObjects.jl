@@ -7,6 +7,9 @@ using TestItemRunner
 # owner's tree; once it finishes it leaves the reader again (a failed one stays). A read
 # inside an ordinary helper function is the helper's business and stays flat.
 #
+# Explicit threading (`@fetch!`, an `@progress` body's sibling reads) is the same blocking
+# read computed inline, but its node stays under the reader and hits show "(cached)".
+#
 # Nesting is observed while the work runs: each fixture parks on a gate the test opens.
 @testmodule ImpliedProgressFixtures begin
 using DynamicObjects
@@ -15,7 +18,8 @@ using DynamicObjects.Treebars: render_text, @progress
 export render_text, @progress, rows, depth_of, labels, gate, release!, settles, node_of, poller,
     IPChain, IPInner, IPOuter, IPViaHelper, IPWithIP, IPBoom, IPKw, IPSpawned,
     IPRewriteRuntime, REWRITE_CALLS, IPReread, REREAD_CALLS, IPMarked, IPLocked,
-    IPUnderLock, IPPopulation, IPModel, IPRoute, IPRemountRoot, IPPhased, IPLoops
+    IPUnderLock, IPFetchLocked, IPFetchUnderLock, IPTaskOf, IPFetchTask, IPGatedSource,
+    IPFetching, IPPopulation, IPModel, IPRoute, IPRemountRoot, IPPhased, IPLoops
 
 const _STATES = ('✓', '✗', '▶', '·')
 
@@ -176,6 +180,63 @@ end
     value = lock(IP_LOCK) do
         other.locked()
     end
+end
+
+# Explicit threading (`@fetch!`, an `@progress` body's sibling reads) computes inline too
+# (todo `1o2uih6`). Its own lock, so a regression fails these items without hanging others.
+const IP_FETCH_LOCK = ReentrantLock()
+@dynamicstruct struct IPFetchLocked
+    n::Int
+    "Locked entry"
+    entry(k) = lock(() -> 10k, IP_FETCH_LOCK)
+    "Locked bare"
+    bare = lock(() -> n, IP_FETCH_LOCK)
+end
+@dynamicstruct struct IPFetchUnderLock
+    other
+    entry_read() = lock(() -> @fetch!(__status__, other.entry(1)), IP_FETCH_LOCK)
+    bare_read = lock(() -> @fetch!(__status__, other.bare), IP_FETCH_LOCK)
+    "Locked sibling entry"
+    sibling(k) = lock(() -> k + 100, IP_FETCH_LOCK)
+    "Locked sibling"
+    sibling_bare = lock(() -> 200, IP_FETCH_LOCK)
+    @progress marked_entry_read = lock(() -> sibling(1), IP_FETCH_LOCK)
+    @progress marked_bare_read = lock(() -> sibling_bare, IP_FETCH_LOCK)
+end
+
+# Each computation reports the task it ran on.
+@dynamicstruct struct IPTaskOf
+    n::Int
+    "Entry task"
+    entry(k) = current_task()
+    "Bare task"
+    bare = current_task()
+end
+@dynamicstruct struct IPFetchTask
+    other
+    entry_read() = (@fetch!(__status__, other.entry(1)), current_task())
+    bare_read = (@fetch!(__status__, other.bare), current_task())
+    "Sibling entry task"
+    sibling(k) = current_task()
+    "Sibling task"
+    sibling_bare = current_task()
+    @progress marked_entry_read = (sibling(1), current_task())
+    @progress marked_bare_read = (sibling_bare, current_task())
+end
+
+@dynamicstruct struct IPGatedSource
+    tag::Symbol
+    "Gated work"
+    work = (gate(tag); 9)
+    "Gated entry"
+    entry(k) = (gate(tag); 10k)
+end
+@dynamicstruct struct IPFetching
+    other
+    "Fetching bare"
+    bare_read = @fetch!(__status__, other.work)
+    "Fetching entry"
+    entry_read = @fetch!(__status__, other.entry(2))
 end
 
 # The snag's shape (`awaited-compute-bde2f24d`): a route reads another object's
@@ -372,6 +433,55 @@ u = IPUnderLock(IPLocked(1))
 t = Threads.@spawn u.value
 @test settles(() -> istaskdone(t), 10)
 @test fetch(t) == 42
+end
+
+@testitem "explicit threading: @fetch! and @progress reads under the reader's lock do not deadlock" tags=[:progress] setup=[ImpliedProgressFixtures] begin
+using .ImpliedProgressFixtures
+for (read, expected) in ((u -> u.entry_read(), 10), (u -> u.bare_read, 3),
+                         (u -> u.marked_entry_read, 101), (u -> u.marked_bare_read, 200))
+    u = IPFetchUnderLock(IPFetchLocked(3))
+    t = Threads.@spawn read(u)
+    # Never `fetch` a task that did not finish: it would hang the suite instead of failing.
+    @test settles(() -> istaskdone(t), 10)
+    istaskdone(t) && @test fetch(t) == expected
+end
+end
+
+@testitem "explicit threading: @fetch! and @progress reads compute on the reader's task" tags=[:progress] setup=[ImpliedProgressFixtures] begin
+using .ImpliedProgressFixtures
+u = IPFetchTask(IPTaskOf(1))
+for (computed, reader) in (u.entry_read(), u.bare_read, u.marked_entry_read, u.marked_bare_read)
+    @test computed === reader
+end
+end
+
+@testitem "explicit threading: @fetch! keeps the read's node under the reader" tags=[:progress] setup=[ImpliedProgressFixtures] begin
+using .ImpliedProgressFixtures
+src = IPGatedSource(:fetched)
+r = IPFetching(src)
+tb = Threads.@spawn r.bare_read
+te = Threads.@spawn r.entry_read
+@test settles(() -> depth_of(r.__status__, "Gated work") !== nothing &&
+                    depth_of(r.__status__, "Gated entry") !== nothing)
+@test depth_of(r.__status__, "Gated work") == depth_of(r.__status__, "Fetching bare") + 1
+@test depth_of(r.__status__, "Gated entry") == depth_of(r.__status__, "Fetching entry") + 1
+# Each computation keeps its place in its owner's tree.
+@test "Gated work" in labels(src.__status__)
+@test "Gated entry" in labels(src.__status__)
+release!(:fetched)
+@test settles(() -> istaskdone(tb) && istaskdone(te))
+@test fetch(tb) == 9
+@test fetch(te) == 20
+# Unlike an implied read's link, the finished node stays under the reader. (A finished
+# subtree renders only from its own node.)
+@test labels(node_of(r, :bare_read)) == ["Fetching bare", "Gated work"]
+@test labels(node_of(r, :entry_read)) == ["Fetching entry", "Gated entry"]
+# A hit shows the entry's finished node under the reader, relabelled.
+r2 = IPFetching(src)
+@test r2.bare_read == 9
+@test r2.entry_read == 20
+@test labels(node_of(r2, :bare_read)) == ["Fetching bare", "Gated work (cached)"]
+@test labels(node_of(r2, :entry_read)) == ["Fetching entry", "Gated entry (cached)"]
 end
 
 @testitem "implied progress: a route shows queued fits read without @fetch!" tags=[:progress] setup=[ImpliedProgressFixtures] begin

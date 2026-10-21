@@ -1427,7 +1427,8 @@ end
 # `link` is the progress node of the code that wrote the read, passed by a read the
 # property-body rewrite threads (`_read_threaded` / `_call_threaded`). While a blocking
 # access computes the entry or waits for it, the computation's node also shows under
-# `link` (`_linked`). Hits and polls never link.
+# `link` (`_linked`). Hits and polls never link. An `_Attached` link (`@fetch!` /
+# `@progress`) keeps the node there and shows hits too (`_link_hit!`).
 Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substatus=nothing, retry_failed=true,
           trace_t0=_trace_clock(), link=nothing) = begin
     # Fast path: a ready value returns immediately, no substatus cost. (`_missing_sentinel`
@@ -1440,6 +1441,7 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     end
     if hit !== _missing_sentinel
         t0 == 0 || _trace_read!(f, Val(:hit), t0)
+        _link_hit!(link, c, key, hit)
         return hit
     end
     # Build the substatus OUTSIDE the lock — factories recurse into DO props on the SAME
@@ -1473,6 +1475,7 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     if kind === :value
         !isnothing(s) && _finalize_substatus!(s)
         t0 == 0 || _trace_read!(f, Val(:hit), t0)
+        _link_hit!(link, c, key, action[2])
         return action[2]
     end
     if kind === :error
@@ -1665,9 +1668,9 @@ end
 
 Declaration-site executor of indexed property `name`. When it returns an executor, every
 memoized computation of the property starts through `executor(d::DeferredCompute)`, whichever
-task triggers it and however it is called: a blocking call `o.name(args...)` (computed
-inline otherwise), a poll (`fetchindex`, `fetch=identity`), or a progress-threaded call
-under `@progress` / `@fetch!` (spawned otherwise). It is `fetch=Deferred(executor)` chosen
+task triggers it and however it is called: a blocking call `o.name(args...)`, a
+progress-threaded call under `@progress` / `@fetch!` (both computed inline otherwise), or a
+poll (`fetchindex`, `fetch=identity`). It is `fetch=Deferred(executor)` chosen
 by the declaration instead of by each caller; a caller's own `fetch=Deferred(other)` takes
 precedence. The default, `nothing`, keeps the per-call behavior.
 
@@ -1695,7 +1698,7 @@ property_executor(o, ::Val) = nothing
 Wraps every blocking wait of a call that carries `executor` (any call of a property whose
 [`property_executor`](@ref DynamicObjects.property_executor) returns it, or a call with
 `fetch=Deferred(executor)`), including a blocking `fetch` of a [`Pending`](@ref) such a call
-returned, as `fetchindex!` and `@progress` / `@fetch!` call sites do. For a property with a
+returned. For a property with a
 declared executor that is every blocking wait on it: a caller waiting for the compute it
 handed to the executor, and a caller that finds the computation already queued or running.
 Waits that would not block (the value or failure is already recorded) do not call it.
@@ -2416,6 +2419,19 @@ function _linked(f, parent::Treebars.ProgressNode, node::Treebars.ProgressNode)
         Treebars.is_failed(node) || pop!(parent.children, node, nothing)
     end
 end
+
+# The `link` of a read `@fetch!` or `@progress` threads (`fetchindex!` / `fetchproperty!`
+# with a progress node). The read is the ordinary blocking read, computed inline, but the
+# computation's node stays under `parent` after it finishes, and a hit attaches the entry's
+# node too, relabelled " (cached)" when documented (`_attach_fetched!`).
+struct _Attached
+    parent::Treebars.ProgressNode
+end
+_linked(f, a::_Attached, node) = (Treebars.add_child!(a.parent, node); f())
+# What a hit of `key` in `c` shows under `link`: nothing, except for an `_Attached` read.
+_link_hit!(link, c, key, v) = nothing
+_link_hit!(a::_Attached, c::AbstractThreadsafeDict, key, v) =
+    _attach_fetched!(a.parent, v, _status_of(c, key))
 
 # The state of `key` behind latch `cnd`: `:value`, `:error`, `:gone` (the latch was
 # retracted with neither), or — without `block` — `:pending` while it is still in flight.
@@ -3486,12 +3502,20 @@ fetchindex!(status::Treebars.ProgressNode, ip, indices...; fetch=Base.fetch, kwa
         _attach_fetched!(status, rv, s)
         fetch(rv)
     end
+# A blocking read computes inline, on the reader's task, as a plain read does: a
+# computation run on a spawned task while the reader waits for it would deadlock on any
+# lock the reader holds (todo `1o2uih6`). A poll (`fetch=identity`) still starts it in the
+# background and returns a `Pending`.
+function fetchindex!(status::Treebars.ProgressNode, ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict},
+                     indices...; fetch=Base.fetch, force=false, retry_failed=force, kwargs...)
+    _is_blocking(fetch) || return invoke(fetchindex!, Tuple{Treebars.ProgressNode,Any,Vararg{Any}},
+                                         status, ip, indices...; fetch, force, retry_failed, kwargs...)
+    force && invalidate!(ip, indices...; kwargs...)
+    _memoize_linked!(_Attached(status), ip, indices...; fetch, retry_failed, kwargs...)
+end
 
 fetchproperty!(status::Treebars.ProgressNode, o, name::Symbol) =
-    fetchproperty(o, name) do rv, s
-        _attach_fetched!(status, rv, s)
-        Base.fetch(rv)
-    end
+    _is_dynamic_object(o) ? _getorcompute_linked(o, name, _Attached(status)) : getproperty(o, name)
 
 maybepop!(c::AbstractDict, key) = haskey(c, key) && pop!(c, key)
 maybepop!(c::AbstractThreadsafeDict, key) = begin
@@ -4248,6 +4272,7 @@ function _getorcompute_bare(cache::PropertyCache, o, name::Symbol; link=nothing)
     if hit !== _missing_sentinel
         # Reading an indexed property's wrapper is not a read of its value.
         t0 == 0 || _own_wrapper(o, name, hit) || _trace_read!(o, name, nothing, Val(:hit), t0)
+        _link_hit!(link, getfield(cache, :cache), name, hit)
         return hit
     end
     substatus_f = _bare_substatus_f(o, name)
@@ -8981,6 +9006,7 @@ function _opaque_shared!(oc::_OpaqueSubcache, key; fetch=Base.fetch, retry_faile
     args, kwargs = _opaque_call(oc, key)
     if hit !== _missing_sentinel
         t0 == 0 || _trace_read!(oc.requester, oc.name, _trace_args(args, kwargs), Val(:hit), t0)
+        _link_hit!(link, oc, key, hit)
         return hit
     end
     local_value = Ref{Any}(_missing_sentinel)
