@@ -315,9 +315,9 @@ c = IPChain(:chain)
 t = Threads.@spawn c.top
 @test settles(() -> node_of(c, :raw) !== nothing)
 top = node_of(c, :top)
+@test settles(() -> depth_of(top, "Load raw data") == 2)
 @test depth_of(top, "Top level") == 0
 @test depth_of(top, "Summarise") == 1
-@test depth_of(top, "Load raw data") == 2
 # Each computation keeps its place in the owner's tree, rendered once.
 @test count(==("Load raw data"), labels(c.__status__)) == 1
 release!(:chain)
@@ -331,7 +331,7 @@ using .ImpliedProgressFixtures
 o = IPOuter(IPInner(:outer))
 t = Threads.@spawn o.combined
 @test settles(() -> node_of(o.inner, :work) !== nothing)
-@test depth_of(node_of(o, :combined), "Inner work") == 1
+@test settles(() -> depth_of(node_of(o, :combined), "Inner work") == 1)
 @test "Inner work" in labels(o.inner.__status__)
 release!(:outer)
 @test fetch(t) == 10
@@ -353,14 +353,14 @@ using .ImpliedProgressFixtures
 w = IPWithIP(:items)
 t = Threads.@spawn w.total
 @test settles(() -> DynamicObjects.getstatus(w.item, 2) !== nothing)
-@test depth_of(node_of(w, :total), "Per-index work") == 1
+@test settles(() -> depth_of(node_of(w, :total), "Per-index work") == 1)
 release!(:items)
 @test fetch(t) == 60
 
 k = IPKw(:kw)
 t = Threads.@spawn k.uses
 @test settles(() -> DynamicObjects.getstatus(k.scaled, 3; factor = 4) !== nothing)
-@test depth_of(node_of(k, :uses), "Scaled") == 1
+@test settles(() -> depth_of(node_of(k, :uses), "Scaled") == 1)
 release!(:kw)
 @test fetch(t) == 12
 end
@@ -370,7 +370,7 @@ using .ImpliedProgressFixtures
 s = IPSpawned(:spawned)
 t = Threads.@spawn s.parent
 @test settles(() -> node_of(s, :child) !== nothing)
-@test depth_of(node_of(s, :parent), "Spawned child") == 1
+@test settles(() -> depth_of(node_of(s, :parent), "Spawned child") == 1)
 release!(:spawned)
 @test fetch(t) == 4
 end
@@ -515,7 +515,7 @@ view = DynamicObjects.remount(root; __prefix__ = "/v")
 p = poller()
 rv = fetchindex!(p, view.routed; fetch=identity)
 @test settles(() -> node_of(root.inner, :work) !== nothing)
-@test depth_of(p, "Inner work") == depth_of(p, "Routed") + 1
+@test settles(() -> depth_of(p, "Inner work") == depth_of(p, "Routed") + 1)
 release!(:remount)
 @test fetch(rv) == (9, "/v")
 end
