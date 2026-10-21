@@ -51,6 +51,12 @@ export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, in
 
 import SHA, Serialization, Mmap, Treebars, ScopedValues
 
+# Every unmarked property body is wrapped in `Treebars.@progress_scope` (decision `0r44qxt`).
+# Treebars has it from `bdf76d5`; its version number does not say so, hence this check.
+isdefined(Treebars, Symbol("@progress_scope")) || error(
+    "DynamicObjects needs a Treebars with `Treebars.@progress_scope` (Treebars `bdf76d5` or " *
+    "later, nsiccha/Treebars.jl main). The loaded Treebars, $(pathof(Treebars)), has none: update it.")
+
 struct DiskCacheLocks
     lock::ReentrantLock
     locks::Dict{String, ReentrantLock}
@@ -4991,11 +4997,25 @@ _is_assignment_head(head) = head isa Symbol && head !== :kw && endswith(String(h
 _is_progress_marked(macros) = any(m -> m in macros,
     (Symbol("@progress"), Symbol("@PROGRESS"), Symbol("@fetch!"), Symbol("@dynamic_progress")))
 
-# Bind `__progress__` to the body's own node for the rewritten reads. A plain binding:
-# inline `@progress "phase"` lines and loop counters still come from an explicit
-# `@progress` marker (decision `0r44qxt` asks whether unmarked bodies get them too).
+# The unmarked body inside `Treebars.@progress_scope __status__ …` (decision `0r44qxt`): it
+# binds `__progress__` to the body's node for the rewritten reads and runs inline
+# `@progress "phase"` lines, while loops stay plain. An explicit
+# `@progress "label" for …` still counts.
 _implied_progress_wrap(body, lnn) =
-    Expr(:let, Expr(:(=), :__progress__, :__status__), Expr(:block, lnn, body))
+    Expr(:macrocall, GlobalRef(Treebars, Symbol("@progress_scope")), lnn, :__status__,
+         _progress_body_block(body))
+
+# The body as a block the Treebars walker can safely lower. A string in statement position
+# would read as a phase label, so it becomes `identity("…")` (same value). A non-block
+# body is block-wrapped, so a bare comprehension stays a value. A block body is rebuilt in
+# place, keeping inline phase markers direct statements of the scope (`1ce8892`).
+_progress_safe_stmt(x) = x
+_progress_safe_stmt(x::String) = Expr(:call, GlobalRef(Base, :identity), x)
+_progress_safe_stmt(x::Expr) =
+    Meta.isexpr(x, :string) ? Expr(:call, GlobalRef(Base, :identity), x) : x
+_progress_body_block(rhs) = Meta.isexpr(rhs, :block) ?
+    Expr(:block, Any[_progress_safe_stmt(a) for a in rhs.args]...) :
+    Expr(:block, _progress_safe_stmt(rhs))
 
 # Macros whose arguments are evaluated as ordinary code, so reads in them nest.
 # `@memo!` / `@fresh` keep their meaning through their `_call_threaded` arms.

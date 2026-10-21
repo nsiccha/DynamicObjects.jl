@@ -11,11 +11,11 @@ using TestItemRunner
 @testmodule ImpliedProgressFixtures begin
 using DynamicObjects
 import DynamicObjects.Treebars
-using DynamicObjects.Treebars: render_text
-export render_text, rows, depth_of, labels, gate, release!, settles, node_of, poller,
+using DynamicObjects.Treebars: render_text, @progress
+export render_text, @progress, rows, depth_of, labels, gate, release!, settles, node_of, poller,
     IPChain, IPInner, IPOuter, IPViaHelper, IPWithIP, IPBoom, IPKw, IPSpawned,
     IPRewriteRuntime, REWRITE_CALLS, IPReread, REREAD_CALLS, IPMarked, IPLocked,
-    IPUnderLock, IPPopulation, IPModel, IPRoute, IPRemountRoot
+    IPUnderLock, IPPopulation, IPModel, IPRoute, IPRemountRoot, IPPhased, IPLoops
 
 const _STATES = ('✓', '✗', '▶', '·')
 
@@ -201,6 +201,42 @@ end
     model
     "Route"
     route() = (model.fit(), :viewed)
+end
+
+# Inline phases need no marker on the property (decision `0r44qxt`); both the imported
+# and the module-qualified spelling are Treebars' source surface.
+@dynamicstruct struct IPPhased
+    tag::Symbol
+    "Two phases"
+    staged = begin
+        @progress "first"
+        x = tag === :never ? 0 : 1
+        Treebars.@progress "second"
+        gate(tag)
+        x + 1
+    end
+end
+
+# Loops stay plain unless counted explicitly.
+@dynamicstruct struct IPLoops
+    tag::Symbol
+    "Plain loop"
+    plain = begin
+        acc = 0
+        for i in 1:3
+            acc += i
+        end
+        gate(tag)
+        acc
+    end
+    "Counted loop"
+    counted = begin
+        acc = 0
+        @progress "items" for i in 1:3
+            acc += i
+        end
+        acc
+    end
 end
 
 # Request views of a retained root (HTMXObjects' `RootProvider`).
@@ -433,4 +469,31 @@ params = only(a for a in shorthand.args if Meta.isexpr(a, :parameters))
 @test count_ref(rw(:(__self__.ip(other.y)), false), readref) == 1
 @test rw(:(__self__.ip(1)), false).args[1] == :(__self__.ip)
 @test rw(:(other.ip(1)), false).args[1] == callref
+end
+
+@testitem "implied progress: inline phases need no marker on the property" tags=[:progress] setup=[ImpliedProgressFixtures] begin
+using .ImpliedProgressFixtures
+p = IPPhased(:phased)
+t = Threads.@spawn p.staged
+@test settles(() -> "second" in labels(something(node_of(p, :staged), poller())))
+staged = node_of(p, :staged)
+@test depth_of(staged, "first") == 1
+@test depth_of(staged, "second") == 1
+@test occursin("▶ second", render_text(staged))
+release!(:phased)
+@test fetch(t) == 2
+@test occursin("✓ second", render_text(staged))
+end
+
+@testitem "implied progress: loops stay uncounted unless marked" tags=[:progress] setup=[ImpliedProgressFixtures] begin
+using .ImpliedProgressFixtures
+l = IPLoops(:loops)
+t = Threads.@spawn l.plain
+@test settles(() -> node_of(l, :plain) !== nothing)
+@test labels(node_of(l, :plain)) == ["Plain loop"]
+release!(:loops)
+@test fetch(t) == 6
+@test labels(node_of(l, :plain)) == ["Plain loop"]
+@test l.counted == 6
+@test "items (3/3)" in labels(node_of(l, :counted))
 end
