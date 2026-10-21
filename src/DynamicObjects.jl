@@ -1478,7 +1478,7 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
         # Blocking waiter: block on the in-flight computer's latch, then read value/error.
         # We built `s` but aren't the computer; finalize it (the winner owns the status).
         !isnothing(s) && _finalize_substatus!(s)
-        return _linked(link, _status_of(c, key)) do
+        return _linked(link, link === nothing ? nothing : _status_of(c, key)) do
             _await_cache_value!(c, key, action[2]::Threads.Condition, f; fetch, substatus, retry_failed, link)
         end
     end
