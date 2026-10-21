@@ -6679,27 +6679,25 @@ else
     dump(x)
     error("Don't know how to handle $x")
 end
+# Make a built call valid: its keyword block goes first, wherever arguments were spliced.
+# A call with no keyword block gets none, and a single block keeps its written order: an
+# empty `;` changes the call a macro reads (Treebars' `@progress … map(…) do` splices
+# `map`'s arguments), and keyword order is precedence (`f(; nt..., a=2)` passes `a=2`).
 fixcall(x) = x
 fixcall(x::Expr) = if Meta.isexpr(x, :call)
     f = x.args[1]
-    # Collect keyword args in two passes: fixed kwargs first, splats (kwargs...) last.
-    # This is necessary because the new Expr-based method generation may merge multiple
-    # :parameters nodes (e.g. one from info.indices containing `kwargs...` and one from
-    # cp_kwargs containing `name=val`). Julia requires splat kwargs to be final, so we
-    # sort them to the end regardless of which :parameters node they originated from.
-    pargs_fixed = []
-    pargs_splat = []
-    args = []
-    for arg in fixcall.(x.args[2:end])
-        if Meta.isexpr(arg, :parameters)
-            for a in arg.args
-                Meta.isexpr(a, :(...)) ? push!(pargs_splat, a) : push!(pargs_fixed, a)
-            end
-        else
-            push!(args, arg)
-        end
-    end
-    Expr(x.head, f, Expr(:parameters, pargs_fixed..., pargs_splat...), args...)
+    args = fixcall.(x.args[2:end])
+    blocks = filter(a -> Meta.isexpr(a, :parameters), args)
+    positional = filter(a -> !Meta.isexpr(a, :parameters), args)
+    length(blocks) <= 1 && return Expr(x.head, f, blocks..., positional...)
+    # Several blocks only arise in Expr-based method generation (e.g. one from
+    # info.indices containing `kwargs...` and one from cp_kwargs containing `name=val`).
+    # A signature requires splat kwargs to be final, so merge them, splats last,
+    # regardless of which :parameters node they originated from.
+    pargs = Any[a for b in blocks for a in b.args]
+    Expr(x.head, f, Expr(:parameters, filter(a -> !Meta.isexpr(a, :(...)), pargs)...,
+                                      filter(a -> Meta.isexpr(a, :(...)), pargs)...),
+         positional...)
 else
     Expr(x.head, fixcall.(x.args)...)
 end
