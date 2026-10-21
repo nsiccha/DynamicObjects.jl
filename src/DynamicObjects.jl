@@ -3397,6 +3397,14 @@ fetchindex(fetch, ip::IndexableProperty, indices...; kwargs...) = memoize!(ip, i
 In-place variant of [`fetchindex`](@ref). When `callback` is `nothing`, falls
 through to a plain `memoize!(ip, indices...; fetch, kwargs...)` — useful for
 sites that opt out of the two-phase fetch dance without changing call shape.
+
+When `callback` is a `Treebars.ProgressNode`, the call blocks for the value. It
+computes inline on the caller's task, as a plain call does, and attaches the
+computation's node under `callback`, where it stays once finished; a documented
+cache hit attaches the entry's node relabelled " (cached)". With `fetch=identity`
+it polls instead and returns a [`Pending`](@ref) while the computation runs.
+[`fetchproperty!`](@ref) with a progress node is the blocking form for a bare
+property; `@fetch!` and `@progress` thread their reads through both.
 """
 fetchindex!(::Nothing, ip, indices...; fetch=Base.fetch, kwargs...) = memoize!(ip, indices...; fetch, kwargs...)
 
