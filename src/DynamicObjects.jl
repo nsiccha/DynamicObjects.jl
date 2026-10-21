@@ -877,8 +877,8 @@ end
 # `getorcomputeproperty` routes around this layer when indices/kwargs are
 # present (see ~L1109), so this overload only needs to handle the
 # bare-name case.
-Base.get!(f::Function, c::PropertyCache, key; substatus=nothing, kwargs...) =
-    get!(f, c.cache, key; substatus)
+Base.get!(f::Function, c::PropertyCache, key; substatus=nothing, link=nothing, kwargs...) =
+    get!(f, c.cache, key; substatus, link)
 Base.get!(f::Function, ::PropertyCache, key, indices...; kwargs...) = f(nothing)
 Base.setindex!(c::PropertyCache, args...) = setindex!(c.cache, args...)
 Base.show(io::IO, pc::PropertyCache) =
@@ -1366,7 +1366,12 @@ n_running(c::AbstractThreadsafeDict) = lock(c.lock) do; length(c.computing); end
 Base.show(io::IO, c::ThreadsafeDict{K,V}) where {K,V} = lock(c.lock) do
     print(io, "ThreadsafeDict{", K, ",", V, "}(", length(c.cache), " cached, ", length(c.computing), " running)")
 end
-memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...; fetch=Base.fetch, retry_failed=true, kwargs...) where {name} = begin
+memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...; fetch=Base.fetch, retry_failed=true, kwargs...) where {name} =
+    _memoize_linked!(nothing, ip, indices...; fetch, retry_failed, kwargs...)
+# `memoize!` whose blocking computation or wait also shows under `link` (see `get!`): the
+# memoized call a threaded read makes (`_call_threaded`).
+_memoize_linked!(link, ip::IndexableProperty, indices...; kwargs...) = memoize!(ip, indices...; kwargs...)
+_memoize_linked!(link, ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...; fetch=Base.fetch, retry_failed=true, kwargs...) where {name} = begin
     (;o, cache) = ip
     substatus_f = if name != :__substatus__ && name != :__status__
         () -> begin
@@ -1392,7 +1397,7 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
         v = _computeproperty(o, name, indices...; __status__=s, kwargs...)
         _adopt_source_child(o, name, args_key, v)
     end
-    get!(compute, cache, args_key; fetch, substatus=substatus_f, retry_failed, trace_t0=t0)
+    get!(compute, cache, args_key; fetch, substatus=substatus_f, retry_failed, trace_t0=t0, link)
 end
 # The substatus is created pending and started by `_run_cache_compute!` when the compute
 # runs, so a compute waiting in an executor, a job queue or for a `:default` thread does not
@@ -1412,8 +1417,13 @@ end
 # `trace_t0` is when a traced read began (`_trace_clock()`, `0` untraced). A caller that
 # builds `key` first (`memoize!` hashes it in `_memo_key`) passes the clock from before, so
 # a traced hit's time includes hashing the key.
+#
+# `link` is the progress node of the code that wrote the read, passed by a read the
+# property-body rewrite threads (`_read_threaded` / `_call_threaded`). While a blocking
+# access computes the entry or waits for it, the computation's node also shows under
+# `link` (`_linked`). Hits and polls never link.
 Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substatus=nothing, retry_failed=true,
-          trace_t0=_trace_clock()) = begin
+          trace_t0=_trace_clock(), link=nothing) = begin
     # Fast path: a ready value returns immediately, no substatus cost. (`_missing_sentinel`
     # distinguishes "absent" from a legitimately-cached `nothing`.)
     t0 = trace_t0
@@ -1468,7 +1478,9 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
         # Blocking waiter: block on the in-flight computer's latch, then read value/error.
         # We built `s` but aren't the computer; finalize it (the winner owns the status).
         !isnothing(s) && _finalize_substatus!(s)
-        return _await_cache_value!(c, key, action[2]::Threads.Condition, f; fetch, substatus, retry_failed)
+        return _linked(link, _status_of(c, key)) do
+            _await_cache_value!(c, key, action[2]::Threads.Condition, f; fetch, substatus, retry_failed, link)
+        end
     end
     if kind === :pending
         # Poller, compute already in flight elsewhere — hand back a cheap Pending, no spawn.
@@ -1478,7 +1490,9 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     end
     if kind === :inline
         # Blocking first-arriver: compute on THIS thread (no spawn), publish, return value.
-        return _run_cache_compute!(c, key, action[2]::Threads.Condition, f, s)
+        return _linked(link, s) do
+            _run_cache_compute!(c, key, action[2]::Threads.Condition, f, s)
+        end
     end
     # :start — first-arriver of a poller, or of any caller with an executor: kick the
     # REAL compute off (it writes the cache, or records a failure in `c.errors`). The Task
@@ -1489,7 +1503,9 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     cnd = action[2]::Threads.Condition
     _start_compute(executor, DeferredCompute(c, key, cnd, f, s))
     # A blocking caller waits for the compute it started, as for one already in flight.
-    sync && return _await_cache_value!(c, key, cnd, f; fetch, substatus, retry_failed)
+    sync && return _linked(link, s) do
+        _await_cache_value!(c, key, cnd, f; fetch, substatus, retry_failed, link)
+    end
     p = Pending(c, key, nothing, executor, _resolver(f, c, key, fetch, substatus, retry_failed))
     # An executor may have run the compute synchronously: hand back the value.
     executor !== nothing && isready(p) && return Base.fetch(p)
@@ -1586,6 +1602,8 @@ function abandon!(d::DeferredCompute, reason::AbstractString="abandoned")
     _claim!(d) || return false
     err = ComputeAbandoned(String(reason))
     c = d.cache
+    # Failed before waiters wake, as in `_run_cache_compute!`.
+    !isnothing(d.status) && _fail_substatus!(d.status, err)
     lock(c.lock) do
         # A latch an invalidation retracted is not this key's failure (`_run_cache_compute!`).
         if get(c.computing, d.key, nothing) === d.latch
@@ -1594,7 +1612,6 @@ function abandon!(d::DeferredCompute, reason::AbstractString="abandoned")
         end
         notify(d.latch)
     end
-    !isnothing(d.status) && _fail_substatus!(d.status, err)
     true
 end
 
@@ -2321,6 +2338,9 @@ function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condit
     try
         v = _with_publish_guard(() -> f(s), f, c, key, cnd)
     catch e
+        # Fail the node before waking waiters: a waiter that shows it under its own
+        # node (`_linked`) keeps it there exactly when it reads as failed.
+        !isnothing(s) && _fail_substatus!(s, e)
         lock(c.lock) do
             if get(c.computing, key, nothing) === cnd
                 delete!(c.computing, key)
@@ -2328,7 +2348,6 @@ function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condit
             end
             notify(cnd)
         end
-        !isnothing(s) && _fail_substatus!(s, e)
         _failed!(f)
         rethrow()
     end
@@ -2359,7 +2378,7 @@ end
 # (rethrow the recorded exception). If the computer vanished with neither (evicted mid
 # flight), recompute from scratch OUTSIDE the lock. With an executor the blocking part
 # runs inside `await_deferred`.
-function _await_cache_value!(c::AbstractThreadsafeDict, key, cnd::Threads.Condition, f; fetch=Base.fetch, substatus=nothing, retry_failed=true)
+function _await_cache_value!(c::AbstractThreadsafeDict, key, cnd::Threads.Condition, f; fetch=Base.fetch, substatus=nothing, retry_failed=true, link=nothing)
     t0 = _trace_clock()
     outcome = _latch_outcome(c, key, cnd, false)
     if outcome[1] === :pending
@@ -2370,7 +2389,26 @@ function _await_cache_value!(c::AbstractThreadsafeDict, key, cnd::Threads.Condit
     t0 == 0 || _trace_read!(f, Val(:wait), t0)
     outcome[1] === :value && return outcome[2]
     outcome[1] === :error && throw(outcome[2])
-    return get!(f, c, key; fetch, substatus, retry_failed)   # :gone → recompute
+    return get!(f, c, key; fetch, substatus, retry_failed, link)   # :gone → recompute
+end
+
+# The progress node of `key`'s computation, registered when it started.
+_status_of(c::AbstractThreadsafeDict, key) = lock(() -> get(c.status, key, nothing), c.lock)
+
+# Show `node`, the computation a threaded read computes or waits for, under `parent`, the
+# node of the code that wrote the read, while `f` runs. The computation keeps its own
+# parent (its owner's tree). A finished node leaves `parent` again; a failed one stays,
+# so the failure shows where it was waited for. A node already under `parent` (attached
+# explicitly, or created there) is left alone.
+_linked(f, parent, node) = f()
+function _linked(f, parent::Treebars.ProgressNode, node::Treebars.ProgressNode)
+    (parent === node || node in parent.children) && return f()
+    Treebars.add_child!(parent, node)
+    try
+        f()
+    finally
+        Treebars.is_failed(node) || pop!(parent.children, node, nothing)
+    end
 end
 
 # The state of `key` behind latch `cnd`: `:value`, `:error`, `:gone` (the latch was
@@ -4192,7 +4230,7 @@ elseif !isempty(indices) || !isempty(kwargs)
 else
     _getorcompute_bare(getfield(o, :cache), o, name)
 end
-function _getorcompute_bare(cache::PropertyCache, o, name::Symbol)
+function _getorcompute_bare(cache::PropertyCache, o, name::Symbol; link=nothing)
     # Fast hit path: a cached bare property returns WITHOUT building the
     # `substatus` factory or the `get!` do-block closure below — both allocate
     # on every access and were the dominant warm-access cost. Hit bookkeeping is
@@ -4214,7 +4252,7 @@ function _getorcompute_bare(cache::PropertyCache, o, name::Symbol)
     is_indexed_property(o, name) && return get!(cache, name; substatus=substatus_f) do s
         IndexableProperty(name, o, subcache(cache, o, Val(name)))
     end
-    get!(_bare_compute(o, name), cache, name; substatus=substatus_f)
+    get!(_bare_compute(o, name), cache, name; substatus=substatus_f, link)
 end
 # The computation of bare property `name`, reported to `property_settled` when it stores.
 # `s` is the substatus the spawn wrapper passed (or `nothing` when there is none). It is
@@ -4226,12 +4264,12 @@ end
 # A remount view first tries the shared namespace for an untainted opaque
 # property; the guarded `__self__` of an opaque computation intercepts every
 # read (`_probe_read`).
-function _getorcompute_bare(cache::PropertyCache{<:MountedThreadsafeDict}, o, name::Symbol)
+function _getorcompute_bare(cache::PropertyCache{<:MountedThreadsafeDict}, o, name::Symbol; link=nothing)
     c = cache.cache
-    c.probe === nothing || return _probe_read(c, c.probe, o, name)
+    c.probe === nothing || return _probe_read(c, c.probe, o, name; link)
     name in c.opaque && !is_indexed_property(o, name) &&
-        return _opaque_bare!(o, name, nothing)
-    invoke(_getorcompute_bare, Tuple{PropertyCache,Any,Symbol}, cache, o, name)
+        return _opaque_bare!(o, name, nothing; link)
+    invoke(_getorcompute_bare, Tuple{PropertyCache,Any,Symbol}, cache, o, name; link)
 end
 _bare_substatus_f(o, name) =
     if name != :__substatus__ && name != :__status__ &&
@@ -4574,6 +4612,52 @@ maybefetchproperty!(progress, o, name::Symbol) =
         fetchproperty!(progress, o, name) :
         getproperty(o, name)
 
+# ── Implied progress (decision `0yvb74c`) ──────────────────────────────────────
+#
+# An unmarked property body is rewritten (`_implied_progress_rewrite`) so that every
+# property read written in it — `obj.name`, `obj.ip(args…)`, and a bare sibling, which
+# `walk_rhs` has made `__self__.name` — passes along the body's progress node
+# (`__progress__`). The read is the ordinary read: it computes inline, a cache hit costs
+# what it did, and nothing is spawned. When it computes or waits for a computation, that
+# computation's node also shows under `progress` meanwhile (`get!`'s `link`); it keeps its
+# place in its owner's tree.
+#
+# One method each, branching inside, so a call resolves statically even when `progress`
+# or the receiver is untyped: a field read in a loop stays a field read.
+@inline function _read_threaded(progress, o, ::Val{name}) where {name}
+    progress isa Treebars.ProgressNode && _is_dynamic_object(o) || return getproperty(o, name)
+    _getorcompute_linked(o, name, progress)
+end
+
+@inline function _call_threaded(progress, f, args...; kwargs...)
+    f isa IndexableProperty && progress isa Treebars.ProgressNode || return f(args...; kwargs...)
+    _call_threaded_ip(progress, f, args...; kwargs...)
+end
+# What the call form `ip(args…)` does, with the computation shown under `progress`: a
+# memoized call links it while it computes or waits; a `@fresh` property's call gets its
+# own node under `progress`, as under `@fetch!`.
+_call_threaded_ip(progress, ip::IndexableProperty{name}, args...; kwargs...) where {name} =
+    _never_cache(ip.o, Val(name)) ? maybeprogress!(progress, ip, args...; kwargs...) :
+                                    _memoize_linked!(progress, ip, args...; kwargs...)
+
+# `getorcomputeproperty(o, name)` (what the generated `getproperty` calls) for a bare
+# name, its computation shown under `link`.
+_getorcompute_linked(o, name::Symbol, link) =
+    hasfield(typeof(o), name) ? getfield(o, name) :
+                                _getorcompute_bare(getfield(o, :cache), o, name; link)
+
+# Call-site `@memo!` / `@fresh` inside a rewritten body expand after the rewrite, so they
+# see `_call_threaded(progress, callee, args…)`. Keep their meaning.
+maybememoize!(::typeof(_call_threaded), progress, ip::IndexableProperty, args...; kwargs...) =
+    progress isa Treebars.ProgressNode ? _memoize_linked!(progress, ip, args...; kwargs...) :
+                                         memoize!(ip, args...; kwargs...)
+maybememoize!(::typeof(_call_threaded), progress, f, args...; kwargs...) =
+    _call_threaded(progress, f, args...; kwargs...)
+maybefresh(::typeof(_call_threaded), progress, ip::IndexableProperty, args...; kwargs...) =
+    maybeprogress!(progress, ip, args...; kwargs...)
+maybefresh(::typeof(_call_threaded), progress, f, args...; kwargs...) =
+    _call_threaded(progress, f, args...; kwargs...)
+
 """
     @fetch! progress expr
 
@@ -4768,6 +4852,165 @@ function _progress_self_rewrite_kwarg(a::Expr)
     end
     return _progress_self_rewrite(a)
 end
+
+# ── Implied progress: the unmarked-body rewrite (decision `0yvb74c`) ──────────
+#
+# Every property read written in an unmarked body nests under the body's progress
+# node. After `walk_rhs` (bare siblings are already `__self__.name`):
+#
+#   obj.name         -> _read_threaded(__progress__, obj, Val(:name))
+#   obj.ip(args...)  -> _call_threaded(__progress__, obj.ip, args...)
+#
+# Any receiver, not only `__self__`: another object's property (`model.fit()`)
+# nests too. Ordinary calls (`sum`, arithmetic, helpers, constructors) stay calls,
+# with only their arguments walked; a read inside a helper is the helper's own
+# business. Syntax that is not an evaluation is left alone: assignment and local
+# function targets, quoted code, type positions. Keyword shorthand, `do` blocks,
+# broadcast calls and named destructuring keep their meaning. Ported from the
+# isolated lane `kb-impl/DynamicObjects-snag.semantic-app-req-fafc83a2`
+# (`3b2f9e7`..`1203b44c`), which emitted the spawning `maybefetch*` helpers.
+# `self=false` (an `@progress` body, whose marker already threads `__self__` reads
+# through `_progress_self_rewrite`) leaves `__self__`-rooted reads as written and
+# rewrites only reads on other objects.
+_implied_progress_rewrite(pv::Symbol, x, self::Bool=true) = x
+function _implied_progress_rewrite(pv::Symbol, x::Expr, self::Bool=true)
+    rw(a) = _implied_progress_rewrite(pv, a, self)
+    threads(access) = _is_property_access(access) && (self || access.args[1] !== :__self__)
+    Meta.isexpr(x, (:quote, :inert, :curly, :where, :meta)) && return x
+    if Meta.isexpr(x, :(::))
+        return length(x.args) == 2 ? Expr(:(::), rw(x.args[1]), x.args[2]) : x
+    end
+
+    # A macro's arguments are only walked when it evaluates them as ordinary code;
+    # anything else may read its arguments as syntax (`@.` would broadcast the
+    # inserted helper call, `@ccall` parses a signature), so it is left as written.
+    if Meta.isexpr(x, :macrocall)
+        (length(x.args) <= 2 || !_implied_progress_macro(x.args[1])) && return x
+        return Expr(:macrocall, x.args[1], x.args[2], Any[rw(a) for a in x.args[3:end]]...)
+    end
+
+    # Local function and lambda signatures are declarations: rewrite the body only.
+    if Meta.isexpr(x, (:function, :(->))) && length(x.args) == 2
+        return Expr(x.head, x.args[1], rw(x.args[2]))
+    end
+
+    # Named destructuring reads properties during lowering. Evaluate the source once
+    # and make each read explicit, keeping the assignment's value.
+    if Meta.isexpr(x, :(=)) && Meta.isexpr(x.args[1], :tuple) &&
+       length(x.args[1].args) == 1 && Meta.isexpr(x.args[1].args[1], :parameters) &&
+       (self || x.args[2] !== :__self__)
+        binds = _fetch_destructure_binds(x.args[1].args[1])
+        if binds !== nothing
+            src = gensym(:progress_src)
+            block = Expr(:block, :($src = $(rw(x.args[2]))))
+            for (lhs, nm) in binds
+                push!(block.args, :($lhs = $(_read_threaded_expr(pv, src, nm))))
+            end
+            push!(block.args, src)
+            return block
+        end
+    end
+
+    # Never rewrite an assignment target (including short-form method signatures and
+    # dotted or compound assignment); the right-hand side is an evaluation.
+    if length(x.args) >= 2 && _is_assignment_head(x.head)
+        return Expr(x.head, x.args[1], Any[rw(a) for a in x.args[2:end]]...)
+    end
+
+    # `obj.f(args...) do … end`: the lambda is the first argument after the callee.
+    if Meta.isexpr(x, :do) && length(x.args) == 2 && Meta.isexpr(x.args[1], :call)
+        call = x.args[1]
+        lambda = rw(x.args[2])
+        if !isempty(call.args) && threads(call.args[1])
+            rest = Any[rw(a) for a in call.args[2:end]]
+            return fixcall(Expr(:call, GlobalRef(@__MODULE__, :_call_threaded),
+                pv, _implied_progress_callee(pv, call.args[1], self), lambda, rest...))
+        end
+        callee = _is_property_access(call.args[1]) ? call.args[1] : rw(call.args[1])
+        return Expr(:do, fixcall(Expr(:call, callee, Any[rw(a) for a in call.args[2:end]]...)), lambda)
+    end
+
+    # Broadcast `obj.f.(args...)`: the progress node and the callee are scalars (a
+    # `ProgressNode` is iterable); a `:parameters` block stays first in the tuple.
+    if Meta.isexpr(x, :.) && length(x.args) == 2 && Meta.isexpr(x.args[2], :tuple)
+        callee = x.args[1]
+        args = Any[rw(a) for a in x.args[2].args]
+        if threads(callee)
+            params = Any[a for a in args if Meta.isexpr(a, :parameters)]
+            positional = Any[a for a in args if !Meta.isexpr(a, :parameters)]
+            return Expr(:., GlobalRef(@__MODULE__, :_call_threaded),
+                Expr(:tuple, params...,
+                    Expr(:call, GlobalRef(Core, :Ref), pv),
+                    Expr(:call, GlobalRef(Core, :Ref), _implied_progress_callee(pv, callee, self)),
+                    positional...))
+        end
+        _is_property_access(callee) || (callee = rw(callee))
+        return Expr(:., callee, Expr(:tuple, args...))
+    end
+
+    # `obj.f(args...)`: keep the callee `obj.f` itself, so the helper receives the
+    # `IndexableProperty`; its receiver and the arguments are walked.
+    if Meta.isexpr(x, :call) && !isempty(x.args)
+        if threads(x.args[1])
+            rest = Any[rw(a) for a in x.args[2:end]]
+            return fixcall(Expr(:call, GlobalRef(@__MODULE__, :_call_threaded),
+                pv, _implied_progress_callee(pv, x.args[1], self), rest...))
+        end
+        callee = _is_property_access(x.args[1]) ? x.args[1] : rw(x.args[1])
+        return fixcall(Expr(:call, callee, Any[rw(a) for a in x.args[2:end]]...))
+    end
+
+    # Keyword shorthand `; obj.field` stays keyword syntax: `field = <read>`.
+    if Meta.isexpr(x, :parameters)
+        return Expr(:parameters, Any[threads(a) ? Expr(:kw, a.args[2].value, rw(a)) : rw(a)
+                                     for a in x.args]...)
+    end
+    if Meta.isexpr(x, :kw) && length(x.args) == 2
+        return Expr(:kw, x.args[1], rw(x.args[2]))
+    end
+
+    threads(x) && return _read_threaded_expr(pv, rw(x.args[1]), x.args[2].value)
+
+    Expr(x.head, Any[rw(a) for a in x.args]...)
+end
+
+_read_threaded_expr(pv::Symbol, receiver, name::Symbol) =
+    Expr(:call, GlobalRef(@__MODULE__, :_read_threaded), pv, receiver,
+         Expr(:call, Expr(:curly, GlobalRef(Base, :Val), QuoteNode(name))))
+
+# The callee of `obj.f(...)` with its receiver walked and `.f` itself kept literal.
+_implied_progress_callee(pv::Symbol, x::Expr, self::Bool=true) =
+    Expr(:., _implied_progress_rewrite(pv, x.args[1], self), x.args[2])
+
+# A syntactic property access `obj.name`, as opposed to broadcast `f.(xs)`.
+_is_property_access(x) = Meta.isexpr(x, :.) && length(x.args) == 2 && x.args[2] isa QuoteNode
+
+_is_assignment_head(head) = head isa Symbol && head !== :kw && endswith(String(head), "=")
+
+# A progress-family marker on a declaration owns its body; the implied rewrite stands down.
+_is_progress_marked(macros) = any(m -> m in macros,
+    (Symbol("@progress"), Symbol("@PROGRESS"), Symbol("@fetch!"), Symbol("@dynamic_progress")))
+
+# Bind `__progress__` to the body's own node for the rewritten reads. A plain binding:
+# inline `@progress "phase"` lines and loop counters still come from an explicit
+# `@progress` marker (decision `0r44qxt` asks whether unmarked bodies get them too).
+_implied_progress_wrap(body, lnn) =
+    Expr(:let, Expr(:(=), :__progress__, :__status__), Expr(:block, lnn, body))
+
+# Macros whose arguments are evaluated as ordinary code, so reads in them nest.
+# `@memo!` / `@fresh` keep their meaning through their `_call_threaded` arms.
+_implied_progress_macro(head) = _macro_basename(head) in (
+    Symbol("@memo!"), Symbol("@fresh"), Symbol("@progress"), Symbol("@phases"),
+    Symbol("@inbounds"), Symbol("@views"), Symbol("@view"), Symbol("@simd"),
+    Symbol("@fastmath"), Symbol("@inline"), Symbol("@noinline"),
+    Symbol("@spawn"), Symbol("@async"), Symbol("@sync"), Symbol("@threads"), Symbol("@lock"),
+    Symbol("@assert"), Symbol("@show"), Symbol("@time"), Symbol("@timed"),
+    Symbol("@elapsed"), Symbol("@allocated"),
+    Symbol("@info"), Symbol("@debug"), Symbol("@warn"), Symbol("@error"), Symbol("@logmsg"))
+_macro_basename(head::Symbol) = head
+_macro_basename(head::GlobalRef) = head.name
+_macro_basename(head::Expr) = _is_property_access(head) ? head.args[2].value : nothing
+_macro_basename(head) = nothing
 
 """
     noprogress(f, args...; kwargs...)
@@ -8082,7 +8325,10 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                     # @progress block (else: "phase marker must be a direct statement of
                     # an enclosing @progress block"). Only a bare-expr body needs a fresh
                     # block wrapper.
-                    _rewritten = _progress_self_rewrite(walked_rhs)
+                    # Reads on other objects nest too (decision `0yvb74c`), through the
+                    # implied rewrite; `__self__` reads keep the marker's own threading.
+                    _rewritten = _progress_self_rewrite(
+                        _implied_progress_rewrite(:__progress__, walked_rhs, false))
                     walked_rhs = Expr(:macrocall,
                         GlobalRef(Treebars, Symbol("@progress")),
                         something(info.lnn, LineNumberNode(0, :unknown)),
@@ -8106,6 +8352,16 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                         something(info.lnn, LineNumberNode(0, :unknown)),
                         :__status__,
                         Meta.isexpr(_rewritten_all, :block) ? _rewritten_all : Expr(:block, _rewritten_all))
+                end
+                # UNMARKED — the default, so the shape almost every property takes.
+                # Progress nesting is implied (decision `0yvb74c`): every property read
+                # written in the body passes the body's node along
+                # (`_implied_progress_rewrite`), bound to `__progress__` here. A marker
+                # above owns its body instead, and DO's own `__…__` properties
+                # (`__status__`, `__substatus__`, `__hash__`, …) have no node to nest under.
+                if !_is_progress_marked(info.macros) && !_is_dunder(name)
+                    walked_rhs = _implied_progress_wrap(
+                        _implied_progress_rewrite(:__progress__, walked_rhs), _lnn)
                 end
                 block = Expr(:block,
                     _lnn, Expr(:(=), _call(:compute_property, cp_kwargs...), Expr(:block, _lnn, walked_rhs)),
@@ -8662,11 +8918,11 @@ function _opaque_substatus_f(oc::_OpaqueSubcache, (indices, kwargs))
     o, name = oc.requester, oc.name
     () -> compute_property(o, Val(:__substatus__), name, indices...; __status__=o.__status__, __pending__=true, kwargs...)
 end
-_opaque_local!(oc::_OpaqueBare, key; fetch=Base.fetch, retry_failed=true) =
-    _local_bare!(oc.requester, oc.name; fetch, retry_failed)
-_opaque_local!(oc::_OpaqueSubcache, (indices, kwargs); fetch=Base.fetch, retry_failed=true) =
-    memoize!(IndexableProperty(oc.name, oc.requester, oc.local_dict), indices...;
-             fetch, retry_failed, kwargs...)
+_opaque_local!(oc::_OpaqueBare, key; fetch=Base.fetch, retry_failed=true, link=nothing) =
+    _local_bare!(oc.requester, oc.name; fetch, retry_failed, link)
+_opaque_local!(oc::_OpaqueSubcache, (indices, kwargs); fetch=Base.fetch, retry_failed=true, link=nothing) =
+    _memoize_linked!(link, IndexableProperty(oc.name, oc.requester, oc.local_dict), indices...;
+                     fetch, retry_failed, kwargs...)
 # Opaque names are view-local, so a bare value lands in the requester's overlay.
 # Returns whether it stored `value` (a value already there is kept).
 _store_local!(oc::_OpaqueBare, key, value) =
@@ -8679,9 +8935,9 @@ _store_new!(dict, key, value, dict_lock) = lock(dict_lock) do
     true
 end
 
-_local_bare!(o, name::Symbol; fetch=Base.fetch, retry_failed=true) =
+_local_bare!(o, name::Symbol; fetch=Base.fetch, retry_failed=true, link=nothing) =
     get!(_bare_compute(o, name), getfield(o, :cache).cache, name;
-         substatus=_bare_substatus_f(o, name), fetch, retry_failed)
+         substatus=_bare_substatus_f(o, name), fetch, retry_failed, link)
 
 # The call an opaque key stands for, as `property_settled` reports it.
 _opaque_call(oc::_OpaqueBare, key) = ((), (;))
@@ -8699,7 +8955,7 @@ end
 # guard. A computation that read context taints the key, gives its value to the
 # requester alone, and fails the latch with `_RemountContextDependent`, so every
 # other accessor computes the key in its own view.
-function _opaque_shared!(oc::_OpaqueSubcache, key; fetch=Base.fetch, retry_failed=true, trace_t0=_trace_clock())
+function _opaque_shared!(oc::_OpaqueSubcache, key; fetch=Base.fetch, retry_failed=true, trace_t0=_trace_clock(), link=nothing)
     t0 = trace_t0
     hit = get(oc, key, _missing_sentinel)
     args, kwargs = _opaque_call(oc, key)
@@ -8727,7 +8983,7 @@ function _opaque_shared!(oc::_OpaqueSubcache, key; fetch=Base.fetch, retry_faile
         end
         value
     end
-    get!(compute, oc, key; fetch, retry_failed, substatus=_opaque_substatus_f(oc, key), trace_t0=t0)
+    get!(compute, oc, key; fetch, retry_failed, substatus=_opaque_substatus_f(oc, key), trace_t0=t0, link)
 end
 
 # The latch records a context-dependent computation as a failure; its progress
@@ -8738,13 +8994,13 @@ _fail_substatus!(s::Treebars.ProgressNode, e::_RemountContextDependent) =
 # Read opaque `key` through `oc`, on behalf of `reader` — the guard of an
 # enclosing opaque computation, or `nothing` for the view itself.
 function _opaque_get!(oc::_OpaqueSubcache, key, reader; fetch=Base.fetch, retry_failed=true,
-                      trace_t0=_trace_clock())
+                      trace_t0=_trace_clock(), link=nothing)
     # A guard reads values, never handles: a handle could resolve to the
     # requester's context-dependent value after the guard stopped watching.
     reader === nothing || (fetch = _blocking_selector(fetch))
     if !_ns_tainted(oc.ns, _taint_key(oc, key))
         try
-            return _opaque_shared!(oc, key; fetch, retry_failed, trace_t0)
+            return _opaque_shared!(oc, key; fetch, retry_failed, trace_t0, link)
         catch e
             e isa _RemountContextDependent || rethrow()
             if _own_failure(e, oc.requester)
@@ -8755,12 +9011,12 @@ function _opaque_get!(oc::_OpaqueSubcache, key, reader; fetch=Base.fetch, retry_
     end
     # Context-dependent: the requester's own value, which is context to a guard.
     reader === nothing || _taint!(reader, oc.name)
-    _opaque_local!(oc, key; fetch, retry_failed)
+    _opaque_local!(oc, key; fetch, retry_failed, link)
 end
 
-_opaque_bare!(requester, name::Symbol, reader; fetch=Base.fetch) = begin
+_opaque_bare!(requester, name::Symbol, reader; fetch=Base.fetch, link=nothing) = begin
     c = getfield(requester, :cache).cache
-    _opaque_get!(_OpaqueSubcache(c.namespace, name, requester, c.namespace.cache, c), name, reader; fetch)
+    _opaque_get!(_OpaqueSubcache(c.namespace, name, requester, c.namespace.cache, c), name, reader; fetch, link)
 end
 
 function _opaque_status(oc::_OpaqueSubcache, key)
@@ -8772,15 +9028,15 @@ end
 # through the namespace on the requester's behalf. Context — anything the
 # remount routes view-locally — is served from the requester and taints the
 # computation. Everything else is provably context-independent.
-function _probe_read(c::MountedThreadsafeDict, probe::_OpaqueProbe, o, name::Symbol)
+function _probe_read(c::MountedThreadsafeDict, probe::_OpaqueProbe, o, name::Symbol; link=nothing)
     requester = probe.requester
     if name in c.opaque
         is_indexed_property(o, name) &&
             return IndexableProperty(name, o, getproperty(requester, name).cache)
-        return _opaque_bare!(requester, name, probe)
+        return _opaque_bare!(requester, name, probe; link)
     end
     name in c.invalidated && !(name in _REMOUNT_STATUS_NAMES) && _taint!(probe, name)
-    getproperty(requester, name)
+    link === nothing ? getproperty(requester, name) : _getorcompute_linked(requester, name, link)
 end
 
 function _mounted_fetchproperty(fetch, c::MountedThreadsafeDict, o, name::Symbol)
@@ -8796,10 +9052,13 @@ function _mounted_fetchproperty(fetch, c::MountedThreadsafeDict, o, name::Symbol
 end
 
 memoize!(ip::IndexableProperty{name,<:Any,<:_OpaqueSubcache}, indices...;
-         fetch=Base.fetch, retry_failed=true, kwargs...) where {name} = begin
+         fetch=Base.fetch, retry_failed=true, kwargs...) where {name} =
+    _memoize_linked!(nothing, ip, indices...; fetch, retry_failed, kwargs...)
+_memoize_linked!(link, ip::IndexableProperty{name,<:Any,<:_OpaqueSubcache}, indices...;
+                 fetch=Base.fetch, retry_failed=true, kwargs...) where {name} = begin
     t0 = _trace_clock()   # before the key, so a traced hit's time includes hashing it
     _opaque_get!(ip.cache, _memo_key(indices, (;kwargs...)), _remount_probe(ip.o);
-                 fetch=_declared_fetch(fetch, ip.o, Val(name)), retry_failed, trace_t0=t0)
+                 fetch=_declared_fetch(fetch, ip.o, Val(name)), retry_failed, trace_t0=t0, link)
 end
 
 getstatus(ip::IndexableProperty{<:Any,<:Any,<:_OpaqueSubcache}, indices...; kwargs...) =
