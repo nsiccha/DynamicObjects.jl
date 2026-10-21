@@ -148,6 +148,16 @@ end
 
 @testitem "spawned tasks inherit the trace; a read joining a running computation is a wait" setup=[ComputeTraceFixtures] begin
 using DynamicObjects
+# Compile the computing and the joining read outside the measurement: on a loaded host
+# a first call's compilation can eat most of the 0.2 s the waiter is given below.
+gate_reset!()
+warm = CTGated()
+warm_computer = Threads.@spawn warm.slow
+@test settles(() -> CT_STARTED[] == 1)
+warm_waiter = Threads.@spawn warm.slow
+sleep(0.05)
+notify(CT_GATE[])
+@test fetch(warm_computer) + fetch(warm_waiter) == 2
 gate_reset!()
 o = CTGated()
 _, trace = with_compute_trace() do
