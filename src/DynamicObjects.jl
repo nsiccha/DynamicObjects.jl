@@ -8755,6 +8755,14 @@ Keyword arguments that correspond to fixed fields replace those field values in
 the new instance. Any remaining keyword arguments are forwarded to the
 constructor as cache pre-population overrides.
 
+The new instance is also constructed with every keyword argument `obj` itself
+was constructed with (its `PropertyCache.seed`: property overrides, `__parent__`
+wiring, `__status__`, and, for a [`remount`](@ref) view, the retained object's
+inputs under the view's context) that `kwargs` does not name. Those overrides
+therefore stay inputs of the new instance: [`clear_mem_caches!`](@ref) keeps
+them, and an override keeps its value even when its default reads a changed
+fixed field.
+
 Because a `@dynamicstruct` is a pure function of its fixed fields and cache
 overrides, any already memoized property of `obj` whose transitive
 dependencies — fixed fields and rhs-declared properties alike — are all
@@ -8779,29 +8787,41 @@ c  = Config(100, 2.0); c.result   # memoizes base + result
 c2 = remake(c; scale=3.0)  # n unchanged → `base` CARRIED over; `result` recomputed
 c3 = remake(c; n=200)      # n changed → both base & result recomputed
 c4 = remake(c; result=0.0) # result pre-set to 0.0 (explicit override wins)
+c5 = remake(c4; n=200)     # result stays 0.0: c4's override is an input of c5
 ```
 """
 remake(obj; kwargs...) = _remake(obj, values(kwargs))
 function _remake(obj::T, nt::NamedTuple{KW}) where {T,KW}
     fixed = fieldnames(T)[1:end-1]               # all fields except :cache
     args = Any[haskey(nt, n) ? nt[n] : getfield(obj, n) for n in fixed]
-    # Reuse the source's still-valid memoized properties; explicit cache
-    # pre-population kwargs (non-fixed-field) override any carried value.
-    # Carried values are written into the new cache AFTER construction rather
-    # than passed as constructor kwargs: they are still-valid memos, not
-    # instance inputs, so a later `clear_mem_caches!` must drop (recompute)
-    # them while the explicit seeds survive.
+    # The source's own construction kwargs are inputs, not memos: pass them to
+    # the constructor (unless this call names them) so they become the new
+    # instance's seeds. Reuse the source's still-valid memoized properties;
+    # constructor kwargs override any carried value. Carried values are
+    # written into the new cache AFTER construction rather than passed as
+    # constructor kwargs: they are still-valid memos, not instance inputs, so
+    # a later `clear_mem_caches!` must drop (recompute) them while the seeds
+    # survive.
     carried = _carryover(obj, Val(KW))
     explicit = Base.structdiff(nt, NamedTuple{fixed})
-    remade = T(args...; explicit...)
+    inputs = merge(Base.structdiff(_construction_seed(obj), nt), explicit)
+    remade = T(args...; inputs...)
     if !isempty(carried)
         c = getfield(remade, :cache).cache
         for (key, value) in pairs(carried)
-            haskey(explicit, key) || _seed_store!(c, key, value)
+            haskey(inputs, key) || _seed_store!(c, key, value)
         end
     end
     remade
 end
+
+# The keyword arguments `obj` was constructed with. A remount view's own seed
+# is its context, layered over the retained object's seed: `_restore_seeds!`
+# restores both.
+_construction_seed(obj) = _construction_seed(getfield(obj, :cache))
+_construction_seed(pc::PropertyCache) = _construction_seed(pc.cache, pc.seed)
+_construction_seed(c::MountedThreadsafeDict, seed) = merge(getfield(c.source, :cache).seed, seed)
+_construction_seed(_, seed) = seed
 
 # --- immutable cache remounting ------------------------------------------------
 
