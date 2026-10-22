@@ -1396,11 +1396,17 @@ end
 # A view's copy of a shared parent alias is current only while the parent still
 # holds the very value it copied: once a `sync!` or `clear_cache!` dropped or
 # replaced it, the next read re-reads it through the parent. A view kept across
-# the drop then never computes shared work from its stale copy.
+# the drop then never computes shared work from its stale copy. Every read checks:
+# the hit fast path (`_peek_hit`) and `get!`.
 function Base.get!(f::Function, c::MountedThreadsafeDict, key; kwargs...)
+    _revalidate_alias!(c, key)
+    invoke(get!, Tuple{Function,AbstractThreadsafeDict,Any}, f, c, key; kwargs...)
+end
+
+function _revalidate_alias!(c::MountedThreadsafeDict, key)
     target = get(c.aliases, key, nothing)
     target === nothing || _revalidate_alias!(c, key, target)
-    invoke(get!, Tuple{Function,AbstractThreadsafeDict,Any}, f, c, key; kwargs...)
+    nothing
 end
 
 function _revalidate_alias!(c::MountedThreadsafeDict, key::Symbol, target::Symbol)
@@ -4322,6 +4328,8 @@ function _peek_hit(c::AbstractThreadsafeDict, name::Symbol)
     end
 end
 _peek_hit(c::AbstractDict, name::Symbol) = get(c, name, _missing_sentinel)
+_peek_hit(c::MountedThreadsafeDict, name::Symbol) =
+    (_revalidate_alias!(c, name); invoke(_peek_hit, Tuple{AbstractThreadsafeDict,Symbol}, c, name))
 
 getorcomputeproperty(o, name, indices...; kwargs...) = if hasfield(typeof(o), name)
     @assert length(indices) == length(kwargs) == 0

@@ -186,3 +186,20 @@ write(path, "bb"); notify_change!(p.tracked)
 @test remount(p; request = "r2").table == ["bbx.", "bby."]
 @test p.child(:x).seen == "bbx"
 end
+
+@testitem "a view kept across a sync! of another view computes no shared work from stale copies" setup=[ParentReadFixtures] begin
+using DynamicObjects
+
+path = tempname(); write(path, "a")
+p = ReadParent(path)
+old = remount(p; request = "old")
+@test old.child(:x).seen == "ax"           # its child view copied `content`
+write(path, "bb"); notify_change!(p.tracked)
+new = remount(p; request = "new")
+@test :content in sync!(new)
+# The old view was not synced: its child view re-reads the forwarded name
+# through its parent instead of recomputing the shared `seen` from its copy.
+@test old.child(:x).seen == "bbx"
+@test new.child(:x).seen == "bbx"
+@test p.child(:x).seen == "bbx"
+end
