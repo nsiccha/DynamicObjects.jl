@@ -10694,12 +10694,24 @@ function _inferred_domain(input_type)
     _unrestricted_domain()
 end
 
+# A vector input holds several values, each drawn from the one domain: the
+# domain (declared or type-inferred) governs its ELEMENTS, and `multiple` tells
+# a consumer to check every element and offer a multiple-choice control.
+_domain_element(input_type) = (input_type, false)
+_domain_element(input_type::Type{<:AbstractVector}) = (eltype(input_type), true)
+
+_option_declaration(arg::NamedTuple, ::Nothing) = nothing
+_option_declaration(arg::NamedTuple, declarations::AbstractDict) =
+    arg.name === nothing ? nothing : get(declarations, arg.name, nothing)
+
 # A declaration wins over the type-inferred domain: `Bool`/`Enum` prove a domain,
 # but an author who declared one for that name meant it.
-_input_domain(arg::NamedTuple, ::Nothing) = _inferred_domain(arg.type)
-_input_domain(arg::NamedTuple, declarations::AbstractDict) =
-    let declaration = arg.name === nothing ? nothing : get(declarations, arg.name, nothing)
-        declaration === nothing ? _inferred_domain(arg.type) : _declared_domain(declaration)
+_element_domain(element, ::Nothing) = _inferred_domain(element)
+_element_domain(element, declaration::NamedTuple) = _declared_domain(declaration)
+
+_input_domain(arg::NamedTuple, declarations) =
+    let (element, multiple) = _domain_element(arg.type)
+        merge(_element_domain(element, _option_declaration(arg, declarations)), (; multiple))
     end
 
 _descriptor_input(arg::NamedTuple, kind::Symbol, declarations=nothing) = (;
@@ -10894,6 +10906,13 @@ therefore no `inputs` entry to hang a domain on. Every domain has one of three
   reflection reports the declaration without running it. Call
   [`property_options`](@ref)`(o, name)` for the domain's actual value.
 - `:unrestricted` — no domain is known; the type is the only constraint.
+
+A domain's `multiple` is `true` exactly when the input is an `AbstractVector`
+(`tags::Vector{String}`): its value holds several elements, and the domain —
+declared or type-inferred — governs each ELEMENT. An `@options(tags)`
+declaration lists the allowed elements, and `stages::Vector{Stage}` for an
+`Enum` `Stage` reports the `Stage` instances as a `:static` domain. A consumer
+checks every element and offers a multiple-choice control.
 """
 function property_descriptor(T::Type, prop::Symbol)
     applicable(meta, T) || return nothing
