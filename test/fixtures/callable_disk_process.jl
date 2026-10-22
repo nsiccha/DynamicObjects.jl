@@ -19,6 +19,9 @@ end
     input::Vector{Float64}
     trace = joinpath(__cache_base__, "executions.txt")
     allow_compute = true
+    # `allow_compute` only guards the cold run; it never changes a value, so it
+    # stays out of identity (a read override would otherwise split entries).
+    __hash_fields__ = (input,)
     @cached $IMPLEMENTATION_VERSION statistic(f) = begin
         allow_compute || error("cold hit recomputed statistic")
         record(trace, "statistic")
