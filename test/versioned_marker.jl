@@ -193,3 +193,142 @@ versions, remake invalidation, cycle rejection, pruning, and retention opt-out.
         @test_throws ErrorException file_version(f; by = :bogus)
     end
 end
+
+"""
+A versioned type that declares `__hash_fields__` or `__hash__` keeps its
+`@cached` entries under that identity, `base/<__hash__>/<version>/`, as every
+type does, and the declaration may not read the version (snag
+`cache-a-versione-5429048f`).
+"""
+@testitem "@versioned identity follows a declared __hash_fields__ or __hash__" tags=[:versioned] begin
+    using DynamicObjects: canonical_hash
+
+    const FIT_RUNS = Ref(0)
+
+    # The reporter's shape: a computed version, and `__hash_fields__` leaving out
+    # where the data lives, so a copy of the data at another path shares the fit.
+    @dynamicstruct struct IdFieldsModel
+        data_dir::String
+        seed::Int
+        revision::Int
+        __hash_fields__ = (seed,)
+        @versioned model_version = string("model-", revision)
+        @cached fit() = (FIT_RUNS[] += 1; (seed, revision))
+    end
+
+    @dynamicstruct struct IdFieldsFixed
+        path::String
+        host::String
+        @versioned content_version::String
+        __hash_fields__ = (path,)
+        @cached payload() = string(path, ":", content_version)
+    end
+
+    @dynamicstruct struct IdCustomHash
+        path::String
+        tag::Int
+        __hash__ = canonical_hash((typeof(__self__), "format-1", tag))
+        @versioned model_version = "model-1"
+    end
+
+    # The auto `__hash_fields__ = (__parent__, selection, K)` of an indexed inline
+    # child is a declared override too, and reads no version.
+    @dynamicstruct struct IdParent
+        name::String
+        version = "v1"
+        @struct rows(selection; K::Int) = begin
+            @versioned derived = __parent__.version
+            __hold_recent_version__ = false
+            @cached payload = (selection, K, name)
+        end
+    end
+
+    @testset "__hash_fields__ names the identity directory" begin
+        base = mktempdir()
+        original = IdFieldsModel("/data/rain", 1, 1; __cache_base__ = base)
+        elsewhere = IdFieldsModel("/copy/rain", 1, 1; __cache_base__ = base)
+        @test original.__identity_hash__ == original.__hash__
+        @test elsewhere.__identity_hash__ == original.__identity_hash__
+        @test elsewhere.__cache_path__ == original.__cache_path__
+        @test basename(dirname(original.__cache_path__)) == original.__hash__
+        @test basename(original.__cache_path__) == original.__version_tag__
+
+        @test original.fit() == (1, 1)
+        @test elsewhere.fit() == (1, 1)
+        @test FIT_RUNS[] == 1                 # the copy read the original's entry
+
+        other_seed = IdFieldsModel("/data/rain", 2, 1; __cache_base__ = base)
+        @test other_seed.__identity_hash__ != original.__identity_hash__
+
+        # The version still selects the segment, and hold-most-recent still prunes.
+        next = IdFieldsModel("/copy/rain", 1, 2; __cache_base__ = base)
+        @test next.__identity_hash__ == original.__identity_hash__
+        @test next.__version_tag__ != original.__version_tag__
+        @test next.fit() == (1, 2)
+        @test FIT_RUNS[] == 2
+        @test readdir(dirname(next.__cache_path__)) == [basename(next.__cache_path__)]
+    end
+
+    @testset "a fixed @versioned field left out of __hash_fields__" begin
+        base = mktempdir()
+        v1 = IdFieldsFixed("/data/f", "alpha", "v1"; __cache_base__ = base)
+        v2 = IdFieldsFixed("/data/f", "beta", "v2"; __cache_base__ = base)
+        @test v1.__identity_hash__ == v1.__hash__ == v2.__identity_hash__
+        @test v1.__version_tag__ != v2.__version_tag__
+        @test v1.payload() == "/data/f:v1"
+        @test v2.payload() == "/data/f:v2"
+        @test readdir(dirname(v2.__cache_path__)) == [basename(v2.__cache_path__)]
+    end
+
+    @testset "a custom __hash__ names the identity directory" begin
+        a = IdCustomHash("/x", 1)
+        b = IdCustomHash("/y", 1)
+        @test a.__identity_hash__ == a.__hash__ == canonical_hash((IdCustomHash, "format-1", 1))
+        @test a.__cache_path__ == b.__cache_path__
+        @test a.__cache_path__ == joinpath(a.__cache_base__, a.__hash__, a.__version_tag__)
+        @test IdCustomHash("/x", 2).__identity_hash__ != a.__identity_hash__
+    end
+
+    @testset "indexed inline children keep their entries apart" begin
+        base = mktempdir()
+        parent = IdParent("p"; __cache_base__ = base)
+        @test parent.rows(:north; K = 1).payload == (:north, 1, "p")
+        @test parent.rows(:south; K = 2).payload == (:south, 2, "p")
+        @test IdParent("q"; __cache_base__ = base).rows(:north; K = 1).payload == (:north, 1, "q")
+    end
+
+    # refused: `@versioned` makes the property the cache version, the directory
+    # below identity; an identity override that reads it gives every version its
+    # own identity directory, so hold-most-recent never prunes (snag
+    # `cache-a-versione-5429048f`).
+    refusal(ex) = try
+        Core.eval(@__MODULE__, ex)
+        nothing
+    catch e
+        sprint(showerror, e)
+    end
+    fixed_in_fields = refusal(:(@dynamicstruct struct IdBadFixed
+        path::String
+        @versioned content_version::String
+        __hash_fields__ = (path, content_version)
+    end))
+    @test fixed_in_fields !== nothing
+    @test occursin("`__hash_fields__` (transitively) reads `@versioned` property `content_version`", fixed_in_fields)
+
+    computed_via_sibling = refusal(:(@dynamicstruct struct IdBadComputed
+        seed::Int
+        @versioned model_version = "model-1"
+        label = string(seed, model_version)
+        __hash_fields__ = (label,)
+    end))
+    @test computed_via_sibling !== nothing
+    @test occursin("reads `@versioned` property `model_version`", computed_via_sibling)
+
+    hash_over_default_fields = refusal(:(@dynamicstruct struct IdBadHash
+        path::String
+        @versioned content_version::String
+        __hash__ = canonical_hash((typeof(__self__), "format-1", __hash_fields__))
+    end))
+    @test hash_over_default_fields !== nothing
+    @test occursin("`__hash__` (transitively) reads `@versioned` property `content_version`", hash_over_default_fields)
+end

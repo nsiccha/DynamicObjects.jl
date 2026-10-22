@@ -542,13 +542,16 @@ canonical_hash(x) = persistent_hash(_hash_replace(x))
 # most recent" prune stale siblings); a fresh version cache-misses cleanly.
 # Non-versioned types keep the byte-identical `base/<__hash__>/` layout via the
 # fast path below. The per-type `has_versioned_fields` / `_identity_hash_fields`
-# / `_version_hash_fields` overrides are emitted by @dynamicstruct ONLY when a
-# `@versioned` field is declared, so every existing struct is unaffected.
+# / `_identity_hash` / `_version_hash_fields` overrides are emitted by
+# @dynamicstruct ONLY when a `@versioned` field is declared, so every existing
+# struct is unaffected. A versioned type that declares `__hash__` or
+# `__hash_fields__` gets `_identity_hash(o) = o.__hash__`: its override chooses
+# what identity covers, as for every type (snag `cache-a-versione-5429048f`).
 has_versioned_fields(::Type) = false
 _identity_hash_fields(o) = o.__hash_fields__   # non-versioned: identity = all fixed fields
+_identity_hash(o) = canonical_hash((typeof(o), _identity_hash_fields(o)))
 _version_hash_fields(o) = ()                   # non-versioned: no version segment
-compute_property(o, ::Val{:__identity_hash__}) =
-    canonical_hash((typeof(o), _identity_hash_fields(o)))
+compute_property(o, ::Val{:__identity_hash__}) = _identity_hash(o)
 compute_property(o, ::Val{:__version_tag__}) = begin
     vhf = _version_hash_fields(o)
     isempty(vhf) ? "" : canonical_hash(vhf)
@@ -7881,6 +7884,11 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     #     e.g. `file_version(path)`); identity is UNCHANGED — a computed prop is
     #     never in `__hash_fields__`, so there is nothing to exclude and the version
     #     segment is purely additive. Acyclicity guarded once `dependson` is built.
+    # A declared `__hash__` / `__hash_fields__` is the type's identity override, so
+    # the identity dir is `__hash__` (`base/<__hash__>/<version>/`), exactly the dir
+    # a non-versioned type would use; the override may not read the version (guarded
+    # once `dependson` is built). Without one, identity = the non-versioned fixed
+    # fields (snag `cache-a-versione-5429048f`).
     versioned_names = [name for (name, info) in oproperties if Symbol("@versioned") in info.macros]
     versioned_fixed = Set{Symbol}(name for (name, info) in oproperties if isfixed(info) && Symbol("@versioned") in info.macros)
     # A computed `@versioned` prop cannot ALSO be disk-cached: computing its own
@@ -7891,9 +7899,12 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             error("@versioned computed property `$name` may not also be @cached/@mmap: computing its value needs the cache path, which needs the version — a cycle. Make the version dimension a plain computed property.")
     end
     identity_fixed_names = [n for n in fixed_names if !(n in versioned_fixed)]
+    identity_overrides = Symbol[n for n in (:__hash__, :__hash_fields__) if n in prop_names]
     versioned_defs = isempty(versioned_names) ? Any[] : Any[
         :($DynamicObjects.has_versioned_fields(::Type{$type_dispatch}) = true),
-        :($DynamicObjects._identity_hash_fields(__self__::$type) = $(Expr(:tuple, [:(getfield(__self__, $(QuoteNode(n)))) for n in identity_fixed_names]...))),
+        (isempty(identity_overrides) ?
+            :($DynamicObjects._identity_hash_fields(__self__::$type) = $(Expr(:tuple, [:(getfield(__self__, $(QuoteNode(n)))) for n in identity_fixed_names]...))) :
+            :($DynamicObjects._identity_hash(__self__::$type) = __self__.__hash__)),
         :($DynamicObjects._version_hash_fields(__self__::$type) = $(Expr(:tuple, [(n in versioned_fixed ? :(getfield(__self__, $(QuoteNode(n)))) : :($DynamicObjects.getorcomputeproperty(__self__, $(QuoteNode(n))))) for n in versioned_names]...))),
     ]
     # ── Static dependency graph ──────────────────────────────────────────────
@@ -7961,6 +7972,28 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 push!(_seen, _d)
                 _d in _forbidden_ver_deps && error("@versioned computed property `$_vname` (transitively) depends on `$_d`, whose value needs the cache path — computing the version would then need the version itself (a cycle). Derive the version dimension without reading any @cached/@mmap property or cache-path machinery.")
                 append!(_stack, get(_ver_depmap, _d, Set{Symbol}()))
+            end
+        end
+    end
+    # ── @versioned + identity override: the version stays out of identity ─────
+    # The override names the identity dir and the version names the segment below
+    # it, so an override that reads the version gives every version its own
+    # identity dir: "hold only the most recent" then has nothing to prune, and a
+    # fixed field's `@versioned` (excluded from identity) contradicts it. Follows
+    # the reads the body shows; an undeclared `__hash_fields__` is every fixed field.
+    if !isempty(versioned_names) && !isempty(identity_overrides)
+        _id_depmap = Dict{Symbol,Set{Symbol}}(name => info.dependson
+            for (name, info) in properties if info.dependson !== nothing)
+        :__hash_fields__ in prop_names || (_id_depmap[:__hash_fields__] = Set{Symbol}(fixed_names))
+        for _oname in identity_overrides
+            _seen = Set{Symbol}()
+            _stack = collect(get(_id_depmap, _oname, Set{Symbol}()))
+            while !isempty(_stack)
+                _d = pop!(_stack)
+                _d in _seen && continue
+                push!(_seen, _d)
+                _d in versioned_names && error("`$_oname` (transitively) reads `@versioned` property `$_d`. A `@versioned` property is the cache version: it selects the directory below the identity directory that `$_oname` names, so it cannot be part of identity too — every version would get its own identity directory, and \"hold only the most recent\" could never prune the old ones. Leave `$_d` out of `$_oname`.")
+                append!(_stack, get(_id_depmap, _d, Set{Symbol}()))
             end
         end
     end
