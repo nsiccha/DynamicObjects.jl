@@ -5360,6 +5360,9 @@ end
   o.state`) resets it, and the next read re-runs its initializer.
 - On an object with a computed `@versioned` property, the version and cache path
   are re-derived on the next read, as for `sync!`.
+- The children this object holds drop what they read of a dropped property, and
+  what they derived from it, as for `sync!`; this object drops what it derived
+  from them in the same call.
 - A holder that derived from this object (a parent reading one of its children)
   drops its own dependents on its next `sync!`: the object's
   `object_version` moves. HTMXObjects calls `sync!` on every request root.
@@ -12837,7 +12840,16 @@ settled entry of an indexed property — is examined:
 Where a version moved, the transitive [`dependents`](@ref) of that property are
 dropped — memory, and the disk entry of a `@cached` / `@mmap` dependent — so the
 next read recomputes them. The changed slot itself is kept: it is the same
-container (or object) that observed the change. A dropped indexed property loses
+container (or object) that observed the change.
+
+The children `o` holds — inline `@struct` children, and any object constructed
+with `__parent__ = o` held where `sync!` looks — drop what they read of a dropped
+or changed property of `o`, and what they derived from it. A child reads a parent
+property through a forwarded (bare) name, `__parent__.name`,
+`__self__.__parent__.name` or `(; name) = __parent__`; a forwarded copy still
+holding the very value `o` keeps stays. The child instance, its inputs and its
+`@state` are kept, and `o` drops what it derived from a child that dropped
+something in the same call. A dropped indexed property loses
 all its entries. A file changing under one entry of `@struct run(id) = …` drops
 only that child's own derived properties, plus whatever the parent derived from
 `run`. A `@state` property is never dropped, even when a fixed field its
@@ -12846,7 +12858,8 @@ value observes a change.
 
 On an object with a computed `@versioned` property, dropping anything also drops
 that property, what reads it (memory only) and the cache path, so the next read
-re-derives the version and publishes recomputed values under it. A fixed
+re-derives the version and publishes recomputed values under it; its children's
+cache paths, which extend it, move with it. A fixed
 `@versioned` field is kept: move it with [`remake`](@ref).
 
 A slot `sync!` has not stamped yet compares against the version its value had
@@ -12857,7 +12870,8 @@ Computes nothing: only values already in memory are examined, at the cost of one
 probe per tracked file plus a walk of the cached entries. Each object is synced
 once per call however many parents hold it; `__parent__` back-references are not
 followed. On a [`remount`](@ref) view it syncs the retained object and then
-drops the view's own copies of the dropped names. `sync!` of a value that is not
+drops the view's own copies of the dropped names, and its child views' copies
+of what they read of them. `sync!` of a value that is not
 a `@dynamicstruct` object returns `Symbol[]`: it holds no property cache.
 
 Call it where a host decides what to serve. HTMXObjects' root provider calls it
