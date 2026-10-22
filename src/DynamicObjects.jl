@@ -496,8 +496,45 @@ end
 
 iscached(o, ::Val) = false
 cache_version(o, ::Val) = nothing
-compute_property(o, ::Val{:__hash_fields__}) = ntuple(Base.Fix1(getfield, o), fieldcount(typeof(o))-1)
+compute_property(o, ::Val{:__hash_fields__}) =
+    _with_identity_inputs(o, ntuple(Base.Fix1(getfield, o), fieldcount(typeof(o))-1))
 compute_property(o, ::Val{:__hash__}) = canonical_hash((typeof(o), o.__hash_fields__))
+
+# An object's default identity covers what it was constructed from: its fixed
+# fields AND the constructor keywords its properties read — the `__parent__` an
+# `@include` or inline child is mounted under, and overrides of computed
+# defaults (snag `include-child-em-c6b53d27`, decision `0e4o8w2`). Before, only
+# fixed fields counted, so an `@include`d child reading its parent, or two
+# objects differing only in an override, shared one disk cache and served each
+# other's entries. `@dynamicstruct` emits the per-type names (sorted): the
+# non-indexed properties some body reads (every one when a body hands `__self__`
+# to other code), plus `__parent__` when read — never a fixed field, `@state`,
+# `@versioned` or another `__…__` name. A type that declares `__hash_fields__`
+# or `__hash__` emits none: its override is its identity.
+_identity_input_names(::Type) = ()
+# The supplied inputs, as a `NamedTuple` in emitted (sorted) order; a `nothing`
+# parent is no parent. A remount view shares its retained object's identity, so
+# identity reads that object's seed, never the view's rebound context.
+function _identity_inputs(o)
+    names = _identity_input_names(typeof(o))
+    isempty(names) && return (;)
+    seed = _identity_seed(getfield(o, :cache))
+    picked = Pair{Symbol,Any}[]
+    for name in names
+        haskey(seed, name) || continue
+        value = seed[name]
+        name === :__parent__ && value === nothing && continue
+        push!(picked, name => value)
+    end
+    (; picked...)
+end
+_identity_seed(pc) = _identity_seed(pc.cache, pc.seed)
+_identity_seed(_, seed) = seed
+# Objects built without inputs keep the exact tuple they always had, so their
+# disk keys do not move.
+_with_identity_inputs(o, fields::Tuple) = let inputs = _identity_inputs(o)
+    isempty(inputs) ? fields : (fields..., inputs)
+end
 # Shallow walker behind `canonical_hash`. Leaves non-DO values
 # structurally identical so hashes stay stable for DOs that don't nest DOs,
 # and substitutes any DO with its own (stable) `.__hash__` string. Per-type
@@ -515,8 +552,11 @@ serialized after every `@dynamicstruct` value inside it is replaced by that valu
 and columns). It names an object's cache directory and keys its disk-cache entries, so
 equal content gives the same digest in every process, however much an object has memoized.
 
-Every default `__hash__` is `canonical_hash((typeof(o), o.__hash_fields__))`. To choose
-what an object's identity covers, override `__hash_fields__`; to also mix in constants such
+Every default `__hash__` is `canonical_hash((typeof(o), o.__hash_fields__))`, and the
+default `__hash_fields__` is what the object was constructed from: its fixed fields, plus
+(as a trailing `NamedTuple`) the constructor keywords its properties read — the
+`__parent__` it is mounted under and overrides of computed defaults. To choose what an
+object's identity covers, override `__hash_fields__`; to also mix in constants such
 as a cache-format version, override `__hash__` through `canonical_hash`:
 
 ```julia
@@ -679,13 +719,16 @@ end
 # resolved like a sibling property. The injected data-side auto-properties are
 # otherwise absent from a struct's `prop_names` (they live only in the slot-
 # inference topology), so `walk_rhs` would leave a bare `__hash__` as a free
-# variable. NOT here: `__parent__` (children already declare it via a
-# `__parent__ = nothing` prepend, so it's a real entry in their `prop_names`;
-# a top-level struct has no parent) and `__status__`/`__substatus__`
-# (`__status__` is threaded as a kwarg-local and must STAY the local, never
-# `__self__.__status__`; `__substatus__` is an indexed call, not a value).
+# variable. `__parent__` is here too: an external struct mounted with
+# `@include` receives its parent as a constructor keyword without declaring it,
+# so a bare `__parent__` (e.g. `__hash_fields__ = (__parent__,)`) was an
+# `UndefVarError` (snag `include-child-em-c6b53d27`); inline children declare
+# it anyway. NOT here: `__status__`/`__substatus__` (`__status__` is threaded
+# as a kwarg-local and must STAY the local, never `__self__.__status__`;
+# `__substatus__` is an indexed call, not a value).
 const _BAREREF_MAGIC = Set{Symbol}([
     :__hash__, :__hash_fields__, :__cache_base__, :__cache_path__, :__strict__,
+    :__parent__,
 ])
 
 # Substatus lifecycle hooks — the generic methods are no-ops so DO stays
@@ -5573,11 +5616,12 @@ end
 # opaque property in the closure — means the dependency set is NOT a sound
 # over-approximation, so NO kwarg change can be proven independent: `tainted`
 # carries only when `remake` changed nothing at all. A content-hash dunder in
-# the closure is taint-free but unprovable from fixed fields alone, so ALL
-# fixed fields invalidate (explicit cache overrides cannot move an identity
-# hash, which derives from fixed fields only).
+# the closure is taint-free but unprovable from the property's own reads, so
+# every identity name invalidates: the fixed fields plus the construction
+# inputs the default identity covers (`_identity_input_names`), which the
+# caller passes as `identity_set`.
 const _HASH_DUNDERS = (:__hash__, :__hash_fields__, :__cache_base__, :__cache_path__)
-function _carry_invalidators(prop::Symbol, direct_deps::AbstractDict, fixed_set, opaque_props)
+function _carry_invalidators(prop::Symbol, direct_deps::AbstractDict, identity_set, opaque_props)
     (prop in opaque_props) && return (Set{Symbol}(), true)
     inv = Set{Symbol}()
     seen = Set{Symbol}()
@@ -5588,7 +5632,7 @@ function _carry_invalidators(prop::Symbol, direct_deps::AbstractDict, fixed_set,
         push!(seen, n)
         for d in get(direct_deps, n, ())
             (d in opaque_props) && return (Set{Symbol}(), true)
-            (d in _HASH_DUNDERS) && return (copy(fixed_set), false)
+            (d in _HASH_DUNDERS) && return (Set{Symbol}(identity_set), false)
             push!(inv, d)
             push!(stack, d)
         end
@@ -7903,7 +7947,8 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     versioned_defs = isempty(versioned_names) ? Any[] : Any[
         :($DynamicObjects.has_versioned_fields(::Type{$type_dispatch}) = true),
         (isempty(identity_overrides) ?
-            :($DynamicObjects._identity_hash_fields(__self__::$type) = $(Expr(:tuple, [:(getfield(__self__, $(QuoteNode(n)))) for n in identity_fixed_names]...))) :
+            :($DynamicObjects._identity_hash_fields(__self__::$type) = $DynamicObjects._with_identity_inputs(__self__,
+                $(Expr(:tuple, [:(getfield(__self__, $(QuoteNode(n)))) for n in identity_fixed_names]...)))) :
             :($DynamicObjects._identity_hash(__self__::$type) = __self__.__hash__)),
         :($DynamicObjects._version_hash_fields(__self__::$type) = $(Expr(:tuple, [(n in versioned_fixed ? :(getfield(__self__, $(QuoteNode(n)))) : :($DynamicObjects.getorcomputeproperty(__self__, $(QuoteNode(n))))) for n in versioned_names]...))),
     ]
@@ -8017,6 +8062,32 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     state_defs = isempty(state_names) ? Any[] : Any[
         :($DynamicObjects._state_names(::Type{$type_dispatch}) = $(Tuple(unique!(state_names)))),
     ]
+    # ── Construction inputs in the default identity (`_identity_input_names`) ──
+    # The constructor keywords a body reads join the default identity next to
+    # the fixed fields: `__parent__` when read (also through
+    # `__self__.__parent__`, which `dependson` records), and any non-indexed
+    # property an override can replace. An opaque body may read any of them.
+    # A declared `__hash_fields__`/`__hash__` is the identity, so it gets none
+    # (snag `include-child-em-c6b53d27`, decision `0e4o8w2`).
+    identity_inputs = Symbol[]
+    if isempty(identity_overrides)
+        read_names = Set{Symbol}()
+        for (_, info) in properties
+            info.dependson === nothing || union!(read_names, info.dependson)
+        end
+        excluded = union(Set{Symbol}(fixed_names), state_names, versioned_names)
+        candidates = Set{Symbol}(name for (name, info) in properties if !isfixed(info) && !info.indexed)
+        push!(candidates, :__parent__)
+        for name in candidates
+            (name === :__parent__ || !startswith(String(name), "__")) || continue
+            name in excluded && continue
+            (!isempty(opaque_props) || name in read_names) && push!(identity_inputs, name)
+        end
+        sort!(identity_inputs)
+    end
+    identity_defs = isempty(identity_inputs) ? Any[] : Any[
+        :($DynamicObjects._identity_input_names(::Type{$type_dispatch}) = $(Tuple(identity_inputs))),
+    ]
     # ── `remake` carry-over bake (decision yf4z8x) ───────────────────────────
     # A memoized bare property may be reused verbatim by `remake` when NONE of
     # the names it (transitively) depends on — fixed fields AND rhs-declared
@@ -8041,7 +8112,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         (isfixed(info) || info.indexed || name in inline_child_names ||
             name in _seen_carry || startswith(String(name), "__")) && continue
         push!(_seen_carry, name)
-        _inv, _tainted = _carry_invalidators(name, direct_deps, fixed_set, opaque_props)
+        _inv, _tainted = _carry_invalidators(name, direct_deps, union(fixed_set, identity_inputs), opaque_props)
         if _tainted
             push!(_carry_calls, :($DynamicObjects._carry1_tainted(__obj__, Val(__KW__), Val($(QuoteNode(name))))))
         else
@@ -8173,6 +8244,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             $DynamicObjects._hash_replace(__self__::$type) = __self__.__hash__
             $(versioned_defs...)
             $(state_defs...)
+            $(identity_defs...)
             $([:(
                 $DynamicObjects._disk_cache(::$type, ::Val{$(QuoteNode(name))}) = $varname
             ) for (name, varname) in cached_names]...)
@@ -8822,6 +8894,9 @@ _construction_seed(obj) = _construction_seed(getfield(obj, :cache))
 _construction_seed(pc::PropertyCache) = _construction_seed(pc.cache, pc.seed)
 _construction_seed(c::MountedThreadsafeDict, seed) = merge(getfield(c.source, :cache).seed, seed)
 _construction_seed(_, seed) = seed
+# Identity is the retained object's (`_REMOUNT_INTRINSIC_KEYS` are shared), so a
+# view's rebound context never enters it.
+_identity_seed(c::MountedThreadsafeDict, _) = _identity_seed(getfield(c.source, :cache))
 
 # --- immutable cache remounting ------------------------------------------------
 
