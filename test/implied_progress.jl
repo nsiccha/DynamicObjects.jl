@@ -16,7 +16,7 @@ using DynamicObjects
 import DynamicObjects.Treebars
 using DynamicObjects.Treebars: render_text, @progress
 export render_text, @progress, rows, depth_of, labels, gate, release!, settles, node_of, poller,
-    IPChain, IPInner, IPOuter, IPViaHelper, IPWithIP, IPBoom, IPKw, IPSpawned,
+    IPChain, IPInner, IPOuter, IPDestructured, IPViaHelper, IPWithIP, IPBoom, IPKw, IPSpawned,
     IPRewriteRuntime, REWRITE_CALLS, IPReread, REREAD_CALLS, IPMarked, IPLocked,
     IPUnderLock, IPFetchLocked, IPFetchUnderLock, IPTaskOf, IPFetchTask, IPGatedSource,
     IPFetching, IPPopulation, IPModel, IPRoute, IPRemountRoot, IPPhased, IPLoops
@@ -77,6 +77,31 @@ end
     inner
     "Combined"
     combined = inner.work + 1
+end
+
+# A named destructure in a declaration or a binding header reads like `inner.work`
+# (snag `local-namedtuple-c640cee8`).
+@dynamicstruct struct IPDestructured
+    inner
+    "Declared"
+    declared = begin
+        local (; work) = inner
+        work + 1
+    end
+    "Let-bound"
+    let_bound = let (; work) = inner
+        work + 2
+    end
+    "Looped"
+    looped = begin
+        acc = 0
+        for (; work) in (inner,)
+            acc += work + 3
+        end
+        acc
+    end
+    "Comprehended"
+    comprehended = only([work + 4 for (; work) in (inner,) if work > 0])
 end
 
 # The read happens inside an ordinary helper, which the rewrite never sees.
@@ -337,6 +362,19 @@ release!(:outer)
 @test fetch(t) == 10
 end
 
+@testitem "implied progress: a named destructure nests in a declaration or a binding header" tags=[:progress] setup=[ImpliedProgressFixtures] begin
+using .ImpliedProgressFixtures
+for (name, value) in ((:declared, 10), (:let_bound, 11), (:looped, 12), (:comprehended, 13))
+    tag = Symbol(:destructured_, name)
+    d = IPDestructured(IPInner(tag))
+    t = Threads.@spawn getproperty(d, name)
+    @test settles(() -> node_of(d.inner, :work) !== nothing)
+    @test settles(() -> depth_of(node_of(d, name), "Inner work") == 1)
+    release!(tag)
+    @test fetch(t) == value
+end
+end
+
 @testitem "implied progress: a read inside a helper stays flat" tags=[:progress] setup=[ImpliedProgressFixtures] begin
 using .ImpliedProgressFixtures
 v = IPViaHelper(IPInner(:helper))
@@ -572,6 +610,15 @@ shorthand = rw(Expr(:call, :f, Expr(:parameters, :(obj.y))))
 params = only(a for a in shorthand.args if Meta.isexpr(a, :parameters))
 @test Meta.isexpr(only(params.args), :kw)
 @test count_ref(rw(:((; a, b) = obj)), readref) == 2
+# A named destructure in a declaration or a binding header reads through too, and the
+# result still lowers (snag `local-namedtuple-c640cee8`: `local begin … end` did not).
+lowers(ex) = !Meta.isexpr(Meta.lower(@__MODULE__, :((obj, objs) -> $ex)), :error)
+for src in (:(local (; a, b) = obj), :(global (; a, b) = obj), :(let (; a, b) = obj; a end),
+            :(for (; a, b) in objs; end), :([a for (; a, b) in objs if b > 0]))
+    @test lowers(src)
+    @test count_ref(rw(src), readref) == 2
+    @test lowers(rw(src))
+end
 
 # Inside an `@progress` body only reads on other objects are rewritten; `__self__`
 # reads are left to the marker's own threading.
