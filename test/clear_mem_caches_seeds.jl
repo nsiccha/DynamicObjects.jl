@@ -3,7 +3,8 @@ using TestItemRunner
 @testmodule ClearSeedsFixtures begin
 using DynamicObjects
 export SeedParent, SeedChild, SeedInlineOwner, SeedOverridable, SeedRemakeSrc,
-       SeedRemountStore, SEED_CALLS, SEED_GEN
+       SeedRemountStore, SeedRemakeProbe, SeedRemakeDerived, SeedRemakeView,
+       SEED_CALLS, SEED_GEN
 
 const SEED_CALLS = Dict{Any,Int}()
 const SEED_GEN = Ref(0)
@@ -41,6 +42,22 @@ end
 @dynamicstruct struct SeedRemountStore
     tag = "retained"
     read_value(key) = (_seed_bump!((:read_value, key, SEED_GEN[])); (SEED_GEN[], key))
+end
+
+@dynamicstruct struct SeedRemakeProbe
+    dir::String
+    label::String = "default-label"
+    shout = (_seed_bump!(:shout); uppercase(label))
+end
+
+@dynamicstruct struct SeedRemakeDerived
+    base::String
+    label::String = base * "-derived"
+end
+
+@dynamicstruct struct SeedRemakeView
+    tag = "retained"
+    label = "default-label"
 end
 end
 
@@ -135,6 +152,71 @@ r2 = remake(c; result=0.0)
 @test r2.result == 0.0
 clear_mem_caches!(r2)
 @test r2.result == 0.0
+end
+
+@testitem "remake keeps the source's construction overrides as inputs" setup=[ClearSeedsFixtures] begin
+using DynamicObjects
+
+# Pre-fix `remake` constructed with only its own kwargs: a source override
+# reached the remade instance as a carried memo, lost on its next clear, or,
+# when its default read a changed fixed field, not at all (snag
+# remake-drops-the-295be6c2).
+empty!(SEED_CALLS)
+SEED_GEN[] = 0
+p = SeedRemakeProbe("d"; label="configured-label")
+@test p.shout == "CONFIGURED-LABEL"
+r = remake(p; dir="e")
+@test r.dir == "e"
+@test getfield(r, :cache).seed == (; label="configured-label")
+@test r.label == "configured-label"
+@test r.shout == "CONFIGURED-LABEL"
+@test SEED_CALLS[:shout] == 1  # label unchanged, so `shout` is carried
+clear_mem_caches!(r)
+@test r.label == "configured-label"
+@test r.shout == "CONFIGURED-LABEL"
+@test SEED_CALLS[:shout] == 2  # the carried memo recomputes from the kept input
+
+# An override whose default reads the changed fixed field is still an input.
+q = SeedRemakeDerived("a"; label="configured-label")
+@test remake(q; base="b").label == "configured-label"
+@test remake(SeedRemakeDerived("a"); base="b").label == "b-derived"
+
+# Naming the override replaces it; a chain of remakes keeps it.
+o = remake(p; label="other")
+@test o.label == "other"
+@test getfield(o, :cache).seed == (; label="other")
+@test o.shout == "OTHER"
+rr = remake(r; dir="f")
+clear_mem_caches!(rr)
+@test rr.label == "configured-label"
+
+# Construction wiring survives too: a silenced progress subtree and an
+# undeclared `__parent__`, which has no default to fall back to.
+s = remake(SeedOverridable(5; __status__=nothing); base=6)
+clear_mem_caches!(s)
+@test s.__status__ === nothing
+parent = SeedParent(2)
+c = remake(SeedChild(; __parent__=parent))
+clear_mem_caches!(c)
+@test c.__parent__ === parent
+@test c.val == 20
+end
+
+@testitem "remake of a remount view keeps the retained inputs and the view context" setup=[ClearSeedsFixtures] begin
+using DynamicObjects
+
+# A view's inputs are the retained object's seed under the view's context,
+# as `clear_mem_caches!` on the view restores them.
+s = SeedRemakeView(; label="configured-label")
+v = remount(s; tag="req-1")
+r = remake(v)
+seed = getfield(r, :cache).seed
+@test Dict(pairs(seed)) == Dict(:label => "configured-label", :tag => "req-1")
+clear_mem_caches!(r)
+@test r.label == "configured-label"
+@test r.tag == "req-1"
+@test remake(v; tag="req-2").tag == "req-2"
+@test s.tag == "retained"
 end
 
 @testitem "clear_mem_caches! on a remount view preserves request context" setup=[ClearSeedsFixtures] begin
