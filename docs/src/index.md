@@ -725,6 +725,9 @@ p4 = remake(p; r=99.0)           # change a cached value (not a fixed field)
 
 `remake` separates kwargs into "fixed-field updates" and "cache overrides",
 so it works for either purpose without you having to know which is which.
+The overrides the source was constructed with stay overrides of the remade
+instance unless you name them again: `remake(p2; x=5.0).r == 10.0`, also after
+`clear_mem_caches!`.
 
 ## Errors: `PropertyComputationError`
 
