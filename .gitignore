@@ -12,6 +12,8 @@ syssysconfig
 os
 getopt
 Manifest.toml
+!web/Manifest.toml
+!web/app/Manifest.toml
 _site/
 CLAUDE.md
 
