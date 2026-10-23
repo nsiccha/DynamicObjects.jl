@@ -4841,28 +4841,12 @@ function _fetch_rewrite(pv::Symbol, x::Expr)
     # `@fetch!` body thread through auto-forwarded parent properties. General
     # over any source: for a non-DO source `maybefetchproperty!` degrades to
     # `getproperty`, so the rewrite stays semantically identical to the plain
-    # destructure off-DO and only adds threading on a DO source. The source is
-    # bound once (no double-eval) and returned, so the block keeps the
-    # assignment's value (a destructure evaluates to its RHS). A `:block` does
-    # not introduce scope, so the destructured names leak to the enclosing
-    # scope exactly like the original destructure.
-    if Meta.isexpr(x, :(=)) && Meta.isexpr(x.args[1], :tuple) &&
-       length(x.args[1].args) == 1 && Meta.isexpr(x.args[1].args[1], :parameters)
-        binds = _fetch_destructure_binds(x.args[1].args[1])
-        if binds !== nothing
-            src = gensym(:fetch_src)
-            block = Expr(:block, :($src = $(_fetch_rewrite(pv, x.args[2]))))
-            for (lhs, nm) in binds
-                push!(block.args, :($lhs = $(Expr(:call,
-                    GlobalRef(@__MODULE__, :maybefetchproperty!), pv, src, QuoteNode(nm)))))
-            end
-            push!(block.args, src)
-            return block
-        end
-        # Unsupported element shape (kw-default `(;a=1)`, splat `(;xs...)`,
-        # nested) — fall through to the generic recursion, which passes the
-        # destructure through unchanged (today's no-threading behaviour).
-    end
+    # destructure off-DO and only adds threading on a DO source. The shape per
+    # position (statement, `local`, `let`, `for`, comprehension) is
+    # `_destructure_rewrite`'s.
+    rewritten = _destructure_rewrite(x, a -> _fetch_rewrite(pv, a),
+        (src, nm) -> Expr(:call, GlobalRef(@__MODULE__, :maybefetchproperty!), pv, src, QuoteNode(nm)))
+    rewritten === nothing || return rewritten
     Expr(x.head, Any[_fetch_rewrite(pv, a) for a in x.args]...)
 end
 
@@ -4883,6 +4867,77 @@ function _fetch_destructure_binds(params::Expr)
         end
     end
     return binds
+end
+
+# Named destructuring `(; a, b::T) = src` reads properties during lowering, so the
+# body rewriters (`_fetch_rewrite`, `_implied_progress_rewrite`) make each read
+# explicit as `read(s, name)`, with `rw` rewriting the source. Only a statement can
+# become a block, so the destructure's position picks the shape:
+#
+#   (; a, b) = src            begin s = src; a = read(s, :a); b = read(s, :b); s end
+#   local (; a, b) = src      begin local a, b; <the statement form> end   (and `global`)
+#   let (; a, b) = src        let (a, b) = (s -> (read(s, :a), read(s, :b)))(src)
+#   for (; a, b) in itr       for (a, b) in Generator(s -> (read(s, :a), read(s, :b)), itr)
+#   [… for (; a, b) in itr]   the same per element; a filter keeps reading `a`, `b`
+#
+# Each keeps the plain destructure's scope, read order and value: the source is
+# evaluated once, and the statement form returns it. `expand(src)` says whether a
+# destructure of that source is rewritten at all. Another element shape (kw-default,
+# splat, nested) or source keeps its target as written and only its source is
+# rewritten. Returns `nothing` when `x` is none of these forms.
+function _destructure_rewrite(x::Expr, rw, read, expand=Returns(true))
+    binds = _named_destructure_binds(x, expand)
+    binds === nothing || return _destructure_statement(binds, rw(x.args[2]), read)
+    if Meta.isexpr(x, (:local, :global))
+        any(a -> _named_destructure_binds(a, expand) !== nothing, x.args) || return nothing
+        return Expr(:block, Any[_destructure_declaration(x.head, a, rw, read, expand) for a in x.args]...)
+    elseif Meta.isexpr(x, :let) && length(x.args) == 2
+        return Expr(:let, _destructure_header(x.args[1], rw, read, expand, _bind_reads), rw(x.args[2]))
+    elseif Meta.isexpr(x, :for) && length(x.args) == 2
+        return Expr(:for, _destructure_header(x.args[1], rw, read, expand, _iterate_reads), rw(x.args[2]))
+    elseif Meta.isexpr(x, :generator)
+        return Expr(:generator, rw(x.args[1]),
+            Any[_destructure_header(a, rw, read, expand, _iterate_reads) for a in x.args[2:end]]...)
+    end
+    nothing
+end
+_bind_reads(reads, value) = Expr(:call, reads, value)
+_iterate_reads(reads, itr) = Expr(:call, GlobalRef(Base, :Generator), reads, itr)
+_named_destructure_binds(x, expand) = nothing
+function _named_destructure_binds(x::Expr, expand)
+    Meta.isexpr(x, :(=)) && Meta.isexpr(x.args[1], :tuple) && length(x.args[1].args) == 1 &&
+        Meta.isexpr(x.args[1].args[1], :parameters) && expand(x.args[2]) || return nothing
+    _fetch_destructure_binds(x.args[1].args[1])
+end
+function _destructure_statement(binds, src_value, read)
+    src = gensym(:destructure_src)
+    block = Expr(:block, :($src = $src_value))
+    for (lhs, nm) in binds
+        push!(block.args, :($lhs = $(read(src, nm))))
+    end
+    push!(block.args, src)
+    block
+end
+# One argument of `local` / `global`: the names are declared before the statement form.
+function _destructure_declaration(head, arg, rw, read, expand)
+    binds = _named_destructure_binds(arg, expand)
+    binds === nothing && return Expr(head, rw(arg))
+    Expr(:block, Expr(head, Any[nm for (_, nm) in binds]...), _destructure_statement(binds, rw(arg.args[2]), read))
+end
+# A binding of a `let`, `for` or comprehension header: the target is a declaration,
+# only the value is rewritten. A named destructure binds the tuple of its reads,
+# which `wrap(reads, value)` applies to the bound value or to each iterated element.
+_destructure_header(x, rw, read, expand, wrap) = x
+function _destructure_header(x::Expr, rw, read, expand, wrap)
+    header(a) = _destructure_header(a, rw, read, expand, wrap)
+    Meta.isexpr(x, :block) && return Expr(:block, Any[header(a) for a in x.args]...)
+    Meta.isexpr(x, :filter) && return Expr(:filter, rw(x.args[1]), Any[header(a) for a in x.args[2:end]]...)
+    Meta.isexpr(x, :(=)) && length(x.args) == 2 || return x
+    binds = _named_destructure_binds(x, expand)
+    binds === nothing && return Expr(:(=), x.args[1], rw(x.args[2]))
+    s = gensym(:destructure_src)
+    reads = Expr(:(->), s, Expr(:tuple, Any[read(s, nm) for (_, nm) in binds]...))
+    Expr(:(=), Expr(:tuple, Any[lhs for (lhs, _) in binds]...), wrap(reads, rw(x.args[2])))
 end
 
 # Rewrite one element of a `:parameters` (keyword) block, keeping it valid
@@ -5013,21 +5068,10 @@ function _implied_progress_rewrite(pv::Symbol, x::Expr, self::Bool=true)
     end
 
     # Named destructuring reads properties during lowering. Evaluate the source once
-    # and make each read explicit, keeping the assignment's value.
-    if Meta.isexpr(x, :(=)) && Meta.isexpr(x.args[1], :tuple) &&
-       length(x.args[1].args) == 1 && Meta.isexpr(x.args[1].args[1], :parameters) &&
-       (self || x.args[2] !== :__self__)
-        binds = _fetch_destructure_binds(x.args[1].args[1])
-        if binds !== nothing
-            src = gensym(:progress_src)
-            block = Expr(:block, :($src = $(rw(x.args[2]))))
-            for (lhs, nm) in binds
-                push!(block.args, :($lhs = $(_read_threaded_expr(pv, src, nm))))
-            end
-            push!(block.args, src)
-            return block
-        end
-    end
+    # and make each read explicit, in statements, declarations and binding headers.
+    rewritten = _destructure_rewrite(x, rw, (src, nm) -> _read_threaded_expr(pv, src, nm),
+        src -> self || src !== :__self__)
+    rewritten === nothing || return rewritten
 
     # Never rewrite an assignment target (including short-form method signatures and
     # dotted or compound assignment); the right-hand side is an evaluation.
@@ -5399,7 +5443,7 @@ isfixed(info::NamedTuple) = isnothing(info.rhs)
 # Per-element handler for the `:local` branch of `walk_rhs` — register
 # Symbol locals via dispatch instead of an `if arg isa Symbol …` chain
 # inside the loop body. Tuple-Expr leaves go through `_push_if_symbol!`,
-# Symbol assignment LHS through `_walk_local_assign!`.
+# assignments through `_walk_local_assign!`.
 _walk_local_arg!(arg::Symbol; locals, kwargs...) = (push!(locals, arg); arg)
 _walk_local_arg!(arg; locals, properties, lnn) = walk_rhs(arg; locals, properties, lnn)
 function _walk_local_arg!(arg::Expr; locals, properties, lnn)
@@ -5413,7 +5457,10 @@ function _walk_local_arg!(arg::Expr; locals, properties, lnn)
 end
 _walk_local_assign!(lhs::Symbol, arg, locals, properties, lnn) =
     (push!(locals, lhs); Expr(:(=), lhs, walk_rhs(arg.args[2]; locals, properties, lnn)))
-_walk_local_assign!(_, arg, locals, properties, lnn) = walk_rhs(arg; locals, properties, lnn)
+# `local x::T = …`, `local (a, b) = …`, `local (; a, b) = …`: every name the target
+# binds is declared local, so the assignment is no cache write and later reads stay local.
+_walk_local_assign!(lhs, arg, locals, properties, lnn) =
+    (union!(locals, extractnames([lhs])); walk_rhs(arg; locals, properties, lnn))
 _push_if_symbol!(locals, s::Symbol) = (push!(locals, s); nothing)
 _push_if_symbol!(_, _) = nothing
 
@@ -10731,12 +10778,24 @@ function _inferred_domain(input_type)
     _unrestricted_domain()
 end
 
+# A vector input holds several values, each drawn from the one domain: the
+# domain (declared or type-inferred) governs its ELEMENTS, and `multiple` tells
+# a consumer to check every element and offer a multiple-choice control.
+_domain_element(input_type) = (input_type, false)
+_domain_element(input_type::Type{<:AbstractVector}) = (eltype(input_type), true)
+
+_option_declaration(arg::NamedTuple, ::Nothing) = nothing
+_option_declaration(arg::NamedTuple, declarations::AbstractDict) =
+    arg.name === nothing ? nothing : get(declarations, arg.name, nothing)
+
 # A declaration wins over the type-inferred domain: `Bool`/`Enum` prove a domain,
 # but an author who declared one for that name meant it.
-_input_domain(arg::NamedTuple, ::Nothing) = _inferred_domain(arg.type)
-_input_domain(arg::NamedTuple, declarations::AbstractDict) =
-    let declaration = arg.name === nothing ? nothing : get(declarations, arg.name, nothing)
-        declaration === nothing ? _inferred_domain(arg.type) : _declared_domain(declaration)
+_element_domain(element, ::Nothing) = _inferred_domain(element)
+_element_domain(element, declaration::NamedTuple) = _declared_domain(declaration)
+
+_input_domain(arg::NamedTuple, declarations) =
+    let (element, multiple) = _domain_element(arg.type)
+        merge(_element_domain(element, _option_declaration(arg, declarations)), (; multiple))
     end
 
 _descriptor_input(arg::NamedTuple, kind::Symbol, declarations=nothing) = (;
@@ -10931,6 +10990,13 @@ therefore no `inputs` entry to hang a domain on. Every domain has one of three
   reflection reports the declaration without running it. Call
   [`property_options`](@ref)`(o, name)` for the domain's actual value.
 - `:unrestricted` — no domain is known; the type is the only constraint.
+
+A domain's `multiple` is `true` exactly when the input is an `AbstractVector`
+(`tags::Vector{String}`): its value holds several elements, and the domain —
+declared or type-inferred — governs each ELEMENT. An `@options(tags)`
+declaration lists the allowed elements, and `stages::Vector{Stage}` for an
+`Enum` `Stage` reports the `Stage` instances as a `:static` domain. A consumer
+checks every element and offers a multiple-choice control.
 """
 function property_descriptor(T::Type, prop::Symbol)
     applicable(meta, T) || return nothing

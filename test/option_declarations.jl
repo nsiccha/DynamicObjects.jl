@@ -4,8 +4,8 @@ using TestItemRunner
 using DynamicObjects
 export OptionDomainFixture, SpaceFormOptionFixture, OverrideableDefaultFixture,
     UndeclaredOptionFixture, VarargOperationFixture, DocumentedNodeFixture,
-    UndocumentedNodeFixture, LabelledOptionFixture, OPTION_STUDIES,
-    option_values_for, labelled_doses_for
+    UndocumentedNodeFixture, LabelledOptionFixture, MultipleOptionFixture,
+    OptionStage, OPTION_STUDIES, option_values_for, labelled_doses_for
 
 # Application data DynamicObjects knows nothing about. The point of `@options`
 # is that a domain may be spelled in terms of these and still be recorded.
@@ -63,6 +63,22 @@ end
     @options(target_acceptance) = 0.5:0.005:0.999
 
     draws(seed::Integer) = (n_chain, target_acceptance, resume, seed)
+end
+
+# Vector inputs take several values from one domain: an `@options` declaration
+# (or a type-proved domain) lists the allowed ELEMENTS.
+@enum OptionStage option_queued option_active option_done
+
+@dynamicstruct struct MultipleOptionFixture
+    tags::Vector{Symbol}
+    @options(tags) = [:north, :south, :east]
+    @options(features) = option_domain(["dusche" => "Dusche", "aufzug" => "Aufzug"])
+    tag_default::Vector{Symbol} = [:north]
+    @options(tag_default) = [:north, :south]
+
+    estimate(; features::Vector{String}=String[], area::Float64=70.0) = (tags, features, area)
+    stages(picked::Vector{OptionStage}; flags::Vector{Bool}=Bool[], seeds::Vector{Int}=Int[]) =
+        (picked, flags, seeds)
 end
 
 @dynamicstruct struct UndeclaredOptionFixture
@@ -217,6 +233,65 @@ o = OverrideableDefaultFixture()
 # The default is overrideable, and the domain does not change with it.
 @test OverrideableDefaultFixture(; n_chain=32).n_chain == 32
 @test property_options(OverrideableDefaultFixture(; n_chain=32), :n_chain) == 1:64
+end
+
+@testitem "a vector input's domain governs its elements" setup=[OptionFixtures] begin
+using DynamicObjects
+
+# A declared domain on a vector argument lists the allowed elements; the input
+# takes several of them, and `multiple` is what tells a consumer so.
+estimate = Dict(input.name => input for input in
+    property_descriptor(MultipleOptionFixture, :estimate).inputs)
+@test estimate[:features].kind === :keyword
+@test estimate[:features].domain.kind === :declared
+@test estimate[:features].domain.multiple
+@test estimate[:features].domain.declaration.parameter === :features
+@test isempty(estimate[:features].domain.options)
+# A scalar beside it holds one value.
+@test estimate[:area].domain.kind === :unrestricted
+@test !estimate[:area].domain.multiple
+# A vector field reaches the operation as a context input with the same domain.
+@test estimate[:tags].kind === :context
+@test estimate[:tags].domain.kind === :declared
+@test estimate[:tags].domain.multiple
+
+tags = property_descriptor(MultipleOptionFixture, :tags)
+@test only(tags.inputs).domain.multiple
+@test tags.domain.multiple
+# An overrideable default reports it on the descriptor's own domain.
+tag_default = property_descriptor(MultipleOptionFixture, :tag_default)
+@test tag_default.domain.kind === :declared
+@test tag_default.domain.multiple
+
+# Scalar declared and inferred domains keep holding one value.
+@test !only(property_descriptor(OptionDomainFixture, :model).inputs).domain.multiple
+@test !property_descriptor(OverrideableDefaultFixture, :resume).domain.multiple
+
+# A type-proved domain is inferred from the element type: a vector of an Enum or
+# of Bool is that element's static domain, taken several times.
+stages = Dict(input.name => input for input in
+    property_descriptor(MultipleOptionFixture, :stages).inputs)
+@test stages[:picked].kind === :positional
+@test stages[:picked].domain.kind === :static
+@test [option.value for option in stages[:picked].domain.options] ==
+    collect(instances(OptionStage))
+@test stages[:picked].domain.cardinality == 3
+@test stages[:picked].domain.multiple
+@test stages[:flags].domain.kind === :static
+@test [option.value for option in stages[:flags].domain.options] == [false, true]
+@test stages[:flags].domain.multiple
+# An element type that proves nothing stays unrestricted; the input still holds
+# several values.
+@test stages[:seeds].domain.kind === :unrestricted
+@test stages[:seeds].domain.multiple
+
+# The evaluated domain is unchanged: it lists elements, so membership is
+# answered per element.
+o = MultipleOptionFixture([:north, :east])
+@test all(in(property_options(o, :tags)), o.tags)
+@test !(:west in property_options(o, :tags))
+@test collect(property_options(o, :features)) == ["dusche", "aufzug"]
+@test o.estimate(; features=["dusche", "aufzug"]) == ([:north, :east], ["dusche", "aufzug"], 70.0)
 end
 
 @testitem "@options for an unattached parameter stays inspectable" setup=[OptionFixtures] begin
