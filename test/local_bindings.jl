@@ -8,7 +8,47 @@ using TestItemRunner
 # forms (`let`, `while`, `try`) keep what they bind inside them.
 @testmodule LocalBindingFixtures begin
 using DynamicObjects
-export Receipts, LocalSignatures, LocalScopes
+using DynamicObjects.Treebars: @progress
+export Receipts, LocalSignatures, LocalScopes, LocalDestructures
+
+# Snag `local-namedtuple-c640cee8`: `local` with a destructuring or typed target
+# declares every name it binds, and a named destructure stays valid Julia in a
+# declaration or a binding header. `a` is also a property here.
+@dynamicstruct struct LocalDestructures
+    a::Int = 100
+    named(nt; k=1) = begin
+        local (; a, b) = nt
+        a + b + k
+    end
+    positional(t) = begin
+        local (a, b) = t
+        a + b
+    end
+    typed(v) = begin
+        local a::Int = v
+        a + 1
+    end
+    value(nt) = (local (; b) = nt)
+    let_bound(nt) = let (; a, b) = nt
+        a + b
+    end
+    looped(nts) = begin
+        acc = 0
+        for (; a, b) in nts
+            acc += a + b
+        end
+        acc
+    end
+    comprehended(nts) = [a + b for (; a, b) in nts if a > 0]
+    @progress marked(nt) = begin
+        local (; a, b) = nt
+        a + b
+    end
+    @fetch! fetched(nt) = begin
+        local (; a, b) = nt
+        a + b
+    end
+end
 
 @dynamicstruct struct Receipts
     source::String = ""
@@ -122,4 +162,23 @@ end
     @test s.if_branch == "i+"          # `if` opens no scope
     @test s.try_else == :else_ran
     @test s.typed_let == 4
+end
+
+@testitem "local destructuring declares its names, in every body form" tags=[:core] setup=[LocalBindingFixtures] begin
+    using DynamicObjects
+    s = LocalDestructures()
+    @test s.named((a=1, b=2)) == 4
+    @test s.positional((1, 2)) == 3
+    @test s.typed(1) == 2
+    @test s.value((b=5,)) == (b=5,)
+    @test s.let_bound((a=1, b=2)) == 3
+    @test s.looped([(a=1, b=2), (a=3, b=4)]) == 10
+    @test s.comprehended([(a=1, b=2), (a=-1, b=5)]) == [3]
+    @test s.marked((a=1, b=2)) == 3
+    @test s.fetched((a=1, b=2)) == 3
+    # The declared `a` is the local, not the property: no dependency edge on it.
+    for name in (:named, :positional, :typed, :marked, :fetched)
+        @test :a ∉ DynamicObjects.metafirst(LocalDestructures, name).dependson
+    end
+    @test s.a == 100
 end
