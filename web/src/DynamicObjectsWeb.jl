@@ -33,7 +33,6 @@ const APPDATA = DOAppData()
 
     @get index() = h.div(
         h.h1("DynamicObjectsWeb"),
-        h.p("Edit src/DynamicObjectsWeb.jl and Revise will reload automatically."),
         h.p(h.a(href=__self__/"gallery")("DO concept gallery")),
         h.p(h.a(href=__self__/"tests")("Tests")),
         h.p(h.a(href=__self__/"structure")("DO type structure browser")),
