@@ -56,6 +56,16 @@ import SHA, Serialization, Mmap, Treebars, ScopedValues
 isdefined(Treebars, Symbol("@progress_scope")) || error(
     "DynamicObjects needs a Treebars with `Treebars.@progress_scope` (Treebars `bdf76d5` or " *
     "later, nsiccha/Treebars.jl main). The loaded Treebars, $(pathof(Treebars)), has none: update it.")
+# A property read in an `@progress` label is threaded through `__progress__` like any other
+# (`_implied_progress_rewrite`). Treebars binds it in labels from `3282255`; no symbol marks
+# that, so check that the expansion leaves no bare `__progress__` behind.
+let mentions(ex) = ex === :__progress__ || (ex isa Expr && any(mentions, ex.args))
+    mentions(macroexpand(Treebars, :(@progress_scope nothing begin @progress "$(__progress__)"; nothing end))) && error(
+        "DynamicObjects needs a Treebars that binds `__progress__` in `@progress` labels (Treebars " *
+        "`3282255` or later, nsiccha/Treebars.jl main); without it a property read in a phase label " *
+        "fails with `UndefVarError: __progress__`. The loaded Treebars, $(pathof(Treebars)), " *
+        "leaves it unbound: update it.")
+end
 
 struct DiskCacheLocks
     lock::ReentrantLock
