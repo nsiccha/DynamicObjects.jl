@@ -19,7 +19,7 @@ export render_text, @progress, rows, depth_of, labels, gate, release!, settles, 
     IPChain, IPInner, IPOuter, IPDestructured, IPViaHelper, IPWithIP, IPBoom, IPKw, IPSpawned,
     IPRewriteRuntime, REWRITE_CALLS, IPReread, REREAD_CALLS, IPMarked, IPLocked,
     IPUnderLock, IPFetchLocked, IPFetchUnderLock, IPTaskOf, IPFetchTask, IPGatedSource,
-    IPFetching, IPPopulation, IPModel, IPRoute, IPRemountRoot, IPPhased, IPLoops
+    IPFetching, IPPopulation, IPModel, IPRoute, IPRemountRoot, IPPhased, IPLoops, IPLabelled
 
 const _STATES = ('✓', '✗', '▶', '·')
 
@@ -322,6 +322,54 @@ end
             acc += i
         end
         acc
+    end
+end
+
+# A read in an `@progress` label is a read like any other (snag `inline-phase-lab-c8aa11da`):
+# it nests under the node the labelled node is created under.
+@dynamicstruct struct IPLabelled
+    tag::Symbol
+    inner
+    "Label source"
+    title(x) = (gate(tag); "T$x")
+    "Phase label"
+    phase_label = begin
+        @progress "phase $(title(1))"
+        1
+    end
+    "Loop-body phase label"
+    loop_phase_label = begin
+        acc = 0
+        for i in 1:2
+            @progress "phase $(title(i))"
+            acc += i
+        end
+        acc
+    end
+    "Block label"
+    block_label = begin
+        v = @progress "block $(title(3))" begin
+            3
+        end
+        v
+    end
+    "Loop label"
+    loop_label = begin
+        acc = 0
+        @progress "items $(title(4))" for i in 1:2
+            acc += i
+        end
+        acc
+    end
+    "Marked label"
+    @progress marked_label = begin
+        @progress "phase $(title(5))"
+        5
+    end
+    "Marked other label"
+    @progress marked_other_label = begin
+        @progress "phase $(inner.work)"
+        6
     end
 end
 
@@ -653,4 +701,24 @@ release!(:loops)
 @test labels(node_of(l, :plain)) == ["Plain loop"]
 @test l.counted == 6
 @test "items (3/3)" in labels(node_of(l, :counted))
+end
+
+@testitem "implied progress: a read in an @progress label nests and fills the label" tags=[:progress] setup=[ImpliedProgressFixtures] begin
+using .ImpliedProgressFixtures
+for (name, value, source, label) in (
+        (:phase_label, 1, "Label source", "phase T1"),
+        (:loop_phase_label, 3, "Label source", nothing),  # its phases leave with their iteration
+        (:block_label, 3, "Label source", "block T3"),
+        (:loop_label, 3, "Label source", "items T4 (2/2)"),
+        (:marked_label, 5, "Label source", "phase T5"),
+        (:marked_other_label, 6, "Inner work", "phase 9"))
+    tag = Symbol(:labelled_, name)
+    o = IPLabelled(tag, IPInner(tag))
+    t = Threads.@spawn getproperty(o, name)
+    @test settles(() -> (n = node_of(o, name); n !== nothing && depth_of(n, source) == 1))
+    release!(tag)
+    @test settles(() -> istaskdone(t), 10)
+    istaskdone(t) && @test fetch(t) == value
+    isnothing(label) || @test label in labels(node_of(o, name))
+end
 end
