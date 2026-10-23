@@ -3855,6 +3855,14 @@ Clear all in-memory memoized property values on a `@dynamicstruct` instance,
 leaving disk caches (`@cached` files) untouched. Every derived property —
 including child DOs stored as values — will be recomputed on next access.
 
+Holders follow, as for `DynamicObjects.clear_cache!`: when the clear drops a
+derived value, `obj`'s `object_version` moves, so an object holding `obj` (as an
+indexed-property entry, a field or a property value, directly or in an array,
+tuple or dict) drops what it derived from `obj` on its next `sync!`, and so do
+the children that holder holds. A clear that drops nothing but inputs, `@state`
+values and DO's own `__…__` entries leaves the version where it was. To free
+memory without invalidating anything, use [`prune_mem_caches!`](@ref).
+
 Constructor-passed inputs are NOT dropped: the kwargs the instance was created
 with (`__parent__` wiring, inline-child index params, property overrides such
 as `__status__ = nothing`) are restored after the clear, so the instance keeps
@@ -3907,14 +3915,20 @@ function clear_mem_caches!(obj)
     # nothing, `_run_cache_compute!`). Everything kept is put back within the
     # same critical section, so no reader finds it missing, and each subcache
     # is then emptied under its own lock.
-    subcaches = lock(c.lock) do
+    inputs = _seed_names(pc)
+    dropped, subcaches = lock(c.lock) do
         parts = _clear_parts(c)
         kept = [(cache, name, value) for (cache, _, _) in parts for (name, value) in cache
                 if !(value isa Pending) && (name in state || _own_wrapper(obj, name, value))]
         running = [(status, computing, name, computing[name], get(status, name, nothing))
                    for (_, status, computing) in parts for name in state if haskey(computing, name)]
-        subcaches = [value.cache for (cache, _, _) in parts for (name, value) in cache
+        subcaches = [(name, value.cache) for (cache, _, _) in parts for (name, value) in cache
                      if value isa IndexableProperty && !(name in state)]
+        # What a holder may have derived from: the values dropped here, except the
+        # inputs `_restore_seeds!` puts back and DO's own `__…__` entries.
+        dropped = Symbol[name for (cache, _, _) in parts for (name, value) in cache
+                         if !(value isa Pending || name in state || name in inputs ||
+                              _own_wrapper(obj, name, value) || _is_dunder(name))]
         empty!(c)
         for (cache, name, value) in kept
             cache[name] = value
@@ -3923,10 +3937,14 @@ function clear_mem_caches!(obj)
             computing[name] = latch
             node === nothing || (status[name] = node)
         end
-        subcaches
+        dropped, subcaches
     end
-    foreach(empty!, subcaches)
+    for (name, subcache) in subcaches
+        _holds_entries(subcache) && !_is_dunder(name) && push!(dropped, name)
+        empty!(subcache)
+    end
     _restore_seeds!(pc)
+    isempty(dropped) || _object_cleared!(obj, unique!(dropped))
     held === nothing || _trace_invalidation!(:clear_mem_caches!, obj, _trace_cleared(held, c, state))
     nothing
 end
@@ -3955,6 +3973,14 @@ _clear_parts(c::MountedThreadsafeDict) = ((c.shared.cache, c.shared.status, c.sh
 # `name` — not a value that a bare property computed, which a clear drops.
 _own_wrapper(obj, name::Symbol, value) =
     value isa IndexableProperty{name} && is_indexed_property(obj, name)
+
+# The constructor inputs a whole-object clear puts back (`_restore_seeds!`): for a
+# remount view, its request context and its retained object's own inputs.
+_seed_names(pc::PropertyCache) = pc.cache isa MountedThreadsafeDict ?
+    union(keys(pc.seed), keys(getfield(pc.cache.source, :cache).seed)) : keys(pc.seed)
+
+# Whether an indexed-property subcache holds a settled entry, as `_drop_property!` counts one.
+_holds_entries(subcache) = lock(() -> !isempty(subcache.cache), subcache.lock)
 
 # Names of `T`'s `@state` properties: per-instance state that whole-object
 # clears keep and `sync!` never drops. `@dynamicstruct` emits a method for each
@@ -12531,10 +12557,11 @@ mutable struct _TrackedState
     observers::Vector{Any}
 end
 
-# Set when the first tracked value is constructed, or when `clear_cache!` first
-# moves an object's version. Until then no `sync!` can observe anything (object
+# Set when the first tracked value is constructed, or when an invalidation
+# (`clear_cache!`, `clear_mem_caches!`) first moves an object's version
+# (`_version_moved!`). Until then no `sync!` can observe anything (object
 # versions move only through those drops), so it returns at once and an
-# application that uses neither pays nothing.
+# application that uses none of them pays nothing.
 const _TRACKED_IN_USE = Threads.Atomic{Bool}(false)
 
 function _TrackedState()
@@ -12881,14 +12908,37 @@ _sync_record(shared::ThreadsafeDict) = lock(_SYNC_LOCK) do
     get!(() -> _SyncRecord(Dict{Any,Tuple{UInt,UInt64}}(), UInt64(1)), _SYNC_RECORDS, shared.lock)
 end
 
+# An invalidation dropped values of `record`'s object: its version moves, so a
+# holder drops what it derived from the object on its next `sync!`, which from
+# now on has a version to observe. Call under `_SYNC_LOCK`.
+function _version_moved!(record::_SyncRecord)
+    record.generation += UInt64(1)
+    _TRACKED_IN_USE[] = true
+    nothing
+end
+
+# `clear_mem_caches!(o)` dropped the derived values `dropped`: their sync stamps go
+# with them, as `_drop_targets!` forgets a dropped slot's, and `o`'s version moves.
+# After the clear, never before it: a holder synced in between would recompute from
+# the values about to be dropped and stamp the moved version.
+function _object_cleared!(o, dropped)
+    lock(_SYNC_LOCK) do
+        record = _sync_record(last(_remount_source(o)))
+        filter!(p -> !(_slot_name(first(p)) in dropped), record.stamps)
+        _version_moved!(record)
+    end
+end
+
 """
     object_version(o) -> UInt64
 
 Monotone count of the changes [`sync!`](@ref) has observed through `o` — a
-tracked value it holds moving, or a nested object it holds changing. The
-aggregate a holder watches: `sync!` stamps each child's version per holder, so a
-child shared by several parents reports its change to each, whenever each looks.
-A remount view reports its retained object's number.
+tracked value it holds moving, or a nested object it holds changing — and of
+the invalidations that dropped values of `o` (`DynamicObjects.clear_cache!`,
+[`clear_mem_caches!`](@ref)). The aggregate a holder watches: `sync!` stamps
+each child's version per holder, so a child shared by several parents reports
+its change to each, whenever each looks. A remount view reports its retained
+object's number. Eviction ([`prune_mem_caches!`](@ref)) does not move it.
 """
 function object_version(o)
     _is_dynamic_object(o) ||
@@ -13234,10 +13284,7 @@ function _invalidate_property!(o, name::Symbol)
             _drop_view_child_reads!(o, stale, :clear_cache!)
         end
         result = sort!(unique!(dropped))
-        if !isempty(result)
-            record.generation += UInt64(1)
-            _TRACKED_IN_USE[] = true
-        end
+        isempty(result) || _version_moved!(record)
         result
     end
     _trace_invalidation!(:clear_cache!, o, result)

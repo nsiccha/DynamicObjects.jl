@@ -2,7 +2,8 @@ using TestItemRunner
 
 @testmodule PropertyInvalidationFixtures begin
 using DynamicObjects
-export Ladder, CachedLadder, LadderApp, VersionedLadder, PI_CALLS, PI_BUILD, PI_CACHE_BASE
+export Ladder, CachedLadder, LadderApp, VersionedLadder, HeldInner, InnerHolder,
+    PI_CALLS, PI_BUILD, PI_CACHE_BASE, PI_SOURCE
 
 const PI_CALLS = Dict{Any,Int}()
 _pi!(key) = (PI_CALLS[key] = get(PI_CALLS, key, 0) + 1)
@@ -51,6 +52,30 @@ end
     __cache_base__ = PI_CACHE_BASE[]
     @versioned content_version = file_version(path; by = :hash)
     @cached native_build = (_pi!(:versioned_build); "build#$(PI_BUILD[])")
+end
+
+# An external input `value` re-reads after a clear.
+const PI_SOURCE = Ref(1)
+
+@dynamicstruct struct HeldInner
+    x::Int
+    scale::Int = 1
+    @state attempts = Ref(0)
+    value = (_pi!((:held_value, x)); PI_SOURCE[] * x * scale)
+end
+
+# Holds objects it did not construct as children: indexed entries (read by an inline
+# child too, through the forwarded name), a fixed field, and a vector element.
+@dynamicstruct struct InnerHolder
+    pinned::HeldInner
+    inner(x::Int) = HeldInner(x)
+    total(x::Int) = (_pi!((:held_total, x)); inner(x).value + 100)
+    @struct cell(x::Int) = begin
+        result = (_pi!((:held_cell, x)); inner(x).value + 1)
+    end
+    pinned_total = (_pi!(:pinned_total); pinned.value + 1000)
+    listed = [HeldInner(3)]
+    listed_total = (_pi!(:listed_total); sum(i.value for i in listed))
 end
 end
 
@@ -157,6 +182,88 @@ PI_BUILD[] = 2
 @test PI_CALLS[(:app_build, "b")] == 1     # the other model's preparation is kept
 @test PI_CALLS[(:app_sb, "a")] == 1        # and so is the other branch of this one
 @test sync!(app) == Symbol[]
+end
+
+@testitem "a holder drops what it derived from an object clear_mem_caches! cleared" setup=[PropertyInvalidationFixtures] begin
+using DynamicObjects
+
+empty!(PI_CALLS); PI_SOURCE[] = 1
+h = InnerHolder(HeldInner(4))
+@test h.total(2) == 102 && h.cell(2).result == 3
+@test h.pinned_total == 1004 && h.listed_total == 3
+sync!(h)
+
+PI_SOURCE[] = 5
+inner = h.inner(2)
+version = object_version(inner)
+clear_mem_caches!(inner)
+@test object_version(inner) == version + 1
+@test inner.value == 10
+@test sync!(h) == [:total]                 # the inline child drops its read too
+@test h.total(2) == 110 && h.cell(2).result == 11
+@test PI_CALLS[(:held_total, 2)] == 2 && PI_CALLS[(:held_cell, 2)] == 2
+@test h.pinned_total == 1004 && PI_CALLS[:pinned_total] == 1   # other objects' work is kept
+@test sync!(h) == Symbol[]
+
+clear_mem_caches!(h.pinned)                # held as a fixed field
+@test sync!(h) == [:pinned_total]
+@test h.pinned_total == 1020
+
+clear_mem_caches!(only(h.listed))          # held as a vector element
+@test sync!(h) == [:listed_total]
+@test h.listed_total == 15
+@test PI_CALLS[(:held_total, 2)] == 2     # each clear reaches only what derived from its object
+@test sync!(h) == Symbol[]
+end
+
+@testitem "clear_mem_caches! moves no version when it drops nothing derived" setup=[PropertyInvalidationFixtures] begin
+using DynamicObjects
+
+PI_SOURCE[] = 1
+o = HeldInner(7; scale = 2)
+o.attempts[] += 1                          # @state, and DO's own entries it computes
+version = object_version(o)
+clear_mem_caches!(o)
+@test object_version(o) == version
+@test o.scale == 2 && o.attempts[] == 1    # the input and the state are kept
+
+@test o.value == 14
+clear_mem_caches!(o)
+@test object_version(o) == version + 1
+
+h = InnerHolder(HeldInner(1))
+h.inner                                    # the wrapper alone holds no value
+version = object_version(h)
+clear_mem_caches!(h)
+@test object_version(h) == version
+h.inner(1)
+clear_mem_caches!(h)                       # an emptied indexed entry is a dropped value
+@test object_version(h) == version + 1
+end
+
+@testitem "clear_mem_caches! through a remount view moves the retained object's version" setup=[PropertyInvalidationFixtures] begin
+using DynamicObjects
+
+l = Ladder("m")
+view = remount(l; request = "req-1")
+version = object_version(l)
+clear_mem_caches!(view)                    # only the view's request context was there
+@test object_version(view) == object_version(l) == version
+
+@test view.banner == "req-1:query[build#$(PI_BUILD[])[spec(m)]]"
+clear_mem_caches!(view)
+@test object_version(view) == object_version(l) == version + 1
+@test view.banner == "req-1:query[build#$(PI_BUILD[])[spec(m)]]"   # the context is kept
+end
+
+@testitem "a holder follows clear_mem_caches! in a process that tracks nothing else" begin
+using DynamicObjects
+
+# A fresh process: no tracked value and no `clear_cache!` has made `sync!` look yet.
+script = normpath(joinpath(dirname(pathof(DynamicObjects)), "..", "test", "fixtures", "clear_mem_caches_holder_process.jl"))
+project = dirname(Base.active_project())
+output = read(`$(Base.julia_cmd()) --startup-file=no --project=$project $script`, String)
+@test occursin("CLEAR-HOLDER-PROCESS-OK", output)
 end
 
 @testitem "clear_cache! through a remount view drops shared and view-local work" setup=[PropertyInvalidationFixtures] begin
