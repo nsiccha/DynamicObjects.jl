@@ -707,9 +707,13 @@ see does deadlock it, for example polling `isready` in a loop: block with
 and its value. `@queued` on a bare (non-call-form) property is a macro-time
 error.
 
-A queued computation logs where the call that started it logs, including a
-`with_logger` around that call, whichever task admits and runs it. The same
-holds for a computation an executor's worker runs.
+A queued computation runs as the call that started it would have, whichever
+task admits and runs it: it logs where that call logs (including a
+`with_logger` around it) and sees every `ScopedValue` set around it, such as a
+web framework's request context. Only the queue's own slot belongs to the task
+that runs the computation. The same holds for a computation an executor's
+worker runs. Task-local storage does not carry over: a layer that wants its
+context to follow deferred work keeps it in a `ScopedValue`.
 
 A layer on top (a web framework's job board, say) can watch and steer the queue:
 
