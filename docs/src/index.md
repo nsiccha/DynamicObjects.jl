@@ -652,6 +652,15 @@ via the `progress=` kwarg of whatever long-running API you call.
 (`obj.prop(key)` or `@memo! obj.prop(key)`). Explicit `@fresh` access and
 scalar property access don't trigger it.
 
+DO writes three notes into these nodes: `from disk: 26.9 MB` while a `@cached`
+value loads from disk, `queued · #k` while a computation waits in the job queue
+(`@queued`, below), and `(cached)` on a documented property's node that a
+progress-threaded read finds already in memory. They are Treebars notes, written
+in the language of the page that renders the node: an HTMXObjects app declaring
+`__lang__ = "de"` shows `aus dem Zwischenspeicher (26,9 MB)`, `wartet · Nr. 2`
+and `(zwischengespeichert)`. DO's words are the table
+`DynamicObjects.progress_notes`.
+
 ### Bounded execution: `@queued`
 
 `@queued` marks an indexed property's computations as heavy work. Every

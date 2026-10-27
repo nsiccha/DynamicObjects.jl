@@ -66,6 +66,11 @@ let mentions(ex) = ex === :__progress__ || (ex isa Expr && any(mentions, ex.args
         "fails with `UndefVarError: __progress__`. The loaded Treebars, $(pathof(Treebars)), " *
         "leaves it unbound: update it.")
 end
+# The notes DO writes into progress nodes (`progress_notes`) are written in the language of the
+# page that renders them. Treebars has `treebar_notes` from `753f826`.
+isdefined(Treebars, :treebar_notes) || error(
+    "DynamicObjects needs a Treebars with `Treebars.treebar_notes` (Treebars `753f826` or later, " *
+    "nsiccha/Treebars.jl main). The loaded Treebars, $(pathof(Treebars)), has none: update it.")
 
 struct DiskCacheLocks
     lock::ReentrantLock
@@ -893,21 +898,27 @@ _fail_substatus!(s::Treebars.ProgressNode, e) = Treebars.fail_progress!(s, e)
 _note_substatus!(s::Treebars.ProgressNode, text) = Treebars.update_progress!(s, text)
 _start_substatus!(s::Treebars.ProgressNode) = (Treebars.start_progress!(s); nothing)
 
-# Disk-load reporting — set the substatus message to a human-readable
-# "from disk: <size>" so big-file loads show up in the tree instead of
-# stalling silently. Description stays as the property label; message
-# is the running annotation Treebars renders alongside.
-_report_disk_load!(s::Treebars.ProgressNode, cache_path, size_bytes) =
-    Treebars.update_progress!(s, "from disk: " * _format_size(size_bytes))
+"""
+    DynamicObjects.progress_notes
 
-# Format a byte count as "1.2 MB" / "850 KB" / "42 B" for human-readable
-# progress messages.
-function _format_size(n::Integer)
-    n < 1024            && return "$n B"
-    n < 1024^2          && return string(round(n / 1024,        digits=1), " KB")
-    n < 1024^3          && return string(round(n / 1024^2,      digits=1), " MB")
-    string(round(n / 1024^3, digits=1), " GB")
-end
+The words DynamicObjects writes into progress nodes, in English and German: `from_disk`, the
+running message of an explicit `@cached`/`@mmap` value read back from disk, and `cached`, the note on a
+documented property's node when a reader finds its value already in memory. A node is shared
+by every viewer, and a computation often runs on a background task, so DynamicObjects writes a
+`Treebars.TreebarNote` and each page renders it in its own language (`__lang__`, see Treebars'
+`treebar_texts`). An app rewords them by passing this table to `Treebars.treebar_texts`, e.g.
+`treebar_texts(:de, DynamicObjects.progress_notes => (from_disk = "von der Festplatte ({size})",))`.
+"""
+const progress_notes = Treebars.treebar_notes(
+    en = (from_disk = "from disk: {size}", cached = "(cached)"),
+    de = (from_disk = "aus dem Zwischenspeicher ({size})", cached = "(zwischengespeichert)"))
+
+# Disk-load reporting — set the substatus message to "from disk: <size>" so
+# big-file loads show up in the tree instead of stalling silently. Description
+# stays as the property label; message is the running annotation Treebars
+# renders alongside.
+_report_disk_load!(s::Treebars.ProgressNode, cache_path, size_bytes) =
+    Treebars.update_progress!(s, progress_notes(:from_disk; size = Treebars.ByteSize(size_bytes)))
 
 """
     PropertyCache{D}(cache)
@@ -2462,7 +2473,7 @@ function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condit
             _on_hit!(c, key)          # defensive: someone published first
         end
         delete!(c.computing, key)
-        notify(cnd)                    # leave c.status[key] finalized — getstatus / "(cached)" relabel rely on it
+        notify(cnd)                    # leave c.status[key] finalized — getstatus / the "(cached)" note rely on it
         (existing, published)
     end
     !isnothing(s) && _finalize_substatus!(s)
@@ -2510,7 +2521,7 @@ end
 # The `link` of a read `@fetch!` or `@progress` threads (`fetchindex!` / `fetchproperty!`
 # with a progress node). The read is the ordinary blocking read, computed inline, but the
 # computation's node stays under `parent` after it finishes, and a hit attaches the entry's
-# node too, relabelled " (cached)" when documented (`_attach_fetched!`).
+# node too, noted "(cached)" when documented (`_attach_fetched!`).
 struct _Attached
     parent::Treebars.ProgressNode
 end
@@ -2954,7 +2965,8 @@ end
 function _note_position!(item::QueuedItem, k::Int)
     item.note == k && return
     item.note = k
-    _note_substatus!(_queued_status(item.work), k == 0 ? "" : "queued · #$(k)")
+    _note_substatus!(_queued_status(item.work),
+        k == 0 ? "" : Treebars.treebar_note(:queued_position; position = k))
 end
 
 _queued_status(d::DeferredCompute) = d.status
@@ -3488,7 +3500,7 @@ sites that opt out of the two-phase fetch dance without changing call shape.
 When `callback` is a `Treebars.ProgressNode`, the call blocks for the value. It
 computes inline on the caller's task, as a plain call does, and attaches the
 computation's node under `callback`, where it stays once finished; a documented
-cache hit attaches the entry's node relabelled " (cached)". With `fetch=identity`
+cache hit attaches the entry's node noted "(cached)". With `fetch=identity`
 it polls instead and returns a [`Pending`](@ref) while the computation runs.
 [`fetchproperty!`](@ref) with a progress node is the blocking form for a bare
 property; `@fetch!` and `@progress` thread their reads through both.
@@ -3549,48 +3561,39 @@ fetchproperty!(::Nothing, o, name::Symbol) = getproperty(o, name)
 # `Pending` handle while the computation is in flight, and the VALUE once it is done.
 # So at callback entry `!(rv isa Pending)` means the value was already in the
 # in-memory cache — a hit. On a DOCUMENTED in-memory hit we KEEP the original
-# node `s` and its ENTIRE sub-step subtree intact, and swap ONLY the subtree
-# ROOT's LABEL — appending " (cached)" in place — so it renders e.g.
-# "Compute subject data (cached) — done (13s)" (carrying `s`'s own frozen
-# ORIGINAL-compute duration) with all of `s`'s sub-steps rendering beneath it,
-# unchanged.
+# node `s` and its ENTIRE sub-step subtree intact, and set ONLY the subtree
+# ROOT's note to `progress_notes(:cached)` in place — so it renders e.g.
+# "Compute subject data — (cached)" (carrying `s`'s own frozen ORIGINAL-compute
+# duration) with all of `s`'s sub-steps rendering beneath it, unchanged. The note
+# replaces a disk load's "from disk: …".
 #
-# In-place relabel (vs. a new born-finished root with the children re-homed) is
+# In-place marking (vs. a new born-finished root with the children re-homed) is
 # the correct mechanism here: `s` is SHARED per cache key (`getstatus` returns
 # the same node to every status tree / poll). Re-homing `s`'s children into a new
 # node would EMPTY `s.children`, so a second status tree hitting the same shared
 # `s` would build a CHILDLESS "(cached)" node — exactly the collapsed-subtree bug
-# this corrects. Relabeling `s` itself keeps the one shared subtree intact for all
+# this corrects. Marking `s` itself keeps the one shared subtree intact for all
 # trees, preserves children's (immutable) parent pointers, and mirrors
 # `_report_disk_load!` above, which already mutates the shared `s`'s display state
-# in place.
+# in place. Because `s` is shared and a hit can come from a background task, the
+# note is a `TreebarNote`, rendered in each viewer's page language.
 #
-# UNDOCUMENTED hit (`s.impl.description` empty): no relabel — `s` stays a bare
+# UNDOCUMENTED hit (`s.impl.description` empty): no note — `s` stays a bare
 # wrapper the renderer inlines away. Running (`rv isa Pending`) and no-substatus
-# (`s === nothing`): no relabel. All four paths then attach `s` via `add_child!`
+# (`s === nothing`): no note. All four paths then attach `s` via `add_child!`
 # (idempotent on the `ThreadsafeSet`; no-op on `nothing`).
-const _CACHED_SUFFIX = " (cached)"
-
 function _attach_fetched!(status::Treebars.ProgressNode, rv, s)
     if !(rv isa Pending) && !isnothing(s) && !isempty(s.impl.description)
-        _mark_cached!(s)                   # documented in-memory hit → relabel root in place
+        _mark_cached!(s)                   # documented in-memory hit → note the root in place
     end
     Treebars.add_child!(status, s)         # keep/attach the subtree root (no-op on `nothing`)
     nothing
 end
 
-# Append the "(cached)" suffix to `s`'s description exactly once. Idempotent under
-# repeat polls (web routes poll the tree repeatedly and re-fetch the same shared
-# `s`) via the `endswith` guard, and locked on `s.impl.lock` so concurrent first
-# hits cannot double-append. `s` is finished/frozen on a hit, so the visible
-# duration stays the frozen original-compute time.
-function _mark_cached!(s::Treebars.ProgressNode)
-    sp = s.impl
-    lock(sp.lock) do
-        endswith(sp.description, _CACHED_SUFFIX) || (sp.description *= _CACHED_SUFFIX)
-    end
-    nothing
-end
+# Set `s`'s note to the cached marker. Repeat polls (web routes poll the tree repeatedly and
+# re-fetch the same shared `s`) set the same note again. `s` is finished/frozen on a hit,
+# so the visible duration stays the frozen original-compute time.
+_mark_cached!(s::Treebars.ProgressNode) = (Treebars.update_progress!(s, progress_notes(:cached)); nothing)
 
 fetchindex!(status::Treebars.ProgressNode, ip, indices...; fetch=Base.fetch, kwargs...) =
     fetchindex(ip, indices...; kwargs...) do rv, s
