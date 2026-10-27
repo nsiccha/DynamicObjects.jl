@@ -23,7 +23,7 @@ Treebars = {url = "https://github.com/nsiccha/Treebars.jl"}
 [compat]
 Arrow = "2"
 DataFrames = "1"
-ScopedValues = "1"
+ScopedValues = "1.6"
 TestItemRunner = "1"
 Treebars = "0.1"
 julia = "1.10"
