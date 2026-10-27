@@ -14,6 +14,24 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.2
+
+- The notes DynamicObjects writes into Treebars progress nodes follow the
+  language of the page that renders them: `from disk: 26.9 MB` while a
+  `@cached` value loads, `queued · #k` while a computation waits in the job
+  queue, and `(cached)` on an in-memory hit. A page declaring
+  `__lang__ = "de"` shows `aus dem Zwischenspeicher (26,9 MB)`,
+  `wartet · Nr. 2` and `(zwischengespeichert)`; English renders the old
+  strings. DO's words are the table `DynamicObjects.progress_notes`, which an
+  app rewords through Treebars' `treebar_texts` (`9cc0d8a`).
+- An in-memory hit's `(cached)` is now the node's note instead of a suffix on
+  its label, so it replaces an earlier `from disk: …` note: a node loaded from
+  disk and later hit reads `X — (cached)`, no longer
+  `X (cached) — from disk: 26.9 MB` (`9cc0d8a`).
+- Loading DynamicObjects needs Treebars `753f826` or later (`treebar_notes`)
+  and says so if it is older. Treebars is still at 0.1.0, so `[compat]`
+  cannot state this floor (`9cc0d8a`).
+
 ## 0.5.1
 
 The first version since 0.5.0 that names an API line. It carries everything on
