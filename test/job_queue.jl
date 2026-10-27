@@ -264,7 +264,9 @@ ms(n, d) = n * oneunit(d)
 # The progress node of the computation waiting behind `w`'s gated blocker.
 waiting_node(w) = begin
     found = nothing
-    walk(n) = (n.impl.message == "queued · #1" && (found = n); foreach(walk, n.children))
+    # The note is a Treebars note, written in the page's language ("queued · #1" in English).
+    walk(n) = (n.impl.message == Treebars.treebar_note(:queued_position; position = 1) && (found = n);
+               foreach(walk, n.children))
     walk(w.__status__)
     found
 end

@@ -562,12 +562,12 @@ release!(:fetched)
 # subtree renders only from its own node.)
 @test labels(node_of(r, :bare_read)) == ["Fetching bare", "Gated work"]
 @test labels(node_of(r, :entry_read)) == ["Fetching entry", "Gated entry"]
-# A hit shows the entry's finished node under the reader, relabelled.
+# A hit shows the entry's finished node under the reader, noted "(cached)".
 r2 = IPFetching(src)
 @test r2.bare_read == 9
 @test r2.entry_read == 20
-@test labels(node_of(r2, :bare_read)) == ["Fetching bare", "Gated work (cached)"]
-@test labels(node_of(r2, :entry_read)) == ["Fetching entry", "Gated entry (cached)"]
+@test labels(node_of(r2, :bare_read)) == ["Fetching bare", "Gated work — (cached)"]
+@test labels(node_of(r2, :entry_read)) == ["Fetching entry", "Gated entry — (cached)"]
 end
 
 @testitem "implied progress: a route shows queued fits read without @fetch!" tags=[:progress] setup=[ImpliedProgressFixtures] begin
