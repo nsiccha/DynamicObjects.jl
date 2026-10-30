@@ -134,9 +134,8 @@ end
     tree = o.__status__
     @test timedwait(() -> occursin("Slow input", render_text(tree)), 20; pollint=0.01) === :ok
     lines = split(render_text(tree), '\n')
-    fragment = findfirst(l -> occursin("Fragment", l), lines)
-    slow = findfirst(l -> occursin("Slow input", l), lines)
-    @test !isnothing(fragment) && slow == fragment + 1
+    depth(label) = findfirst(in(('✓', '✗', '▶', '·')), collect(lines[findfirst(l -> occursin(label, l), lines)]))
+    @test depth("Slow input") > depth("Fragment")
     release!(:quoted_nesting)
     @test fetch(task) == :(y + 1)
 end
