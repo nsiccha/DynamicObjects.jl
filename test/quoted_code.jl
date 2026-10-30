@@ -131,11 +131,10 @@ end
 @testitem "a read in an interpolation nests like any read" tags=[:core, :progress] setup=[QuotedCodeFixtures] begin
     o = QuotedProgress(:quoted_nesting)
     task = Threads.@spawn o.fragment
-    tree = o.__status__
-    @test timedwait(() -> occursin("Slow input", render_text(tree)), 20; pollint=0.01) === :ok
-    lines = split(render_text(tree), '\n')
-    depth(label) = findfirst(in(('✓', '✗', '▶', '·')), collect(lines[findfirst(l -> occursin(label, l), lines)]))
-    @test depth("Slow input") > depth("Fragment")
+    # The owner's tree shows a computation once, at its own place; a read shows on its reader.
+    reader() = DynamicObjects._status_of(getfield(o, :cache).cache, :fragment)
+    shown() = (node = reader(); node !== nothing && occursin("Slow input", render_text(node)))
+    @test timedwait(shown, 20; pollint=0.01) === :ok
     release!(:quoted_nesting)
     @test fetch(task) == :(y + 1)
 end
