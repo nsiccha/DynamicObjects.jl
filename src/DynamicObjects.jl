@@ -4744,6 +4744,26 @@ macro fresh(x)
     esc(_call_rewrite(x, :maybefresh))
 end
 
+# Quoted code is data for whoever evaluates it later, not an evaluation of this body,
+# so no body rewriter touches it: a name inside `:(…)` / `quote … end` stays the symbol
+# it is. Only an interpolation the quote evaluates when it is built is code of the body,
+# and `f` maps that code. Levels count as in Julia's own quasi-quote: each nested quote
+# takes one more `$` to reach the enclosing code, so the `$x` of `:(:($x))` is data here
+# and the `$($x)` of `:(:($($x)))` is code.
+_map_interpolations(f, x, level::Int=0) = x
+function _map_interpolations(f, x::Expr, level::Int=0)
+    Meta.isexpr(x, :$) && return Expr(:$,
+        Any[level == 1 ? f(a) : _map_interpolations(f, a, level - 1) for a in x.args]...)
+    Expr(x.head, Any[_map_interpolations(f, a, level + Meta.isexpr(x, :quote)) for a in x.args]...)
+end
+# What of `x`'s subexpressions the body evaluates, for scanners that only read.
+_evaluated_args(x::Expr) = Meta.isexpr(x, :quote) ? _interpolations(x) : x.args
+function _interpolations(x::Expr)
+    code = Any[]
+    _map_interpolations(a -> push!(code, a), x)
+    code
+end
+
 # Recursively rewrite every call site to `\$target(...)` (`maybememoize!` for
 # `@memo!`, `maybefresh` for `@fresh`). Plain property accesses (`.foo`,
 # `.bar.baz`) are left untouched — only `:call` heads are transformed. The
@@ -4751,6 +4771,7 @@ end
 # call (everything else).
 _call_rewrite(x, target::Symbol) = x
 function _call_rewrite(x::Expr, target::Symbol)
+    Meta.isexpr(x, :quote) && return _map_interpolations(a -> _call_rewrite(a, target), x)
     if Meta.isexpr(x, :do) && length(x.args) == 2 && Meta.isexpr(x.args[1], :call)
         call = x.args[1]
         lambda = _call_rewrite(x.args[2], target)
@@ -4869,6 +4890,7 @@ end
 
 _fetch_rewrite(pv::Symbol, x) = x
 function _fetch_rewrite(pv::Symbol, x::Expr)
+    Meta.isexpr(x, :quote) && return _map_interpolations(a -> _fetch_rewrite(pv, a), x)
     if Meta.isexpr(x, :do) && length(x.args) == 2 && Meta.isexpr(x.args[1], :call)
         call = x.args[1]
         lambda = _fetch_rewrite(pv, x.args[2])
@@ -5042,6 +5064,7 @@ _is_self_access(x) = Meta.isexpr(x, :.) && length(x.args) == 2 &&
 # dangling-`__progress__` footgun that killed the 1-arg `@fetch!`.
 _progress_self_rewrite(x) = x
 function _progress_self_rewrite(x::Expr)
+    Meta.isexpr(x, :quote) && return _map_interpolations(_progress_self_rewrite, x)
     # do-block with self-IP callee: desugar so the lambda lands after progress+callee
     if Meta.isexpr(x, :do) && length(x.args) == 2 && Meta.isexpr(x.args[1], :call) &&
        length(x.args[1].args) >= 1 && _is_self_access(x.args[1].args[1])
@@ -5100,8 +5123,9 @@ end
 # nests too. Ordinary calls (`sum`, arithmetic, helpers, constructors) stay calls,
 # with only their arguments walked; a read inside a helper is the helper's own
 # business. Syntax that is not an evaluation is left alone: assignment and local
-# function targets, quoted code, type positions. Keyword shorthand, `do` blocks,
-# broadcast calls and named destructuring keep their meaning. Ported from the
+# function targets, quoted code (bar its interpolations), type positions. Keyword
+# shorthand, `do` blocks, broadcast calls and named destructuring keep their meaning.
+# Ported from the
 # isolated lane `kb-impl/DynamicObjects-snag.semantic-app-req-fafc83a2`
 # (`3b2f9e7`..`1203b44c`), which emitted the spawning `maybefetch*` helpers.
 # `self=false` (an `@progress` body, whose marker already threads `__self__` reads
@@ -5111,7 +5135,8 @@ _implied_progress_rewrite(pv::Symbol, x, self::Bool=true) = x
 function _implied_progress_rewrite(pv::Symbol, x::Expr, self::Bool=true)
     rw(a) = _implied_progress_rewrite(pv, a, self)
     threads(access) = _is_property_access(access) && (self || access.args[1] !== :__self__)
-    Meta.isexpr(x, (:quote, :inert, :curly, :where, :meta)) && return x
+    Meta.isexpr(x, :quote) && return _map_interpolations(rw, x)
+    Meta.isexpr(x, (:inert, :curly, :where, :meta)) && return x
     if Meta.isexpr(x, :(::))
         return length(x.args) == 2 ? Expr(:(::), rw(x.args[1]), x.args[2]) : x
     end
@@ -5346,6 +5371,7 @@ end
 # do the right thing at runtime.
 _progress_rewrite(progress_var::Symbol, x) = x
 function _progress_rewrite(progress_var::Symbol, x::Expr)
+    Meta.isexpr(x, :quote) && return _map_interpolations(a -> _progress_rewrite(progress_var, a), x)
     if Meta.isexpr(x, :do) && length(x.args) == 2 && Meta.isexpr(x.args[1], :call)
         call = x.args[1]
         lambda = _progress_rewrite(progress_var, x.args[2])
@@ -5689,6 +5715,8 @@ elseif e.head in (:kw, :(=))
         Expr(e.head, _walk_assign_target(lhs; locals, properties, lnn),
             walk_rhs.(e.args[2:end]; locals, properties, lnn)...)
     end
+elseif e.head == :quote
+    _map_interpolations(a -> walk_rhs(a; locals, properties, lnn), e)
 elseif e.head == :local
     # `local x`, `local x, y, z`, or `local x = expr` — add names to the local
     # scope so subsequent assignments don't hit the property cache.
@@ -5741,7 +5769,7 @@ function _collect_self_deps_walk!(deps::Set{Symbol}, opaque::Ref{Bool}, e)
         if e.head === :. && length(e.args) == 2 && e.args[1] === :__self__ && e.args[2] isa QuoteNode
             push!(deps, e.args[2].value::Symbol)   # `__self__.field` — a tracked dependency
         else
-            for a in e.args
+            for a in _evaluated_args(e)
                 _collect_self_deps_walk!(deps, opaque, a)
             end
         end
@@ -5804,15 +5832,15 @@ end
 
 # --- Bare-rhs scanners (used by no-self-access check) ---
 _contains_self_ref(e::Symbol) = e === :__self__
-_contains_self_ref(e::Expr) = any(_contains_self_ref, e.args)
+_contains_self_ref(e::Expr) = any(_contains_self_ref, _evaluated_args(e))
 _contains_self_ref(_) = false
 
 _contains_bare_prop_ref(e::Symbol, prop_names) = e in prop_names
-_contains_bare_prop_ref(e::Expr, prop_names) = any(a -> _contains_bare_prop_ref(a, prop_names), e.args)
+_contains_bare_prop_ref(e::Expr, prop_names) = any(a -> _contains_bare_prop_ref(a, prop_names), _evaluated_args(e))
 _contains_bare_prop_ref(_, _) = false
 
 _contains_call(_) = false
-_contains_call(e::Expr) = Meta.isexpr(e, :call) || any(_contains_call, e.args)
+_contains_call(e::Expr) = Meta.isexpr(e, :call) || any(_contains_call, _evaluated_args(e))
 
 # Common short identifiers that ARE meaningful — full English words, or
 # unambiguous in any code context. Anything else under 4 characters is
@@ -5870,7 +5898,7 @@ function _scan_bracket_ip!(hits::Vector{Symbol}, e::Expr, prop_names)
         callee = _bracket_ip_callee(e.args[1])
         callee isa Symbol && callee in prop_names && push!(hits, callee)
     end
-    for a in e.args
+    for a in _evaluated_args(e)
         _scan_bracket_ip!(hits, a, prop_names)
     end
 end

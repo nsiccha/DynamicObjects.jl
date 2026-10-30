@@ -14,6 +14,20 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.3
+
+- Quoted code in a property body stays as written. A name inside `:(…)` or
+  `quote … end` that equals a sibling property is no longer rewritten to
+  `__self__.name`, and it no longer counts as a dependency of the property:
+  `fragment = :(1 + source)` returns `:(1 + source)`, and `@fetch!`,
+  `@dynamic_progress`, `@memo!` and `@fresh` leave calls inside a quote alone.
+  An assignment in a quote (`:(source = 1)`) is no longer refused as shadowing
+  a property. What the quote interpolates when it is built is ordinary body
+  code: `$source` reads the sibling, and the read nests under the body's
+  progress node. A nested quote takes one more `$`, as in Julia.
+  **Breaking:** a body that relied on the old rewrite gets a bare symbol
+  instead of `__self__.name`; interpolate the value with `$name`.
+
 ## 0.5.2
 
 - The notes DynamicObjects writes into Treebars progress nodes follow the
