@@ -14,6 +14,21 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.4
+
+- DynamicObjects states its Treebars floor where Pkg sees it:
+  `[compat] Treebars = "0.1.1"`. Treebars 0.1.1 (`14068fa`) is the first
+  Treebars version number that carries everything DynamicObjects uses, the
+  last of it being `treebar_notes` (Treebars `753f826`, needed since 0.5.2).
+  An environment that pins an older Treebars is now refused when it resolves,
+  with `Unsatisfiable requirements detected for package Treebars`, instead of
+  resolving and then failing to load. That includes the commits from `753f826`
+  up to `14068fa`: they carry `treebar_notes` but still say 0.1.0.
+  **Breaking:** an environment pinning one of those commits moves its Treebars
+  pin to `14068fa` (0.1.1) or later when it moves to DynamicObjects 0.5.4.
+  The load-time check stays, for an environment that loads DynamicObjects
+  without resolving it. Its message now names Treebars 0.1.1.
+
 ## 0.5.3
 
 - Quoted code in a property body stays as written. A name inside `:(…)` or
