@@ -51,26 +51,32 @@ export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, in
 
 import SHA, Serialization, Mmap, Treebars, ScopedValues
 
+# `[compat] Treebars = "0.1.1"` states the floor for the three Treebars features checked below:
+# 0.1.1 (`14068fa`) is the first Treebars version number that carries all of them, so Pkg
+# refuses an older Treebars when it resolves. The commits that brought them still say 0.1.0.
+# The checks stay for an environment that loads DO without resolving against that floor, such
+# as a Manifest resolved before it and loaded as it is.
+#
 # Every unmarked property body is wrapped in `Treebars.@progress_scope` (decision `0r44qxt`).
-# Treebars has it from `bdf76d5`; its version number does not say so, hence this check.
+# Treebars has it from `bdf76d5`.
 isdefined(Treebars, Symbol("@progress_scope")) || error(
-    "DynamicObjects needs a Treebars with `Treebars.@progress_scope` (Treebars `bdf76d5` or " *
-    "later, nsiccha/Treebars.jl main). The loaded Treebars, $(pathof(Treebars)), has none: update it.")
+    "DynamicObjects needs Treebars 0.1.1 or later; it uses `Treebars.@progress_scope` (Treebars " *
+    "`bdf76d5`). The loaded Treebars, $(pathof(Treebars)), has none: update it.")
 # A property read in an `@progress` label is threaded through `__progress__` like any other
 # (`_implied_progress_rewrite`). Treebars binds it in labels from `3282255`; no symbol marks
 # that, so check that the expansion leaves no bare `__progress__` behind.
 let mentions(ex) = ex === :__progress__ || (ex isa Expr && any(mentions, ex.args))
     mentions(macroexpand(Treebars, :(@progress_scope nothing begin @progress "$(__progress__)"; nothing end))) && error(
-        "DynamicObjects needs a Treebars that binds `__progress__` in `@progress` labels (Treebars " *
-        "`3282255` or later, nsiccha/Treebars.jl main); without it a property read in a phase label " *
-        "fails with `UndefVarError: __progress__`. The loaded Treebars, $(pathof(Treebars)), " *
-        "leaves it unbound: update it.")
+        "DynamicObjects needs Treebars 0.1.1 or later; it relies on Treebars binding " *
+        "`__progress__` in `@progress` labels (Treebars `3282255`). Without it a property read in " *
+        "a phase label fails with `UndefVarError: __progress__`. The loaded Treebars, " *
+        "$(pathof(Treebars)), leaves it unbound: update it.")
 end
 # The notes DO writes into progress nodes (`progress_notes`) are written in the language of the
 # page that renders them. Treebars has `treebar_notes` from `753f826`.
 isdefined(Treebars, :treebar_notes) || error(
-    "DynamicObjects needs a Treebars with `Treebars.treebar_notes` (Treebars `753f826` or later, " *
-    "nsiccha/Treebars.jl main). The loaded Treebars, $(pathof(Treebars)), has none: update it.")
+    "DynamicObjects needs Treebars 0.1.1 or later; it uses `Treebars.treebar_notes` (Treebars " *
+    "`753f826`). The loaded Treebars, $(pathof(Treebars)), has none: update it.")
 
 struct DiskCacheLocks
     lock::ReentrantLock
