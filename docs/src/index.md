@@ -832,9 +832,11 @@ ComputeTrace: 0.211 s traced · 10 reads · 1 hits · 5 computed · 4 fresh · 0
 `rows` ran four times and owns nearly all the time. Memoizing it (dropping `@fresh`, or reading the file through a `TrackedFile`) removes three parses. The columns:
 
 - `calls`: recorded reads; `hits`: reads served from memory, with `hit s` their time (including hashing the memo key);
-- `computed`: memoized computations; `disk`: those served from a `@cached`/`@mmap` entry; `fresh`: uncached computations;
+- `computed`: memoized computations whose body ran; `disk`: reads served from a `@cached`/`@mmap` entry, with no body run; `fresh`: uncached computations;
 - `waits`: reads that blocked on a computation running on another task (or in an executor), with `wait s` the time blocked; `pending`: polls that got a `Pending`; `errors`: failures;
-- `total s`: wall time of the property's computations including nested reads, `max s` the slowest; `self s`: `total s` minus the nested reads recorded on the computing task.
+- `total s`: wall time of the property's computations and disk loads including nested reads, `max s` the slowest; `self s`: `total s` minus the nested reads recorded on the computing task.
+
+Each recorded read counts under exactly one of `hits`, `computed`, `disk`, `fresh`, `waits`, `pending` and `errors`, so they sum to `calls`. `disk` reads are not counted under `computed`: a process that reloads everything from disk reads `computed` 0 and `disk` N.
 
 Rows are sorted by own time (`self s + hit s`); all-zero columns are omitted. Invalidations print below the table, with what they dropped and the traced computation that issued them:
 

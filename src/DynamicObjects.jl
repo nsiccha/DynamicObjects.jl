@@ -2122,7 +2122,10 @@ Per `(type, property)` the table counts:
 - `calls`: recorded reads. A blocking read of a property with a declared executor records
   both its computation (on the worker) and its wait;
 - `hits`: reads served from memory; `hit s` is their time, including the hashing of the key;
-- `computed`: memoized computations; `disk`: those served from a `@cached`/`@mmap` entry;
+- `computed`: memoized computations whose body ran;
+- `disk`: reads served from a `@cached`/`@mmap` entry, with no body run. They are not counted
+  under `computed`, so a process that reloads everything from disk reads `computed` 0 and
+  `disk` N;
 - `fresh`: uncached computations (`@fresh`, `fresh`);
 - `waits`: reads that blocked on a computation running on another task, or in an executor;
   `wait s` is the time blocked. A blocking `fetch` of a [`Pending`](@ref) handle is not a
@@ -2130,10 +2133,13 @@ Per `(type, property)` the table counts:
 - `pending`: polls that got a [`Pending`](@ref);
 - `errors`: computations that threw, and reads that surfaced a recorded failure.
 
-`total s` is the wall time of the property's computations, including nested reads, and
-`max s` the slowest one. `self s` is `total s` minus the nested reads recorded on the
-computing task, so `self s`, `hit s` and `wait s` partition the traced time of one task. Time
-a computation spends blocked on tasks it spawned counts as its own.
+Each recorded read counts under exactly one of `hits`, `computed`, `disk`, `fresh`, `waits`,
+`pending` and `errors`, so they sum to `calls`.
+
+`total s` is the wall time of the property's computations and disk loads, including nested
+reads, and `max s` the slowest one. `self s` is `total s` minus the nested reads recorded on
+the computing task, so `self s`, `hit s` and `wait s` partition the traced time of one task.
+Time a computation spends blocked on tasks it spawned counts as its own.
 
 The second form records into an existing `trace`, which is still filled in when `f` throws,
 and can be reused to collect several calls. Traces nest: an inner scope also records into
