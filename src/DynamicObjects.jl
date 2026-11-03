@@ -4632,14 +4632,24 @@ end
 # moved. The joined result is passed through `_bound_segment` so a fat key cannot
 # blow past the filesystem's NAME_MAX, after `_path_safe` so an argument printing
 # a `/` (`1//3`, `Symbol("a/b")`) cannot turn the entry into a nested file that
-# `clear_disk_caches!` never reaches.
+# `clear_disk_caches!` never reaches, and on Windows cannot make an illegal name.
 cache_segment(name, args...; kwargs...) = begin
     parts = map(maybehash, (name, args...))
     keyword_parts = length(kwargs) == 0 ? () :
         map(canonical_hash, Tuple(sort(collect(pairs(map(_disk_key, NamedTuple(kwargs)))); by=first)))
     _bound_segment(_path_safe(join((parts..., keyword_parts...), "_")))
 end
-_path_safe(seg::AbstractString) = occursin('/', seg) ? replace(seg, "//" => "over", "/" => "over") : seg
+_path_safe(seg::AbstractString) = begin
+    flat = occursin('/', seg) ? replace(seg, "//" => "over", "/" => "over") : seg
+    Sys.iswindows() ? _windows_file_name(flat) : flat
+end
+# Windows refuses these in a file name, so a property with such an argument computed and
+# then failed to save (`*` from `1//3 + 1//7*im`), and it reads `:` as a stream of the file
+# before it. They are percent-encoded rather than replaced by one character, so two
+# different arguments keep two names. Only on Windows, so keys elsewhere do not move.
+_is_windows_reserved(c::Char) = c in ('\\', ':', '*', '?', '"', '<', '>', '|') || c < ' '
+_windows_file_name(seg::AbstractString) = any(_is_windows_reserved, seg) ?
+    join(_is_windows_reserved(c) ? "%" * uppercase(string(UInt32(c); base=16, pad=2)) : c for c in seg) : seg
 get_cache_path(o, name, args...; kwargs...) = begin
     seg = cache_segment(name, args...; kwargs...)
     ver = cache_version(o, Val(name))
