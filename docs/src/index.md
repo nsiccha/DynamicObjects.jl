@@ -122,8 +122,10 @@ Two access forms:
 | `@fresh obj.prop(args...)` | Recompute, bypassing the in-memory cache.                          |
 
 Two calls share an entry when their arguments are `isequal`: an equal but
-distinct `Dict`, a new literal `[1, 2]`, or `1:2` in place of `[1, 2]` all
-find the same entry. A mutable argument (a `Dict`, `Vector`, `Set`, or mutable
+distinct `Dict`, a new literal `[1, 2]`, `1:2` in place of `[1, 2]`, or `-50.0`
+in place of `-50` all find the same entry, in memory and, for a `@cached` or
+`@mmap` property, on disk. The first spelling computes it, and later spellings
+get that value. A mutable argument (a `Dict`, `Vector`, `Set`, or mutable
 struct) is content-hashed the first time a call passes that object and is
 remembered by identity afterwards. So a helper called once per row with one
 shared context pays for hashing that context once, not once per call. Never

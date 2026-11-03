@@ -47,7 +47,7 @@ using DynamicObjects
 @test DynamicObjects.maybehash(:s) === :s
 @test DynamicObjects.maybehash("s") == DynamicObjects.persistent_hash("s")
 @test DynamicObjects.maybehash((1, "a")) == DynamicObjects.persistent_hash((1, "a"))
-@test DynamicObjects.maybehash([1.0, 2.0]) == DynamicObjects.persistent_hash([1.0, 2.0])
+@test DynamicObjects.maybehash([1.5, 2.0]) == DynamicObjects.persistent_hash([1.5, 2.0])
 @test DynamicObjects.maybehash((x = 1, y = "a")) ==
     DynamicObjects.persistent_hash((x = 1, y = "a"))
 end

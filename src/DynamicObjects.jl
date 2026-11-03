@@ -4475,7 +4475,108 @@ _bare_substatus_f(o, name) =
         nothing
     end
 
-maybehash(x::Number) = x
+# --- Disk keys of `isequal` arguments ---------------------------------------------------
+#
+# A memo key matches arguments by `isequal`, so `f(-50)` and `f(-50.0)` share one memory
+# entry. A disk key is built from how an argument prints or serializes, which differs for
+# those two, so whichever spelling computed first was the only one persisted and a restart
+# recomputed the other (snag `memo-key-isequal-1b4ae3b0`). The reverse held too: `0.1f0` and
+# `0.1` are not `isequal`, print alike, and shared one file, so one served the other's value.
+#
+# `_disk_key(x)` is one representative of `x`'s `isequal` class: `isequal(a, b)` gives
+# `_disk_key(a)` and `_disk_key(b)` the same key, and values that are not `isequal` never
+# get one. It only names the disk entry; a body still receives the caller's argument.
+#
+# It returns an already canonical value unchanged, so that value's disk key does not move:
+# `Int`, `String`, non-integer `Float64`, `Vector{Int}` and float vectors holding a
+# non-integer keep their keys. That is why integers are the canonical spelling of an
+# integer-valued float rather than the reverse, and why a float vector stays `Float64`
+# unless every element is integer-valued.
+#
+# A type left to the fallback keeps its own serialization. Equal values of two such types
+# then get two entries, which costs a recompute and never serves a wrong value:
+# - `Bool` stays apart from numbers. `f(true)` keeps `f_true.sjl` rather than renaming every
+#   flag's entry to `f_1.sjl` for a crossing callers have no reason to make.
+# - Array wrappers other than ranges, bit arrays and views of an `Array` stay as they are:
+#   making a sparse or lazy array dense here could cost quadratic memory. An array with
+#   offset axes does too, because it is not `isequal` to its dense copy.
+# - Only `Dict` and `Set` are sorted: another `AbstractDict`'s `isequal` may depend on order.
+# - Types with their own cross-type `isequal` (`Day(1)`, `Hour(24)`) are not known here.
+# - An argument holding one array twice (`[v, v]`) serializes with a back-reference, so it
+#   keeps a different key from one holding two equal arrays.
+_disk_key(x) = x
+_disk_key(x::Bool) = x
+_disk_key(x::Int) = x
+_disk_key(x::Union{Base.BitInteger,BigInt,Base.IEEEFloat,BigFloat,Rational}) = begin
+    _is_int_valued(x) && return Int(x)
+    # Keeps NaN (every NaN is `isequal`), the infinities and -0.0 (not `isequal` to 0).
+    float = Float64(x)
+    isequal(float, x) && return float
+    isinteger(x) ? BigInt(x) : Rational{BigInt}(x)
+end
+_is_int_valued(x) =
+    isfinite(x) && isinteger(x) && !(iszero(x) && signbit(x)) && typemin(Int) <= x <= typemax(Int)
+_disk_key(z::Complex) = begin
+    re, ie = _disk_key(real(z)), _disk_key(imag(z))
+    # `Complex(1.0, -0.0)` is `isequal` to neither 1.0 nor `Complex(1.0, 0.0)`.
+    ie === 0 && return re
+    re isa Int && ie isa Int && return Complex{Int}(re, ie)
+    _is_exact_float(re) && _is_exact_float(ie) && return ComplexF64(re, ie)
+    z
+end
+_is_exact_float(x::Union{Int,Float64}) = isequal(Float64(x), x)
+_is_exact_float(_) = false
+_disk_key(x::AbstractString) = String(x)
+_disk_key(x::Tuple) = map(_disk_key, x)
+_disk_key(x::NamedTuple) = map(_disk_key, x)
+_disk_key(x::Pair) = _disk_key(x.first) => _disk_key(x.second)
+# A range is a few fields however long it is, so collecting a huge one here could exhaust
+# memory for a key that used to cost nothing. Past this length it keeps its own key.
+const _RANGE_DISK_KEY_MAX = 2^24
+_disk_key(x::AbstractRange) = length(x) > _RANGE_DISK_KEY_MAX ? x : _dense_disk_key(x)
+_disk_key(x::BitArray) = _dense_disk_key(x)
+_disk_key(x::SubArray{<:Any,<:Any,<:Array}) = _dense_disk_key(x)
+_dense_disk_key(x) = Base.has_offset_axes(x) ? x : _disk_key(collect(x))
+# An empty array is `isequal` to any other of its size, whatever its element type.
+function _disk_key(x::Array{T,N}) where {T,N}
+    isempty(x) && return Array{Int,N}(undef, size(x))
+    (T === Int || T === Bool || T === String || T === Symbol) && return x
+    T === Float64 && return all(_is_int_valued, x) ? Int.(x) : x
+    elements = Any[_disk_key(element) for element in x]
+    all(element -> element isa Int, elements) && return Array{Int,N}(elements)
+    all(_is_exact_float, elements) && return Array{Float64,N}(elements)
+    S = typeof(first(elements))
+    all(element -> typeof(element) === S, elements) ? Array{S,N}(elements) : elements
+end
+# A `Dict` iterates in an order its insertion history decides, and `isequal` ignores order.
+# Each entry's digest is computed once and then sorted on: a `by=` digest would serialize
+# on every comparison.
+struct _DictDiskKey
+    pairs::Vector{Pair{Any,Any}}
+end
+struct _SetDiskKey
+    elements::Vector{Any}
+end
+function _disk_key(x::Dict)
+    entries = Vector{Pair{String,Pair{Any,Any}}}(undef, length(x))
+    for (i, (k, v)) in enumerate(x)
+        key = _disk_key(k)
+        entries[i] = canonical_hash(key) => (key => _disk_key(v))
+    end
+    sort!(entries; by=first)
+    _DictDiskKey(Pair{Any,Any}[last(entry) for entry in entries])
+end
+function _disk_key(x::Set)
+    entries = Vector{Pair{String,Any}}(undef, length(x))
+    for (i, element) in enumerate(x)
+        key = _disk_key(element)
+        entries[i] = canonical_hash(key) => key
+    end
+    sort!(entries; by=first)
+    _SetDiskKey(Any[last(entry) for entry in entries])
+end
+
+maybehash(x::Number) = _disk_key(x)
 maybehash(x::Symbol) = x
 # Route through `canonical_hash` — the same digest the `__hash__` compute uses —
 # so a `@dynamicstruct` argument hashes by its stable `__hash__` (per-type
@@ -4485,7 +4586,7 @@ maybehash(x::Symbol) = x
 # with a cold argument never hit with a warm one. Plain values are unaffected:
 # `_hash_replace` is the identity there (modulo rebuilding an equal
 # Tuple/NamedTuple, which serializes identically).
-maybehash(x) = canonical_hash(x)
+maybehash(x) = canonical_hash(_disk_key(x))
 
 # POSIX per-path-component byte limit. A single file or directory name longer
 # than this fails with ENAMETOOLONG on `mkpath`/`open`, no matter how short
@@ -4526,12 +4627,19 @@ end
 #   2. As the per-level directory name in the inline-child cache_path
 #      auto-wiring, so the on-disk layout mirrors the DO hierarchy.
 # Kwargs are sorted by name so callers passing the same kwargs in different
-# syntactic order land in the same segment. The joined result is passed through
-# `_bound_segment` so a fat key cannot blow past the filesystem's NAME_MAX.
+# syntactic order land in the same segment. A keyword's value is canonicalized
+# before its pair is built, so the pair keeps the type it always had when nothing
+# moved. The joined result is passed through `_bound_segment` so a fat key cannot
+# blow past the filesystem's NAME_MAX, after `_path_safe` so an argument printing
+# a `/` (`1//3`, `Symbol("a/b")`) cannot turn the entry into a nested file that
+# `clear_disk_caches!` never reaches.
 cache_segment(name, args...; kwargs...) = begin
-    parts = length(kwargs) == 0 ? (name, args...) : (name, args..., sort(collect(kwargs); by=first)...)
-    _bound_segment(join(map(maybehash, parts), "_"))
+    parts = map(maybehash, (name, args...))
+    keyword_parts = length(kwargs) == 0 ? () :
+        map(canonical_hash, Tuple(sort(collect(pairs(map(_disk_key, NamedTuple(kwargs)))); by=first)))
+    _bound_segment(_path_safe(join((parts..., keyword_parts...), "_")))
 end
+_path_safe(seg::AbstractString) = occursin('/', seg) ? replace(seg, "//" => "over", "/" => "over") : seg
 get_cache_path(o, name, args...; kwargs...) = begin
     seg = cache_segment(name, args...; kwargs...)
     ver = cache_version(o, Val(name))
@@ -7703,7 +7811,11 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             end
         end
         if will_prepend_hash_fields
-            push!(prepend, :(__hash_fields__ = $(Expr(:tuple, :__parent__, index_params..., kwarg_names...))))
+            # Through `_disk_key`, like this child's own directory (`cache_segment` below): a
+            # child is memoized per `isequal` arguments, so its identity must not depend on
+            # which spelling built it first.
+            push!(prepend, :(__hash_fields__ = $(Expr(:tuple, :__parent__,
+                (:(DynamicObjects._disk_key($name)) for name in (index_params..., kwarg_names...))...))))
         end
         # Forward each parent prop as a `@fetch!`-marked property
         # (`@fetch! nm = __parent__.nm`) rather than one
