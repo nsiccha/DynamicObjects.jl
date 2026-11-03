@@ -7,7 +7,7 @@ using TestItemRunner
 # a scope (snag `no-trace-of-what-e8f9d53e`).
 @testmodule ComputeTraceFixtures begin
 using DynamicObjects
-export CTApp, CTSlow, CTDisk, CTGated, CTClearer, CTTracked, CTQueue, CTView,
+export CTApp, CTSlow, CTDisk, CTMmap, CTGated, CTClearer, CTTracked, CTQueue, CTView,
        CTHashed, CTHashView, SlowHash, SLOW_HASH_S,
        CT_CACHE_BASE, CT_STARTED, CT_GATE, row, hasrow, settles, gate_reset!
 
@@ -42,6 +42,13 @@ end
     seed::Int
     __cache_base__ = CT_CACHE_BASE[]
     @cached stored = 2seed
+end
+
+@dynamicstruct struct CTMmap
+    seed::Int
+    __cache_base__ = CT_CACHE_BASE[]
+    @mmap values::Vector{Float64} = fill(Float64(seed), 3)
+    @mmap scaled(factor::Int)::Vector{Float64} = fill(Float64(seed * factor), 3)
 end
 
 @dynamicstruct struct CTGated
@@ -144,6 +151,36 @@ r = row(second_trace, CTDisk, :stored)
 @test (r.calls, r.disk, r.computed) == (1, 1, 0)
 # DynamicObjects' own `__name__` properties (hash, cache path, status) are not recorded.
 @test all(r -> !startswith(string(r.property), "__"), compute_trace_rows(first_trace))
+end
+
+# `computed` counts bodies that ran and `disk` reads served from an entry, never both, so a
+# reload reads `computed 0, disk N` (snag `do-use-compute-t-f4bea629`).
+@testitem "computed and disk are disjoint, and a row's outcomes sum to its calls" setup=[ComputeTraceFixtures] begin
+using DynamicObjects
+CT_CACHE_BASE[] = mktempdir()
+m = CTMmap(3)
+read_all() = (m.values, m.scaled(1), m.scaled(2), m.scaled(2))
+counts(r) = (r.calls, r.hits, r.computed, r.disk)
+_, cold = with_compute_trace(read_all)
+@test counts(row(cold, CTMmap, :values)) == (1, 0, 1, 0)
+@test counts(row(cold, CTMmap, :scaled)) == (3, 1, 2, 0)
+clear_mem_caches!(m)
+_, reloaded = with_compute_trace(read_all)
+@test counts(row(reloaded, CTMmap, :values)) == (1, 0, 0, 1)
+@test counts(row(reloaded, CTMmap, :scaled)) == (3, 1, 0, 2)
+app = CTApp(1)
+_, mixed = with_compute_trace() do
+    app.top, app.top
+    try
+        app.boom
+    catch
+    end
+end
+@test row(mixed, CTApp, :boom).errors == 1
+@test row(mixed, CTApp, :c).fresh == 2
+for trace in (cold, reloaded, mixed), r in compute_trace_rows(trace)
+    @test r.calls == r.hits + r.computed + r.disk + r.fresh + r.waits + r.pending + r.errors
+end
 end
 
 @testitem "spawned tasks inherit the trace; a read joining a running computation is a wait" setup=[ComputeTraceFixtures] begin
