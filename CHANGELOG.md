@@ -14,6 +14,44 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.5
+
+- One disk entry per memo entry. Calls whose arguments are `isequal` share a
+  memory entry, and they now share a `@cached`/`@mmap` entry too, for positional
+  and keyword arguments and for an indexed inline child's directory and
+  `__hash__`. `f(-50)` and `f(-50.0)` used to name two files, so a restart
+  recomputed whichever spelling had not computed first. This covers numbers of
+  any type, a `SubString` and its `String`, ranges, views and arrays of any
+  numeric element type, tuples, named tuples, pairs, and `Dict`s and `Set`s
+  whatever their insertion history.
+- Fixed: a non-dyadic `Float32` shared a file with the `Float64` that prints the
+  same, so `f(0.1)` could return the value stored by `f(0.1f0)`. An existing file
+  cannot tell which of the two wrote it. If a property was called with both
+  types, bump its `v"N"`.
+- Fixed: an argument printing a `/` (`1//3`, `Symbol("a/b")`) wrote a nested file
+  that `clear_disk_caches!` never removed. It is now a flat entry, `f_1over3.sjl`.
+- A later spelling gets the result the first spelling computed, across a restart
+  as within a process. A property whose result depends on an argument's type
+  rather than its value, or that has same-name methods split by numeric type
+  (`f(x::Int)` and `f(x::Float64)`), already behaved this way in memory.
+- These stay separate entries, which costs a recompute and never serves a wrong
+  value: `Bool` against numbers, a range longer than 2^24 against its array, array
+  wrappers such as sparse arrays against their dense equal, an argument holding
+  one array twice against one holding two equal arrays, and types with their own
+  cross-type `isequal` (`Day(1)` and `Hour(24)`).
+- **Breaking:** these disk keys move once. The next access recomputes the entry,
+  and the old file stays as an orphan no process reads until
+  `clear_disk_caches!`, `clear_cache!` or your own cleanup removes it: an
+  integer-valued float (`mwc_24.0.sjl` becomes `mwc_24.sjl`), an array whose
+  elements are all integer-valued floats, a tuple holding an integer-valued float
+  (`(0.5, 1.0)`), a non-dyadic `Float32`, a rational, a range, view or bit array,
+  a `SubString`, a complex number with integer-valued float parts, an array of any
+  other numeric or abstract element type, every `Dict` or `Set` argument, and the
+  `__hash__` of an indexed inline child whose index has one of these spellings.
+  Keys of `Int`, `Bool`, `Symbol`, `String`, non-integer floats, `Vector{Int}`,
+  float vectors holding a non-integer, `@dynamicstruct` objects and `DataFrame`s
+  do not move.
+
 ## 0.5.4
 
 - DynamicObjects states its Treebars floor where Pkg sees it:
