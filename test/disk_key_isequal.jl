@@ -318,7 +318,7 @@ const DO = DynamicObjects
 base = mktempdir()
 dk_reset!()
 owner = DKOwner(1; __cache_base__=base)
-@testset "$(repr(argument))" for argument in (1 // 3, (1 // 3) + (1 // 7) * im, Symbol("a/b"))
+@testset "$(repr(argument))" for argument in (1 // 3, (1 // 3) + (1 // 7) * im, Symbol("a/b"), Symbol("a*b"), Symbol("a:b"), Symbol("a|b?c"))
     dk_reset!()
     @test !occursin('/', DO.cache_segment(:saved, argument))
     DKOwner(1; __cache_base__=base).saved(argument)
@@ -337,23 +337,45 @@ end
 @test DO.cache_segment(:f, 1 // 3) != DO.cache_segment(:f, 3)
 end
 
+@testitem "a file name is legal on Windows, and distinct arguments keep distinct names" tags=[:core] setup=[DiskKeyFixtures] begin
+using DynamicObjects
+const DO = DynamicObjects
+
+# The rule itself, on every host. The round trip above runs it for real on Windows.
+@test DO._windows_file_name("saved_1over3 + 1over7*im") == "saved_1over3 + 1over7%2Aim"
+@test DO._windows_file_name("f_a:b") == "f_a%3Ab"
+@test DO._windows_file_name("f_a|b?c<d>\"e\\f") == "f_a%7Cb%3Fc%3Cd%3E%22e%5Cf"
+@test DO._windows_file_name("f_\tx") == "f_%09x"
+names = ["f_a*b", "f_a:b", "f_a?b", "f_a|b", "f_a<b", "f_a>b", "f_a\"b", "f_a\\b"]
+@test allunique(DO._windows_file_name.(names))
+@test !any(name -> any(DO._is_windows_reserved, DO._windows_file_name(name)), names)
+# What needs no encoding keeps its name, including on Windows.
+for name in ("f_-50", "f_1.5", "f_1 + 2im", "f_1over3", "f_π", "f_" * DO.persistent_hash(1), "f_a_b")
+    @test DO._windows_file_name(name) === name
+end
+# Keys move on no other host.
+@test DO._path_safe("f_a*b:c") == (Sys.iswindows() ? "f_a%2Ab%3Ac" : "f_a*b:c")
+@test DO.cache_segment(:f, Symbol("a*b")) == (Sys.iswindows() ? "f_a%2Ab" : today_segment(:f, Symbol("a*b")))
+end
+
 @testitem "invalidation and status see one entry per isequal value" tags=[:core] setup=[DiskKeyFixtures] begin
 using DynamicObjects
 
 base = mktempdir()
 dk_reset!()
 owner = DKOwner(1; __cache_base__=base)
-owner.frac(-50.0)
-@test (@cache_status owner.frac(-50)) === :ready
-@test (@cache_status owner.frac(-50.0)) === :ready
-@test (@cache_path owner.frac(-50)) == (@cache_path owner.frac(-50.0))
+# `@cached`, not `@mmap`: Windows refuses to delete a file a live mapping holds.
+owner.saved(-50.0)
+@test (@cache_status owner.saved(-50)) === :ready
+@test (@cache_status owner.saved(-50.0)) === :ready
+@test (@cache_path owner.saved(-50)) == (@cache_path owner.saved(-50.0))
 # Dropping one spelling drops the entry, memory and disk.
-invalidate!(owner.frac, -50)
-@test (@cache_status owner.frac(-50.0)) === :unstarted
-owner.frac(-50.0)
-@test dk_calls(:frac) == 2
-DynamicObjects.clear_cache!(owner, :frac)
-@test (@cache_status owner.frac(-50)) === :unstarted
+invalidate!(owner.saved, -50)
+@test (@cache_status owner.saved(-50.0)) === :unstarted
+owner.saved(-50.0)
+@test dk_calls(:saved) == 2
+DynamicObjects.clear_cache!(owner, :saved)
+@test (@cache_status owner.saved(-50)) === :unstarted
 end
 
 @testitem "a body still receives the caller's argument, and typed methods keep the first" tags=[:core] setup=[DiskKeyFixtures] begin
