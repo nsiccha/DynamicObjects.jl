@@ -5907,6 +5907,53 @@ function _collect_self_deps_walk!(deps::Set{Symbol}, opaque::Ref{Bool}, e)
     nothing
 end
 
+# The names read along `__self__.a(args).b.c(args)` and the arguments of its calls,
+# or `nothing` when `e` is not such a chain.
+function _self_chain(e)
+    path = Symbol[]
+    args = Any[]
+    while true
+        if e === :__self__
+            return reverse!(path), args
+        elseif Meta.isexpr(e, :., 2) && e.args[2] isa QuoteNode && e.args[2].value isa Symbol
+            push!(path, e.args[2].value)
+            e = e.args[1]
+        elseif Meta.isexpr(e, :call) && !isempty(e.args)
+            append!(args, @view e.args[2:end])
+            e = e.args[1]
+        else
+            return nothing
+        end
+    end
+end
+
+# Harvest what a walked RHS reads of the inline `children` (`_remount_child_reads`).
+# A child read any other way than through a named member, a bare `__self__.child`
+# or a call of it with no member after, leaves the one-name path that means the
+# body holds the instance.
+function _collect_child_reads!(paths, e, children)
+    e isa Expr || return paths
+    if e.head === :(=) && length(e.args) == 2 && Meta.isexpr(e.args[1], :tuple, 1) &&
+       Meta.isexpr(e.args[1].args[1], :parameters)
+        chain = _self_chain(e.args[2])
+        if chain !== nothing && !isempty(first(chain)) && first(first(chain)) in children
+            for name in e.args[1].args[1].args
+                push!(paths, (first(chain)..., name::Symbol))
+            end
+            foreach(a -> _collect_child_reads!(paths, a, children), last(chain))
+            return paths
+        end
+    end
+    chain = _self_chain(e)
+    if chain !== nothing && !isempty(first(chain)) && first(first(chain)) in children
+        push!(paths, Tuple(first(chain)))
+        foreach(a -> _collect_child_reads!(paths, a, children), last(chain))
+        return paths
+    end
+    foreach(a -> _collect_child_reads!(paths, a, children), _evaluated_args(e))
+    paths
+end
+
 # Names that (transitively) invalidate `prop`'s value: every fixed-field AND
 # rhs-declared name reachable from `prop` in the direct-dependency graph. A
 # `remake` kwarg may override an rhs-declared property (a cache override, not
@@ -6807,6 +6854,18 @@ already settled on the source only when that call constructs it alike
 """
 _source_shared_child(::Type, ::Val) = false
 
+"""    _remount_child_reads(::Type{T})
+
+What each property of `T` reads of its inline `@struct` children, as
+`(property, paths)` pairs. A path is the chain of names read from `__self__`,
+starting at the child: `(:pins, :ap3)` for `pins.ap3`, and `(:pins,)` when the
+body uses the child itself, which hands out an instance that holds a request's
+view. [`remount`](@ref) uses it to decide a sibling of a child by what it reads.
+A property with no entry, as in an older expansion, is context if it depends on
+a child.
+"""
+_remount_child_reads(::Type) = ()
+
 """    _analysis_nested_type(::Type{T}, ::Val{name})
 
 Like `_nested_struct_type`, but registered for `prop::T = rhs` typed
@@ -7651,6 +7710,9 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     # one); emits `_source_shared_child` so `remount` resolves them lazily on
     # the retained source instead of pre-seeding view copies.
     source_shared_children = Symbol[]
+    # The ones whose call a view forwards by value alone: a keyword default that
+    # is code may read request context, so what reads such a child stays per view.
+    remount_read_children = Set{Symbol}()
     # Typed computed properties (`prop::T = rhs`) register T only with
     # `_analysis_nested_type` (not `_nested_struct_type`), so the analyzer's
     # tree walk follows them but HTMXObjects' route walker doesn't (typed
@@ -7916,6 +7978,8 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 Expr(:tuple, Expr(:parameters, [Expr(:kw, kn, kn) for (kn, _) in index_kwargs]...)),
                 gen_name, Expr(:tuple, Expr(:parameters, constructor_kwargs...)))
             push!(source_shared_children, prop_name)
+            all(((_, d),) -> d === nothing || !(something(d) isa Expr), index_kwargs) &&
+                push!(remount_read_children, prop_name)
         end
         # Use `index_param_exprs` (typed `:(name::T)` when annotated, bare
         # `:name` otherwise) for the method signature so downstream readers
@@ -8267,12 +8331,16 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     # (below), so mutating them here ships them populated — un-stubbing
     # `property_source_info`/`reflect(T)` and feeding the `remake` carry-over bake.
     opaque_props = Set{Symbol}()
+    child_reads = Dict{Symbol,Set{Tuple{Vararg{Symbol}}}}()
     for (name, info) in properties
         (info.rhs === nothing) && continue        # fixed fields have no RHS
-        _collect_self_deps!(info.dependson,
-            walk_rhs(deepcopy(info.rhs); locals=copy(info.locals), properties=walk_props, lnn=info.lnn)) &&
-            push!(opaque_props, name)
+        walked = walk_rhs(deepcopy(info.rhs); locals=copy(info.locals), properties=walk_props, lnn=info.lnn)
+        _collect_self_deps!(info.dependson, walked) && push!(opaque_props, name)
+        isempty(remount_read_children) && continue
+        _collect_child_reads!(get!(() -> Set{Tuple{Vararg{Symbol}}}(), child_reads, name),
+                              walked, remount_read_children)
     end
+    filter!(p -> !isempty(last(p)), child_reads)
     # ── `@options` domain declarations ───────────────────────────────────────
     # Each declaration became an ordinary `__options__(::Val{parameter})`
     # property above, so its `dependson` was just populated by the pass above —
@@ -8546,6 +8614,8 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             $(option_declaration_defs...)
             $_carryover_expr
             $DynamicObjects._remount_opaque_properties(::Type{$type_dispatch}) = $(Tuple(sort!(collect(opaque_props))))
+            $DynamicObjects._remount_child_reads(::Type{$type_dispatch}) = $(Tuple(
+                (name, Tuple(sort!(collect(paths)))) for (name, paths) in sort!(collect(child_reads); by=first)))
             $DynamicObjects.is_generated_property(::$type, name::Symbol) = name in $generated_names
             $DynamicObjects.is_indexed_property(::$type, name::Symbol) = name in $indexed_names
             $DynamicObjects._hash_replace(__self__::$type) = __self__.__hash__
@@ -9264,11 +9334,11 @@ _parent_alias(_) = nothing
 # the parent view itself routes the target locally. No parent view (an explicit
 # `__parent__=` rebinding to an arbitrary object) proves nothing.
 _shared_parent_aliases(::Type, ::Nothing) = Dict{Symbol,Symbol}()
-function _shared_parent_aliases(::Type{T}, parent_view) where {T}
+function _shared_parent_aliases(::Type{T}, parent_context) where {T}
     aliases = Dict{Symbol,Symbol}()
     for (name, info) in meta(T)
         target = _parent_alias(get(info, :rhs, nothing))
-        target === nothing || _remount_invalidated(parent_view, target) || (aliases[name] = target)
+        target === nothing || parent_context(target) || (aliases[name] = target)
     end
     aliases
 end
@@ -9287,14 +9357,31 @@ end
 function _remount_partition(source, shared::ThreadsafeDict{Symbol,Any}, changed,
                             forced_local=(), parent_view=nothing)
     T = typeof(source)
+    parent_context = parent_view === nothing ? nothing : name -> _remount_invalidated(parent_view, name)
+    invalidated, opaque, aliases = _remount_context(T, changed, forced_local, parent_context)
+    local_names = union(invalidated, keys(aliases))
+    for (name, info) in meta(T)
+        get(info, :indexed, false) || continue
+        value = get(shared, name, _missing_sentinel)
+        (value === _missing_sentinel || value isa IndexableProperty) && push!(local_names, name)
+    end
+    invalidated, local_names, opaque, aliases
+end
+
+# The static part of the partition, which a type and its rebound names decide.
+# A nested child instance is always per view, because it holds its parent. What
+# depends on the child is not, when it is an inline child whose memoized cache
+# every view shares: a sibling reading `pins.ap3` is per view exactly when that
+# member reaches context (`_child_read_is_context`). That can depend on what the
+# parent already routes per view, through a forwarded name, and adding a sibling
+# can make another read context, so the two closures alternate until settled.
+function _remount_context(::Type{T}, changed, forced_local, parent_context) where {T}
     dependencies = Dict{Symbol,Set{Symbol}}()
     computed = Set{Symbol}()
-    indexed = Set{Symbol}()
     names = Set{Symbol}()
     for (name, info) in meta(T)
         push!(names, name)
         get(info, :rhs, nothing) === nothing || push!(computed, name)
-        get(info, :indexed, false) && push!(indexed, name)
         deps = get(info, :dependson, nothing)
         deps === nothing || union!(get!(() -> Set{Symbol}(), dependencies, name), deps)
     end
@@ -9304,7 +9391,7 @@ function _remount_partition(source, shared::ThreadsafeDict{Symbol,Any}, changed,
     # it explicitly. Keeping it local also prevents a mounted request from
     # relabelling/reparenting the retained graph's progress tree on cache hits.
     for name in (:__status__, :__substatus__)
-        hasproperty(source, name) && push!(invalidated, name)
+        name in names && push!(invalidated, name)
     end
     # Every nested child retains `__parent__`; never share a child instance whose
     # parent is the retained source object with a mounted view.
@@ -9314,20 +9401,54 @@ function _remount_partition(source, shared::ThreadsafeDict{Symbol,Any}, changed,
     declared_opaque = _remount_opaque_properties(T)
     # An older expansion carries no opacity data: every computed property is context.
     declared_opaque === nothing && union!(invalidated, computed)
-    aliases = filter!(p -> !(first(p) in invalidated), _shared_parent_aliases(T, parent_view))
+    aliases = filter!(p -> !(first(p) in invalidated), _shared_parent_aliases(T, parent_context))
     shared_aliases = keys(aliases)
-    _close_dependents!(invalidated, dependencies, shared_aliases)
+    # A property whose reads of a child are recorded is decided by those reads, so
+    # the child's name is no dependency of it here. `sync!` keeps the full graph.
+    child_reads = _remount_child_reads(T)
+    for (name, paths) in child_reads
+        deps = get(dependencies, name, nothing)
+        deps === nothing || foreach(path -> delete!(deps, first(path)), paths)
+    end
+    while true
+        _close_dependents!(invalidated, dependencies, shared_aliases)
+        grew = false
+        for (name, paths) in child_reads
+            (name in invalidated || name in shared_aliases) && continue
+            any(path -> _child_read_is_context(T, path, invalidated), paths) || continue
+            push!(invalidated, name)
+            grew = true
+        end
+        grew || break
+    end
     opaque = declared_opaque === nothing ? Set{Symbol}() :
         setdiff!(Set{Symbol}(declared_opaque), invalidated)
     _close_dependents!(opaque, dependencies, union(invalidated, shared_aliases))
     union!(invalidated, opaque)
+    invalidated, opaque, aliases
+end
 
-    local_names = union(invalidated, shared_aliases)
-    for name in indexed
-        value = get(shared, name, _missing_sentinel)
-        (value === _missing_sentinel || value isa IndexableProperty) && push!(local_names, name)
+# Does reading `path` from the inline child `first(path)` of a `T` view reach
+# context, given the `T` names routed per view? Uses the partition the child's own
+# view gets (`_remount_child`), so the answer and the routing cannot disagree.
+# Holding the instance itself, a name the child does not declare, and anything
+# opaque count as context.
+function _child_read_is_context(::Type{T}, path, parent_names) where {T}
+    length(path) == 1 && return true
+    C = _nested_struct_type(T, Val(first(path)))
+    C === nothing && return true
+    member = path[2]
+    child_names = Set{Symbol}(first(p) for p in meta(C))
+    member in child_names || return true
+    changed = Symbol[]
+    :__parent__ in child_names && push!(changed, :__parent__)
+    :__req__ in child_names && any(p -> first(p) === :__req__, meta(T)) && push!(changed, :__req__)
+    forced = (:__status__, (:__prefix__ in child_names ? (:__prefix__,) : ())...)
+    context, = _remount_context(C, changed, forced, name -> name in parent_names)
+    if _source_shared_child(C, Val(member)) && length(path) > 2
+        return _child_read_is_context(C, path[2:end], context)
     end
-    invalidated, local_names, opaque, aliases
+    member in context
 end
 
 # Grow `names` by every property that transitively depends on one of them,
