@@ -3,7 +3,7 @@ using TestItemRunner
 @testmodule RemountChildReaders begin
 using DynamicObjects
 export ReaderRoot, DeepRoot, OpaqueMemberRoot, ExternalChildRoot, DefaultedChildRoot,
-       ForwardingRoot, PinnedRoot, RCR_CALLS, rcr_reset!, rcr_bump!, rcr_context_names
+       ForwardingRoot, PinnedRoot, TwoContextRoot, RCR_CALLS, rcr_reset!, rcr_bump!, rcr_context_names
 
 const RCR_CALLS = Dict{Symbol,Int}()
 const RCR_LOCK = ReentrantLock()
@@ -118,6 +118,20 @@ end
     end
     model_reader = (rcr_bump!(:model_reader); other.on_model)
     pins_reader = (rcr_bump!(:pins_reader); other.on_pins)
+end
+
+# Which names are rebound decides the routing, so the two remounts below differ.
+@dynamicstruct struct TwoContextRoot
+    first_context = nothing
+    second_context = nothing
+    @struct child = begin
+        on_first = first_context
+        on_second = second_context
+        explicit = __parent__.second_context
+    end
+    first_reader = (rcr_bump!(:first_reader); child.on_first)
+    second_reader = (rcr_bump!(:second_reader); child.on_second)
+    explicit_reader = (rcr_bump!(:explicit_reader); child.explicit)
 end
 
 # The shape a refit has: a member holds an object of its own, whose cached choice
@@ -348,4 +362,30 @@ for i in 6:8
     @test w.evaluation == 21
 end
 @test RCR_CALLS[:pinned_evaluation] == 2
+end
+
+@testitem "the routing follows which names a remount rebinds" setup=[RemountChildReaders] begin
+using DynamicObjects
+
+rcr_reset!()
+source = TwoContextRoot()
+firsts = [remount(source; first_context=i) for i in 1:3]
+@test [v.first_reader for v in firsts] == [1, 2, 3]
+@test RCR_CALLS[:first_reader] == 3
+@test [v.second_reader for v in firsts] == [nothing, nothing, nothing]
+@test RCR_CALLS[:second_reader] == 1
+
+seconds = [remount(source; second_context=i) for i in 1:3]
+@test [v.second_reader for v in seconds] == [1, 2, 3]
+@test RCR_CALLS[:second_reader] == 4
+@test [v.first_reader for v in seconds] == [nothing, nothing, nothing]
+@test RCR_CALLS[:first_reader] == 4
+
+# An explicit `__parent__.name` in a child body is a read of the rebound parent.
+@test [v.explicit_reader for v in seconds] == [1, 2, 3]
+@test RCR_CALLS[:explicit_reader] == 3
+
+# Asking again, after other remounts were decided, gives the first routing.
+@test :first_reader in getfield(remount(source; first_context=9), :cache).cache.invalidated
+@test !(:first_reader in getfield(remount(source; second_context=9), :cache).cache.invalidated)
 end

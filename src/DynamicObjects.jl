@@ -9334,11 +9334,11 @@ _parent_alias(_) = nothing
 # the parent view itself routes the target locally. No parent view (an explicit
 # `__parent__=` rebinding to an arbitrary object) proves nothing.
 _shared_parent_aliases(::Type, ::Nothing) = Dict{Symbol,Symbol}()
-function _shared_parent_aliases(::Type{T}, parent_context) where {T}
+function _shared_parent_aliases(::Type{T}, parent_context::Set{Symbol}) where {T}
     aliases = Dict{Symbol,Symbol}()
     for (name, info) in meta(T)
         target = _parent_alias(get(info, :rhs, nothing))
-        target === nothing || parent_context(target) || (aliases[name] = target)
+        target === nothing || target in parent_context || (aliases[name] = target)
     end
     aliases
 end
@@ -9357,7 +9357,7 @@ end
 function _remount_partition(source, shared::ThreadsafeDict{Symbol,Any}, changed,
                             forced_local=(), parent_view=nothing)
     T = typeof(source)
-    parent_context = parent_view === nothing ? nothing : name -> _remount_invalidated(parent_view, name)
+    parent_context = parent_view === nothing ? nothing : _remount_context_names(parent_view)
     invalidated, opaque, aliases = _remount_context(T, changed, forced_local, parent_context)
     local_names = union(invalidated, keys(aliases))
     for (name, info) in meta(T)
@@ -9375,7 +9375,31 @@ end
 # member reaches context (`_child_read_is_context`). That can depend on what the
 # parent already routes per view, through a forwarded name, and adding a sibling
 # can make another read context, so the two closures alternate until settled.
+#
+# The answer depends only on the type and on which names are rebound, a small fixed
+# set for an app, so it is computed once per process: `remount` runs per request
+# and per child read. The result is shared, so no caller may mutate it. It is held
+# per `meta(T)` object, which a re-expanded struct replaces.
+const _REMOUNT_CONTEXTS = IdDict{Any,Dict{Any,Any}}()
+const _REMOUNT_CONTEXTS_LOCK = ReentrantLock()
 function _remount_context(::Type{T}, changed, forced_local, parent_context) where {T}
+    declaration = meta(T)
+    key = (sort!(collect(Symbol, changed)), sort!(collect(Symbol, forced_local)), parent_context)
+    known = lock(_REMOUNT_CONTEXTS_LOCK) do
+        contexts = get(_REMOUNT_CONTEXTS, declaration, nothing)
+        contexts === nothing ? nothing : get(contexts, key, nothing)
+    end
+    known === nothing || return known
+    # Outside the lock: computing recurses into child types. A race computes twice.
+    context = _compute_remount_context(T, changed, forced_local, parent_context)
+    stored = (first(key), key[2], parent_context === nothing ? nothing : copy(parent_context))
+    lock(_REMOUNT_CONTEXTS_LOCK) do
+        get!(() -> Dict{Any,Any}(), _REMOUNT_CONTEXTS, declaration)[stored] = context
+    end
+    context
+end
+
+function _compute_remount_context(::Type{T}, changed, forced_local, parent_context) where {T}
     dependencies = Dict{Symbol,Set{Symbol}}()
     computed = Set{Symbol}()
     names = Set{Symbol}()
@@ -9444,7 +9468,7 @@ function _child_read_is_context(::Type{T}, path, parent_names) where {T}
     :__parent__ in child_names && push!(changed, :__parent__)
     :__req__ in child_names && any(p -> first(p) === :__req__, meta(T)) && push!(changed, :__req__)
     forced = (:__status__, (:__prefix__ in child_names ? (:__prefix__,) : ())...)
-    context, = _remount_context(C, changed, forced, name -> name in parent_names)
+    context, = _remount_context(C, changed, forced, parent_names)
     if _source_shared_child(C, Val(member)) && length(path) > 2
         return _child_read_is_context(C, path[2:end], context)
     end
@@ -9468,13 +9492,16 @@ function _close_dependents!(names::Set{Symbol}, dependencies, excluded=())
     names
 end
 
-_remount_invalidated(o, name::Symbol) = begin
-    hasfield(typeof(o), :cache) || return false
+# The names a parent routes per view: none unless it is itself a remount view.
+const _NO_CONTEXT_NAMES = Set{Symbol}()
+_remount_context_names(o) = begin
+    hasfield(typeof(o), :cache) || return _NO_CONTEXT_NAMES
     pc = getfield(o, :cache)
-    pc isa PropertyCache || return false
+    pc isa PropertyCache || return _NO_CONTEXT_NAMES
     c = pc.cache
-    c isa MountedThreadsafeDict && name in c.invalidated
+    c isa MountedThreadsafeDict ? c.invalidated : _NO_CONTEXT_NAMES
 end
+_remount_invalidated(o, name::Symbol) = name in _remount_context_names(o)
 
 # --- opaque remount sharing ----------------------------------------------------
 
@@ -9850,6 +9877,13 @@ per-argument cache is shared only when the property is context-independent.
 Context-dependent `@cached`/`@mmap` properties bypass their intrinsic disk entry
 because the rebound context is intentionally not part of the retained disk
 identity.
+
+What reads a nested child is decided by the read. Reading a member of a memoized
+inline `@struct` child, `pins.ap3`, makes a property per view only when that member
+reaches rebound context, directly, through a forwarded parent name, or through a
+nested child; otherwise the property is shared like any other. Holding the child
+itself (`f(pins)`) is per view, because the instance holds its view, and so is
+reading an opaque member or calling a child with a keyword default that is code.
 
 An opaque property — one that hands a bare `__self__` to code the dependency
 scan cannot follow, such as `fit(key) = run(__self__, key)` — and its dependents
