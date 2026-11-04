@@ -14,6 +14,28 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.6
+
+- A property that reads a member of an inline `@struct` child is shared across
+  `remount` views unless that member reaches rebound context. It was recomputed
+  for every view, and so was everything derived from it, so a retained request
+  root paid for that work on every request. With `model = make(pins.ap3)`,
+  `fit = model.fit()` and `evaluation = score(fit)`, all three now compute once.
+  It stays per view, with each view's value, when the member reads context
+  directly, through a forwarded parent name or `__parent__`, or through a nested
+  child, or through a keyword default of the child's call; when the body holds
+  the child itself (`f(pins)`); and when the member is opaque. `sync!` and
+  `clear_cache!` reach these properties as before.
+- Such a property now follows the contract of every shared property. One that
+  also depends on something no input records, such as the clock or a file read
+  through a plain path, used to be recomputed per request by accident and now
+  keeps its first value: declare it `@fresh`, or read the file through a
+  `TrackedFile`. As a shared property, a `@cached` or `@mmap` one now uses its
+  disk entry through a view.
+- `remount` decides its routing once per type and set of rebound names, instead
+  of on every call. On a struct of 300 properties it takes 125 µs, down from
+  579 µs.
+
 ## 0.5.5
 
 - One disk entry per memo entry. Calls whose arguments are `isequal` share a
