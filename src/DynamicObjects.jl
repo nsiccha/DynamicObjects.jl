@@ -6866,15 +6866,6 @@ a child.
 """
 _remount_child_reads(::Type) = ()
 
-"""    _remount_read_children(::Type{T})
-
-The inline children of `T` a read can be decided for (`_remount_child_reads`):
-every memoized one whose call a view forwards by value alone. A keyword default
-that is code runs under the view and may read context, so what reads such a child
-is context.
-"""
-_remount_read_children(::Type) = ()
-
 """    _analysis_nested_type(::Type{T}, ::Val{name})
 
 Like `_nested_struct_type`, but registered for `prop::T = rhs` typed
@@ -7719,9 +7710,6 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     # one); emits `_source_shared_child` so `remount` resolves them lazily on
     # the retained source instead of pre-seeding view copies.
     source_shared_children = Symbol[]
-    # The ones whose call a view forwards by value alone: a keyword default that
-    # is code may read request context, so what reads such a child stays per view.
-    remount_read_children = Set{Symbol}()
     # Typed computed properties (`prop::T = rhs`) register T only with
     # `_analysis_nested_type` (not `_nested_struct_type`), so the analyzer's
     # tree walk follows them but HTMXObjects' route walker doesn't (typed
@@ -7987,8 +7975,6 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 Expr(:tuple, Expr(:parameters, [Expr(:kw, kn, kn) for (kn, _) in index_kwargs]...)),
                 gen_name, Expr(:tuple, Expr(:parameters, constructor_kwargs...)))
             push!(source_shared_children, prop_name)
-            all(((_, d),) -> d === nothing || !(something(d) isa Expr), index_kwargs) &&
-                push!(remount_read_children, prop_name)
         end
         # Use `index_param_exprs` (typed `:(name::T)` when annotated, bare
         # `:name` otherwise) for the method signature so downstream readers
@@ -8345,9 +8331,9 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         (info.rhs === nothing) && continue        # fixed fields have no RHS
         walked = walk_rhs(deepcopy(info.rhs); locals=copy(info.locals), properties=walk_props, lnn=info.lnn)
         _collect_self_deps!(info.dependson, walked) && push!(opaque_props, name)
-        isempty(remount_read_children) && continue
+        isempty(source_shared_children) && continue
         _collect_child_reads!(get!(() -> Set{Tuple{Vararg{Symbol}}}(), child_reads, name),
-                              walked, remount_read_children)
+                              walked, source_shared_children)
     end
     filter!(p -> !isempty(last(p)), child_reads)
     # ── `@options` domain declarations ───────────────────────────────────────
@@ -8625,7 +8611,6 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             $DynamicObjects._remount_opaque_properties(::Type{$type_dispatch}) = $(Tuple(sort!(collect(opaque_props))))
             $DynamicObjects._remount_child_reads(::Type{$type_dispatch}) = $(Tuple(
                 (name, Tuple(sort!(collect(paths)))) for (name, paths) in sort!(collect(child_reads); by=first)))
-            $DynamicObjects._remount_read_children(::Type{$type_dispatch}) = $(Tuple(sort!(collect(remount_read_children))))
             $DynamicObjects.is_generated_property(::$type, name::Symbol) = name in $generated_names
             $DynamicObjects.is_indexed_property(::$type, name::Symbol) = name in $indexed_names
             $DynamicObjects._hash_replace(__self__::$type) = __self__.__hash__
@@ -9469,7 +9454,7 @@ end
 # opaque count as context.
 function _child_read_is_context(::Type{T}, path, parent_names) where {T}
     length(path) == 1 && return true
-    first(path) in _remount_read_children(T) || return true
+    _source_shared_child(T, Val(first(path))) || return true
     C = _nested_struct_type(T, Val(first(path)))
     C === nothing && return true
     member = path[2]
@@ -9480,7 +9465,7 @@ function _child_read_is_context(::Type{T}, path, parent_names) where {T}
     :__req__ in child_names && any(p -> first(p) === :__req__, meta(T)) && push!(changed, :__req__)
     forced = (:__status__, (:__prefix__ in child_names ? (:__prefix__,) : ())...)
     context, = _remount_context(C, changed, forced, parent_names)
-    if member in _remount_read_children(C) && length(path) > 2
+    if _source_shared_child(C, Val(member)) && length(path) > 2
         return _child_read_is_context(C, path[2:end], context)
     end
     member in context
@@ -9894,7 +9879,7 @@ inline `@struct` child, `pins.ap3`, makes a property per view only when that mem
 reaches rebound context, directly, through a forwarded parent name, or through a
 nested child; otherwise the property is shared like any other. Holding the child
 itself (`f(pins)`) is per view, because the instance holds its view, and so is
-reading an opaque member or calling a child with a keyword default that is code.
+reading an opaque member.
 
 An opaque property — one that hands a bare `__self__` to code the dependency
 scan cannot follow, such as `fit(key) = run(__self__, key)` — and its dependents

@@ -3,7 +3,7 @@ using TestItemRunner
 @testmodule RemountChildReaders begin
 using DynamicObjects
 export ReaderRoot, DeepRoot, OpaqueMemberRoot, ExternalChildRoot, DefaultedChildRoot,
-       ForwardingRoot, PinnedRoot, TwoContextRoot, DeepDefaultedRoot, RCR_CALLS, rcr_reset!, rcr_bump!, rcr_context_names
+       ForwardingRoot, PinnedRoot, TwoContextRoot, DeepDefaultedRoot, PureDefaultRoot, RCR_CALLS, rcr_reset!, rcr_bump!, rcr_context_names
 
 const RCR_CALLS = Dict{Symbol,Int}()
 const RCR_LOCK = ReentrantLock()
@@ -95,7 +95,15 @@ end
     scoped_reader = (rcr_bump!(:external_scoped_reader); scoped.value)
 end
 
-# A keyword default that is code runs under the view, so it may read context.
+# A keyword default is a property of the child, decided by what it reads.
+@dynamicstruct struct PureDefaultRoot
+    ctx = nothing
+    @struct run(; scale = 1 + 2) = begin
+        scaled = scale * 2
+    end
+    reader = (rcr_bump!(:pure_default_reader); run().scaled)
+end
+
 @dynamicstruct struct DefaultedChildRoot
     ctx = nothing
     @struct run(; scale = something(ctx, 0)) = begin
@@ -268,8 +276,13 @@ views = [remount(source; ctx=i) for i in 1:3]
 @test RCR_CALLS[:external_scoped_reader] == 3
 end
 
-@testitem "a keyword default that is code keeps a reader per view" setup=[RemountChildReaders] begin
+@testitem "a keyword default of a child is decided by what it reads" setup=[RemountChildReaders] begin
 using DynamicObjects
+
+rcr_reset!()
+pure = PureDefaultRoot()
+@test [remount(pure; ctx=i).reader for i in 1:3] == [6, 6, 6]
+@test RCR_CALLS[:pure_default_reader] == 1
 
 rcr_reset!()
 source = DefaultedChildRoot()

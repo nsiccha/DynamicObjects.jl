@@ -23,8 +23,8 @@ failing or silently behaving differently at run time.
   `fit = model.fit()` and `evaluation = score(fit)`, all three now compute once.
   It stays per view, with each view's value, when the member reads context
   directly, through a forwarded parent name or `__parent__`, or through a nested
-  child; when the body holds the child itself (`f(pins)`); when the member is
-  opaque; and when the child has a keyword default that is code. `sync!` and
+  child, or through a keyword default of the child's call; when the body holds
+  the child itself (`f(pins)`); and when the member is opaque. `sync!` and
   `clear_cache!` reach these properties as before.
 - Such a property now follows the contract of every shared property. One that
   also depends on something no input records, such as the clock or a file read
