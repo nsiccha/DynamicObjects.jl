@@ -5938,7 +5938,7 @@ function _collect_child_reads!(paths, e, children)
         chain = _self_chain(e.args[2])
         if chain !== nothing && !isempty(first(chain)) && first(first(chain)) in children
             for name in e.args[1].args[1].args
-                push!(paths, (first(chain)..., name::Symbol))
+                push!(paths, name isa Symbol ? (first(chain)..., name) : Tuple(first(chain)))
             end
             foreach(a -> _collect_child_reads!(paths, a, children), last(chain))
             return paths
@@ -6865,6 +6865,15 @@ A property with no entry, as in an older expansion, is context if it depends on
 a child.
 """
 _remount_child_reads(::Type) = ()
+
+"""    _remount_read_children(::Type{T})
+
+The inline children of `T` a read can be decided for (`_remount_child_reads`):
+every memoized one whose call a view forwards by value alone. A keyword default
+that is code runs under the view and may read context, so what reads such a child
+is context.
+"""
+_remount_read_children(::Type) = ()
 
 """    _analysis_nested_type(::Type{T}, ::Val{name})
 
@@ -8616,6 +8625,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
             $DynamicObjects._remount_opaque_properties(::Type{$type_dispatch}) = $(Tuple(sort!(collect(opaque_props))))
             $DynamicObjects._remount_child_reads(::Type{$type_dispatch}) = $(Tuple(
                 (name, Tuple(sort!(collect(paths)))) for (name, paths) in sort!(collect(child_reads); by=first)))
+            $DynamicObjects._remount_read_children(::Type{$type_dispatch}) = $(Tuple(sort!(collect(remount_read_children))))
             $DynamicObjects.is_generated_property(::$type, name::Symbol) = name in $generated_names
             $DynamicObjects.is_indexed_property(::$type, name::Symbol) = name in $indexed_names
             $DynamicObjects._hash_replace(__self__::$type) = __self__.__hash__
@@ -9459,6 +9469,7 @@ end
 # opaque count as context.
 function _child_read_is_context(::Type{T}, path, parent_names) where {T}
     length(path) == 1 && return true
+    first(path) in _remount_read_children(T) || return true
     C = _nested_struct_type(T, Val(first(path)))
     C === nothing && return true
     member = path[2]
@@ -9469,7 +9480,7 @@ function _child_read_is_context(::Type{T}, path, parent_names) where {T}
     :__req__ in child_names && any(p -> first(p) === :__req__, meta(T)) && push!(changed, :__req__)
     forced = (:__status__, (:__prefix__ in child_names ? (:__prefix__,) : ())...)
     context, = _remount_context(C, changed, forced, parent_names)
-    if _source_shared_child(C, Val(member)) && length(path) > 2
+    if member in _remount_read_children(C) && length(path) > 2
         return _child_read_is_context(C, path[2:end], context)
     end
     member in context

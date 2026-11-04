@@ -3,7 +3,7 @@ using TestItemRunner
 @testmodule RemountChildReaders begin
 using DynamicObjects
 export ReaderRoot, DeepRoot, OpaqueMemberRoot, ExternalChildRoot, DefaultedChildRoot,
-       ForwardingRoot, PinnedRoot, TwoContextRoot, RCR_CALLS, rcr_reset!, rcr_bump!, rcr_context_names
+       ForwardingRoot, PinnedRoot, TwoContextRoot, DeepDefaultedRoot, RCR_CALLS, rcr_reset!, rcr_bump!, rcr_context_names
 
 const RCR_CALLS = Dict{Symbol,Int}()
 const RCR_LOCK = ReentrantLock()
@@ -102,6 +102,17 @@ end
         scaled = scale * 2
     end
     reader = (rcr_bump!(:defaulted_reader); run().scaled)
+end
+
+# The same keyword default on a child nested in another child.
+@dynamicstruct struct DeepDefaultedRoot
+    ctx = nothing
+    @struct outer = begin
+        @struct run(; scale = something(ctx, 0)) = begin
+            scaled = scale * 2
+        end
+    end
+    reader = (rcr_bump!(:deep_defaulted_reader); outer.run().scaled)
 end
 
 # A sibling child reading another child's member through its forwarded name.
@@ -264,6 +275,11 @@ rcr_reset!()
 source = DefaultedChildRoot()
 @test [remount(source; ctx=i).reader for i in 1:3] == [2, 4, 6]
 @test RCR_CALLS[:defaulted_reader] == 3
+
+rcr_reset!()
+deep = DeepDefaultedRoot()
+@test [remount(deep; ctx=i).reader for i in 1:3] == [2, 4, 6]
+@test RCR_CALLS[:deep_defaulted_reader] == 3
 end
 
 @testitem "a child reading a sibling child's member through its forwarded name" setup=[RemountChildReaders] begin
@@ -388,4 +404,21 @@ seconds = [remount(source; second_context=i) for i in 1:3]
 # Asking again, after other remounts were decided, gives the first routing.
 @test :first_reader in getfield(remount(source; first_context=9), :cache).cache.invalidated
 @test !(:first_reader in getfield(remount(source; second_context=9), :cache).cache.invalidated)
+end
+
+@testitem "remount keeps one routing per type however many requests it serves" setup=[RemountChildReaders] begin
+using DynamicObjects
+
+source = ReaderRoot()
+declaration = DynamicObjects.meta(ReaderRoot)
+@test declaration === DynamicObjects.meta(ReaderRoot)
+touch_views(n) = for i in 1:n
+    v = remount(source; ctx=i)
+    v.fit, v.pins.shared, v.context_reader
+end
+touch_views(2)
+routings() = sum(length, values(DynamicObjects._REMOUNT_CONTEXTS))
+settled = routings()
+touch_views(50)
+@test routings() == settled
 end
