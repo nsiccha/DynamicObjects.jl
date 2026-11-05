@@ -136,7 +136,7 @@ end
 
 @testitem "workers: roots that share __hash__ keep their own construction inputs" setup=[WorkerFixtures] tags=[:core, :workers] begin
 using DynamicObjects
-using WorkerToy: HashCompiled, HashToy
+using WorkerToy: HashCompiled, HashToy, HashVersionedOwn
 const DO = DynamicObjects
 with_worker() do
     root = mktempdir()
@@ -171,6 +171,20 @@ with_worker() do
     @test h1.__hash__ == h2.__hash__
     @test h1.saved(2).value == h2.saved(2).value == 3
     @test isfile(DO.get_cache_path(h1, :saved, 2)) && isfile(DO.get_cache_path(h2, :saved, 2))
+
+    # The same for a version a declared identity leaves out (todo `12fnna6`), and an
+    # invalidation reaches the root of its own version.
+    data = Dict("k" => 1)
+    v1, v2 = HashVersionedOwn(data, dir_a, "v1"), HashVersionedOwn(data, dir_a, "v2")
+    @test v1.__hash__ == v2.__hash__ && v1.__cache_path__ != v2.__cache_path__
+    @test v1.saved(2) == (pid=worker_pid(), revision="v1", value=3)
+    @test v2.saved(2) == (pid=worker_pid(), revision="v2", value=3)
+    path = DO.get_cache_path(v2, :saved, 2)
+    @test isfile(path)
+    invalidate!(v2.saved, 2)
+    @test !isfile(path)
+    @test v2.saved(2).revision == "v2"
+    @test isfile(path)
 end
 end
 
