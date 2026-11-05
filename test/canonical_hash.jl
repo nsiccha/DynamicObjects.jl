@@ -9,7 +9,13 @@ using TestItemRunner
 
 @testmodule CanonicalHashFixtures begin
 using DynamicObjects, DataFrames, Arrow
-export CHInner, CHPlain, CHVersioned, CHCustom, CH_VERSION
+export CHInner, CHPlain, CHVersioned, CHCustom, CH_VERSION, CHLazyArray
+
+struct CHLazyArray <: AbstractMatrix{Float64}
+    n::Int
+end
+Base.size(x::CHLazyArray) = (x.n, x.n)
+Base.getindex(::CHLazyArray, ::Int, ::Int) = error("hashing must not materialize a lazy array")
 
 @dynamicstruct struct CHInner
     x::Int
@@ -93,4 +99,99 @@ inner.blob(2)
 
 # Whatever contains the custom-hashed object keys it by that custom `__hash__`.
 @test DO.canonical_hash((o, 1)) == DO.persistent_hash((o.__hash__, 1))
+end
+
+@testitem "container identity survives insertion history and serialization" tags=[:core] begin
+using DynamicObjects, Serialization
+const DO = DynamicObjects
+roundtrip(x) = (io = IOBuffer(); serialize(io, x); seekstart(io); deserialize(io))
+
+for n in (0, 3, 10, 30, 100)
+    forward = Dict{String,Any}("k$i" => i for i in 1:n)
+    reserved = Dict{String,Any}("k$i" => i for i in n:-1:1)
+    sizehint!(reserved, 1000)
+    # A matrix wrapper in the reported model inputs must stay stable too.
+    forward["matrix"] = reserved["matrix"] = reshape(collect(1.0:6.0), 2, 3)'
+    @test isequal(forward, reserved)
+    expected = DO.canonical_hash(("code", forward))
+    @test DO.canonical_hash(("code", reserved)) == expected
+    @test DO.canonical_hash(("code", roundtrip(reserved))) == expected
+    @test DO.canonical_hash(("code", roundtrip(forward))) == expected
+    @test DO.canonical_hash(("code", merge(forward, Dict("different" => 0)))) != expected
+
+    a, b = Set(keys(forward)), Set(reverse(collect(keys(forward))))
+    sizehint!(b, 1000)
+    @test DO.canonical_hash(a) == DO.canonical_hash(b) == DO.canonical_hash(roundtrip(b))
+end
+
+# Preserve identity's existing scalar/type distinctions: _disk_key's broader
+# numeric isequal normalization belongs to indexed arguments, not object identity.
+@test DO.canonical_hash(Dict{Any,Any}(:x => 1)) != DO.canonical_hash(Dict{Any,Any}(:x => 1.0))
+@test DO.canonical_hash(Dict(:x => 1)) != DO.canonical_hash(Dict{Any,Any}(:x => 1))
+@test DO.canonical_hash(Set([1])) != DO.canonical_hash(Set([1.0]))
+@test DO.canonical_hash(Set{Int}()) != DO.canonical_hash(Set{String}())
+
+# Dicts and Sets nested inside pairs, arrays and one another all reach the walker.
+a = Dict(:x => Any[(values=Set([:a, :b]),), :nested => Dict(:a => 1, :b => 2)])
+b = Dict(:x => Any[(values=Set([:b, :a]),), :nested => Dict(:b => 2, :a => 1)])
+@test DO.canonical_hash(a) == DO.canonical_hash(b) == DO.canonical_hash(roundtrip(b))
+@test DO.canonical_hash(a[:x]) == DO.canonical_hash(b[:x])
+
+# Aliases and cycles survive the walk, and no input is modified.
+d = Dict{String,Any}("x" => 1)
+d["self"] = d
+before = collect(keys(d))
+@test DO.canonical_hash(d) == DO.canonical_hash(roundtrip(d))
+@test d["self"] === d && collect(keys(d)) == before
+v = Any[d, d]
+push!(v, v)
+@test DO.canonical_hash(v) == DO.canonical_hash(roundtrip(v))
+@test v[1] === v[2] === d && v[3] === v
+end
+
+@testitem "nested dynamic objects and tables hash content without their memoized state" tags=[:core] setup=[CanonicalHashFixtures] begin
+using DynamicObjects, DataFrames, Arrow
+const DO = DynamicObjects
+@test Base.get_extension(DO, :DataFramesArrowExt) !== nothing
+
+inner = CHInner(1)
+df = DataFrame(x=[1, 2], y=["a", "b"])
+make(inner, df) = Dict(:objects => [inner], :table => df, :pair => (:child => inner))
+value = make(inner, df)
+cold = DO.canonical_hash(value)
+inner.blob(10)
+@test DO.canonical_hash(value) == cold
+@test DO.canonical_hash(make(CHInner(1), copy(df))) == cold
+@test DO.canonical_hash(make(CHInner(2), copy(df))) != cold
+@test DO.canonical_hash(make(CHInner(1), DataFrame(x=[1, 3], y=["a", "b"]))) != cold
+
+# A top-level extension replacement also re-enters the container walk.
+column = Dict{String,Any}("k$i" => i for i in 1:30)
+reserved = copy(column)
+sizehint!(reserved, 1000)
+@test DO.canonical_hash(DataFrame(x=[column])) == DO.canonical_hash(DataFrame(x=[reserved]))
+@test DO.canonical_hash(df) == DO.persistent_hash((string.(names(df)), [collect(c) for c in eachcol(df)]))
+
+# Distinct keys may canonicalize alike. Their differing values must determine
+# the tie order, not the Dict's original iteration order.
+k1, k2 = CHInner(1), CHInner(1)
+a = Dict(k1 => "a", k2 => "b")
+b = Dict(k2 => "b", k1 => "a")
+sizehint!(b, 1000)
+@test length(a) == length(b) == 2
+@test DO.canonical_hash(a) == DO.canonical_hash(b)
+end
+
+@testitem "unaffected identities keep their bytes and array wrappers stay lazy" tags=[:core] setup=[CanonicalHashFixtures] begin
+using DynamicObjects
+const DO = DynamicObjects
+values = (1, 1.0, -0.0, true, "x", :x, (1, :x), (x=1, y=:y),
+    [1.0, 2.0], Any[1, "x"], ["x", "y"], Pair{Any,Any}(:x, 1),
+    reshape(collect(1.0:6.0), 2, 3)', CHLazyArray(10^9))
+for x in values
+    @test DO.canonical_hash(x) == DO.persistent_hash(x)
+end
+v = [1, 2]
+@test DO.canonical_hash((v, v)) == DO.persistent_hash((v, v))
+@test DO.canonical_hash(Any[v, v]) == DO.persistent_hash(Any[v, v])
 end

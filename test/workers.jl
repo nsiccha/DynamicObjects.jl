@@ -83,6 +83,57 @@ end
     started_at=nothing, in_flight=0, last_message_at=nothing)
 end
 
+@testitem "workers: container identities agree for disk, mmap, children and versions" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects, Serialization
+using WorkerToy: HashCompiled, HashToy, HashVersioned
+const DO = DynamicObjects
+data = Dict{String,Any}("k$i" => i for i in 1:30)
+sizehint!(data, 1000)
+data["matrix"] = reshape(collect(1.0:6.0), 2, 3)'
+data["nested"] = Any[(values=Set([:a, :b]),), :pair => Dict(:x => 1, :y => 2)]
+io = IOBuffer(); serialize(io, data); seekstart(io)
+rebuilt = deserialize(io)
+@test isequal(data, rebuilt)
+
+with_worker() do
+    dir = mktempdir()
+    o = HashToy(HashCompiled("model", data), dir)
+    peer = HashToy(HashCompiled("model", rebuilt), dir)
+    @test o.__hash__ == peer.__hash__
+    status = DO.Treebars.initialize_progress!(:state; description="Hash requester")
+    result = DO.fetchindex!(status, o.saved, 2)
+    @test result.pid == worker_pid() != getpid()
+    @test result.value == 2 + length(data)
+    @test result.hash == o.__hash__
+    @test result.compiled_hash == o.compiled.__hash__
+    @test isfile(DO.get_cache_path(o, :saved, 2))
+    @test peer.saved(2) == result
+
+    mapped = o.mapped(2)
+    @test mapped == fill(Float64(result.value), 4)
+    @test isfile(DO.get_cache_path(o, :mapped, 2))
+    @test peer.mapped(2) == mapped
+    child_result = o.child(3).saved(4)
+    @test child_result == (pid=worker_pid(), value=7 + length(data))
+    @test peer.child(3).saved(4) == child_result
+    view_result = remount(o; __prefix__="/view").saved(3)
+    @test view_result.pid == worker_pid() && view_result.hash == o.__hash__
+
+    # Invalidation addresses the same worker object even after the Dict travelled.
+    invalidate!(o.saved, 2)
+    again = o.saved(2)
+    @test again.n > result.n && again.value == result.value
+    @test again.hash == o.__hash__ && again.pid == worker_pid()
+
+    a, b = HashVersioned(data, dir, "v1"), HashVersioned(rebuilt, dir, "v2")
+    @test a.__identity_hash__ == b.__identity_hash__
+    @test a.__cache_path__ != b.__cache_path__
+    @test a.saved(2) == (pid=worker_pid(), revision="v1", value=2 + length(data))
+    @test b.saved(2) == (pid=worker_pid(), revision="v2", value=2 + length(data))
+    @test HashVersioned(rebuilt, dir, "v1").saved(2) == a.saved(2)
+end
+end
+
 @testitem "workers: same-key callers share one worker computation" setup=[WorkerFixtures] tags=[:core, :workers] begin
 using DynamicObjects
 with_worker() do
