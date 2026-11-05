@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Reproduce the macOS x64 Julia 1.14-alpha2 requester-logger crash.
+"""Reproduce the macOS x64 Julia 1.14-alpha2 crash in its full-suite context.
 
 Run explicitly on macOS with Python 3.8+, git, curl, and tar available. On an
 Apple Silicon Mac, the x64 Julia binary requires Rosetta already installed.
 Everything downloaded or generated stays in the printed temporary directory;
 the user's Julia depot, startup file, git configuration, and checkouts are unused.
 The directory is retained for inspecting the resolved manifests after a failure.
+The full coverage suite has a 45-minute limit within a 60-minute overall limit.
 """
 
 import hashlib
@@ -41,8 +42,9 @@ def run(command, *, cwd, env, seconds, deadline, capture=False):
     """Bound the whole subprocess group, including Pkg.test's Julia children."""
     remaining = min(seconds, deadline - time.monotonic())
     if remaining <= 0:
-        raise TimeoutError("45-minute diagnostic deadline reached")
-    print("+ " + shlex.join(map(str, command)), flush=True)
+        raise TimeoutError("60-minute diagnostic deadline reached")
+    started = time.monotonic()
+    print(f"+ [limit {remaining:.0f}s] " + shlex.join(map(str, command)), flush=True)
     process = subprocess.Popen(
         command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE if capture else None,
@@ -55,6 +57,9 @@ def run(command, *, cwd, env, seconds, deadline, capture=False):
         stop_group(process.pid)
         process.communicate()
         raise
+    finally:
+        print(f"Command finished after {time.monotonic() - started:.1f}s; "
+              f"child status: {process.returncode}", flush=True)
     if output:
         print(output, end="", flush=True)
     if process.returncode:
@@ -67,7 +72,7 @@ def main():
     if platform.system() != "Darwin":
         raise SystemExit("This diagnostic requires native macOS; nothing was downloaded.")
     root = Path(tempfile.mkdtemp(prefix="do-requester-logger-"))
-    deadline = time.monotonic() + 45 * 60
+    deadline = time.monotonic() + 60 * 60
     print("Diagnostic scratch directory:", root, flush=True)
     print("Host architecture:", platform.machine(), "Julia target: x86_64", flush=True)
     env = {
@@ -119,20 +124,13 @@ def main():
         'url="https://github.com/nsiccha/Treebars.jl", rev="' + TREEBARS_SHA + '")); '
         'Pkg.instantiate(); Pkg.status(; mode=Pkg.PKGMODE_MANIFEST)'
     ], seconds=900, cwd=source)
-    phases = [
-        ("focused requester logger", 'using Pkg; Pkg.test(; coverage=true, '
-         'test_args=["--file=test/requester_logger.jl"])', 600),
-        ("full CI suite", 'using Pkg; Pkg.test(; coverage=true)', 1800),
-    ]
-    completed = []
-    for label, code, seconds in phases:
-        print("BEGIN:", label, flush=True)
-        execute(julia_project + [code], seconds=seconds, cwd=source)
-        completed.append(label)
-        print("PASS:", label, flush=True)
-    if completed != [phase[0] for phase in phases]:
-        raise RuntimeError("Not all diagnostic phases completed")
-    print("Both test phases passed; the crash was not reproduced in this run.", flush=True)
+    # CI crashes occurred late in the full suite. A preliminary focused run in a
+    # cold depot spent 508 of its 600 seconds precompiling, then failed readiness
+    # checks and timed out before this full-suite context could run at all.
+    print("BEGIN: full CI suite", flush=True)
+    execute(julia_project + ['using Pkg; Pkg.test(; coverage=true)'],
+            seconds=45 * 60, cwd=source)
+    print("PASS: full CI suite; the crash was not reproduced in this run.", flush=True)
 
 
 if __name__ == "__main__":
