@@ -14,6 +14,24 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.9
+
+- `DynamicObjects.canonical_hash` now sorts built-in `Dict` entries and `Set`
+  elements deterministically. Equal contents with different insertion histories
+  or serialization layouts give the same object identity, so a worker publishes
+  a Dict-bearing object's cached result at the path its requester reads.
+- Identity replacement now descends through `Pair` and dense `Array` as well as
+  tuples, named tuples, dictionaries and sets. Nested dynamic objects hash by
+  `__hash__`, and DataFrames by their names and columns, without memoized state.
+  Concrete container types and scalar type distinctions remain significant;
+  other array wrappers and arbitrary structs retain their serialized form.
+- **Breaking:** affected identities miss their old disk entries once. Old
+  files remain; no cache deletion or migration occurs. Plain scalar and numeric
+  array identities keep their bytes. Consumers relying on deterministic
+  Dict-bearing worker identities must set `DynamicObjects = "0.5.9"` as their
+  compatibility floor. This does not promise stability across Julia versions
+  or order-independent hashing of cyclic container graphs.
+
 ## 0.5.8
 
 - `DynamicObjects.carry_to_worker!(owner::Module, name::Symbol; wire=identity,

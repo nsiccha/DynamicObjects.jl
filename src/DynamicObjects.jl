@@ -656,7 +656,7 @@ end
     DynamicObjects.canonical_hash(x)::String
 
 The content digest DynamicObjects uses for cache identity: a SHA-1 hex string of `x`,
-serialized after every `@dynamicstruct` value inside it is replaced by that value's own
+serialized after supported nested `@dynamicstruct` values are replaced by their own
 `__hash__` (and, with DataFrames and Arrow loaded, every `DataFrame` by its column names
 and columns). It names an object's cache directory and keys its disk-cache entries, so
 equal content gives the same digest in every process, however much an object has memoized.
@@ -681,12 +681,13 @@ Replacement recurses through `Tuple`, `NamedTuple`, `Pair`, dense `Array`, `Dict
 Dict entries and Set elements are order-independent; their concrete types and scalar
 value types remain part of identity. Other containers, array wrappers and arbitrary
 structs are serialized as written; sparse or lazy arrays are never densified here.
-Container aliases and cycles are retained. Stability across Julia versions is not promised.
+Repeated references are retained, so alias structure can affect a digest. Order-independent
+hashing of cyclic container graphs and stability across Julia versions are not promised.
 
 Since 0.5.9, identities containing Dicts/Sets or newly replaced nested values change once:
-their old disk entries miss and remain on disk until explicitly cleared. Unchanged plain
-values keep their existing digests. This also lets a worker reconstruct a Dict-bearing
-object and publish at the same cache path its requester reads.
+their old disk entries miss and remain on disk until explicitly cleared. Plain scalar
+and numeric array values keep their existing digests. This also lets a worker reconstruct
+a Dict-bearing object and publish at the same cache path its requester reads.
 """
 canonical_hash(x) = persistent_hash(_hash_replace(x, IdDict()))
 
