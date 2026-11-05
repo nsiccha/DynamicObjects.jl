@@ -224,6 +224,91 @@ function _type_packages!(set::Set{Base.PkgId}, T, seen=Base.IdSet{Any}())
     set
 end
 
+# --- Requester scoped values ----------------------------------------------------------------
+
+# ScopedValue identity is process-local. Send a package/module/binding address, not a copy
+# of the variable; the package's __init__ registers the worker's own variable and converter.
+const _WorkerScopeKey = Tuple{Base.PkgId,Tuple{Vararg{Symbol}},Symbol}
+struct _WorkerScopeBinding
+    variable::ScopedValues.ScopedValue
+    wire::Any
+    unwire::Any
+end
+const _WORKER_SCOPES = Dict{_WorkerScopeKey,_WorkerScopeBinding}()
+const _WORKER_SCOPES_LOCK = ReentrantLock()
+
+function _worker_scope_key(owner::Module, name::Symbol)
+    root = Base.moduleroot(owner)
+    id = Base.PkgId(root)
+    (root === Main || id.uuid === nothing) && throw(ArgumentError(
+        "carry_to_worker!: $(owner).$(name) must belong to a loadable package"))
+    path = Symbol[]
+    while owner !== root
+        pushfirst!(path, nameof(owner))
+        owner = parentmodule(owner)
+    end
+    (id, Tuple(path), name)
+end
+
+_worker_scope_name(key) = join((Symbol(key[1].name), key[2]..., key[3]), ".")
+
+"""
+    DynamicObjects.carry_to_worker!(owner::Module, name::Symbol; wire=identity, unwire=identity)
+
+Carry the `ScopedValue` bound to `owner.name` into worker computations. Register it in the
+owning package's `__init__`, so both processes register their own variable and conversion
+functions. `owner` may be a nested module of that package. Returns the scoped variable;
+registering the same binding again replaces its converters for subsequent computations.
+
+Before submitting a computation, `wire(variable[])` runs in the initiating requester's
+scope. The result must be serializable data. The worker loads the owning package and binds
+its registered variable to `unwire(value)` while reconstructing the addressed object and
+running its computation. Default values travel too. Each computation has its own scope;
+bindings do not persist into later requests, including after an error or worker restart.
+Conversions must not mutate their inputs. Register before starting computations.
+
+This applies to memoized and fresh `@queued` property computations with `workers=1`.
+In-process computations already inherit every requester scoped value and do not call these
+converters. A shared memoized computation still uses the scope of its first caller; this
+does not add context to cache keys. Unregistered scoped values are not transported.
+Missing worker registrations and conversion failures fail the computation instead of
+silently running it with a default value.
+"""
+function carry_to_worker!(owner::Module, name::Symbol; wire=identity, unwire=identity)
+    key = _worker_scope_key(owner, name)
+    isdefined(owner, name) || throw(ArgumentError("carry_to_worker!: $(owner).$(name) is not defined"))
+    variable = getfield(owner, name)
+    variable isa ScopedValues.ScopedValue || throw(ArgumentError(
+        "carry_to_worker!: $(owner).$(name) is not a ScopedValue"))
+    lock(() -> _WORKER_SCOPES[key] = _WorkerScopeBinding(variable, wire, unwire), _WORKER_SCOPES_LOCK)
+    variable
+end
+
+function _capture_worker_scopes!(packages)
+    bindings = lock(() -> collect(_WORKER_SCOPES), _WORKER_SCOPES_LOCK)
+    map(bindings) do (key, binding)
+        push!(packages, key[1])
+        value = binding.wire(binding.variable[])
+        _packages!(packages, value)
+        (key, value)
+    end
+end
+
+function _with_worker_scopes(f, values)
+    bindings = lock(_WORKER_SCOPES_LOCK) do
+        map(values) do (key, _)
+            get(_WORKER_SCOPES, key, nothing)
+        end
+    end
+    scoped = map(zip(values, bindings)) do ((key, value), binding)
+        binding === nothing && throw(ArgumentError(
+            "DynamicObjects worker: $(_worker_scope_name(key)) is not registered; " *
+            "call carry_to_worker! in the owning package's __init__"))
+        binding.variable => binding.unwire(value)
+    end
+    ScopedValues.with(f, scoped...)
+end
+
 # --- Requester messages ----------------------------------------------------------------------
 
 const _WORKER_REQUEST = ScopedValues.ScopedValue{Union{Nothing,Int}}(nothing)
@@ -337,26 +422,28 @@ function _worker_control_loop()
 end
 
 function _worker_control(::Val{:submit}, id::Int, address, name::Symbol, args, kwargs, is_fresh::Bool,
-                         min_level::Int32, mirrored::Bool)
+                         min_level::Int32, mirrored::Bool, scopes)
     logger = _ForwardLogger(id, Base.CoreLogging.LogLevel(min_level))
     started = try
-        o = _resolve(address, _W_OBJECTS)
-        sync!(_retained_object(_root_of(o)))
-        args = _unwire(args, _W_OBJECTS)
-        kwargs = _unwire(kwargs, _W_OBJECTS)
-        ScopedValues.with_logger(logger) do
-            ScopedValues.with(_WORKER_REQUEST => id) do
-                ip = getproperty(o, name)
-                if is_fresh
-                    # A fresh call has no cache cell to hold its node: it gets one here, as a
-                    # progress-threaded fresh call does, so its tree can be mirrored.
-                    node = _default_substatus(o.__status__, o, name, args...; __pending__=true, kwargs...)
-                    mirror = mirrored ? _mirror(id, node) : nothing
-                    (o, Threads.@spawn(_fresh_in_worker(o, name, args, kwargs, node)), node, mirror)
-                else
-                    rv = memoize!(ip, args...; fetch=identity, kwargs...)
-                    node = rv isa Pending ? getstatus(ip, args...; kwargs...) : nothing
-                    (o, rv, node, mirrored ? _mirror(id, node) : nothing)
+        _with_worker_scopes(scopes) do
+            ScopedValues.with_logger(logger) do
+                ScopedValues.with(_WORKER_REQUEST => id) do
+                    o = _resolve(address, _W_OBJECTS)
+                    sync!(_retained_object(_root_of(o)))
+                    args = _unwire(args, _W_OBJECTS)
+                    kwargs = _unwire(kwargs, _W_OBJECTS)
+                    ip = getproperty(o, name)
+                    if is_fresh
+                        # A fresh call has no cache cell to hold its node: it gets one here, as a
+                        # progress-threaded fresh call does, so its tree can be mirrored.
+                        node = _default_substatus(o.__status__, o, name, args...; __pending__=true, kwargs...)
+                        mirror = mirrored ? _mirror(id, node) : nothing
+                        (o, Threads.@spawn(_fresh_in_worker(o, name, args, kwargs, node)), node, mirror)
+                    else
+                        rv = memoize!(ip, args...; fetch=identity, kwargs...)
+                        node = rv isa Pending ? getstatus(ip, args...; kwargs...) : nothing
+                        (o, rv, node, mirrored ? _mirror(id, node) : nothing)
+                    end
                 end
             end
         end
@@ -707,6 +794,12 @@ function _compute_in_worker(f::_WorkerCompute, o, name::Symbol, args::Tuple, kwa
             (ArgumentError("DynamicObjects cannot send `$(name)` to the worker process: " * err.msg), nothing)))
     end
     packages = _packages!(_packages!(_packages!(Set{Base.PkgId}(), address), wired_args), wired_kwargs)
+    scopes = try
+        _capture_worker_scopes!(packages)
+    catch err
+        throw(PropertyComputationError(string(nameof(typeof(o))), name, args, Tuple(pairs(kwargs)),
+            (err, catch_backtrace())))
+    end
     min_level = Int32(Base.CoreLogging.min_enabled_level(ScopedValues.current_logger()).level)
     req = lock(conn.lock) do
         conn.next_id += 1
@@ -718,7 +811,7 @@ function _compute_in_worker(f::_WorkerCompute, o, name::Symbol, args::Tuple, kwa
     try
         w, pid = _submit!(q, req, o, name, args, kwargs, packages,
                           (req.id, address, name, wired_args, wired_kwargs, is_fresh, min_level,
-                           _mirrorable(status)))
+                           _mirrorable(status), scopes))
         replica = _replica(status, conn, w, req.id)
         interrupter = replica === nothing ? _forward_interrupts(conn, w, req.id, status) : replica
         while true

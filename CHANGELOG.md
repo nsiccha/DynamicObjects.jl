@@ -14,6 +14,20 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.8
+
+- `DynamicObjects.carry_to_worker!(owner::Module, name::Symbol; wire=identity,
+  unwire=identity)` carries a package's named `ScopedValue` into memoized and
+  fresh worker computations. Register in the owning package's `__init__`;
+  nested modules are supported. The caller's value, including its default,
+  travels as serializable data, and the worker binds its own variable while
+  reconstructing the object and computing. Converters stay in their owning
+  process. Missing registrations and conversion errors fail the computation.
+- Worker context remains isolated across concurrent requests and restarts.
+  In-process scope inheritance and first-caller memoization are unchanged;
+  this does not add scope values to cache keys. A layer using the registration
+  API must declare `DynamicObjects = "0.5.8"` as its compatibility floor.
+
 ## 0.5.7
 
 - `@queued` computations can run in a separate Julia worker process:
