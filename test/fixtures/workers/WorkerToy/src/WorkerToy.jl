@@ -94,6 +94,14 @@ end
         DynamicObjects.send_to_requester(:toy, (x + 1, getpid()))
         x
     end
+    "Gated talking item"
+    @queued gated_talks(x::Int; dir::String) = begin
+        @info "gated toy log" x
+        DynamicObjects.send_to_requester(:toy, (x, getpid()))
+        touch(joinpath(dir, "talking_$(x)_$(getpid())"))
+        waitfile(joinpath(dir, "talk_go_$x"))
+        x
+    end
     "Interruptible item"
     @queued stoppable(x::Int; dir::String) = begin
         touch(joinpath(dir, "stoppable_$x"))

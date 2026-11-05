@@ -327,6 +327,65 @@ with_worker() do
 end
 end
 
+@testitem "workers: a replaced worker's computations log to their requesters" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects, Logging
+# The records of the gated talking item that reached `logger`, as `x => worker pid`.
+talked(logger) = [Dict(r.kwargs)[:x] => Dict(r.kwargs)[:worker] for r in logger.logs
+                  if r.message == "gated toy log"]
+kill_worker(pid) = run(Sys.iswindows() ? `taskkill /F /PID $pid` : `kill -9 $pid`)
+with_worker() do
+    t = Toy(1, mktempdir())
+    dir = mktempdir()
+    received = []
+    DynamicObjects.on_requester_message!(p -> push!(received, p), :toy)
+    @test t.square(1).pid == worker_pid()
+    if !Sys.iswindows()
+        # Hold the worker, so the next request waits in its send, and kill it there. The
+        # request never reached it, so it goes to a fresh worker and logs to its requester
+        # from there. Its requester used to get `ComputeAbandoned` while the fresh worker
+        # computed it for nobody, so a retry joined that computation and received none of
+        # its records (snag `worker-log-recor-d660d227`).
+        held = worker_pid()
+        run(`kill -STOP $held`)
+        logger = TestLogger()
+        task = Threads.@spawn with_logger(() -> t.gated_talks(1; dir), logger)
+        @test settles(() -> DynamicObjects.worker_status().in_flight == 1)
+        run(`kill -KILL $held`)
+        @test settles(() -> something(worker_pid(), held) != held, 120.0)
+        fresh = worker_pid()
+        @test waitfor(joinpath(dir, "talking_1_$fresh"))
+        touch(joinpath(dir, "talk_go_1"))
+        @test fetch(task) == 1
+        @test talked(logger) == [1 => fresh]
+        @test received == [(1, fresh)]
+        @test DynamicObjects.worker_status().in_flight == 0
+    end
+
+    # A worker killed while it computes fails that computation, after its records arrived.
+    # The retry computes on a fresh worker, and its records reach the retry's logger.
+    empty!(received)
+    old = worker_pid()
+    first_logger, retry_logger = TestLogger(), TestLogger()
+    task = Threads.@spawn with_logger(() -> t.gated_talks(2; dir), first_logger)
+    @test waitfor(joinpath(dir, "talking_2_$old"))
+    @test settles(() -> length(received) == 1)
+    @test talked(first_logger) == [2 => old]
+    kill_worker(old)
+    err = try
+        fetch(task); nothing
+    catch e
+        unwrap_error(e)
+    end
+    @test err isa ComputeAbandoned && err.started
+    touch(joinpath(dir, "talk_go_2"))
+    @test with_logger(() -> t.gated_talks(2; dir), retry_logger) == 2
+    new = worker_pid()
+    @test new != old
+    @test talked(retry_logger) == [2 => new]
+    @test received == [(2, old), (2, new)]
+end
+end
+
 @testitem "workers: requester messages, forwarded logs and interrupts" setup=[WorkerFixtures] tags=[:core, :workers] begin
 using DynamicObjects, Logging
 import DynamicObjects.Treebars

@@ -14,6 +14,22 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.11
+
+- A computation whose worker process exits while the computation is being
+  sent to it, before the worker has received it, now runs on a fresh worker,
+  as the send intended. Its log records (with `worker=<pid>`), requester
+  messages, progress and value reach its requester as usual. Before, the
+  requester got `ComputeAbandoned` (`the worker process … exited while
+  computing it`) while the fresh worker still computed it for nobody: its
+  records, messages and value were dropped, and a retry of the same key
+  joined that computation in the worker and got the value without any of the
+  body's log records. A worker that exits after a computation reached it
+  still fails that computation with `ComputeAbandoned`.
+- Consumers that rely on a computation's log records or messages after a
+  worker restart must set `DynamicObjects = "0.5.11"` as their compatibility
+  floor.
+
 ## 0.5.10
 
 - A worker process keeps each root by what it was built from, not by its
