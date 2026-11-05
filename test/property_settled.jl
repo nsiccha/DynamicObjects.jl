@@ -155,7 +155,7 @@ end
 end
 
 @testitem "a failed computation does not settle; a throwing hook is logged and the value stays stored" setup=[SettledFixtures] begin
-using DynamicObjects
+using DynamicObjects, Logging
 settled_reset!()
 app = PSApp(4)
 FAIL[] = true
@@ -167,7 +167,7 @@ end
 @test isempty(settled())
 HOOK_THROWS[] = true
 value = try
-    @test_logs (:error, r"property_settled hook threw") app.value
+    @test_logs (:error, r"property_settled hook threw") min_level=Logging.Error app.value
 finally
     HOOK_THROWS[] = false
 end

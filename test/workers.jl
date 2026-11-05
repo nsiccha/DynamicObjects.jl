@@ -100,7 +100,7 @@ end
 end
 
 @testitem "workers: an invalidation during a worker computation publishes nothing" setup=[WorkerFixtures] tags=[:core, :workers] begin
-using DynamicObjects
+using DynamicObjects, WorkerToy
 with_worker() do
     dir = mktempdir()
     t = Toy(1, mktempdir())
@@ -141,7 +141,12 @@ with_worker() do
     replacement = Threads.@spawn fetch(p)
     touch(joinpath(dir, "disk_go_9_1"))
     @test waitfor(joinpath(dir, "disk_started_9_2"))
-    @test settles(() -> DynamicObjects.worker_status().in_flight == 1)
+    # The old remote request may re-resolve its Pending and join the replacement,
+    # so both requests can stay in flight. Wait for the old computing task itself:
+    # its publication fence has run, while the replacement remains gated.
+    conn = DynamicObjects.job_queue().conn
+    @test settles(() -> DynamicObjects._remote_fetch(conn, conn.worker,
+        WorkerToy.disk_task_finished, 1))
     @test !isfile(path)
     touch(joinpath(dir, "disk_go_9_2"))
     @test fetch(replacement).n == 2
@@ -158,7 +163,7 @@ with_worker() do
     p = t.gated(7; dir, fetch=identity)
     @test waitfor(joinpath(dir, "started_7_1"))
     pid = worker_pid()
-    run(`kill -9 $pid`)
+    run(Sys.iswindows() ? `taskkill /F /PID $pid` : `kill -9 $pid`)
     err = try
         fetch(p); nothing
     catch e
@@ -224,7 +229,7 @@ end
 @test_throws ArgumentError DynamicObjects.configure_queue!(; worker_start=:later)
 with_worker() do
     t = Toy(1, mktempdir())
-    r = @test_logs (:warn, r"reads the request") t.reads_request(1)
+    r = @test_logs (:warn, r"reads the request") match_mode=:any t.reads_request(1)
     @test r.pid == getpid()
     @test t.reads_request(2).pid == getpid()          # warned once per property
     err = try

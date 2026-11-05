@@ -49,6 +49,12 @@ const COUNTED_NODES = Dict{Int,Any}()
 const COUNTED_LOCK = ReentrantLock()
 counted_duration(n) = Treebars.duration(lock(() -> COUNTED_NODES[n], COUNTED_LOCK))
 
+# A transport request can re-resolve after invalidation and wait for a replacement.
+# Retain the actual computing task to observe when the old disk publisher is done.
+const DISK_TASKS = Dict{Int,Task}()
+const DISK_TASKS_LOCK = ReentrantLock()
+disk_task_finished(n) = istaskdone(lock(() -> DISK_TASKS[n], DISK_TASKS_LOCK))
+
 waitfile(path) = while !isfile(path)
     sleep(0.02)
 end
@@ -72,6 +78,7 @@ end
     "Gated disk item"
     @queued @cached gated_disk(x::Int; dir::String) = begin
         n = computed!(:gated_disk)
+        lock(() -> DISK_TASKS[n] = current_task(), DISK_TASKS_LOCK)
         touch(joinpath(dir, "disk_started_$(x)_$n"))
         waitfile(joinpath(dir, "disk_go_$(x)_$n"))
         (pid=getpid(), n=n, value=base + x)

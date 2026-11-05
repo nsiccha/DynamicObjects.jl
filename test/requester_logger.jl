@@ -5,7 +5,7 @@ using TestItemRunner
 # computation run by an executor's worker, used to log to that task's logger instead of the
 # logger its caller had set (snag `log-lines-emitte-68e385aa`).
 @testmodule RequesterLoggerFixtures begin
-using DynamicObjects
+using DynamicObjects, Logging
 export RLJobs, RL_STARTED, RL_GATE, gate_reset!, settles, messages
 
 const RL_STARTED = Threads.Atomic{Int}(0)
@@ -13,7 +13,9 @@ const RL_GATE = Ref(Base.Event())
 
 gate_reset!() = (RL_STARTED[] = 0; RL_GATE[] = Base.Event())
 settles(f, seconds=10.0) = timedwait(f, seconds; pollint=0.01) === :ok
-messages(logger) = [string(r.message) for r in logger.logs]
+# These fixtures emit Info records. Dependency deprecation warnings are unrelated
+# to which requester receives those records (and vary across Julia releases).
+messages(logger) = [string(r.message) for r in logger.logs if r.level == Logging.Info]
 
 @dynamicstruct struct RLJobs
     # Holds the queue's only slot until the test opens the gate.
