@@ -21,7 +21,9 @@ next_read(seconds=10) = timedwait(() -> isready(READS), seconds) === :ok ? take!
 # waiters, `fetch`es of a `Pending`), so a test invalidates only once they wait there.
 waiting(c, key) = lock(c.lock) do
     cnd = get(c.computing, key, nothing)
-    cnd === nothing ? 0 : length(cnd.waitq)
+    # Julia 1.14 wait entries can belong to multiple queues; the queue reference
+    # carries the condition identity needed to traverse the right links.
+    cnd === nothing ? 0 : length(isdefined(Base, :waitqueue) ? Base.waitqueue(cnd) : cnd.waitq)
 end
 
 gated_read(path) = begin
