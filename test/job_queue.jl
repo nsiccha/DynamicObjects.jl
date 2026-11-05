@@ -215,10 +215,12 @@ try
     counts_reset!()
     w = Jobs()
     stuck = [Threads.@spawn w.polled_batch(b, 3cap; release=false) for b in 30:29+cap]
+    # Start observing the deadlock only once a child is waiting: submitting it can
+    # take longer than the observation window on a cold CI runner.
+    @test settles(() -> DynamicObjects.queue_settings().queued > 0, 60.0)
     @test !settles(() -> all(istaskdone, stuck), 2.0)
     @test done() == 0
     @test DynamicObjects.queue_settings().running == cap
-    @test DynamicObjects.queue_settings().queued > 0
     # Switching the queue off starts everything waiting, which ends it.
     queue_off!()
     @test settles(() -> all(istaskdone, stuck), 60.0)
