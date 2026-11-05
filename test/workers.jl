@@ -134,6 +134,79 @@ with_worker() do
 end
 end
 
+@testitem "workers: roots that share __hash__ keep their own construction inputs" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects
+using WorkerToy: HashCompiled, HashToy
+const DO = DynamicObjects
+with_worker() do
+    root = mktempdir()
+    # Request context is not identity: these fresh roots share `__hash__`, so the worker
+    # used to compute both on the root it built first (snag `fresh-root-worke-beeaa921`).
+    a, b = Toy(2, root; __prefix__="/a"), Toy(2, root; __prefix__="/b")
+    @test a.__hash__ == b.__hash__
+    @test a.prefixed(1) == (pid=worker_pid(), value="/a1")
+    @test b.prefixed(1) == (pid=worker_pid(), value="/b1")
+    # A content-equal root with the same context finds the worker's warm root; a root
+    # with other context computes on its own, as a fresh root does in this process.
+    first = a.square(5)
+    @test first.pid == worker_pid()
+    @test Toy(2, root; __prefix__="/a").square(5) == first
+    @test b.square(5).n == first.n + 1
+    # A DO object a worker computation returns is this process's object at that address.
+    kid = Threads.@spawn b.kid(3)
+    settles(() -> istaskdone(kid), 30.0) || error("worker child result did not settle")
+    @test fetch(kid) === b.child(3)
+
+    # Cache placement is not identity either: each root publishes under its own base.
+    dir_a, dir_b = mktempdir(), mktempdir()
+    c1, c2 = Toy(3, root; __cache_base__=dir_a), Toy(3, root; __cache_base__=dir_b)
+    @test c1.__hash__ == c2.__hash__
+    @test c1.cube(2).value == c2.cube(2).value == 24
+    @test startswith(DO.get_cache_path(c2, :cube, 2), dir_b)
+    @test isfile(DO.get_cache_path(c1, :cube, 2)) && isfile(DO.get_cache_path(c2, :cube, 2))
+
+    # A declared identity may leave out a fixed field, here the one that places the cache.
+    compiled = HashCompiled("model", Dict("k" => 1))
+    h1, h2 = HashToy(compiled, dir_a), HashToy(compiled, dir_b)
+    @test h1.__hash__ == h2.__hash__
+    @test h1.saved(2).value == h2.saved(2).value == 3
+    @test isfile(DO.get_cache_path(h1, :saved, 2)) && isfile(DO.get_cache_path(h2, :saved, 2))
+end
+end
+
+@testitem "workers: the worker keeps a bounded number of request-context objects" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects
+const DO = DynamicObjects
+with_worker() do
+    root, dir = mktempdir(), mktempdir()
+    plain = Toy(2, root)
+    warm = plain.square(3)
+    conn = DO.job_queue().conn
+    kept() = DO._remote_fetch(conn, conn.worker, DO._worker_kept_objects)
+
+    # A computation in flight keeps its context-bearing root, however many others pass.
+    held = Threads.@spawn Toy(2, root; __prefix__="/held").gated(1; dir)
+    @test waitfor(joinpath(dir, "started_1_1"))
+    for i in 1:(DO._WORKER_KEEP + 6)
+        o = isodd(i) ? Toy(2, root; __prefix__="/p$i") : remount(plain; __prefix__="/p$i")
+        @test o.prefixed(i).value == "/p$i$i"
+    end
+    @test kept().context == DO._WORKER_KEEP
+    joined = Threads.@spawn Toy(2, root; __prefix__="/held").gated(1; dir)
+    @test settles(() -> DO.worker_status().in_flight == 2)
+    touch(joinpath(dir, "go_1"))
+    @test fetch(joined) == fetch(held)
+    @test !isfile(joinpath(dir, "started_1_2"))
+
+    # An evicted context computes again on a root built anew; a root built from its
+    # identity alone is never evicted, so its memo stays warm.
+    @test Toy(2, root; __prefix__="/p1").prefixed(1).value == "/p11"
+    @test Toy(2, root).square(3) == warm
+    @test kept().context <= DO._WORKER_KEEP
+    @test kept().pinned == 0
+end
+end
+
 @testitem "workers: same-key callers share one worker computation" setup=[WorkerFixtures] tags=[:core, :workers] begin
 using DynamicObjects
 with_worker() do

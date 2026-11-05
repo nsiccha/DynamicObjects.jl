@@ -8,8 +8,9 @@
 # What travels is an address, never an object: the root's type, fixed fields and construction
 # inputs, the `(property, key)` steps from the root to the computing object, and a `remount`
 # view's context. The worker builds the same root (same package, same environment), keeps it
-# by `__hash__`, walks the same memoized steps, and computes the property through its own
-# ordinary memoized path. The result comes back through the cache's own guarded path
+# by what it was built from (`_root_digest`: `__hash__`, plus the construction inputs that
+# identity leaves out), walks the same memoized steps, and computes the property through its
+# own ordinary memoized path. The result comes back through the cache's own guarded path
 # (`run!(produce, d)`), so the in-flight fence, `property_settled`, waiters and
 # `Pending.resolve` behave as for a local computation. A disk-tier value (`@cached`, `@mmap`)
 # is published by the worker under the same `base/<__hash__>/…` path and loaded here; a
@@ -47,8 +48,17 @@ struct _RootAddress
     type::Type
     fixed::Tuple
     seed::NamedTuple
-    digest::Any        # the root's `__hash__`: the worker keeps roots by it
+    digest::Any        # what the worker keeps the root by: `__hash__`, or a `_ContextDigest`
 end
+
+# The digest of a root built from inputs its `__hash__` leaves out: the identity plus a
+# canonical hash of those inputs (`_root_digest`).
+struct _ContextDigest
+    identity::Any
+    context::String
+end
+Base.:(==)(a::_ContextDigest, b::_ContextDigest) = isequal(a.identity, b.identity) && a.context == b.context
+Base.hash(d::_ContextDigest, h::UInt) = hash(d.context, hash(d.identity, hash(:_ContextDigest, h)))
 struct _ChildAddress
     parent::Any        # an address
     name::Symbol
@@ -95,10 +105,45 @@ function _root_address(o)
             "the root object's type), or run with `DynamicObjects.configure_queue!(; workers=0)`."))
     end
     fixed = Tuple(_wire(getfield(o, n)) for n in fieldnames(T)[1:end-1])
-    _RootAddress(T, fixed, _wire(_without_local(_construction_seed(o))), o.__hash__)
+    seed = _wire(_without_local(_construction_seed(o)))
+    _RootAddress(T, fixed, seed, _root_digest(o, fixed, seed))
 end
 
 _without_local(seed::NamedTuple) = Base.structdiff(seed, NamedTuple{_LOCAL_SEED_NAMES})
+
+# What the worker keeps a root by. `__hash__` is the root's disk identity, and it leaves out
+# construction inputs on purpose: request context (`__prefix__`, a page parameter), the cache
+# placement (`__cache_base__`, `__strict__`), `@state` and `@versioned` overrides, a fixed
+# field a declared `__hash_fields__`/`__hash__` omits, and a nested object's own such inputs.
+# Those inputs still travel and still decide what the worker computes, so two roots that
+# share `__hash__` but not them must not share one worker root: the second used to compute
+# with the first one's inputs (snag `fresh-root-worke-beeaa921`). A root built from nothing
+# beyond its identity keeps `__hash__`, so the worker keeps it as before.
+function _root_digest(o, fixed::Tuple, seed::NamedTuple)
+    T = typeof(o)
+    declared = _declares_identity(T)
+    extra = declared ? seed : Base.structdiff(seed, NamedTuple{_identity_input_names(T)})
+    haskey(extra, :__parent__) && extra.__parent__ === nothing &&
+        (extra = Base.structdiff(extra, NamedTuple{(:__parent__,)}))
+    nested = _contextual_keys!(Any[], declared ? () : (fixed, seed))
+    !declared && isempty(extra) && isempty(nested) && return o.__hash__
+    uncovered = declared ? (fixed, extra) : (extra, nested)
+    _ContextDigest(o.__hash__, canonical_hash(_address_key(uncovered)))
+end
+
+# Whether `T` declares its identity (`__hash_fields__` or `__hash__`), which may leave out
+# fixed fields.
+_declares_identity(T::Type) = any(p -> first(p) === :__hash_fields__ || first(p) === :__hash__, meta(T))
+
+# Whether the worker keeps the object an address names apart from its disk identity.
+_contextual(a::_RootAddress) = a.digest isa _ContextDigest
+_contextual(a::_ChildAddress) = _contextual(a.parent) || !isempty(_contextual_keys!(Any[], (a.args, a.kwargs)))
+_contextual(::_ViewAddress) = true
+
+# The keys of the context-bearing addresses inside a wired value.
+_contextual_keys!(out, x) = out
+_contextual_keys!(out, a::_Address) = (_contextual(a) && push!(out, _address_key(a)); out)
+_contextual_keys!(out, t::Union{Tuple,NamedTuple}) = (foreach(x -> _contextual_keys!(out, x), t); out)
 
 # The `(name, indexed, args, kwargs)` step under which `parent` holds `o`, or `nothing`.
 function _child_step(parent, o)
@@ -151,10 +196,88 @@ end
 # `build()`, kept in `objects` under `key` (the first one built wins a race).
 _kept!(build, ::Nothing, key) = build()
 function _kept!(build, objects, key)
-    o = lock(() -> get(objects.dict, key, nothing), objects.lock)
+    o = lock(objects.lock) do
+        v = get(objects.dict, key, nothing)
+        v === nothing || _touch!(objects, key)
+        v
+    end
     o === nothing || return o
     o = build()
-    lock(() -> get!(objects.dict, key, o), objects.lock)
+    lock(objects.lock) do
+        v = get!(objects.dict, key, o)
+        _touch!(objects, key)
+        _evict!(objects)
+        v
+    end
+end
+
+# The worker keeps an object built from its identity alone (a root whose digest is its
+# `__hash__`) for good, so its memo stays warm across computations. An object that carries
+# request context — a root whose digest is a `_ContextDigest`, a `remount` view — is as many
+# objects as there are distinct contexts, so the worker keeps only the `_WORKER_KEEP` used
+# most recently, plus every one a computation in flight resolves through. An evicted object
+# takes the views built on it along; the next computation that names it builds it again.
+const _WORKER_KEEP = 64
+
+mutable struct _Recency
+    tick::UInt
+    used::Dict{Any,UInt}    # context-bearing key => its last use
+    pins::Dict{Any,Int}     # key => the computations in flight that resolve through it
+end
+_Recency() = _Recency(0, Dict{Any,UInt}(), Dict{Any,Int}())
+
+# Keys of `objects.dict`: a root's `(type, digest)`, or a view's `(base key, context key)`.
+_evictable(key::Tuple) = key[1] isa Type ? key[2] isa _ContextDigest : true
+# Whether the object kept under `key` is built on the one kept under `base`.
+_rests_on(key, base) = isequal(key, base) ||
+    (key isa Tuple && !isempty(key) && !(key[1] isa Type) && _rests_on(key[1], base))
+
+# Under `objects.lock`. The requester's `objects` (`_requester_objects`) evicts nothing.
+_touch!(objects, key) = hasproperty(objects, :recent) && _evictable(key) &&
+    (r = objects.recent; r.used[key] = (r.tick += 1))
+function _evict!(objects)
+    hasproperty(objects, :recent) || return
+    r = objects.recent
+    while length(r.used) > _WORKER_KEEP
+        victim, oldest = nothing, typemax(UInt)
+        for (key, tick) in r.used
+            get(r.pins, key, 0) == 0 && tick < oldest && ((victim, oldest) = (key, tick))
+        end
+        victim === nothing && return
+        for key in collect(keys(objects.dict))
+            _rests_on(key, victim) || continue
+            delete!(objects.dict, key)
+            delete!(r.used, key)
+        end
+    end
+end
+
+# The keys of `objects.dict` that resolving address `a` goes through.
+_kept_keys(a::_RootAddress) = Any[(a.type, a.digest)]
+_kept_keys(a::_ChildAddress) = _kept_keys(a.parent)
+_kept_keys(a::_ViewAddress) = push!(_kept_keys(a.base), (_address_key(a.base), _address_key(a.context)))
+
+# Keep `keys` from eviction while a computation resolves through them (`delta = 1`), and
+# release them when it ends (`delta = -1`).
+function _pin!(objects, keys, delta::Int)
+    lock(objects.lock) do
+        r = objects.recent
+        for key in keys
+            n = get(r.pins, key, 0) + delta
+            n > 0 ? (r.pins[key] = n) : delete!(r.pins, key)
+        end
+        delta < 0 && _evict!(objects)
+    end
+    nothing
+end
+
+# What the worker keeps, for tests and diagnosis: objects kept for good, and the
+# context-bearing ones it keeps at most `_WORKER_KEEP` of beyond those in flight.
+function _worker_kept_objects()
+    lock(_W_OBJECTS.lock) do
+        context = length(_W_OBJECTS.recent.used)
+        (; identity=length(_W_OBJECTS.dict) - context, context, pinned=length(_W_OBJECTS.recent.pins))
+    end
 end
 
 # The object an address names if the worker already holds it, else `nothing`: an
@@ -363,7 +486,7 @@ end
 const _IS_WORKER = Threads.Atomic{Bool}(false)
 const _W_CONTROL = Channel{Any}(Inf)
 const _W_EVENTS = Channel{Any}(Inf)
-const _W_OBJECTS = (; lock=ReentrantLock(), dict=Dict{Any,Any}())
+const _W_OBJECTS = (; lock=ReentrantLock(), dict=Dict{Any,Any}(), recent=_Recency())
 const _W_NODES = Dict{Int,Any}()          # request id => (progress node, mirror or nothing)
 const _W_NODES_LOCK = ReentrantLock()
 
@@ -424,6 +547,8 @@ end
 function _worker_control(::Val{:submit}, id::Int, address, name::Symbol, args, kwargs, is_fresh::Bool,
                          min_level::Int32, mirrored::Bool, scopes)
     logger = _ForwardLogger(id, Base.CoreLogging.LogLevel(min_level))
+    pinned = _kept_keys(address)
+    _pin!(_W_OBJECTS, pinned, 1)
     started = try
         _with_worker_scopes(scopes) do
             ScopedValues.with_logger(logger) do
@@ -448,13 +573,14 @@ function _worker_control(::Val{:submit}, id::Int, address, name::Symbol, args, k
             end
         end
     catch err
+        _pin!(_W_OBJECTS, pinned, -1)
         _push_event!(id, :failed, _failure_text(err, catch_backtrace()))
         return
     end
     o, handle, node, mirror = started
     node === nothing || lock(() -> _W_NODES[id] = (node, mirror), _W_NODES_LOCK)
     errormonitor(Threads.@spawn Base.invokelatest(_worker_finish, id, o, name, args, kwargs, is_fresh,
-                                                  handle, mirror))
+                                                  handle, mirror, pinned))
     nothing
 end
 
@@ -483,7 +609,7 @@ function _mirror(id::Int, node::Treebars.ProgressNode)
     end
 end
 
-function _worker_finish(id, o, name, args, kwargs, is_fresh, handle, mirror)
+function _worker_finish(id, o, name, args, kwargs, is_fresh, handle, mirror, pinned)
     try
         succeeded = false
         value = try
@@ -502,6 +628,7 @@ function _worker_finish(id, o, name, args, kwargs, is_fresh, handle, mirror)
         _push_event!(id, :failed, _failure_text(err, catch_backtrace()))
     finally
         lock(() -> delete!(_W_NODES, id), _W_NODES_LOCK)
+        _pin!(_W_OBJECTS, pinned, -1)
     end
 end
 
@@ -874,7 +1001,7 @@ end
 # process already holds (`root.child(k)` is the memoized child of this root).
 function _requester_objects(o)
     root = _retained_object(_root_of(o))
-    (; lock=ReentrantLock(), dict=Dict{Any,Any}((typeof(root), root.__hash__) => root))
+    (; lock=ReentrantLock(), dict=Dict{Any,Any}((typeof(root), _root_address(root).digest) => root))
 end
 
 _throw_remote(o, name, args, kwargs, pid, text::AbstractString) =
