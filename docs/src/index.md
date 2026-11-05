@@ -756,9 +756,24 @@ package: a type defined in `Main` is refused with an `ArgumentError`.
 What goes to the worker is how to reach the object, not the object: its root's
 type, fixed fields and construction inputs, the memoized steps from the root
 to an inline child, and a `remount` view's context. The worker builds the same
-root, keeps it by `__hash__`, and computes the property through its own
-memoized path, so its intermediate values stay warm from one computation to
-the next. A `@cached` or `@mmap` value comes back through its disk entry,
+root and computes the property through its own memoized path, so its
+intermediate values stay warm from one computation to the next.
+
+The worker keeps a root by its `__hash__` plus every construction input that
+`__hash__` leaves out: request context such as `__prefix__` or a page
+parameter, `__cache_base__`, `__strict__`, `@state` and `@versioned`
+overrides, and a fixed field that a declared `__hash_fields__` or `__hash__`
+omits. Two fresh request roots with different context therefore compute on
+roots of their own, each with its own context, as they would in this process,
+while a content-equal root with the same inputs finds the warm one. A root
+built from its identity alone is kept for the worker's life. Of the roots
+built with such inputs, and of `remount` views, the worker keeps the 64 used
+most recently plus every one a computation in flight resolves through; an
+evicted one is built again by the next computation that names it. Before
+0.5.10 the worker kept roots by `__hash__` alone, so a second root that
+differed only in such inputs computed on the first one.
+
+A `@cached` or `@mmap` value comes back through its disk entry,
 which this process loads; any other value is serialized. In this process the
 value is stored exactly as a local computation's: same-key callers share one
 worker computation, `property_settled` runs once, and an invalidation during

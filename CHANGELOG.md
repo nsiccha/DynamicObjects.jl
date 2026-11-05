@@ -14,6 +14,28 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.10
+
+- A worker process keeps each root by what it was built from, not by its
+  `__hash__` alone. Roots that share `__hash__` but differ in a construction
+  input identity leaves out get separate worker roots, and each computes with
+  its own inputs, as it would in-process. Such inputs include request context
+  (`__prefix__`, a page parameter), `__cache_base__`, `__strict__`, `@state`
+  and `@versioned` overrides, and a fixed field that a declared
+  `__hash_fields__`/`__hash__` omits. Before, a second fresh request root
+  computed with the first one's context. A second root with another
+  `__cache_base__` failed with `the two processes do not agree on the cache
+  location`. A root built from its identity alone is kept as before, and a
+  content-equal root still finds its warm memo.
+- The worker keeps at most 64 request-context objects (roots built with such
+  inputs, and `remount` views), the most recently used, plus every one a
+  computation in flight resolves through. An evicted one is built again by the
+  next computation that names it. Before, it kept one object per distinct
+  context for its whole life. Roots built from their identity alone are never
+  evicted.
+- Consumers that send fresh request roots to a worker must set
+  `DynamicObjects = "0.5.10"` as their compatibility floor.
+
 ## 0.5.9
 
 - `DynamicObjects.canonical_hash` now sorts built-in `Dict` entries and `Set`

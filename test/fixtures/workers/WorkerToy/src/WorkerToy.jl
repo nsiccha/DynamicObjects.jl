@@ -174,4 +174,15 @@ end
     @queued @cached saved(k::Int) = (pid=getpid(), revision=revision, value=k + length(data))
 end
 
+# A declared identity that leaves out the version and the cache root: every revision and
+# root shares `__hash__`, yet each must compute on a worker root of its own.
+@dynamicstruct struct HashVersionedOwn
+    data
+    root::String
+    @versioned revision::String
+    __cache_base__ = root
+    __hash_fields__ = (data,)
+    @queued @cached saved(k::Int) = (pid=getpid(), revision=revision, value=k + length(data))
+end
+
 end
