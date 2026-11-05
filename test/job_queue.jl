@@ -124,7 +124,7 @@ try
     @test all(==(:default), last.(results))
     @test done() == 3cap
     @test peak() == cap
-    @test DynamicObjects.queue_settings() == (; max_running=cap, queued=0, running=0)
+    @test DynamicObjects.queue_settings() == (; max_running=cap, queued=0, running=0, workers=0)
 
     # The same calls from `Threads.@threads` iterations.
     counts_reset!()
@@ -324,9 +324,9 @@ try
     w = Jobs()
     calls = [Threads.@spawn w.item(-2, i) for i in 1:4]
     @test settles(() -> DynamicObjects.queue_settings() ==
-                        (; max_running=1, queued=3, running=1), 10.0)
+                        (; max_running=1, queued=3, running=1, workers=0), 10.0)
     @test DynamicObjects.configure_queue!(; max_running=3) ==
-          (; max_running=3, queued=1, running=3)
+          (; max_running=3, queued=1, running=3, workers=0)
     @test settles(() -> running() == 3, 10.0)
     @test DynamicObjects.configure_queue!(; max_running=0).queued == 0
     @test settles(() -> running() == 4, 10.0)
@@ -416,7 +416,7 @@ dropped = enqueue!(q, QueuedCall(CallWork(60, 4)))
 @test_throws ComputeAbandoned fetch(dropped.work)
 release!(-5)
 @test fetch(gated) == 3
-@test DynamicObjects.queue_settings(q) == (; max_running=1, queued=0, running=0)
+@test DynamicObjects.queue_settings(q) == (; max_running=1, queued=0, running=0, workers=0)
 # A queued call that blocks on another one in the same queue gives its slot back.
 inner = QueuedCall(CallWork(60, 5))
 outer = QueuedCall(() -> fetch(enqueue!(q, inner).work) + 1)
@@ -460,7 +460,7 @@ try
     fetch.([Threads.@spawn fresh(w.item, 81, 1) for _ in 1:3cap])
     @test done() == 3cap
     @test peak() == cap
-    @test DynamicObjects.queue_settings() == (; max_running=cap, queued=0, running=0)
+    @test DynamicObjects.queue_settings() == (; max_running=cap, queued=0, running=0, workers=0)
 
     # A progress-threaded caller shows its waiting fresh call as queued.
     DynamicObjects.configure_queue!(; max_running=1)

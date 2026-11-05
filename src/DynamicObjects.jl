@@ -49,11 +49,12 @@ optionally disk-cached properties.
 module DynamicObjects
 export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, invalidate!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, remount, file_version, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, mem_cache_entries, prune_mem_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending, Deferred, DeferredCompute, ComputeAbandoned, BackgroundCache
 
-import SHA, Serialization, Mmap, Treebars, ScopedValues
+import SHA, Serialization, Mmap, Treebars, ScopedValues, Malt
 
-# `[compat] Treebars = "0.1.1"` states the floor for the three Treebars features checked below:
+# Treebars 0.1.1 is the floor for the three Treebars features checked below:
 # 0.1.1 (`14068fa`) is the first Treebars version number that carries all of them, so Pkg
-# refuses an older Treebars when it resolves. The commits that brought them still say 0.1.0.
+# refuses an older Treebars when it resolves. The worker mirror raises our compat floor to
+# 0.1.6. The commits that brought these earlier features still say 0.1.0.
 # The checks stay for an environment that loads DO without resolving against that floor, such
 # as a Manifest resolved before it and loaded as it is.
 #
@@ -1111,7 +1112,7 @@ no store).
 """
 fresh(ip::IndexableProperty{name}, args...; kwargs...) where {name} =
     _fresh_through(property_executor(ip.o, Val(name)),
-                   () -> _computeproperty(ip.o, name, args...; kwargs...))
+                   _FreshCompute(ip.o, name, args, (; kwargs...), nothing))
 """
     AbstractThreadsafeDict{K,V}
 
@@ -1637,13 +1638,18 @@ _resolver(f, c, key, fetch, substatus, retry_failed) =
     ComputeAbandoned(reason)
 
 Recorded as a key's failure when an executor [`abandon!`](@ref)s a queued compute instead of
-running it. Waiters and pollers see it like any other failure; with the default
-`retry_failed=true` the next access starts a fresh compute.
+running it, or when the worker process running it (see
+[`configure_queue!`](@ref DynamicObjects.configure_queue!)) exited or was restarted
+(`started` is then `true`). Waiters and pollers see it like any other failure; with the
+default `retry_failed=true` the next access starts a fresh compute.
 """
 struct ComputeAbandoned <: Exception
     reason::String
+    started::Bool
 end
-Base.showerror(io::IO, e::ComputeAbandoned) =
+ComputeAbandoned(reason::AbstractString) = ComputeAbandoned(String(reason), false)
+Base.showerror(io::IO, e::ComputeAbandoned) = e.started ?
+    print(io, "ComputeAbandoned: the compute was abandoned while it ran: ", e.reason) :
     print(io, "ComputeAbandoned: the queued compute was abandoned before it started: ", e.reason)
 
 # Deferred work runs as its requester — whoever created the `DeferredCompute` or `QueuedCall`
@@ -1929,6 +1935,11 @@ _settled!(f, value) = nothing
 _settled!(s::_Settling, value) = _property_settled!(s.o, s.name, value, s.args, s.kwargs)
 _failed!(f) = nothing
 _failed!(s::_Settling) = _settled_local!(s, s.local_value)
+# A producer that mirrors another process's node owns its terminal progress state.
+_finish_compute_status!(f, status) = _finalize_substatus!(status)
+_fail_compute_status!(f, status, err) = _fail_substatus!(status, err)
+_finish_compute_status!(s::_Settling, status) = _finish_compute_status!(s.f, status)
+_fail_compute_status!(s::_Settling, status, err) = _fail_compute_status!(s.f, status, err)
 _settled_local!(s::_Settling, ::Nothing) = nothing
 function _settled_local!(s::_Settling, local_value::Base.RefValue{Any})
     value = local_value[]
@@ -2482,7 +2493,7 @@ function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condit
     catch e
         # Fail the node before waking waiters: a waiter that shows it under its own
         # node (`_linked`) keeps it there exactly when it reads as failed.
-        !isnothing(s) && _fail_substatus!(s, e)
+        !isnothing(s) && _fail_compute_status!(f, s, e)
         lock(c.lock) do
             if get(c.computing, key, nothing) === cnd
                 delete!(c.computing, key)
@@ -2493,6 +2504,9 @@ function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condit
         _failed!(f)
         rethrow()
     end
+    # The node must be terminal before releasing waiters: a remote waiter can close
+    # its progress mirror as soon as fetch returns.
+    !isnothing(s) && _finish_compute_status!(f, s)
     stored, published = lock(c.lock) do
         if get(c.computing, key, nothing) !== cnd
             notify(cnd)                # retracted mid-flight (its waiters already woke then)
@@ -2511,7 +2525,6 @@ function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condit
         notify(cnd)                    # leave c.status[key] finalized — getstatus / the "(cached)" note rely on it
         (existing, published)
     end
-    !isnothing(s) && _finalize_substatus!(s)
     published && _settled!(f, stored)
     stored
 end
@@ -2704,6 +2717,33 @@ mutable struct QueuedItem
     note::Int   # the position its progress node shows ("queued · #k"); 0 for none
 end
 
+# The connection of a queue to its worker process (see `workers.jl`).
+mutable struct _RemoteRequest
+    const id::Int
+    const events::Channel{Any}
+    worker::Any       # the worker it was sent to; only that worker's exit abandons it
+end
+
+"""
+Connection to one worker process: its Malt handle (`worker`), the actor task that makes
+every Malt call, and the requests in flight.
+"""
+mutable struct _WorkerConn
+    const lock::ReentrantLock
+    const ops::Channel{Any}
+    actor::Union{Nothing,Task}
+    worker::Any                 # a `Malt.Worker`, `nothing` while none runs
+    spawning::Union{Nothing,Task}
+    pid::Int
+    started_at::Float64
+    last_message_at::Float64
+    next_id::Int
+    const inflight::Dict{Int,_RemoteRequest}
+    const loaded::Set{Base.PkgId}
+end
+_WorkerConn() = _WorkerConn(ReentrantLock(), Channel{Any}(Inf), nothing, nothing, nothing, 0, NaN, NaN, 0,
+                            Dict{Int,_RemoteRequest}(), Set{Base.PkgId}())
+
 """
     DynamicObjects.JobQueue(; max_running=0)
 
@@ -2720,10 +2760,14 @@ mutable struct JobQueue
     const observers::Vector{Any}
     max_running::Int
     running::Int    # slots held
+    workers::Int    # 0: admitted items run here; 1: in the worker process
+    worker_start::Symbol
+    worker_exeflags::Union{Nothing,Vector{String}}
+    const conn::_WorkerConn
 end
 function JobQueue(; max_running::Integer=0)
     _check_max_running(max_running)
-    JobQueue(ReentrantLock(), QueuedItem[], Any[], Int(max_running), 0)
+    JobQueue(ReentrantLock(), QueuedItem[], Any[], Int(max_running), 0, 0, :lazy, nothing, _WorkerConn())
 end
 
 _check_max_running(n) =
@@ -2750,7 +2794,8 @@ The process-wide queue that `@queued` properties admit their computations throug
 job_queue() = _JOB_QUEUE
 
 """
-    DynamicObjects.configure_queue!(q=job_queue(); max_running=nothing) -> NamedTuple
+    DynamicObjects.configure_queue!(q=job_queue(); max_running=nothing, workers=nothing,
+                                    worker_start=nothing, worker_exeflags=nothing) -> NamedTuple
 
 Bound how many queued computations run at once. Off by default (`max_running=0`): a
 `@queued` computation starts on `:default` at once. With `max_running=n` at most `n` run at a
@@ -2759,10 +2804,43 @@ time and the rest wait in FIFO order, their progress node pending (`·`, no cloc
 as earlier ones finish or give their slot back. Raising the cap starts more of what waits;
 `max_running=0` starts everything still waiting. Running computations are never interrupted.
 
+With `workers=1` every computation the queue admits — each memoized or fresh computation of
+a `@queued` property — runs in a separate, long-lived Julia worker process instead of on a
+`:default` task of this one, so a compile, a GC pause or a deadlock there never stalls this
+process. Slots, FIFO order and the "queued · #k" note are unchanged; an admitted computation
+holds its slot while the worker runs it. The worker builds the same object from the same
+inputs (the root object's type must be defined in a package, which the worker loads), computes
+the property through its own memoized path, and hands the value back: a `@cached` / `@mmap`
+value through its disk entry, which this process then loads; any other value serialized. The
+worker's memo stays warm across computations. A computation whose body reads the request
+(`__req__`) stays in this process, with one warning per property. A worker's exception arrives
+as a [`PropertyComputationError`](@ref) caused by a
+[`RemoteComputationError`](@ref DynamicObjects.RemoteComputationError); a worker that exits
+fails every computation it ran with [`ComputeAbandoned`](@ref), and the next one starts a fresh
+worker. `workers=0` (the default) runs everything here; switching to it stops the worker.
+
+The worker runs this process's Julia with its code-generation flags, active project,
+`LOAD_PATH` and `DEPOT_PATH`, and by default `--threads=<this process's default threads>,1`,
+so its message loop keeps answering on the interactive thread while computations run on the
+default ones; `worker_exeflags` replaces that thread flag (pass e.g. `["--threads=8,1"]`).
+`worker_start=:lazy` (the default) starts it with the first computation sent to it,
+`worker_start=:now` at once, in the background (loading a large application takes a while).
+See [`worker_status`](@ref DynamicObjects.worker_status) and
+[`restart_worker!`](@ref DynamicObjects.restart_worker!).
+
 Returns [`queue_settings(q)`](@ref DynamicObjects.queue_settings); an omitted setting is
 unchanged.
 """
-function configure_queue!(q::JobQueue=job_queue(); max_running=nothing)
+function configure_queue!(q::JobQueue=job_queue(); max_running=nothing, workers=nothing,
+                          worker_start=nothing, worker_exeflags=nothing)
+    if workers !== nothing
+        workers in (0, 1) || throw(ArgumentError(
+            "workers must be 0 or 1 (one worker process per queue), got $(workers)"))
+        _IS_WORKER[] && workers > 0 && (workers = 0)   # a worker never spawns its own
+    end
+    worker_start === nothing || worker_start in (:lazy, :now) || throw(ArgumentError(
+        "worker_start must be :lazy or :now, got $(repr(worker_start))"))
+    worker_exeflags === nothing || (worker_exeflags = String[string(f) for f in worker_exeflags])
     if max_running !== nothing
         _check_max_running(max_running)
         admitted = lock(q.lock) do
@@ -2771,16 +2849,25 @@ function configure_queue!(q::JobQueue=job_queue(); max_running=nothing)
         end
         foreach(_start_admitted, admitted)
     end
+    worker_start === nothing || (q.worker_start = worker_start)
+    worker_exeflags === nothing || (q.worker_exeflags = worker_exeflags)
+    if workers !== nothing
+        q.workers = Int(workers)
+        q.workers > 0 && (_WORKERS_ACTIVE[] = true)
+        q.workers == 0 && _stop_worker!(q)
+    end
+    q.workers > 0 && q.worker_start === :now && !_worker_alive(q.conn.worker) && _start_worker_soon!(q)
     queue_settings(q)
 end
 
 """
-    DynamicObjects.queue_settings(q=job_queue()) -> (; max_running, queued, running)
+    DynamicObjects.queue_settings(q=job_queue()) -> (; max_running, queued, running, workers)
 
-`q`'s cap, the number of items waiting, and the number of slots held.
+`q`'s cap, the number of items waiting, the number of slots held, and the number of worker
+processes configured (see [`configure_queue!`](@ref DynamicObjects.configure_queue!)).
 """
 queue_settings(q::JobQueue=job_queue()) = lock(q.lock) do
-    (; max_running=q.max_running, queued=length(q.waiting), running=q.running)
+    (; max_running=q.max_running, queued=length(q.waiting), running=q.running, workers=q.workers)
 end
 
 """
@@ -2971,7 +3058,7 @@ function Base.fetch(c::QueuedCall)
 end
 
 # An admitted item and the slot it holds (`nothing` while its queue is off).
-const _Admitted = Tuple{QueuedItem,Union{Nothing,_QueueSlot}}
+const _Admitted = Tuple{QueuedItem,Union{Nothing,_QueueSlot},JobQueue}
 
 # Admit waiting items, oldest first, while slots are free — every one while the queue is
 # off. The caller holds `q.lock` and starts what this returns once it has let go of it.
@@ -2981,7 +3068,7 @@ function _admit!(q::JobQueue)
         item = popfirst!(q.waiting)
         slot = q.max_running == 0 ? nothing : _QueueSlot(q, true)
         slot === nothing || (q.running += 1)
-        push!(admitted, (item, slot))
+        push!(admitted, (item, slot, q))
     end
     _note_positions!(q, map(first, admitted))
     admitted
@@ -3017,14 +3104,14 @@ _fresh_through(e::QueueExecutor, compute, status=nothing) =
     fetch(enqueue!(e.queue, QueuedCall(compute; status); e.property, e.tag).work)
 
 # Literal pool symbol: `@spawn` accepts a computed pool only on newer Julia.
-_start_admitted((item, slot)::_Admitted) =
-    errormonitor(Threads.@spawn :default _run_admitted(item, slot))
+_start_admitted((item, slot, q)::_Admitted) =
+    errormonitor(Threads.@spawn :default _run_admitted(q, item, slot))
 
 # Run an admitted item as `slot`'s holder — whatever scope its admitting task had — then
 # give the slot back unless a wait already did.
-function _run_admitted(item::QueuedItem, slot::Union{Nothing,_QueueSlot})
+function _run_admitted(q::JobQueue, item::QueuedItem, slot::Union{Nothing,_QueueSlot})
     try
-        ScopedValues.with(() -> run!(item.work), _QUEUE_HOLDER => slot)
+        ScopedValues.with(() -> _run_item(q, item), _QUEUE_HOLDER => slot)
     finally
         _release_slot!(slot)
     end
@@ -3118,6 +3205,7 @@ function invalidate!(ip::IndexableProperty, indices...; kwargs...)
     maybepop!(ip.cache, key)
     on_disk = _remove_disk_entry!(ip.o, name(ip), indices...; kwargs...)
     traced && _trace_invalidation!(:invalidate!, ip.o, held || on_disk ? (name(ip),) : (), _plain_key(key))
+    _forward_entry_invalidation(ip.o, name(ip), indices, (; kwargs...))
     nothing
 end
 
@@ -3946,6 +4034,7 @@ from inside a computation, prefer the narrower `sync!` after `notify_change!`,
 or `DynamicObjects.clear_cache!(obj, name)`.
 """
 function clear_mem_caches!(obj)
+    forward = _invalidation_address(obj)   # while `obj`'s parent still holds it
     pc = getfield(obj, :cache)
     c = pc.cache
     state = _state_names(typeof(obj))
@@ -3994,6 +4083,7 @@ function clear_mem_caches!(obj)
     _restore_seeds!(pc)
     isempty(dropped) || _object_cleared!(obj, unique!(dropped))
     held === nothing || _trace_invalidation!(:clear_mem_caches!, obj, _trace_cleared(held, c, state))
+    _forward_invalidation(forward, :clear_mem_caches!)
     nothing
 end
 
@@ -5471,13 +5561,13 @@ maybeprogress!(progress, ip::IndexableProperty{name}, indices...; kwargs...) whe
     # pending and started by `_fresh_through` when the computation runs, so a call
     # waiting for a job-queue slot does not render as running.
     s = _default_substatus(progress, o, name, indices...; __pending__=true, kwargs...)
+    compute = _FreshCompute(o, name, indices, (; kwargs...), s)
     try
-        rv = _fresh_through(property_executor(o, Val(name)),
-                            () -> _computeproperty(o, name, indices...; __status__=s, kwargs...), s)
-        _finalize_substatus!(s)
+        rv = _fresh_through(property_executor(o, Val(name)), compute, s)
+        _finish_compute_status!(compute, s)
         rv
     catch e
-        _fail_substatus!(s, e)
+        _fail_compute_status!(compute, s, e)
         rethrow()
     end
 end
@@ -5577,7 +5667,13 @@ With indices or kwargs it drops exactly that one entry, as
 [`invalidate!`](@ref) does, and returns `nothing`.
 """
 clear_cache!(o, name::Symbol; kwargs...) =
-    isempty(kwargs) ? _invalidate_property!(o, name) : _clear_cache_entry!(o, name; kwargs...)
+    isempty(kwargs) ? _clear_property!(o, name) : _clear_cache_entry!(o, name; kwargs...)
+function _clear_property!(o, name::Symbol)
+    forward = _invalidation_address(o)
+    names = _invalidate_property!(o, name)
+    _forward_invalidation(forward, :clear_cache!, name)
+    names
+end
 clear_cache!(o, name::Symbol, index, indices...; kwargs...) =
     _clear_cache_entry!(o, name, index, indices...; kwargs...)
 
@@ -5590,6 +5686,7 @@ function _clear_cache_entry!(o, name::Symbol, indices...; kwargs...)
     else
         on_disk = _remove_disk_entry!(o, name, indices...; kwargs...)
         _trace_invalidation!(:invalidate!, o, on_disk ? (name,) : (), (indices, (;kwargs...)))
+        _forward_entry_invalidation(o, name, indices, (; kwargs...))
     end
     nothing
 end
@@ -13354,9 +13451,12 @@ recomputes.
 """
 function sync!(o)
     (_TRACKED_IN_USE[] && _is_dynamic_object(o)) || return Symbol[]
-    lock(_SYNC_LOCK) do
+    forward = _invalidation_address(o)
+    dropped = lock(_SYNC_LOCK) do
         copy(first(_sync!(o, IdDict{Any,Any}())))
     end
+    isempty(dropped) || _forward_invalidation(forward, :sync!)
+    dropped
 end
 
 const _SYNC_BACKREFS = (:__parent__, :__self__)
@@ -14224,5 +14324,7 @@ export with_compute_trace, ComputeTrace, compute_trace_rows
 export execute_materialization, release_materialization!, materialization_ownership, materialization_gc!
 export TrackedFile, TrackedDirectory, tracked_version, tracked_path, tracked_paths,
     on_change!, notify_change!, sync!, object_version, dependents
+
+include("workers.jl")
 
 end

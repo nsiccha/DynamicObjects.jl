@@ -14,6 +14,52 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.7
+
+- `@queued` computations can run in a separate Julia worker process:
+  `DynamicObjects.configure_queue!(; workers=1)`. Every memoized or fresh
+  computation of a `@queued` property that the job queue admits then runs in one
+  long-lived worker instead of on a `:default` task of this process, so a
+  compile, a GC pause or a deadlock in heavy work no longer stalls the process
+  serving pages. `workers=0`, the default, keeps everything here as before.
+  Slots, FIFO order and the "queued · #k" note are unchanged.
+- What travels is an address: the root object's type, fixed fields and
+  construction inputs, the memoized steps to an inline child, and a `remount`
+  view's context. The worker builds the same object, keeps it by `__hash__` so
+  its memo stays warm, and computes through its own memoized path. A `@cached`
+  or `@mmap` value comes back through its disk entry, which this process loads;
+  any other value is serialized. A returned DO object travels by address and
+  resolves to the requester's existing object. The root object's type must be defined in a
+  package (the worker loads it); a type defined in `Main` is refused with an
+  `ArgumentError`. A body that reads `__req__` stays in this process, with one
+  warning per property.
+- The value lands in this process's cache as a local computation's does: the
+  in-flight fence holds (an invalidation during the worker's computation
+  publishes nothing, here or there), `property_settled` runs once, same-key
+  callers share one worker computation. `clear_cache!`, `invalidate!`,
+  `clear_mem_caches!` and `sync!` are forwarded to the worker's objects.
+- A worker's exception arrives as a `PropertyComputationError` caused by the new
+  `DynamicObjects.RemoteComputationError`. A worker that exits fails what it
+  ran with `ComputeAbandoned`, whose new `started` field is then `true`; the next
+  computation starts a fresh worker.
+- Log records of a worker computation go to the requester's logger, tagged
+  `worker=<pid>`. A computation can send its requester messages:
+  `DynamicObjects.send_to_requester(tag, payload)`, handled by
+  `DynamicObjects.on_requester_message!(f, tag)` in the requester's scope (in one
+  process, at once). The worker's progress tree is rebuilt live under the
+  requester's node with the worker's final timestamps, and a Stop on it reaches the worker. Requires Treebars
+  0.1.6 or later.
+- `DynamicObjects.worker_status()` and `DynamicObjects.restart_worker!()` give a
+  watchdog the worker's pid, start time, last message and computations in
+  flight, and a way to replace it. `configure_queue!` takes `worker_start`
+  (`:lazy`, or `:now` to start the worker at boot) and `worker_exeflags`
+  (replacing the default `--threads=<this process's>,1`).
+- `DynamicObjects.run!(produce, d)` publishes a value an executor produced
+  elsewhere through the cache's guarded path, as `run!(d)` publishes its own.
+- `queue_settings()` also reports `workers`, so a comparison against the whole
+  named tuple needs the new field.
+- New dependency: Malt.jl.
+
 ## 0.5.6
 
 - A property that reads a member of an inline `@struct` child is shared across

@@ -1,9 +1,10 @@
 name = "DynamicObjects"
 uuid = "23d02862-63fe-4c6e-8fdb-1d52cbbd39d5"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com> and contributors"]
-version = "0.5.6"
+version = "0.5.7"
 
 [deps]
+Malt = "36869731-bdee-424d-aa32-cab38c994e3b"
 Mmap = "a63ad114-7e13-5084-954f-fe012c677804"
 SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 ScopedValues = "7e506255-f358-4e82-b7e4-beb19740aa63"
@@ -23,9 +24,10 @@ Treebars = {url = "https://github.com/nsiccha/Treebars.jl"}
 [compat]
 Arrow = "2"
 DataFrames = "1"
+Malt = "1.5"
 ScopedValues = "1.6"
 TestItemRunner = "1"
-Treebars = "0.1.1"
+Treebars = "0.1.6"
 julia = "1.10"
 
 [extras]
