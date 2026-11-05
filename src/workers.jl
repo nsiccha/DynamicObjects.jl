@@ -541,7 +541,7 @@ function _spawn_worker!(q)
         end
         _on_actor(() -> errormonitor(@async _event_pump(conn, w)), conn)
     catch
-        _on_actor(() -> Malt.stop(w), conn)
+        _stop_process(conn, w)
         rethrow()
     end
     w
@@ -576,15 +576,19 @@ function _abandon_inflight!(conn::_WorkerConn, w, reason)
     lock(conn.lock) do
         conn.worker === w && (conn.worker = nothing)
         for req in values(conn.inflight)
-            put!(req.events, (:abandoned, reason))
+            req.worker === w && put!(req.events, (:abandoned, reason))
         end
     end
     _malt_stop_quietly(conn, w)
     nothing
 end
 
+# Stop `w` through its own process handle: asked to exit, then `SIGTERM`, then `SIGKILL`. A
+# stuck worker never runs the exit it is asked for, so the signals follow within seconds.
+_stop_process(conn, w) = _on_actor(() -> Malt.stop(w; exit_timeout=3.0, term_timeout=3.0), conn)
+
 _malt_stop_quietly(conn, w) = try
-    Malt.isrunning(w) && _on_actor(() -> Malt.stop(w), conn)
+    Malt.isrunning(w) && _stop_process(conn, w)
 catch
 end
 
@@ -650,26 +654,14 @@ function _compute_in_worker(q, o, name::Symbol, args::Tuple, kwargs::NamedTuple,
     min_level = Int32(Base.CoreLogging.min_enabled_level(ScopedValues.current_logger()).level)
     req = lock(conn.lock) do
         conn.next_id += 1
-        r = _RemoteRequest(conn.next_id, Channel{Any}(Inf))
+        r = _RemoteRequest(conn.next_id, Channel{Any}(Inf), nothing)
         conn.inflight[r.id] = r
         r
     end
     interrupter = nothing
     try
-        w = try
-            _ensure_worker!(q)
-        catch err
-            throw(ComputeAbandoned("the worker process could not be started: " * sprint(showerror, err), true))
-        end
-        pid = lock(() -> conn.pid, conn.lock)
-        try
-            _ensure_packages!(conn, w, packages)
-            _remote_fetch(conn, w, _worker_submit, req.id, address, name, wired_args, wired_kwargs, is_fresh, min_level)
-        catch err
-            err isa Malt.TerminatedWorkerException &&
-                throw(ComputeAbandoned("the worker process (pid $pid) exited before it started", true))
-            _throw_remote(o, name, args, kwargs, pid, err isa Malt.RemoteException ? err.message : sprint(showerror, err))
-        end
+        w, pid = _submit!(q, req, o, name, args, kwargs, packages,
+                          (req.id, address, name, wired_args, wired_kwargs, is_fresh, min_level))
         interrupter = _forward_interrupts(conn, w, req.id, status)
         while true
             kind, payload = take!(req.events)
@@ -690,6 +682,33 @@ function _compute_in_worker(q, o, name::Symbol, args::Tuple, kwargs::NamedTuple,
     finally
         interrupter === nothing || close(interrupter)
         lock(() -> delete!(conn.inflight, req.id), conn.lock)
+    end
+end
+
+# Send `req` to the worker, starting one first if none runs. A worker found dead at the send
+# (it exited before this process noticed) is replaced once: nothing ran there yet.
+function _submit!(q, req::_RemoteRequest, o, name, args, kwargs, packages, message)
+    conn = q.conn
+    for attempt in 1:2
+        w = try
+            _ensure_worker!(q)
+        catch err
+            throw(ComputeAbandoned("the worker process could not be started: " * sprint(showerror, err), true))
+        end
+        lock(() -> req.worker = w, conn.lock)
+        try
+            _ensure_packages!(conn, w, packages)
+            _remote_fetch(conn, w, _worker_submit, message...)
+            return w, w.proc_pid
+        catch err
+            if err isa Malt.TerminatedWorkerException
+                lock(() -> conn.worker === w && (conn.worker = nothing), conn.lock)
+                attempt == 1 && continue
+                throw(ComputeAbandoned("the worker process (pid $(w.proc_pid)) exited before it started", true))
+            end
+            _throw_remote(o, name, args, kwargs, w.proc_pid,
+                          err isa Malt.RemoteException ? err.message : sprint(showerror, err))
+        end
     end
 end
 
@@ -831,8 +850,8 @@ function _stop_worker!(q)
     conn = q.conn
     w = lock(() -> conn.worker, conn.lock)
     w === nothing && return nothing
-    _on_actor(() -> Malt.stop(w), conn)
-    _abandon_inflight!(conn, w, "the worker process (pid $(conn.pid)) was stopped")
+    _stop_process(conn, w)
+    _abandon_inflight!(conn, w, "the worker process (pid $(w.proc_pid)) was stopped")
     nothing
 end
 

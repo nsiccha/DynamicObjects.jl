@@ -2713,6 +2713,7 @@ end
 mutable struct _RemoteRequest
     const id::Int
     const events::Channel{Any}
+    worker::Any       # the worker it was sent to; only that worker's exit abandons it
 end
 
 """
