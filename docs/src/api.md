@@ -81,6 +81,12 @@ DynamicObjects.MemCacheEntry
 invalidate!
 ```
 
+## Worker request context
+
+```@docs
+DynamicObjects.carry_to_worker!
+```
+
 ## Diagnosing computations
 
 ```@docs

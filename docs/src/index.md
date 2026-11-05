@@ -778,6 +778,48 @@ The worker's progress tree is rebuilt live under the computation's node here,
 so it renders where the value is read, and a Stop on it reaches the worker.
 DynamicObjects requires Treebars 0.1.6 or later for this integration.
 
+In-process work inherits all requester `ScopedValue`s automatically. To carry a
+package's request context across the process boundary, register each named variable
+in that package's `__init__` (DynamicObjects 0.5.8 or later):
+
+```julia
+# In a loadable package named RequestLayer:
+module RequestLayer
+using DynamicObjects, ScopedValues
+const AUDIENCE = ScopedValue(:public)
+const PAGE_LANGUAGE = ScopedValue(:en)
+function __init__()
+    DynamicObjects.carry_to_worker!(@__MODULE__, :AUDIENCE)
+    DynamicObjects.carry_to_worker!(@__MODULE__, :PAGE_LANGUAGE)
+end
+@dynamicstruct struct Report
+    @queued context(i::Int) = (AUDIENCE[], PAGE_LANGUAGE[])
+end
+end
+
+# In the application that loads RequestLayer:
+using RequestLayer, DynamicObjects, ScopedValues
+DynamicObjects.configure_queue!(; workers=1)
+report = RequestLayer.Report()
+ScopedValues.with(RequestLayer.AUDIENCE => :private,
+                  RequestLayer.PAGE_LANGUAGE => :de) do
+    report.context(1)  # (:private, :de), computed in the worker
+end
+```
+
+The worker loads the owning package and uses its own registered variable. Nested
+modules work too. Use `wire(value)` and `unwire(data)` when a value needs conversion
+to serializable data; define both converters in the package and pass them at
+registration. They must not mutate their inputs. The initiating caller's values
+are captured when its queued computation is submitted, even after delayed
+admission, and bound during worker object reconstruction and computation. Defaults
+travel too, and bindings do not leak into concurrent or later requests. Missing
+worker registrations and conversion errors fail the computation.
+
+Register before starting computations. Unregistered scoped values stay local, and
+in-process work does not invoke the converters. Memoized computations still use
+their first caller's scope: registration does not make context part of a cache key.
+
 | Function | Purpose |
 |---|---|
 | `DynamicObjects.configure_queue!(; workers, worker_start, worker_exeflags)` | Run admitted computations in a worker process (`workers=1`) or here (`0`) |
@@ -785,6 +827,7 @@ DynamicObjects requires Treebars 0.1.6 or later for this integration.
 | `DynamicObjects.restart_worker!()` | Stop the worker (its computations fail with `ComputeAbandoned`); the next starts a fresh one |
 | `DynamicObjects.send_to_requester(tag, payload)` | From a computation: a message to the caller that requested it |
 | `DynamicObjects.on_requester_message!(f, tag)` | Handle those messages, in the caller's scope |
+| `DynamicObjects.carry_to_worker!(owner, name; wire, unwire)` | Carry a package's named scoped value into worker computations |
 | `DynamicObjects.run!(produce, d)` | For an executor: publish `produce(status)` as `d`'s value through the guarded path |
 
 ## Construction and `remake`

@@ -8,6 +8,31 @@ using DynamicObjects
 import DynamicObjects.Treebars
 export Toy, settled_count, reset_settled!
 
+# Nested modules and custom value conversion must resolve to the worker's own bindings.
+module RequestContext
+using DynamicObjects
+const SV = DynamicObjects.ScopedValues
+const AUDIENCE = SV.ScopedValue(:public)
+const PAGE = SV.ScopedValue((lang=:en,))
+const TEXT = SV.ScopedValue(Ref("default"))
+const LOCAL_ONLY = SV.ScopedValue(:default)
+snapshot() = (audience=AUDIENCE[], page=PAGE[], text=TEXT[][], local_only=LOCAL_ONLY[])
+function to_wire(value)
+    value[] == "fail-wire" && error("context wire failed")
+    (:text, value[])
+end
+function from_wire(value)
+    value[1] === :text || error("context wire format lost")
+    value[2] == "fail-unwire" && error("context unwire failed")
+    Ref(value[2])
+end
+function __init__()
+    DynamicObjects.carry_to_worker!(@__MODULE__, :AUDIENCE)
+    DynamicObjects.carry_to_worker!(@__MODULE__, :PAGE)
+    DynamicObjects.carry_to_worker!(@__MODULE__, :TEXT; wire=to_wire, unwire=from_wire)
+end
+end
+
 const COMPUTED = Dict{Symbol,Int}()
 const COMPUTED_LOCK = ReentrantLock()
 computed!(name) = lock(() -> COMPUTED[name] = get(COMPUTED, name, 0) + 1, COMPUTED_LOCK)
@@ -81,6 +106,21 @@ end
     end
     "Fresh item"
     @queued @fresh fresh_item(x::Int) = (pid=getpid(), n=computed!(:fresh_item), value=x)
+    "Requester context, read by a child task"
+    @queued context(x::Int) = (pid=getpid(), context=fetch(Threads.@spawn RequestContext.snapshot()))
+    "Fresh requester context"
+    @queued @fresh fresh_context(x::Int) = (pid=getpid(), context=RequestContext.snapshot())
+    "Context held across concurrent worker requests"
+    @queued gated_context(x::Int; dir::String) = begin
+        touch(joinpath(dir, "context_$x"))
+        waitfile(joinpath(dir, "context_go_$x"))
+        (pid=getpid(), context=RequestContext.snapshot())
+    end
+    "Read a separately registered package, loaded after this worker started"
+    @queued late_context(x::Int) = begin
+        id = Base.PkgId(Base.UUID("3bdc1aa0-83eb-41fb-9fb2-b4955339e07c"), "WorkerScopeLate")
+        (pid=getpid(), value=Base.root_module(id).VALUE[])
+    end
     "Prefix-reading item"
     @queued prefixed(x::Int) = (pid=getpid(), value=string(__prefix__, x))
     "Child-returning item"
@@ -88,6 +128,10 @@ end
     @struct child(k::Int) = begin
         "Child item"
         @queued scaled(x::Int) = (pid=getpid(), value=base * k * x)
+    end
+    @struct context_child(k::Int; audience::Symbol=RequestContext.AUDIENCE[]) = begin
+        "The scope under which this child's constructor path was evaluated"
+        @queued constructor_context(x::Int) = (pid=getpid(), audience=audience)
     end
     DynamicObjects.property_settled(__self__, ::Val{name}, value, args...; kwargs...) where {name} =
         lock(() -> SETTLED[name] = get(SETTLED, name, 0) + 1, SETTLED_LOCK)
