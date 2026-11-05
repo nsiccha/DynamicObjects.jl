@@ -837,7 +837,8 @@ function _abandon_inflight!(conn::_WorkerConn, w, reason)
     lock(conn.lock) do
         conn.worker === w && (conn.worker = nothing)
         for req in values(conn.inflight)
-            req.worker === w && put!(req.events, (:abandoned, reason))
+            # Names the worker: `_submit!` may send `req` on to a fresh one before it is read.
+            req.worker === w && put!(req.events, (:abandoned, (w, reason)))
         end
     end
     _malt_stop_quietly(conn, w)
@@ -960,7 +961,13 @@ function _compute_in_worker(f::_WorkerCompute, o, name::Symbol, args::Tuple, kwa
             elseif kind === :failed
                 _throw_remote(o, name, args, kwargs, pid, _deserialized(payload))
             elseif kind === :abandoned
-                throw(ComputeAbandoned(payload, true))
+                gone, reason = payload
+                # The worker died while `req` was being sent to it, and `_submit!` sent it on
+                # to a fresh one: that one computes it, so keep receiving its events. Failing
+                # here left it computing for nobody, its log records, messages and value
+                # dropped, and a retry joined it there (snag `worker-log-recor-d660d227`).
+                lock(() -> req.worker !== gone, conn.lock) && continue
+                throw(ComputeAbandoned(reason, true))
             end
         end
     finally
@@ -970,7 +977,9 @@ function _compute_in_worker(f::_WorkerCompute, o, name::Symbol, args::Tuple, kwa
 end
 
 # Send `req` to the worker, starting one first if none runs. A worker found dead at the send
-# (it exited before this process noticed) is replaced once: nothing ran there yet.
+# (it exited before this process noticed, or while the send waited on it) is replaced once:
+# nothing it ran survives it. Its exit still reaches `req` from the event pump as
+# `:abandoned`, naming it, which `_compute_in_worker` then ignores.
 function _submit!(q, req::_RemoteRequest, o, name, args, kwargs, packages, message)
     conn = q.conn
     for attempt in 1:2
