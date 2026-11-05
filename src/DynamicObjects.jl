@@ -5561,13 +5561,13 @@ maybeprogress!(progress, ip::IndexableProperty{name}, indices...; kwargs...) whe
     # pending and started by `_fresh_through` when the computation runs, so a call
     # waiting for a job-queue slot does not render as running.
     s = _default_substatus(progress, o, name, indices...; __pending__=true, kwargs...)
+    compute = _FreshCompute(o, name, indices, (; kwargs...), s)
     try
-        rv = _fresh_through(property_executor(o, Val(name)),
-                            _FreshCompute(o, name, indices, (; kwargs...), s), s)
-        _finalize_substatus!(s)
+        rv = _fresh_through(property_executor(o, Val(name)), compute, s)
+        _finish_compute_status!(compute, s)
         rv
     catch e
-        _fail_substatus!(s, e)
+        _fail_compute_status!(compute, s, e)
         rethrow()
     end
 end

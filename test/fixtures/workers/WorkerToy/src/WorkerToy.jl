@@ -20,10 +20,9 @@ reset_settled!() = lock(() -> empty!(SETTLED), SETTLED_LOCK)
 
 # Read the source node through the test's worker connection, so the test can compare
 # exact completed durations rather than accepting a requester-side re-finalization.
-function counted_duration(address, n, dir)
-    t = DynamicObjects._resolve(address, DynamicObjects._W_OBJECTS)
-    Treebars.duration(getstatus(t.counted, n; dir))
-end
+const COUNTED_NODES = Dict{Int,Any}()
+const COUNTED_LOCK = ReentrantLock()
+counted_duration(n) = Treebars.duration(lock(() -> COUNTED_NODES[n], COUNTED_LOCK))
 
 waitfile(path) = while !isfile(path)
     sleep(0.02)
@@ -73,9 +72,11 @@ end
     end
     "Counted item"
     @queued @progress counted(n::Int; dir::String) = begin
+        lock(() -> COUNTED_NODES[n] = __status__, COUNTED_LOCK)
         Treebars.@progress "Steps" for i in 1:n
             i == n ÷ 2 + 1 && (touch(joinpath(dir, "half_$n")); waitfile(joinpath(dir, "go_$n")))
         end
+        DynamicObjects.send_to_requester(:counted_end, n)
         n
     end
     "Fresh item"

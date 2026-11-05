@@ -260,8 +260,24 @@ with_worker() do
         @test occursin("✓ Steps ($n/$n)", text)
         conn = DynamicObjects.job_queue().conn
         source_duration = DynamicObjects._remote_fetch(conn, conn.worker,
-            WorkerToy.counted_duration, DynamicObjects._address(t), n, dir)
+            WorkerToy.counted_duration, n)
         @test Treebars.duration(node) == source_duration
     end
+
+    # A fresh, progress-threaded call has no cache cell, but its replica still
+    # keeps the worker's end time. Delay the requester to expose re-finalization.
+    DynamicObjects.on_requester_message!(_ -> sleep(0.15), :counted_end)
+    parent = Treebars.prepare_progress!(t.__status__; description="Fresh requester")
+    task = Threads.@spawn maybeprogress!(parent, t.counted, 16; dir)
+    @test waitfor(joinpath(dir, "half_16"))
+    @test settles(() -> occursin("Steps (8/16)", Treebars.render_text(parent)), 30.0)
+    node = only(parent.children) # a successful fresh call removes its transient node
+    touch(joinpath(dir, "go_16"))
+    settles(() -> istaskdone(task), 30.0) || error("fresh worker result did not settle")
+    @test fetch(task) == 16
+    conn = DynamicObjects.job_queue().conn
+    source_duration = DynamicObjects._remote_fetch(conn, conn.worker, WorkerToy.counted_duration, 16)
+    @test Treebars.duration(node) == source_duration
+    DynamicObjects.on_requester_message!(identity, :counted_end)
 end
 end

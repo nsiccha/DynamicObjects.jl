@@ -695,10 +695,6 @@ mutable struct _WorkerCompute{Q,C}
     progress_outcome::Symbol
 end
 (f::_WorkerCompute)(status) = _compute_in_worker(f, f.compute..., status)
-_finish_compute_status!(f::_WorkerCompute, status) =
-    f.progress_outcome === :done ? nothing : _finalize_substatus!(status)
-_fail_compute_status!(f::_WorkerCompute, status, err) =
-    f.progress_outcome === :failed ? nothing : _fail_substatus!(status, err)
 
 function _compute_in_worker(f::_WorkerCompute, o, name::Symbol, args::Tuple, kwargs::NamedTuple, status)
     q, is_fresh = f.queue, f.is_fresh
@@ -986,16 +982,29 @@ function run!(produce, c::QueuedCall)
     catch err
         (false, err)
     end
+    _copy_compute_status!(c.f, produce)
     put!(c.outcome, outcome)
     true
 end
 
 # A fresh computation of property `name`, as `fresh` and a progress-threaded call queue it.
-struct _FreshCompute{O,A<:Tuple,K<:NamedTuple}
+mutable struct _FreshCompute{O,A<:Tuple,K<:NamedTuple}
     o::O
     name::Symbol
     args::A
     kwargs::K
     status::Any
+    progress_outcome::Symbol
 end
+_FreshCompute(o, name, args, kwargs, status) = _FreshCompute(o, name, args, kwargs, status, :pending)
 (c::_FreshCompute)() = _computeproperty(c.o, c.name, c.args...; __status__=c.status, c.kwargs...)
+
+# A fresh caller finalizes its own node after the queued call returns. Carry the
+# worker's ownership of the terminal state back to that caller before waking it.
+_copy_compute_status!(compute, produce) = nothing
+_copy_compute_status!(compute::_FreshCompute, produce::_WorkerCompute) =
+    (compute.progress_outcome = produce.progress_outcome; nothing)
+_finish_compute_status!(f::Union{_WorkerCompute,_FreshCompute}, status) =
+    f.progress_outcome === :done ? nothing : _finalize_substatus!(status)
+_fail_compute_status!(f::Union{_WorkerCompute,_FreshCompute}, status, err) =
+    f.progress_outcome === :failed ? nothing : _fail_substatus!(status, err)
