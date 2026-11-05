@@ -350,24 +350,27 @@ keyed and persisted independently:
 
 #### Where the file lives
 
-`cache_path` defaults to `joinpath(cache_base, hash)` where `cache_base`
-defaults to `"cache"` and `hash` is derived from `hash_fields`. By default
-`hash_fields` is the tuple of all fixed fields. Override either to relocate
-caches or to narrow the hash:
+`__cache_path__` defaults to `joinpath(__cache_base__, __hash__)` where
+`__cache_base__` defaults to `"cache"`. The default `__hash__` is
+`DynamicObjects.canonical_hash((typeof(obj), obj.__hash_fields__))`.
+`__hash_fields__` contains the fixed fields plus constructor keyword inputs
+that the object's properties read. Override the base to relocate caches, or
+the hash fields to choose the inputs that determine the cached result:
 
 ```julia
 @dynamicstruct struct Foo
     a::Int
     b::Int
-    hash_fields = (a,)              # `b` is not part of the cache key
-    cache_base  = "/mnt/cache"
-    @cached result = a + b
+    __hash_fields__ = (a,)          # `b` does not affect this result
+    __cache_base__ = "/mnt/cache"
+    @cached result = a^2
 end
 ```
 
-Inside `hash_fields`, any `@dynamicstruct` value is replaced by its own
-stable `.hash` string before hashing — so nested DOs don't leak their full
-serialised representation into the parent hash.
+Inside supported containers in `__hash_fields__`, a `@dynamicstruct` value is
+replaced by its own stable `.__hash__` string. Built-in dictionaries and sets
+hash independently of insertion order. See [Nested DO hashing](@ref) for the
+supported containers and cache compatibility.
 
 #### Versioning a cache: `@cached v"2"`
 
@@ -1009,14 +1012,38 @@ end
 
 ### Nested DO hashing
 
-When a fixed field is itself a `@dynamicstruct`, its `.hash` field is substituted into the parent's hash inputs (so nested DOs don't bloat the parent's serialised hash key). To check what a given object's hash and cache path will be:
+`DynamicObjects.canonical_hash(x)` replaces nested `@dynamicstruct` values by
+their `__hash__`. With DataFrames and Arrow loaded, it replaces a DataFrame by
+its column names and columns. Memoizing a nested object's properties therefore
+does not change its parent's identity.
+
+Replacement descends through `Tuple`, `NamedTuple`, `Pair`, dense `Array`,
+built-in `Dict` and `Set`. Dict entries and Set elements are sorted before
+serialization, so insertion history and a worker's serialization roundtrip do
+not change their identity. Concrete container types and scalar types remain
+significant: an identity containing `1` can differ from one containing `1.0`.
+Other containers, array wrappers and arbitrary structs retain their serialized
+form; the identity walk does not densify sparse or lazy arrays. Repeated
+references are retained. Order-independent hashing of cyclic container graphs
+and stability across Julia versions are not promised.
+
+To inspect an object's identity and cache directory:
 
 ```julia
-obj.hash         # the cache key
-obj.cache_path   # joinpath(obj.cache_base, obj.hash)
+obj.__hash__         # the cache key
+obj.__cache_path__   # joinpath(obj.__cache_base__, obj.__hash__) unless versioned
 ```
 
-Override `hash_fields` to narrow the hash, or `cache_base` to relocate caches.
+Override `__hash_fields__` to choose the identity inputs, or `__cache_base__`
+to relocate caches. Keep every input that can change a cached result in its
+identity.
+
+Since 0.5.9, identities containing Dicts/Sets or newly replaced nested values
+miss their old disk entries once. The old files remain until explicitly
+cleared; there is no automatic deletion or migration. Plain scalar and numeric
+array identities retain their bytes. A consumer relying on deterministic
+Dict-bearing worker identities must require `DynamicObjects = "0.5.9"` in
+its compatibility bounds.
 
 ### Force recomputation after Revise
 

@@ -94,11 +94,12 @@ end
 # require a declaration-site marker merely to obtain safe write coordination.
 const _AUTOMATIC_MATERIALIZATION_DISK_LOCKS = DiskCacheLocks()
 
-persistent_hash(x) = begin
+_serialized_bytes(x) = begin
     b = IOBuffer()
     Serialization.serialize(b, x)
-    bytes2hex(SHA.sha1(take!(b)))
+    take!(b)
 end
+persistent_hash(x) = bytes2hex(SHA.sha1(_serialized_bytes(x)))
 
 # --- Disk format extension point (D1) ---
 #
@@ -557,19 +558,105 @@ _identity_seed(_, seed) = seed
 _with_identity_inputs(o, fields::Tuple) = let inputs = _identity_inputs(o)
     isempty(inputs) ? fields : (fields..., inputs)
 end
-# Shallow walker behind `canonical_hash`. Leaves non-DO values
-# structurally identical so hashes stay stable for DOs that don't nest DOs,
-# and substitutes any DO with its own (stable) `.__hash__` string. Per-type
-# `_hash_replace(::MyType) = x.__hash__` overloads are emitted by @dynamicstruct.
-_hash_replace(x::Tuple) = map(_hash_replace, x)
-_hash_replace(x::NamedTuple) = map(_hash_replace, x)
+# Replacement keeps unaffected values byte-identical. Dict/Set iteration order is
+# not content: a serialization roundtrip can reorder them. Their tokens retain
+# the original container type and sort on serialized keys, never on Base.hash.
+# The per-walk identity table preserves aliases and terminates container cycles;
+# all placeholders and sorting buffers belong to the walk, never to the input.
+struct _HashDict{T}
+    entries::Vector{Pair{Any,Any}}
+end
+struct _HashSet{T}
+    elements::Vector{Any}
+end
+struct _HashArray{T,N}
+    elements::Array{Any,N}
+end
+struct _HashPair{T}
+    first::Any
+    second::Any
+end
+
 _hash_replace(x) = x
+_hash_replace(x::Union{Tuple,NamedTuple,Pair,Array,Dict,Set}) = _hash_replace(x, IdDict())
+# Per-type one-argument methods are emitted by @dynamicstruct and supplied by the
+# DataFrames extension. Walk their replacements too (e.g. a Dict-valued column).
+function _hash_replace(x, seen)
+    y = _hash_replace(x)
+    y === x ? x : _hash_replace(y, seen)
+end
+_hash_replace(x::Tuple, seen) = map(v -> _hash_replace(v, seen), x)
+_hash_replace(x::NamedTuple, seen) = map(v -> _hash_replace(v, seen), x)
+function _hash_replace(x::Pair, seen)
+    a, b = _hash_replace(x.first, seen), _hash_replace(x.second, seen)
+    a === x.first && b === x.second ? x : _HashPair{typeof(x)}(a, b)
+end
+function _hash_replace(x::Array{T,N}, seen) where {T,N}
+    (isbitstype(T) || T <: Union{AbstractString,Symbol,Type}) && return x
+    haskey(seen, x) && return seen[x]
+    elements = Array{Any,N}(undef, size(x))
+    token = _HashArray{typeof(x),N}(elements)
+    seen[x] = token
+    changed = false
+    for i in eachindex(x)
+        isassigned(x, i) || continue
+        elements[i] = _hash_replace(x[i], seen)
+        changed |= elements[i] !== x[i]
+    end
+    seen[x] = changed ? token : x
+end
+
+# Serialize each sort key once. Equal canonical keys are possible (two distinct
+# DO instances can have one __hash__); break just those ties by the value bytes.
+# Sorting every entire key/value pair would repeatedly serialize large values.
+function _sort_hash_entries!(entries)
+    keys = map(p -> _serialized_bytes(p.first), entries)
+    order = sortperm(keys)
+    entries[:] = entries[order]
+    keys = keys[order]
+    i = 1
+    while i <= length(entries)
+        j = i
+        while j < length(entries) && keys[j + 1] == keys[i]
+            j += 1
+        end
+        if j > i
+            values = [_serialized_bytes(entries[k].second) for k in i:j]
+            entries[i:j] = entries[i:j][sortperm(values)]
+        end
+        i = j + 1
+    end
+    entries
+end
+function _hash_replace(x::Dict, seen)
+    haskey(seen, x) && return seen[x]
+    entries = Vector{Pair{Any,Any}}(undef, length(x))
+    token = _HashDict{typeof(x)}(entries)
+    seen[x] = token
+    for (i, (k, v)) in enumerate(x)
+        entries[i] = _hash_replace(k, seen) => _hash_replace(v, seen)
+    end
+    _sort_hash_entries!(entries)
+    token
+end
+function _hash_replace(x::Set, seen)
+    haskey(seen, x) && return seen[x]
+    elements = Vector{Any}(undef, length(x))
+    token = _HashSet{typeof(x)}(elements)
+    seen[x] = token
+    for (i, v) in enumerate(x)
+        elements[i] = _hash_replace(v, seen)
+    end
+    keys = map(_serialized_bytes, elements)
+    elements[:] = elements[sortperm(keys)]
+    token
+end
 
 """
     DynamicObjects.canonical_hash(x)::String
 
 The content digest DynamicObjects uses for cache identity: a SHA-1 hex string of `x`,
-serialized after every `@dynamicstruct` value inside it is replaced by that value's own
+serialized after supported nested `@dynamicstruct` values are replaced by their own
 `__hash__` (and, with DataFrames and Arrow loaded, every `DataFrame` by its column names
 and columns). It names an object's cache directory and keys its disk-cache entries, so
 equal content gives the same digest in every process, however much an object has memoized.
@@ -590,11 +677,19 @@ as a cache-format version, override `__hash__` through `canonical_hash`:
 end
 ```
 
-Replacement recurses through `Tuple`s and `NamedTuple`s only. A `@dynamicstruct` value or
-`DataFrame` inside an array, a `Dict` or any other container is serialized whole, including
-what it has memoized, so pass such values as tuple elements.
+Replacement recurses through `Tuple`, `NamedTuple`, `Pair`, dense `Array`, `Dict` and `Set`.
+Dict entries and Set elements are order-independent; their concrete types and scalar
+value types remain part of identity. Other containers, array wrappers and arbitrary
+structs are serialized as written; sparse or lazy arrays are never densified here.
+Repeated references are retained, so alias structure can affect a digest. Order-independent
+hashing of cyclic container graphs and stability across Julia versions are not promised.
+
+Since 0.5.9, identities containing Dicts/Sets or newly replaced nested values change once:
+their old disk entries miss and remain on disk until explicitly cleared. Plain scalar
+and numeric array values keep their existing digests. This also lets a worker reconstruct
+a Dict-bearing object and publish at the same cache path its requester reads.
 """
-canonical_hash(x) = persistent_hash(_hash_replace(x))
+canonical_hash(x) = persistent_hash(_hash_replace(x, IdDict()))
 
 # ── @versioned: identity/version split of the disk-cache path ───────────────
 # A `@versioned name::T` fixed field is the *version dimension*: excluded from

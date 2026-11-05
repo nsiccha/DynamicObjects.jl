@@ -171,7 +171,7 @@ end
 @test isequal(forward, backward)
 # The positive control: these iterate differently, so a key built by iterating them differs.
 @test collect(forward) != collect(backward)
-@test today_segment(:f, forward) != today_segment(:f, backward)
+@test DO.persistent_hash(forward) != DO.persistent_hash(backward)
 @test DO.cache_segment(:f, forward) == DO.cache_segment(:f, backward)
 @test collect(pruned) != collect(Dict(key => key for key in 1:10))
 @test DO.cache_segment(:f, pruned) == DO.cache_segment(:f, Dict(key => key for key in 1:10))

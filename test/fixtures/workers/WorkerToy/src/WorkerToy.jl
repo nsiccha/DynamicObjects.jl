@@ -144,4 +144,34 @@ end
         lock(() -> SETTLED[name] = get(SETTLED, name, 0) + 1, SETTLED_LOCK)
 end
 
+# Model-shaped identity: the data dictionary is reached through another DO, as
+# in Bruno's compiled model, and includes a matrix wrapper in the regression.
+@dynamicstruct struct HashCompiled
+    code::String
+    data
+end
+
+@dynamicstruct struct HashToy
+    compiled::HashCompiled
+    root::String
+    __hash_fields__ = (compiled.code, compiled.data)
+    __cache_base__ = root
+    __prefix__ = ""
+    @queued @cached @progress saved(k::Int) =
+        (pid=getpid(), value=k + length(compiled.data), hash=__hash__,
+            compiled_hash=compiled.__hash__, n=computed!(:hash_saved))
+    @queued @mmap mapped(k::Int) = fill(Float64(k + length(compiled.data)), 4)
+    @struct child(k::Int) = begin
+        @queued @cached saved(x::Int) = (pid=getpid(), value=k + x + length(compiled.data))
+    end
+end
+
+@dynamicstruct struct HashVersioned
+    data
+    root::String
+    @versioned revision::String
+    __cache_base__ = root
+    @queued @cached saved(k::Int) = (pid=getpid(), revision=revision, value=k + length(data))
+end
+
 end
