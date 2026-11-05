@@ -18,6 +18,13 @@ const SETTLED_LOCK = ReentrantLock()
 settled_count(name) = lock(() -> get(SETTLED, name, 0), SETTLED_LOCK)
 reset_settled!() = lock(() -> empty!(SETTLED), SETTLED_LOCK)
 
+# Read the source node through the test's worker connection, so the test can compare
+# exact completed durations rather than accepting a requester-side re-finalization.
+function counted_duration(address, n, dir)
+    t = DynamicObjects._resolve(address, DynamicObjects._W_OBJECTS)
+    Treebars.duration(getstatus(t.counted, n; dir))
+end
+
 waitfile(path) = while !isfile(path)
     sleep(0.02)
 end
@@ -38,6 +45,13 @@ end
         waitfile(joinpath(dir, "go_$x"))
         (pid=getpid(), n=COMPUTED[:gated], value=base + x)
     end
+    "Gated disk item"
+    @queued @cached gated_disk(x::Int; dir::String) = begin
+        n = computed!(:gated_disk)
+        touch(joinpath(dir, "disk_started_$(x)_$n"))
+        waitfile(joinpath(dir, "disk_go_$(x)_$n"))
+        (pid=getpid(), n=n, value=base + x)
+    end
     "Failing item"
     @queued doomed(x::Int) = error("doomed $x")
     "Request-reading item"
@@ -57,10 +71,19 @@ end
         end
         (pid=getpid(), value=:interrupted)
     end
+    "Counted item"
+    @queued @progress counted(n::Int; dir::String) = begin
+        Treebars.@progress "Steps" for i in 1:n
+            i == n ÷ 2 + 1 && (touch(joinpath(dir, "half_$n")); waitfile(joinpath(dir, "go_$n")))
+        end
+        n
+    end
     "Fresh item"
     @queued @fresh fresh_item(x::Int) = (pid=getpid(), n=computed!(:fresh_item), value=x)
     "Prefix-reading item"
     @queued prefixed(x::Int) = (pid=getpid(), value=string(__prefix__, x))
+    "Child-returning item"
+    @queued kid(k::Int) = child(k)
     @struct child(k::Int) = begin
         "Child item"
         @queued scaled(x::Int) = (pid=getpid(), value=base * k * x)

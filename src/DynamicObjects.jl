@@ -51,9 +51,10 @@ export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, in
 
 import SHA, Serialization, Mmap, Treebars, ScopedValues, Malt
 
-# `[compat] Treebars = "0.1.1"` states the floor for the three Treebars features checked below:
+# Treebars 0.1.1 is the floor for the three Treebars features checked below:
 # 0.1.1 (`14068fa`) is the first Treebars version number that carries all of them, so Pkg
-# refuses an older Treebars when it resolves. The commits that brought them still say 0.1.0.
+# refuses an older Treebars when it resolves. The worker mirror raises our compat floor to
+# 0.1.6. The commits that brought these earlier features still say 0.1.0.
 # The checks stay for an environment that loads DO without resolving against that floor, such
 # as a Manifest resolved before it and loaded as it is.
 #
@@ -1934,6 +1935,11 @@ _settled!(f, value) = nothing
 _settled!(s::_Settling, value) = _property_settled!(s.o, s.name, value, s.args, s.kwargs)
 _failed!(f) = nothing
 _failed!(s::_Settling) = _settled_local!(s, s.local_value)
+# A producer that mirrors another process's node owns its terminal progress state.
+_finish_compute_status!(f, status) = _finalize_substatus!(status)
+_fail_compute_status!(f, status, err) = _fail_substatus!(status, err)
+_finish_compute_status!(s::_Settling, status) = _finish_compute_status!(s.f, status)
+_fail_compute_status!(s::_Settling, status, err) = _fail_compute_status!(s.f, status, err)
 _settled_local!(s::_Settling, ::Nothing) = nothing
 function _settled_local!(s::_Settling, local_value::Base.RefValue{Any})
     value = local_value[]
@@ -2487,7 +2493,7 @@ function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condit
     catch e
         # Fail the node before waking waiters: a waiter that shows it under its own
         # node (`_linked`) keeps it there exactly when it reads as failed.
-        !isnothing(s) && _fail_substatus!(s, e)
+        !isnothing(s) && _fail_compute_status!(f, s, e)
         lock(c.lock) do
             if get(c.computing, key, nothing) === cnd
                 delete!(c.computing, key)
@@ -2498,6 +2504,9 @@ function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condit
         _failed!(f)
         rethrow()
     end
+    # The node must be terminal before releasing waiters: a remote waiter can close
+    # its progress mirror as soon as fetch returns.
+    !isnothing(s) && _finish_compute_status!(f, s)
     stored, published = lock(c.lock) do
         if get(c.computing, key, nothing) !== cnd
             notify(cnd)                # retracted mid-flight (its waiters already woke then)
@@ -2516,7 +2525,6 @@ function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condit
         notify(cnd)                    # leave c.status[key] finalized — getstatus / the "(cached)" note rely on it
         (existing, published)
     end
-    !isnothing(s) && _finalize_substatus!(s)
     published && _settled!(f, stored)
     stored
 end

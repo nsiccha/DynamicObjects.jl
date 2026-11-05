@@ -56,6 +56,10 @@ with_worker() do
 
     # An inline child is addressed by its memoized step from the root.
     @test t.child(3).scaled(2) == (pid=worker_pid(), value=12)
+    # A DO object a worker computation returns is this process's object at that address.
+    kid = Threads.@spawn t.kid(3)
+    settles(() -> istaskdone(kid), 30.0) || error("worker child result did not settle")
+    @test fetch(kid) === t.child(3)
     # A fresh call goes to the worker too, every time.
     f1, f2 = t.fresh_item(4), t.fresh_item(4)
     @test f1.pid == f2.pid == worker_pid()
@@ -127,6 +131,22 @@ with_worker() do
     second_cube = t.cube(3)
     @test second_cube.n == first_cube.n + 1
     @test isfile(path)
+
+    # Retract an in-flight disk write. Hold the replacement so that an old writer
+    # publishing after invalidation cannot be hidden by a new successful write.
+    p = t.gated_disk(9; dir, fetch=identity)
+    @test waitfor(joinpath(dir, "disk_started_9_1"))
+    path = DynamicObjects.get_cache_path(t, :gated_disk, 9; dir)
+    invalidate!(t.gated_disk, 9; dir)
+    replacement = Threads.@spawn fetch(p)
+    touch(joinpath(dir, "disk_go_9_1"))
+    @test waitfor(joinpath(dir, "disk_started_9_2"))
+    @test settles(() -> DynamicObjects.worker_status().in_flight == 1)
+    @test !isfile(path)
+    touch(joinpath(dir, "disk_go_9_2"))
+    @test fetch(replacement).n == 2
+    @test isfile(path)
+    @test settles(() -> settled_count(:gated_disk) == 1)
 end
 end
 
@@ -218,4 +238,30 @@ with_worker() do
 end
 # Without a worker the same property computes here, as before.
 @test NotInAPackage().twice(1) == 2
+end
+
+@testitem "workers: the worker's progress tree shows under the requester's node" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects
+using WorkerToy
+import DynamicObjects.Treebars
+with_worker() do
+    t = Toy(4, mktempdir())
+    dir = mktempdir()
+    for n in (12, 14)   # the first run includes the mirror's first-use compilation
+        p = t.counted(n; dir, fetch=identity)
+        @test waitfor(joinpath(dir, "half_$n"))
+        node = getstatus(t.counted, n; dir)
+        # The replica rebuilds the worker's tree live under this process's node.
+        @test settles(() -> occursin("Steps ($(n ÷ 2)/$n)", Treebars.render_text(node)), 30.0)
+        touch(joinpath(dir, "go_$n"))
+        @test fetch(p) == n
+        text = Treebars.render_text(node)
+        @test occursin("✓ Counted item", text)
+        @test occursin("✓ Steps ($n/$n)", text)
+        conn = DynamicObjects.job_queue().conn
+        source_duration = DynamicObjects._remote_fetch(conn, conn.worker,
+            WorkerToy.counted_duration, DynamicObjects._address(t), n, dir)
+        @test Treebars.duration(node) == source_duration
+    end
+end
 end

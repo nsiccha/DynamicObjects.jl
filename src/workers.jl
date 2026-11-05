@@ -103,6 +103,10 @@ _without_local(seed::NamedTuple) = Base.structdiff(seed, NamedTuple{_LOCAL_SEED_
 # The `(name, indexed, args, kwargs)` step under which `parent` holds `o`, or `nothing`.
 function _child_step(parent, o)
     for (name, value) in _held_values(getfield(parent, :cache).cache)
+        # Only a declared child is a construction path. An ordinary property can
+        # return that same child: addressing it through that alias can make the
+        # requester wait on the very computation whose result it is resolving.
+        _nested_struct_type(typeof(parent), Val(name)) === nothing && continue
         value === o && return (name, false, (), (;))
         value isa IndexableProperty || continue
         for ((args, kwargs), w) in cached_entries(value)
@@ -275,7 +279,7 @@ const _IS_WORKER = Threads.Atomic{Bool}(false)
 const _W_CONTROL = Channel{Any}(Inf)
 const _W_EVENTS = Channel{Any}(Inf)
 const _W_OBJECTS = (; lock=ReentrantLock(), dict=Dict{Any,Any}())
-const _W_NODES = Dict{Int,Any}()          # request id => the computation's progress node
+const _W_NODES = Dict{Int,Any}()          # request id => (progress node, mirror or nothing)
 const _W_NODES_LOCK = ReentrantLock()
 
 # Set up this process as a worker: called once by the process that spawned it.
@@ -294,7 +298,7 @@ end
 
 _worker_submit(msg...) = (put!(_W_CONTROL, (:submit, msg...)); nothing)
 _worker_invalidate(msg...) = (put!(_W_CONTROL, (:invalidate, msg...)); nothing)
-_worker_interrupt(id::Int) = (put!(_W_CONTROL, (:interrupt, id)); nothing)
+_worker_interrupt(id::Int, node_id::Int=1) = (put!(_W_CONTROL, (:interrupt, id, node_id)); nothing)
 
 # The events queued since the last call, oldest first; waits for at least one.
 function _worker_take_events()
@@ -333,7 +337,7 @@ function _worker_control_loop()
 end
 
 function _worker_control(::Val{:submit}, id::Int, address, name::Symbol, args, kwargs, is_fresh::Bool,
-                         min_level::Int32)
+                         min_level::Int32, mirrored::Bool)
     logger = _ForwardLogger(id, Base.CoreLogging.LogLevel(min_level))
     started = try
         o = _resolve(address, _W_OBJECTS)
@@ -344,12 +348,15 @@ function _worker_control(::Val{:submit}, id::Int, address, name::Symbol, args, k
             ScopedValues.with(_WORKER_REQUEST => id) do
                 ip = getproperty(o, name)
                 if is_fresh
-                    (o, Threads.@spawn fresh(ip, args...; kwargs...))
+                    # A fresh call has no cache cell to hold its node: it gets one here, as a
+                    # progress-threaded fresh call does, so its tree can be mirrored.
+                    node = _default_substatus(o.__status__, o, name, args...; __pending__=true, kwargs...)
+                    mirror = mirrored ? _mirror(id, node) : nothing
+                    (o, Threads.@spawn(_fresh_in_worker(o, name, args, kwargs, node)), node, mirror)
                 else
                     rv = memoize!(ip, args...; fetch=identity, kwargs...)
                     node = rv isa Pending ? getstatus(ip, args...; kwargs...) : nothing
-                    node === nothing || lock(() -> _W_NODES[id] = node, _W_NODES_LOCK)
-                    (o, rv)
+                    (o, rv, node, mirrored ? _mirror(id, node) : nothing)
                 end
             end
         end
@@ -357,16 +364,52 @@ function _worker_control(::Val{:submit}, id::Int, address, name::Symbol, args, k
         _push_event!(id, :failed, _failure_text(err, catch_backtrace()))
         return
     end
-    o, handle = started
-    errormonitor(Threads.@spawn Base.invokelatest(_worker_finish, id, o, name, args, kwargs, is_fresh, handle))
+    o, handle, node, mirror = started
+    node === nothing || lock(() -> _W_NODES[id] = (node, mirror), _W_NODES_LOCK)
+    errormonitor(Threads.@spawn Base.invokelatest(_worker_finish, id, o, name, args, kwargs, is_fresh,
+                                                  handle, mirror))
     nothing
 end
 
 _root_of(o) = (p = get(getfield(o, :cache).seed, :__parent__, nothing); _is_dynamic_object(p) ? _root_of(p) : o)
 
-function _worker_finish(id, o, name, args, kwargs, is_fresh, handle)
+function _fresh_in_worker(o, name::Symbol, args, kwargs, node)
     try
-        value = handle isa Union{Pending,Task} ? fetch(handle) : handle
+        v = _fresh_through(property_executor(o, Val(name)), _FreshCompute(o, name, args, kwargs, node), node)
+        _finalize_substatus!(node)
+        v
+    catch err
+        _fail_substatus!(node, err)
+        rethrow()
+    end
+end
+
+# Treebars' cross-process mirror: the computation's progress
+# tree is followed here and rebuilt under the requester's node.
+_mirror(id::Int, node) = nothing
+function _mirror(id::Int, node::Treebars.ProgressNode)
+    try
+        Treebars.mirror_progress(frame -> _push_event!(id, :progress, frame), node)
+    catch err
+        @error "DynamicObjects worker: the progress tree of a computation cannot be mirrored" exception = (err, catch_backtrace())
+        nothing
+    end
+end
+
+function _worker_finish(id, o, name, args, kwargs, is_fresh, handle, mirror)
+    try
+        succeeded = false
+        value = try
+            result = handle isa Union{Pending,Task} ? fetch(handle) : handle
+            succeeded = true
+            result
+        finally
+            # The closing frame (the whole final tree) goes out before the outcome.
+            if mirror !== nothing
+                close(mirror)
+                _push_event!(id, :progress_closed, succeeded ? :done : :failed)
+            end
+        end
         _push_event!(id, :done, is_fresh ? _wire_result(value) : _result_payload(o, name, args, kwargs, value))
     catch err
         _push_event!(id, :failed, _failure_text(err, catch_backtrace()))
@@ -404,9 +447,13 @@ _apply_invalidation(::Val{:invalidate!}, o, name::Symbol, args, kwargs) =
 _apply_invalidation(::Val{:clear_mem_caches!}, o) = (clear_mem_caches!(o); nothing)
 _apply_invalidation(::Val{:sync!}, o) = (sync!(o); nothing)
 
-function _worker_control(::Val{:interrupt}, id::Int)
-    node = lock(() -> get(_W_NODES, id, nothing), _W_NODES_LOCK)
-    node === nothing || Treebars.request_interrupt!(node)
+# An interrupt a viewer requested on the requester's node of a computation (`node_id` 1) or,
+# through the mirror, on one of its nodes.
+function _worker_control(::Val{:interrupt}, id::Int, node_id::Int)
+    held = lock(() -> get(_W_NODES, id, nothing), _W_NODES_LOCK)
+    held === nothing && return nothing
+    node, mirror = held
+    mirror === nothing ? Treebars.request_interrupt!(node) : Treebars.request_interrupt!(mirror, node_id)
     nothing
 end
 
@@ -638,10 +685,23 @@ end
 function _run_item(q, item)
     compute = q.workers > 0 ? _worker_compute(item.work) : nothing
     (compute === nothing || _reads_request(compute[1], compute[2])) && return run!(item.work)
-    run!(s -> _compute_in_worker(q, compute..., s, item.work isa QueuedCall), item.work)
+    run!(_WorkerCompute(q, compute, item.work isa QueuedCall, :pending), item.work)
 end
 
-function _compute_in_worker(q, o, name::Symbol, args::Tuple, kwargs::NamedTuple, status, is_fresh::Bool)
+mutable struct _WorkerCompute{Q,C}
+    queue::Q
+    compute::C
+    is_fresh::Bool
+    progress_outcome::Symbol
+end
+(f::_WorkerCompute)(status) = _compute_in_worker(f, f.compute..., status)
+_finish_compute_status!(f::_WorkerCompute, status) =
+    f.progress_outcome === :done ? nothing : _finalize_substatus!(status)
+_fail_compute_status!(f::_WorkerCompute, status, err) =
+    f.progress_outcome === :failed ? nothing : _fail_substatus!(status, err)
+
+function _compute_in_worker(f::_WorkerCompute, o, name::Symbol, args::Tuple, kwargs::NamedTuple, status)
+    q, is_fresh = f.queue, f.is_fresh
     conn = q.conn
     address, wired_args, wired_kwargs = try
         _address(o), _wire(args), _wire(kwargs)
@@ -661,18 +721,26 @@ function _compute_in_worker(q, o, name::Symbol, args::Tuple, kwargs::NamedTuple,
     interrupter = nothing
     try
         w, pid = _submit!(q, req, o, name, args, kwargs, packages,
-                          (req.id, address, name, wired_args, wired_kwargs, is_fresh, min_level))
-        interrupter = _forward_interrupts(conn, w, req.id, status)
+                          (req.id, address, name, wired_args, wired_kwargs, is_fresh, min_level,
+                           _mirrorable(status)))
+        replica = _replica(status, conn, w, req.id)
+        interrupter = replica === nothing ? _forward_interrupts(conn, w, req.id, status) : replica
         while true
             kind, payload = take!(req.events)
-            if kind === :log
+            if kind === :progress
+                replica === nothing || Treebars.apply_frame!(replica, _deserialized(payload))
+            elseif kind === :progress_closed
+                # Keep the worker's final timestamps. A subsequent local failure
+                # (for example, loading its disk result) still fails this node.
+                replica === nothing || (f.progress_outcome = _deserialized(payload))
+            elseif kind === :log
                 _emit_log(_deserialized(payload), pid)
             elseif kind === :message
                 _deliver_requester_message(_deserialized(payload)...)
             elseif kind === :done
                 value = _deserialized(payload)
                 value isa _OnDisk && return _load_published(o, name, args, kwargs, status, value.path)
-                return value isa _Address ? _resolve(value, nothing) : value
+                return value isa _Address ? _resolve(value, _requester_objects(o)) : value
             elseif kind === :failed
                 _throw_remote(o, name, args, kwargs, pid, _deserialized(payload))
             elseif kind === :abandoned
@@ -712,12 +780,33 @@ function _submit!(q, req::_RemoteRequest, o, name, args, kwargs, packages, messa
     end
 end
 
+# A DO object a worker computation returned is rebuilt here from its address, starting at the
+# requesting object's own root when the address starts there, so it is the object this
+# process already holds (`root.child(k)` is the memoized child of this root).
+function _requester_objects(o)
+    root = _retained_object(_root_of(o))
+    (; lock=ReentrantLock(), dict=Dict{Any,Any}((typeof(root), root.__hash__) => root))
+end
+
 _throw_remote(o, name, args, kwargs, pid, text::AbstractString) =
     throw(PropertyComputationError(string(nameof(typeof(o))), name, args, Tuple(pairs(kwargs)),
         (RemoteComputationError(pid, text), nothing)))
 
-# Forward an interrupt requested on the requester's node of the computation to the worker's
-# node, once.
+# Whether the worker's progress tree can be rebuilt under the requester's node `status`.
+_mirrorable(status) = status isa Treebars.ProgressNode{<:Treebars.StateProgress}
+
+# The replica of the worker's progress tree under the requester's node `status`; a viewer's
+# Stop on it reaches the worker's node.
+function _replica(status, conn, w, id)
+    _mirrorable(status) || return nothing
+    Treebars.progress_replica(status; on_interrupt = node_id -> try
+        _remote_do(conn, w, _worker_interrupt, id, Int(node_id))
+    catch
+    end)
+end
+
+# Without a mirror: forward an interrupt requested on the requester's node of the computation
+# to the worker's node, once.
 function _forward_interrupts(conn, w, id, status)
     status isa Treebars.ProgressNode || return nothing
     Timer(0.1; interval=0.1) do t

@@ -722,12 +722,70 @@ A layer on top (a web framework's job board, say) can watch and steer the queue:
 | Function | Purpose |
 |---|---|
 | `DynamicObjects.configure_queue!(; max_running)` | Set the cap; returns `queue_settings()` |
-| `DynamicObjects.queue_settings()` | `(; max_running, queued, running)` |
+| `DynamicObjects.queue_settings()` | `(; max_running, queued, running, workers)` |
 | `DynamicObjects.observe_queue!(f)` | Call `f(item)` for every enqueued `QueuedItem` (`work`, `property`, `tag`, `enqueued_ns`) |
 | `DynamicObjects.queued_items()` | Waiting items, oldest first |
 | `DynamicObjects.queue_position(handle)` | Position of a `Pending`, `DeferredCompute`, `QueuedCall` or item |
 | `DynamicObjects.abandon_queued!(q, items, reason)` | Give up on waiting items; their callers get `ComputeAbandoned` |
 | `DynamicObjects.QueuedCall(f)` | Queue work with no cache cell: `enqueue!(job_queue(), call)`, then `fetch(call)` |
+
+### Running queued work in a worker process
+
+```julia
+DynamicObjects.configure_queue!(; max_running=4, workers=1)
+```
+
+With `workers=1`, every admitted `@queued` property computation runs in one separate,
+long-lived Julia process instead of on a `:default` task of this one. A
+compile, a garbage-collection pause or a deadlock in heavy work then stalls
+the worker, never the process that serves pages. The cap, the FIFO order and
+the `queued · #k` note stay as they are; an admitted computation holds its
+slot while the worker runs it.
+
+The worker is started with the first computation sent to it
+(`worker_start=:now` starts it at once, in the background). It runs this
+process's Julia, code-generation flags, active project, `LOAD_PATH` and
+`DEPOT_PATH`, with `--threads=<this process's default threads>,1` unless
+`worker_exeflags` says otherwise. It then loads the package that defines the
+object a computation belongs to, so the object's type must be defined in a
+package: a type defined in `Main` is refused with an `ArgumentError`.
+
+What goes to the worker is how to reach the object, not the object: its root's
+type, fixed fields and construction inputs, the memoized steps from the root
+to an inline child, and a `remount` view's context. The worker builds the same
+root, keeps it by `__hash__`, and computes the property through its own
+memoized path, so its intermediate values stay warm from one computation to
+the next. A `@cached` or `@mmap` value comes back through its disk entry,
+which this process loads; any other value is serialized. In this process the
+value is stored exactly as a local computation's: same-key callers share one
+worker computation, `property_settled` runs once, and an invalidation during
+the worker's computation publishes nothing in either process. `clear_cache!`,
+`invalidate!`, `clear_mem_caches!` and `sync!` reach the worker's objects too.
+
+A body that reads `__req__` stays in this process, with one warning per
+property: pass what it needs from the request as arguments instead. A worker's
+exception arrives as a `PropertyComputationError` caused by a
+`DynamicObjects.RemoteComputationError` that holds the worker's printout. When
+the worker exits (killed, crashed, or replaced by
+`DynamicObjects.restart_worker!()`), each computation it was running fails with
+`ComputeAbandoned`, and the next one starts a fresh worker.
+
+A worker computation logs to the logger of the call that requested it (records
+carry `worker=<pid>`), and it can send that caller messages:
+`DynamicObjects.send_to_requester(tag, payload)` there, handled by
+`DynamicObjects.on_requester_message!(f, tag)` here, in the caller's scope.
+The worker's progress tree is rebuilt live under the computation's node here,
+so it renders where the value is read, and a Stop on it reaches the worker.
+DynamicObjects requires Treebars 0.1.6 or later for this integration.
+
+| Function | Purpose |
+|---|---|
+| `DynamicObjects.configure_queue!(; workers, worker_start, worker_exeflags)` | Run admitted computations in a worker process (`workers=1`) or here (`0`) |
+| `DynamicObjects.worker_status()` | `(; workers, running, pid, started_at, in_flight, last_message_at)` |
+| `DynamicObjects.restart_worker!()` | Stop the worker (its computations fail with `ComputeAbandoned`); the next starts a fresh one |
+| `DynamicObjects.send_to_requester(tag, payload)` | From a computation: a message to the caller that requested it |
+| `DynamicObjects.on_requester_message!(f, tag)` | Handle those messages, in the caller's scope |
+| `DynamicObjects.run!(produce, d)` | For an executor: publish `produce(status)` as `d`'s value through the guarded path |
 
 ## Construction and `remake`
 
