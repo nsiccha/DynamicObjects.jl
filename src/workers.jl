@@ -25,19 +25,24 @@
 # actor's thread long-polls them, in order.
 
 """
-    DynamicObjects.RemoteComputationError(pid, message)
+    DynamicObjects.RemoteComputationError(pid, message, exception=nothing)
 
-The failure of a computation that ran in the worker process `pid`, as the worker printed it
-(`message` holds the exception and its backtrace there). It arrives wrapped in a
-[`PropertyComputationError`](@ref) for the property this process asked for;
-[`unwrap_error`](@ref) returns it.
+The failure of a computation that ran in the worker process `pid`. `message` holds the
+exception and its backtrace as the worker printed them; `exception` holds the exception itself,
+rebuilt in this process, or `nothing` when it could not cross (`message` then says why). It
+arrives wrapped in a [`PropertyComputationError`](@ref) for the property this process asked
+for. [`unwrap_error`](@ref) returns `exception` when there is one, as it returns the original
+exception of a failure in this process, and this error otherwise.
 """
 struct RemoteComputationError <: Exception
     pid::Int
     message::String
+    exception::Any
 end
+RemoteComputationError(pid, message) = RemoteComputationError(pid, message, nothing)
 Base.showerror(io::IO, e::RemoteComputationError) =
     print(io, "RemoteComputationError: in worker process ", e.pid, ":\n", e.message)
+unwrap_error(e::RemoteComputationError) = e.exception === nothing ? e : e.exception
 
 # --- Addresses -------------------------------------------------------------------------------
 
@@ -574,7 +579,7 @@ function _worker_control(::Val{:submit}, id::Int, address, name::Symbol, args, k
         end
     catch err
         _pin!(_W_OBJECTS, pinned, -1)
-        _push_event!(id, :failed, _failure_text(err, catch_backtrace()))
+        _push_event!(id, :failed, _remote_failure(err, catch_backtrace()))
         return
     end
     o, handle, node, mirror = started
@@ -625,7 +630,7 @@ function _worker_finish(id, o, name, args, kwargs, is_fresh, handle, mirror, pin
         end
         _push_event!(id, :done, is_fresh ? _wire_result(value) : _result_payload(o, name, args, kwargs, value))
     catch err
-        _push_event!(id, :failed, _failure_text(err, catch_backtrace()))
+        _push_event!(id, :failed, _remote_failure(err, catch_backtrace()))
     finally
         lock(() -> delete!(_W_NODES, id), _W_NODES_LOCK)
         _pin!(_W_OBJECTS, pinned, -1)
@@ -646,9 +651,56 @@ function _result_payload(o, name::Symbol, args, kwargs, value)
 end
 _wire_result(value) = _is_dynamic_object(value) ? _address(value) : value
 
+# A failed computation sends its printout, which the requester's error log shows, and the
+# exception itself where it can cross, which the requester's `unwrap_error` returns. So a layer
+# above tells its exception types apart the same way with and without a worker.
+struct _RemoteFailure
+    text::String
+    exception::Union{Nothing,Vector{UInt8}}
+end
+
+function _remote_failure(err, bt)
+    text = _failure_text(err, bt)
+    bytes = try
+        io = _CappedIO(IOBuffer())
+        Serialization.serialize(io, unwrap_error(err))
+        take!(io.buffer)
+    catch reason
+        return _RemoteFailure(_not_carried(text, reason), nothing)
+    end
+    _RemoteFailure(text, bytes)
+end
+_not_carried(text, reason) =
+    text * "\n\nThe exception itself did not reach the requesting process: " * sprint(showerror, reason)
+
+# Printed with `:limit`, so a large array an exception holds prints its ends and not every
+# element: the requester keeps this text with the failure.
 _failure_text(err::Base.TaskFailedException, bt) = _failure_text(err.task.exception, err.task.backtrace)
-_failure_text(err, bt) = sprint(showerror, err, bt)
-_failure_text(err::PropertyComputationError, bt) = sprint(showerror, err)
+_failure_text(err, bt) = sprint(showerror, err, bt; context=:limit => true)
+_failure_text(err::PropertyComputationError, bt) = sprint(showerror, err; context=:limit => true)
+
+# An exception can hold anything: a `BoundsError` its whole array, a `MethodError` its arguments.
+# The requester keeps a failure per key until it is retried, so what it is sent has a bound, and
+# serializing stops there instead of walking the rest.
+const _MAX_CARRIED_BYTES = 2^20
+
+struct _NotCarried <: Exception
+    why::String
+end
+Base.showerror(io::IO, e::_NotCarried) = print(io, e.why)
+
+struct _CappedIO <: IO
+    buffer::IOBuffer
+end
+_room!(io::_CappedIO, n) = position(io.buffer) + n > _MAX_CARRIED_BYTES &&
+    throw(_NotCarried("it serializes to more than 1 MiB"))
+Base.write(io::_CappedIO, b::UInt8) = (_room!(io, 1); write(io.buffer, b))
+Base.unsafe_write(io::_CappedIO, p::Ptr{UInt8}, n::UInt) = (_room!(io, n); unsafe_write(io.buffer, p, n))
+
+# What travels is an address, never an object. A copy of a DO object would be useless to the
+# requester, and walking its caches here races this worker's other computations.
+Serialization.serialize(::Serialization.Serializer{_CappedIO}, ::PropertyCache) =
+    throw(_NotCarried("it holds a DynamicObjects object"))
 
 function _worker_control(::Val{:invalidate}, address, verb::Symbol, args...)
     o = _resolve_existing(address, _W_OBJECTS)
@@ -1013,9 +1065,25 @@ function _requester_objects(o)
     (; lock=ReentrantLock(), dict=Dict{Any,Any}((typeof(root), _root_address(root).digest) => root))
 end
 
-_throw_remote(o, name, args, kwargs, pid, text::AbstractString) =
+_throw_remote(o, name, args, kwargs, pid, failure) =
     throw(PropertyComputationError(string(nameof(typeof(o))), name, args, Tuple(pairs(kwargs)),
-        (RemoteComputationError(pid, text), nothing)))
+        (_remote_error(pid, failure), nothing)))
+
+_remote_error(pid, text::AbstractString) = RemoteComputationError(pid, text)
+function _remote_error(pid, failure::_RemoteFailure)
+    failure.exception === nothing && return RemoteComputationError(pid, failure.text)
+    exception = try
+        _deserialized(failure.exception)
+    catch reason    # for one, its type comes from a package this process has not loaded
+        return RemoteComputationError(pid, _not_carried(failure.text, reason))
+    end
+    RemoteComputationError(pid, failure.text, _in_this_process(exception))
+end
+
+# A `MethodError` records the world it happened in. That is another process's count here, and
+# would make it print a matching method as too new.
+_in_this_process(exception) = exception
+_in_this_process(e::MethodError) = MethodError(e.f, e.args)
 
 # Whether the worker's progress tree can be rebuilt under the requester's node `status`.
 _mirrorable(status) = status isa Treebars.ProgressNode{<:Treebars.StateProgress}

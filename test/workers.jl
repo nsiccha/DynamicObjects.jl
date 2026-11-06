@@ -75,7 +75,7 @@ with_worker() do
         e
     end
     @test err isa PropertyComputationError && err.property == :doomed
-    @test unwrap_error(err) isa DynamicObjects.RemoteComputationError
+    @test unwrap_error(err) isa ErrorException && unwrap_error(err).msg == "doomed 1"
     @test occursin("doomed 1", sprint(showerror, err))
     @test DynamicObjects.queue_settings().workers == 1
 end
@@ -464,6 +464,100 @@ with_worker() do
 end
 # Without a worker the same property computes here, as before.
 @test NotInAPackage().twice(1) == 2
+end
+
+@testitem "workers: a worker's exception reads as it does in one process" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects
+using WorkerToy: ToyFault
+failure(f) = try
+    f()
+    error("expected a failure")
+catch e
+    e
+end
+# Wherever the computation throws, a layer above sees its own exception, with its fields.
+faults(t) = map((
+    () -> t.refused(1),                     # the body of a memoized computation
+    () -> t.fresh_refused(2),               # the body of a fresh one
+    () -> t.reads_refusal(3),               # a property the body reads
+    () -> t.reads_refused(4),               # a `@queued` property the body reads
+    () -> t.unmarked_refused(5),            # read by an unmarked property in this process
+    () -> fetch(t.refused(6; fetch=identity)),  # polled
+)) do read
+    inner = unwrap_error(failure(read))
+    inner isa ToyFault ? (inner.status, inner.message) : inner
+end
+expected = ((401, "refused 1"), (402, "fresh refused 2"), (422, "refused by a property"),
+    (404, "refused 4"), (405, "refused 5"), (406, "refused 6"))
+@test faults(Toy(1, mktempdir())) == expected
+with_worker() do
+    t = Toy(1, mktempdir())
+    @test t.square(1).pid == worker_pid() != getpid()   # the worker path is taken
+    @test faults(t) == expected
+
+    # The worker's printout and backtrace stay what the error prints.
+    err = failure(() -> t.refused(7))
+    @test err isa PropertyComputationError && err.property == :refused
+    cause = DynamicObjects._cause_error(err)
+    @test cause isa DynamicObjects.RemoteComputationError && cause.pid == worker_pid()
+    @test cause.exception === unwrap_error(err)
+    text = sprint(showerror, err)
+    @test occursin("in worker process $(worker_pid())", text)
+    @test occursin("refused 7", text)
+    @test occursin("Stacktrace:", text)
+    # A failed computation is retried and fails the same way.
+    @test unwrap_error(failure(() -> t.refused(7))) isa ToyFault
+
+    # Base's exception types cross too. A rebuilt `MethodError` prints as it does in one
+    # process: the world it records is another process's count, so it is not kept.
+    inner = unwrap_error(failure(() -> t.wrong_method(1)))
+    @test inner isa MethodError
+    @test occursin("takes_string", sprint(showerror, inner))
+    @test !occursin("too new", sprint(showerror, inner))
+    @test unwrap_error(failure(() -> t.wrong_closure(1))) isa MethodError
+    # Anything thrown crosses, not only an `Exception`.
+    @test unwrap_error(failure(() -> t.throws_string(1))) == "a thrown string"
+end
+end
+
+@testitem "workers: what cannot cross stays the worker's printout, which says why" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects
+using WorkerToy: BulkyFault
+failure(f) = try
+    f()
+    error("expected a failure")
+catch e
+    e
+end
+with_worker() do
+    t = Toy(1, mktempdir())
+    limit = DynamicObjects._MAX_CARRIED_BYTES
+    under = unwrap_error(failure(() -> t.bulky(limit ÷ 2)))
+    @test under isa BulkyFault && length(under.payload) == limit ÷ 2
+
+    only_the_worker = Base.PkgId(Base.UUID("f6d9a3c2-1e0b-4c57-8a44-7d2e9b6c1f30"), "WorkerOnlyFault")
+    @test !haskey(Base.loaded_modules, only_the_worker)
+    for (read, printed, why) in (
+        (() -> t.bulky(2limit), "BulkyFault", "serializes to more than 1 MiB"),
+        (() -> t.holds_self(1), "MethodError", "holds a DynamicObjects object"),
+        (() -> t.holds_task(1), "HoldsTask", "cannot serialize a running Task"),
+        (() -> t.worker_only(1), "only the worker knows 1", "WorkerOnlyFault"),
+    )
+        err = failure(read)
+        @test err isa PropertyComputationError
+        inner = unwrap_error(err)
+        @test inner isa DynamicObjects.RemoteComputationError
+        @test inner.exception === nothing && inner.pid == worker_pid()
+        @test occursin(printed, inner.message)
+        @test occursin("Stacktrace:", inner.message)
+        @test occursin("did not reach the requesting process: ", inner.message)
+        @test occursin(why, inner.message)
+        # The requester does not hold the payload, as an exception or as its printout.
+        @test sizeof(inner.message) < limit ÷ 2
+    end
+    # Reading the failure did not load the package here.
+    @test !haskey(Base.loaded_modules, only_the_worker)
+end
 end
 
 @testitem "workers: the worker's progress tree shows under the requester's node" setup=[WorkerFixtures] tags=[:core, :workers] begin

@@ -2919,9 +2919,10 @@ value through its disk entry, which this process then loads; any other value ser
 worker's memo stays warm across computations. A computation whose body reads the request
 (`__req__`) stays in this process, with one warning per property. A worker's exception arrives
 as a [`PropertyComputationError`](@ref) caused by a
-[`RemoteComputationError`](@ref DynamicObjects.RemoteComputationError); a worker that exits
-fails every computation it ran with [`ComputeAbandoned`](@ref), and the next one starts a fresh
-worker. `workers=0` (the default) runs everything here; switching to it stops the worker.
+[`RemoteComputationError`](@ref DynamicObjects.RemoteComputationError) that holds the worker's
+printout, and [`unwrap_error`](@ref) returns the exception itself wherever it can cross; a worker
+that exits fails every computation it ran with [`ComputeAbandoned`](@ref), and the next one starts
+a fresh worker. `workers=0` (the default) runs everything here; switching to it stops the worker.
 
 The worker runs this process's Julia with its code-generation flags, active project,
 `LOAD_PATH` and `DEPOT_PATH`, and by default `--threads=<this process's default threads>,1`,
@@ -10171,7 +10172,11 @@ end
     unwrap_error(e)
 
 Recursively unwrap `TaskFailedException`, `CompositeException`, and
-`PropertyComputationError` wrappers to find the root cause exception.
+`PropertyComputationError` wrappers to find the root cause exception. For a
+computation that ran in a worker process (`configure_queue!(; workers=1)`) that
+is the worker's exception itself, of its type and with its fields. An exception
+that could not cross returns a `DynamicObjects.RemoteComputationError` holding
+the worker's printout, which says why.
 """
 unwrap_error(e::Base.TaskFailedException) = unwrap_error(e.task.exception)
 unwrap_error(e::CompositeException) = unwrap_error(first(e.exceptions))

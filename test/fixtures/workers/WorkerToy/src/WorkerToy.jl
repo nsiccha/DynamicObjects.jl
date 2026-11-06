@@ -33,6 +33,20 @@ function __init__()
 end
 end
 
+# What a computation can fail with, for the exception transport.
+struct ToyFault <: Exception
+    status::Int
+    message::String
+end
+Base.showerror(io::IO, e::ToyFault) = print(io, e.message)
+struct BulkyFault <: Exception
+    payload::Vector{UInt8}
+end
+struct HoldsTask <: Exception
+    task::Task
+end
+takes_string(::String) = 1
+
 const COMPUTED = Dict{Symbol,Int}()
 const COMPUTED_LOCK = ReentrantLock()
 computed!(name) = lock(() -> COMPUTED[name] = get(COMPUTED, name, 0) + 1, COMPUTED_LOCK)
@@ -85,6 +99,35 @@ end
     end
     "Failing item"
     @queued doomed(x::Int) = error("doomed $x")
+    "A property that refuses"
+    refusal = throw(ToyFault(422, "refused by a property"))
+    "Refusing item"
+    @queued refused(x::Int) = throw(ToyFault(400 + x, "refused $x"))
+    "Fresh refusing item"
+    @queued @fresh fresh_refused(x::Int) = throw(ToyFault(400 + x, "fresh refused $x"))
+    "Item reading a refusing property"
+    @queued reads_refusal(x::Int) = (x, refusal)
+    "Item reading a refusing item"
+    @queued reads_refused(x::Int) = refused(x)
+    "Unmarked property reading a refusing item"
+    unmarked_refused(x::Int) = refused(x)
+    "Item failing with a wrong method"
+    @queued wrong_method(x::Int) = takes_string(x)
+    "Item failing with a wrong closure call"
+    @queued wrong_closure(x::Int) = (y -> y)(x, x)
+    "Item throwing something other than an exception"
+    @queued throws_string(x::Int) = throw("a thrown string")
+    "Item failing with a large exception"
+    @queued bulky(n::Int) = throw(BulkyFault(zeros(UInt8, n)))
+    "Item failing with an exception that holds this object"
+    @queued holds_self(x::Int) = throw(MethodError(+, (__self__, x)))
+    "Item failing with an exception that cannot be serialized"
+    @queued holds_task(x::Int) = throw(HoldsTask(@async sleep(60)))
+    "Item failing with an exception of a package only the worker loads"
+    @queued worker_only(x::Int) = begin
+        fault = Base.require(Base.PkgId(Base.UUID("f6d9a3c2-1e0b-4c57-8a44-7d2e9b6c1f30"), "WorkerOnlyFault"))
+        throw(Base.invokelatest(fault.Fault, "only the worker knows $x"))
+    end
     "Request-reading item"
     @queued reads_request(x::Int) = (pid=getpid(), req=__req__, value=x)
     "Talking item"

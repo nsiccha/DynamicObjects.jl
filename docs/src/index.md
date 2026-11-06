@@ -799,10 +799,18 @@ the worker's computation publishes nothing in either process. `clear_cache!`,
 `invalidate!`, `clear_mem_caches!` and `sync!` reach the worker's objects too.
 
 A body that reads `__req__` stays in this process, with one warning per
-property: pass what it needs from the request as arguments instead. A worker's
-exception arrives as a `PropertyComputationError` caused by a
-`DynamicObjects.RemoteComputationError` that holds the worker's printout. When
-the worker exits (killed, crashed, or replaced by
+property: pass what it needs from the request as arguments instead.
+
+A worker's exception arrives as a `PropertyComputationError` caused by a
+`DynamicObjects.RemoteComputationError` that holds the worker's printout, and
+`unwrap_error(err)` returns the exception itself, of its type and with its
+fields, as it does for a failure in this process. An exception that cannot cross
+stays a `RemoteComputationError` whose printout says why: one that serializes to
+more than 1 MiB (it holds a large array, say), holds a DynamicObjects object or
+something else that cannot be serialized, or has a type from a package this
+process has not loaded.
+
+When the worker exits (killed, crashed, or replaced by
 `DynamicObjects.restart_worker!()`), each computation it was running fails with
 `ComputeAbandoned`, and the next one starts a fresh worker.
 
