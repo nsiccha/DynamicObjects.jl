@@ -122,7 +122,14 @@ end
     "Item failing with an exception that holds this object"
     @queued holds_self(x::Int) = throw(MethodError(+, (__self__, x)))
     "Item failing with an exception that cannot be serialized"
-    @queued holds_task(x::Int) = throw(HoldsTask(@async sleep(60)))
+    @queued holds_task(x::Int) = begin
+        running = @async sleep(60)
+        # A task that has not started yet can be serialized.
+        while !istaskstarted(running)
+            yield()
+        end
+        throw(HoldsTask(running))
+    end
     "Item failing with an exception of a package only the worker loads"
     @queued worker_only(x::Int) = begin
         fault = Base.require(Base.PkgId(Base.UUID("f6d9a3c2-1e0b-4c57-8a44-7d2e9b6c1f30"), "WorkerOnlyFault"))
