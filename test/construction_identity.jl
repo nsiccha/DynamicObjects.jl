@@ -255,3 +255,272 @@ view = DynamicObjects.remount(root; __prefix__ = "/p")
 @test view.url == "/p/x"
 @test view.shout() == root.shout() == "X"
 end
+
+# A constructor `__hash__` names the object's cache directory on every shape of type:
+# that is how a consumer reads an entry stored under an earlier identity, without knowing
+# DO's file layout (snag `constructor-hash-d738b3b5`). Each shape below declares its
+# identity differently, and `EarlierPlain` / `EarlierVersioned` write the entries
+# independently, as an earlier release of the type did.
+@testmodule EarlierIdentityFixtures begin
+using DynamicObjects
+export RUNS, EarlierPlain, EarlierVersioned, SHAPES, earlier_writer, with_override
+
+const RUNS = Ref(0)
+counted(value) = (RUNS[] += 1; value)
+
+@dynamicstruct struct EarlierPlain
+    key::String
+    answer::String
+    __hash__ = key
+    @cached val = answer
+    @cached idx(k) = string(answer, ":", k)
+end
+@dynamicstruct struct EarlierVersioned
+    key::String
+    answer::String
+    @versioned version::String
+    __hash__ = key
+    @cached val = answer
+    @cached idx(k) = string(answer, ":", k)
+end
+
+@dynamicstruct struct PlainDefault
+    tag::String
+    context = "default"
+    @cached val = counted(string("computed:", tag))
+    @cached idx(k) = counted(string("computed:", tag, ":", k))
+end
+@dynamicstruct struct PlainFields
+    tag::String
+    placement::String
+    context = "default"
+    __hash_fields__ = (tag,)
+    @cached val = counted(string("computed:", tag))
+    @cached idx(k) = counted(string("computed:", tag, ":", k))
+end
+@dynamicstruct struct PlainHash
+    tag::String
+    context = "default"
+    __hash__ = DynamicObjects.canonical_hash((typeof(__self__), "format-1", tag))
+    @cached val = counted(string("computed:", tag))
+    @cached idx(k) = counted(string("computed:", tag, ":", k))
+end
+@dynamicstruct struct VersionedDefault
+    tag::String
+    @versioned version::String
+    context = "default"
+    @cached val = counted(string("computed:", tag))
+    @cached idx(k) = counted(string("computed:", tag, ":", k))
+end
+@dynamicstruct struct VersionedComputed
+    tag::String
+    context = "default"
+    @versioned version = "v1"
+    @cached val = counted(string("computed:", tag))
+    @cached idx(k) = counted(string("computed:", tag, ":", k))
+end
+# The reported shape: `ODLPlaus.FitPin`, whose key moved off its data directory.
+@dynamicstruct struct VersionedFields
+    placement::String
+    tag::String
+    @versioned version::String
+    context = "default"
+    __hash_fields__ = (tag,)
+    @cached val = counted(string("computed:", tag))
+    @cached idx(k) = counted(string("computed:", tag, ":", k))
+end
+@dynamicstruct struct VersionedHash
+    tag::String
+    @versioned version::String
+    context = "default"
+    __hash__ = DynamicObjects.canonical_hash((typeof(__self__), "format-1", tag))
+    @cached val = counted(string("computed:", tag))
+    @cached idx(k) = counted(string("computed:", tag, ":", k))
+end
+
+# Each shape, how to build it, and whether it is `@versioned`.
+const SHAPES = (
+    (PlainDefault, (; kw...) -> PlainDefault("t"; kw...), false),
+    (PlainFields, (; kw...) -> PlainFields("t", "here"; kw...), false),
+    (PlainHash, (; kw...) -> PlainHash("t"; kw...), false),
+    (VersionedDefault, (; kw...) -> VersionedDefault("t", "v1"; kw...), true),
+    (VersionedComputed, (; kw...) -> VersionedComputed("t"; kw...), true),
+    (VersionedFields, (; kw...) -> VersionedFields("here", "t", "v1"; kw...), true),
+    (VersionedHash, (; kw...) -> VersionedHash("t", "v1"; kw...), true),
+)
+
+"Stores `answer` under `key` from a type that shares nothing with the shape reading it."
+function earlier_writer(versioned, key, answer, base)
+    writer = versioned ?
+        EarlierVersioned(key, answer, "v1"; __cache_base__ = base, __hold_recent_version__ = false) :
+        EarlierPlain(key, answer; __cache_base__ = base)
+    writer.val
+    writer.idx(1)
+    writer
+end
+end
+
+@testitem "a constructor __hash__ names the cache directory on every identity shape" tags=[:core] setup=[EarlierIdentityFixtures] begin
+using DynamicObjects
+const DO = DynamicObjects
+key = "earlier-identity"
+
+@testset "$T" for (T, make, versioned) in SHAPES
+    base = mktempdir()
+    current = make(; __cache_base__ = base)
+    earlier = make(; __cache_base__ = base, __hash__ = key)
+    # The sensitivity control: without the keyword the object lives elsewhere.
+    @test current.__cache_path__ != earlier.__cache_path__
+    @test earlier.__hash__ == earlier.__identity_hash__ == key
+    @test earlier.__cache_path__ == (versioned ?
+        joinpath(base, key, earlier.__version_tag__) : joinpath(base, key))
+    # A version still selects the segment below the moved directory.
+    versioned && @test earlier.__version_tag__ == current.__version_tag__
+
+    # Nothing stored there yet, whatever the current identity holds.
+    current.val
+    @test !@is_cached(earlier.val)
+    @test !@is_cached(earlier.idx(1))
+
+    writer = earlier_writer(versioned, key, "stored", base)
+    @test writer.__cache_path__ == earlier.__cache_path__
+    RUNS[] = 0
+    @test @is_cached(earlier.val)
+    @test @is_cached(earlier.idx(1))
+    @test earlier.val == "stored"
+    @test earlier.idx(1) == "stored:1"
+    @test DO.materialization_observation(earlier, :val).disk_state == :ready
+    @test startswith((@cache_path earlier.val), earlier.__cache_path__)
+    @test RUNS[] == 0                        # read from disk, no body ran
+
+    # The current identity keeps its own entry.
+    @test current.val == "computed:t"
+
+    # A clear keeps the keyword: the object stays where it was, and reloads.
+    DO.clear_mem_caches!(earlier)
+    @test earlier.__hash__ == key
+    @test earlier.__cache_path__ == writer.__cache_path__
+    @test earlier.val == "stored"
+    @test RUNS[] == 0
+
+    # A remount view has the object's identity, and `remake` carries the keyword.
+    @test DO.remount(earlier; context = "view").__cache_path__ == earlier.__cache_path__
+    remade = remake(earlier; tag = "another")
+    @test remade.__hash__ == key
+    @test remade.__cache_path__ == earlier.__cache_path__
+    @test remade.val == "stored"
+    @test RUNS[] == 0
+
+    # `remake` naming the keyword moves a settled object, and serves nothing it held.
+    moved = remake(current; __hash__ = "another-identity")
+    @test moved.__hash__ == "another-identity"
+    @test occursin("another-identity", moved.__cache_path__)
+    @test !@is_cached(moved.val)
+
+    # The clears act on that directory, and leave the current identity alone.
+    invalidate!(earlier.idx, 1)
+    @test !@is_cached(earlier.idx(1))
+    @test @is_cached(earlier.val)
+    @test !isempty(DO.clear_cache!(earlier, :val))
+    @test !@is_cached(earlier.val)
+    @test !isfile(joinpath(earlier.__cache_path__, "val.sjl"))
+    @test @is_cached(make(; __cache_base__ = base).val)
+    earlier_writer(versioned, key, "again", base)
+    @test @is_cached(make(; __cache_base__ = base, __hash__ = key).val)
+    DO.clear_disk_caches!(make(; __cache_base__ = base, __hash__ = key))
+    @test !isfile(joinpath(writer.__cache_path__, "val.sjl"))
+    @test @is_cached(make(; __cache_base__ = base).val)
+
+    # Without an entry, a read runs the body and stores under that identity, so guard
+    # a read that must not choose anew with `@is_cached`.
+    miss = make(; __cache_base__ = base, __hash__ = "no-entry-here")
+    @test !@is_cached(miss.val)
+    @test miss.val == "computed:t"
+    @test isfile(joinpath(miss.__cache_path__, "val.sjl"))
+end
+end
+
+@testitem "a constructor __hash_fields__ moves the directory unless __hash__ is declared" tags=[:core] setup=[EarlierIdentityFixtures] begin
+using DynamicObjects
+const DO = DynamicObjects
+
+@testset "$T" for (T, make, versioned) in SHAPES
+    base = mktempdir()
+    earlier = make(; __cache_base__ = base, __hash_fields__ = ("earlier", "fields"))
+    current = make(; __cache_base__ = base)
+    if any(p -> first(p) === :__hash__, DO.meta(T))
+        # A declared `__hash__` reads what it reads, and these do not read `__hash_fields__`.
+        @test earlier.__hash__ == current.__hash__
+        @test earlier.__cache_path__ == current.__cache_path__
+    else
+        key = DO.canonical_hash((T, ("earlier", "fields")))
+        @test earlier.__hash__ == earlier.__identity_hash__ == key
+        @test earlier.__cache_path__ == (versioned ?
+            joinpath(base, key, earlier.__version_tag__) : joinpath(base, key))
+        earlier_writer(versioned, key, "stored", base)
+        @test @is_cached(earlier.val)
+        @test earlier.val == "stored"
+    end
+end
+end
+
+@testitem "the earlier key of a type whose identity moved is canonical_hash of what it hashed" tags=[:core] setup=[EarlierIdentityFixtures] begin
+using DynamicObjects
+using DynamicObjects: canonical_hash
+base = mktempdir()
+
+# The reported move: every fixed field but the version, to a declared `__hash_fields__`.
+@dynamicstruct struct WhenDefault
+    placement::String
+    tag::String
+    @versioned version::String
+    @cached val = "from the default identity"
+end
+stored = WhenDefault("here", "t", "v1"; __cache_base__ = base)
+stored.val
+key = canonical_hash((WhenDefault, ("here", "t")))
+@test stored.__identity_hash__ == key
+reader = EarlierIdentityFixtures.VersionedFields("elsewhere", "t", "v1"; __cache_base__ = base, __hash__ = key)
+@test reader.__cache_path__ == stored.__cache_path__
+@test @is_cached(reader.val)
+@test reader.val == "from the default identity"
+
+# The move back: a default-identity versioned type reading a declared identity's entry.
+declared = EarlierIdentityFixtures.VersionedFields("here", "t", "v1"; __cache_base__ = base, __hold_recent_version__ = false)
+RUNS[] = 0
+@test declared.val == "computed:t"
+back = WhenDefault("here", "t", "v1"; __cache_base__ = base, __hash__ = declared.__hash__)
+@test back.__cache_path__ == declared.__cache_path__
+@test @is_cached(back.val)
+@test back.val == "computed:t"
+@test RUNS[] == 1
+end
+
+@testitem "reading under a moved identity prunes its other versions unless told not to" tags=[:core] setup=[EarlierIdentityFixtures] begin
+using DynamicObjects
+key = "earlier-identity"
+pin(version, base; kw...) = EarlierIdentityFixtures.VersionedFields("here", "t", version; __cache_base__ = base, __hash__ = key, kw...)
+
+function two_versions()
+    base = mktempdir()
+    for version in ("v1", "v2")
+        EarlierVersioned(key, "stored-$version", version; __cache_base__ = base, __hold_recent_version__ = false).val
+    end
+    @test length(readdir(joinpath(base, key))) == 2
+    base
+end
+
+# `@is_cached` only looks; loading the entry holds the most recent, as computing does.
+base = two_versions()
+reader = pin("v1", base)
+@test @is_cached(reader.val)
+@test length(readdir(joinpath(base, key))) == 2
+@test reader.val == "stored-v1"
+@test length(readdir(joinpath(base, key))) == 1
+
+# So an entry an older release still reads takes `__hold_recent_version__ = false`.
+base = two_versions()
+reader = pin("v1", base; __hold_recent_version__ = false)
+@test reader.val == "stored-v1"
+@test length(readdir(joinpath(base, key))) == 2
+end

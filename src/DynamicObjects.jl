@@ -706,7 +706,16 @@ canonical_hash(x) = persistent_hash(_hash_replace(x, IdDict()))
 # what identity covers, as for every type (snag `cache-a-versione-5429048f`).
 has_versioned_fields(::Type) = false
 _identity_hash_fields(o) = o.__hash_fields__   # non-versioned: identity = all fixed fields
-_identity_hash(o) = canonical_hash((typeof(o), _identity_hash_fields(o)))
+# A `__hash__` or `__hash_fields__` passed to the constructor overrides identity as a
+# declared one does, on every shape of type: that is how a consumer reads an entry stored
+# under an earlier key (snag `constructor-hash-d738b3b5`). Without this, a versioned type
+# with no declaration read the keyword back from `o.__hash__` but cached under the fields,
+# so such an object read, wrote and cleared the entries of its current identity.
+function _identity_overridden(o)
+    seed = _identity_seed(getfield(o, :cache))
+    haskey(seed, :__hash__) || haskey(seed, :__hash_fields__)
+end
+_identity_hash(o) = _identity_overridden(o) ? o.__hash__ : canonical_hash((typeof(o), _identity_hash_fields(o)))
 _version_hash_fields(o) = ()                   # non-versioned: no version segment
 compute_property(o, ::Val{:__identity_hash__}) = _identity_hash(o)
 compute_property(o, ::Val{:__version_tag__}) = begin

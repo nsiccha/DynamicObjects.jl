@@ -188,6 +188,30 @@ with_worker() do
 end
 end
 
+@testitem "workers: a constructor __hash__ names one directory in both processes" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects
+using WorkerToy: HashVersioned, HashVersionedOwn
+const DO = DynamicObjects
+with_worker() do
+    dir = mktempdir()
+    data = Dict("k" => 1)
+    # A versioned type with a declared identity, then with the default one. Without the
+    # keyword reaching the worker, it would publish elsewhere and the requester's read of
+    # the entry would fail: `the two processes do not agree on the cache location`.
+    for make in ((; kw...) -> HashVersionedOwn(data, dir, "v1"; kw...),
+                 (; kw...) -> HashVersioned(data, dir, "v1"; kw...))
+        earlier = make(; __hash__ = "earlier-identity")
+        @test earlier.__cache_path__ == joinpath(dir, "earlier-identity", earlier.__version_tag__)
+        @test earlier.saved(2) == (pid=worker_pid(), revision="v1", value=3)
+        path = DO.get_cache_path(earlier, :saved, 2)
+        @test startswith(path, earlier.__cache_path__) && isfile(path)
+        @test !isfile(DO.get_cache_path(make(), :saved, 2))
+        invalidate!(earlier.saved, 2)
+        @test !isfile(path)
+    end
+end
+end
+
 @testitem "workers: the worker keeps a bounded number of request-context objects" setup=[WorkerFixtures] tags=[:core, :workers] begin
 using DynamicObjects
 const DO = DynamicObjects

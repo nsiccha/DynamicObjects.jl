@@ -372,6 +372,24 @@ replaced by its own stable `.__hash__` string. Built-in dictionaries and sets
 hash independently of insertion order. See [Nested DO hashing](@ref) for the
 supported containers and cache compatibility.
 
+When a type's key moves, entries stored under the earlier key stay on disk. To
+read one, pass that key to the constructor as `__hash__`:
+
+```julia
+earlier = Foo(1, 2; __hash__ = DynamicObjects.canonical_hash((Foo, (1, 2))))
+@is_cached(earlier.result) ? earlier.result : nothing
+```
+
+On every type, the keyword names the directory: `joinpath(__cache_base__,
+__hash__)`, with the version as a further segment on a `@versioned` type.
+`@is_cached`, reads and the clears then act on that directory, and the entries
+of the object's current identity stay. A read with no entry there runs the body
+and stores its value under that key, so guard it with `@is_cached`. On a
+`@versioned` type, loading an entry removes the other versions under that key,
+as computing does; pass `__hold_recent_version__ = false` to keep them. Before
+0.5.12, a `@versioned` type that declared neither `__hash_fields__` nor
+`__hash__` ignored the keyword for its directory.
+
 #### Versioning a cache: `@cached v"2"`
 
 Bumping `v"…"` invalidates that property's disk file even when the inputs

@@ -14,6 +14,27 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.12
+
+- A `__hash__` or `__hash_fields__` passed to the constructor now names the
+  object's cache directory on every type, which makes it the supported way to
+  read an entry stored under an earlier key:
+  `T(args...; __hash__ = DynamicObjects.canonical_hash((T, earlier_fields)))`.
+  `@is_cached`, reads, `invalidate!`, `clear_cache!` and `clear_disk_caches!`
+  act on that directory, and a worker computation publishes there too. Types
+  that declare `__hash_fields__` or `__hash__`, and types that are not
+  `@versioned`, already behaved this way; tests now pin it.
+- Fixed: a `@versioned` type that declares neither ignored both keywords for
+  its directory, while `o.__hash__` read the keyword back. Such an object looked
+  under the current identity, served or stored its value there, and its
+  `clear_cache!` deleted the current entry. `remake(o; __hash__ = key)` did the
+  same. An object that passes one of these keywords moves to the directory it
+  names; no other object's key moves.
+- `o.__identity_hash__` now equals the keyword on every type, as the directory
+  does. Before, a non-`@versioned` type reported the hash of its fields.
+- Consumers that pass either keyword to a `@versioned` type with no declared
+  identity must set `DynamicObjects = "0.5.12"` as their compatibility floor.
+
 ## 0.5.11
 
 - A computation whose worker process exits while the computation is being
