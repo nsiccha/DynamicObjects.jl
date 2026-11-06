@@ -14,6 +14,26 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.13
+
+- A worker computation's failure now reads in the requesting process as it does
+  in one process. `unwrap_error(err)` returns the worker's exception itself, of
+  its type and with its fields, wherever in the computation it was thrown, so a
+  layer that recognises its own exception types needs no change for
+  `configure_queue!(; workers=1)`. No registration is involved; state
+  `DynamicObjects = "0.5.13"` to rely on it.
+- **Breaking:** `unwrap_error(err)` no longer returns
+  `DynamicObjects.RemoteComputationError` for such a failure. That error stays the
+  property's cause in `err.cause`, gains an `exception` field, and still prints the
+  worker's printout and backtrace in `showerror(err)`. Code that recognised a worker
+  failure by the `unwrap_error` result reads the `cause` chain instead.
+- An exception that cannot cross stays a `RemoteComputationError`, and its printout
+  says why: it serializes to more than 1 MiB, holds a DynamicObjects object or
+  something else that cannot be serialized, or has a type from a package the
+  requesting process has not loaded.
+- A worker's printout is now written with `:limit`, so a large array an exception
+  holds prints its ends and not every element.
+
 ## 0.5.12
 
 - A `__hash__` or `__hash_fields__` passed to the constructor now names the
