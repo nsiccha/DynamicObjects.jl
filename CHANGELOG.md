@@ -14,6 +14,24 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.14
+
+- `property_signature` and `property_descriptor` now read an argument's or
+  result's type the same while a package image is written as at run time. A
+  `@compile_workload`, or an `__init__` run while another package precompiles,
+  that reflected a type from a package it depends on read every annotation as
+  `nothing`, because Julia refuses `Core.eval` into that package's module then.
+  HTMXObjects' `reflect` and route warm-up read those types.
+- New `DynamicObjects.resolve_annotation(mod, ex)`, not exported: the value an
+  annotation expression names in `mod`, found by looking names up and applying
+  them (names, `Mod.T`, `T{…}` with `<:`/`>:` parameters, `where` clauses,
+  calls, tuples, macro calls such as `@NamedTuple{…}`) rather than by
+  evaluating into `mod`. Other syntax is still evaluated; while an image is
+  written into another module that raises an `ArgumentError` saying to name the
+  annotation (`const T = …`, then `x::T`), and `property_signature` reads such
+  an annotation as `nothing` with a warning. State
+  `DynamicObjects = "0.5.14"` to rely on either.
+
 ## 0.5.13
 
 - A worker computation's failure now reads in the requesting process as it does
