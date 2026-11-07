@@ -11172,10 +11172,13 @@ Both yield `(; positional, kwargs)`, where every entry is a NamedTuple
 
 - `name::Union{Symbol,Nothing}` — the argument name (`nothing` for an anonymous
   `::T` positional).
-- `type::Union{Type,Nothing}` — the annotation resolved against `mod` via
-  `Core.eval`, or `nothing` when un-annotated OR unresolvable (e.g. a free
-  static-parameter type-var like the `V` in `Verb{V}`). Consumers map `nothing`
-  to their permissive default (HTMXObjects → `String`).
+- `type::Union{Type,Nothing}` — the annotation resolved against `mod` by
+  `DynamicObjects.resolve_annotation`, or `nothing` when un-annotated OR
+  unresolvable (e.g. a free static-parameter type-var like the `V` in
+  `Verb{V}`). Consumers map `nothing` to their permissive default
+  (HTMXObjects → `String`). The answer is the same while a package image is
+  written (a `@compile_workload`, or an `__init__` run while another package
+  precompiles) as at run time, though `mod` is then closed to evaluation.
 - `required::Bool` — `true` unless the arg carries a default or is a vararg.
 - `default` — the default-value *expression* when `required === false`;
   `nothing` (and meaningless) when `required === true`. A literal `nothing`
@@ -11263,16 +11266,178 @@ function _parse_signature_arg(node, mod)
        required, default, vararg)
 end
 
+"""    DynamicObjects.resolve_annotation(mod::Module, ex) -> Any
+
+The value the annotation expression `ex` names in module `mod`: what
+`Core.eval(mod, ex)` returns, found without evaluating into `mod`, so it also
+works while a package image is being written. Julia then refuses `Core.eval`
+into every module except the one being compiled, even for a plain name, which
+is the situation of a `@compile_workload`, or of an `__init__` run while
+another package precompiles, that reflects a type from a package it depends
+on.
+
+Resolved by looking names up and applying them:
+
+- a name (`Symbol`, `Alias`), `Mod.Name`, a `GlobalRef`, a quoted value
+  (`:x` in `Val{:x}`) or a literal (`2` in `NTuple{2,Int}`, a type object a
+  macro interpolated);
+- a parametric type `T{A, B}`, including `<:S` and `>:S` parameters
+  (`AbstractVector{<:Real}`), splatted parameters, and `where` clauses with
+  bounds (`Vector{T} where T<:Integer`);
+- a call (`typeof(sum)`, keyword arguments included), a tuple, and a macro
+  call, which is expanded in `mod` first (`@NamedTuple{a::Int}`).
+
+Any other syntax is evaluated with `Core.eval(mod, ex)`. While a package image
+is written into a module other than `mod`, that evaluation is refused and an
+`ArgumentError` says to name the annotation (`const T = …` in `mod`, then
+`x::T`). Everything else throws what `Core.eval` would: an `UndefVarError` for
+an unbound name, such as the free type parameter `V` in `Verb{V}`.
+
+The lookup runs in the latest world, as `Core.eval` does, so a name defined
+after the calling code was compiled resolves.
+
+See also `property_signature`, which resolves each argument's annotation with
+it.
+"""
+resolve_annotation(mod::Module, ex) =
+    Base.invokelatest(_resolve_annotation, mod, ex, _NO_TYPEVARS)
+
+# Type variables a `where` clause (or a `<:S` parameter) bound around the
+# expression being resolved, innermost last.
+const _AnnotationTypeVars = Vector{Pair{Symbol,TypeVar}}
+const _NO_TYPEVARS = _AnnotationTypeVars()
+
+function _resolve_annotation(mod::Module, ex::Symbol, tvs::_AnnotationTypeVars)
+    for i in length(tvs):-1:1
+        first(tvs[i]) === ex && return last(tvs[i])
+    end
+    getglobal(mod, ex)
+end
+_resolve_annotation(::Module, ex::GlobalRef, ::_AnnotationTypeVars) = getglobal(ex.mod, ex.name)
+_resolve_annotation(::Module, ex::QuoteNode, ::_AnnotationTypeVars) = ex.value
+# A literal (`2` in `NTuple{2,Int}`, a string) or an already-resolved value a
+# macro interpolated into the annotation.
+_resolve_annotation(::Module, ex, ::_AnnotationTypeVars) = ex
+
+function _resolve_annotation(mod::Module, ex::Expr, tvs::_AnnotationTypeVars)
+    resolve(x) = _resolve_annotation(mod, x, tvs)
+    if ex.head === :. && length(ex.args) == 2 && ex.args[2] isa QuoteNode
+        return getproperty(resolve(ex.args[1]), ex.args[2].value)
+    elseif ex.head === :curly
+        params = Any[]
+        bound = TypeVar[]
+        for a in @view ex.args[2:end]
+            if Meta.isexpr(a, :<:, 1) || Meta.isexpr(a, :>:, 1)
+                # `T{<:S}` is `T{X} where X<:S` (`>:` bounds from below);
+                # the `#s` name is how Julia prints an anonymous parameter.
+                b = resolve(a.args[1])
+                tv = a.head === :<: ? TypeVar(Symbol("#s", length(bound) + 1), b) :
+                                      TypeVar(Symbol("#s", length(bound) + 1), b, Any)
+                push!(bound, tv)
+                push!(params, tv)
+            elseif Meta.isexpr(a, :..., 1)
+                append!(params, resolve(a.args[1]))
+            elseif a isa Expr && a.head in (:<:, :>:)
+                return _eval_annotation(mod, ex)   # `T{X<:S}` outside `where`: not a type
+            else
+                push!(params, resolve(a))
+            end
+        end
+        t = Core.apply_type(resolve(ex.args[1]), params...)
+        for tv in Iterators.reverse(bound)
+            t = UnionAll(tv, t)
+        end
+        return t
+    elseif ex.head === :where
+        inner = copy(tvs)
+        bound = TypeVar[]
+        for v in @view ex.args[2:end]
+            tv = _where_typevar(mod, v, inner)
+            tv === nothing && return _eval_annotation(mod, ex)
+            push!(bound, tv)
+            push!(inner, tv.name => tv)
+        end
+        t = _resolve_annotation(mod, ex.args[1], inner)
+        for tv in Iterators.reverse(bound)
+            t = UnionAll(tv, t)
+        end
+        return t
+    elseif ex.head === :call
+        args = Any[]
+        kwargs = Pair{Symbol,Any}[]
+        for a in @view ex.args[2:end]
+            if Meta.isexpr(a, :parameters)
+                for p in a.args
+                    Meta.isexpr(p, :kw, 2) && p.args[1] isa Symbol ||
+                        return _eval_annotation(mod, ex)
+                    push!(kwargs, p.args[1] => resolve(p.args[2]))
+                end
+            elseif Meta.isexpr(a, :kw, 2) && a.args[1] isa Symbol
+                push!(kwargs, a.args[1] => resolve(a.args[2]))
+            elseif Meta.isexpr(a, :..., 1)
+                append!(args, resolve(a.args[1]))
+            else
+                push!(args, resolve(a))
+            end
+        end
+        return resolve(ex.args[1])(args...; kwargs...)
+    elseif ex.head === :tuple && !any(a -> a isa Expr && a.head in (:(=), :kw, :parameters, :...), ex.args)
+        return Tuple(resolve(a) for a in ex.args)
+    elseif ex.head === :macrocall
+        return resolve(macroexpand(mod, ex; recursive=true))
+    end
+    _eval_annotation(mod, ex)
+end
+
+# One `where` binding — `T`, `T<:S`, `T>:S` or `L<:T<:U` — as a TypeVar whose
+# bounds resolve with the bindings to its left in scope; `nothing` for a form
+# that is not a binding.
+function _where_typevar(mod, v, tvs)
+    resolve(x) = _resolve_annotation(mod, x, tvs)
+    v isa Symbol && return TypeVar(v)
+    if Meta.isexpr(v, :<:, 2) && v.args[1] isa Symbol
+        return TypeVar(v.args[1], resolve(v.args[2]))
+    elseif Meta.isexpr(v, :>:, 2) && v.args[1] isa Symbol
+        return TypeVar(v.args[1], resolve(v.args[2]), Any)
+    elseif Meta.isexpr(v, :comparison, 5) && v.args[2] === :<: && v.args[4] === :<: && v.args[3] isa Symbol
+        return TypeVar(v.args[3], resolve(v.args[1]), resolve(v.args[5]))
+    end
+    nothing
+end
+
+# The forms `_resolve_annotation` does not look up. Julia refuses this
+# evaluation into any module but the one being compiled while a package image
+# is written; say how to make the annotation resolvable then.
+function _eval_annotation(mod::Module, ex)
+    try
+        Core.eval(mod, ex)
+    catch err
+        err isa ErrorException && ccall(:jl_generating_output, Cint, ()) != 0 &&
+            occursin("closed module", err.msg) || rethrow()
+        throw(ArgumentError("the type annotation `$ex` in $mod needs evaluating, and " *
+            "Julia evaluates into no other package's module while a package image is " *
+            "written. Name it — `const T = $ex` in $mod, then `x::T` — since " *
+            "DynamicObjects.resolve_annotation resolves names, `Mod.T`, `T{…}`, " *
+            "`where` clauses, calls and macro calls without evaluating."))
+    end
+end
+
 # Resolve a type-annotation expression against the struct's defining module.
 # `nothing` for un-annotated args, for results that aren't a `Type`, and for
-# any expression that fails to evaluate (e.g. a free static-parameter type-var
-# such as the `V` in `Verb{V}`). Never throws.
+# any expression that fails to resolve (e.g. a free static-parameter type-var
+# such as the `V` in `Verb{V}`). Never throws. An annotation that would resolve
+# at run time but needs an evaluation Julia refuses while a package image is
+# written also reads `nothing`, with a warning (once per annotation) naming the
+# way out, since that answer differs from the run-time one.
 function _resolve_arg_type(expr, mod)
     expr === nothing && return nothing
     try
-        t = Core.eval(mod, expr)
+        t = resolve_annotation(mod, expr)
         t isa Type ? t : nothing
-    catch
+    catch err
+        if err isa ArgumentError && ccall(:jl_generating_output, Cint, ()) != 0
+            @warn "DynamicObjects reads this annotation as untyped while the package image is written" exception=err maxlog=1 _id=(mod, expr)
+        end
         nothing
     end
 end
