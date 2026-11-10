@@ -94,10 +94,28 @@ end
 # require a declaration-site marker merely to obtain safe write coordination.
 const _AUTOMATIC_MATERIALIZATION_DISK_LOCKS = DiskCacheLocks()
 
+# The bytes DO's digests hash: `x` serialized, under the header Julia 1.10 writes.
+# A serialized stream opens with an 8-byte header ("JL" after a tag byte, then the
+# writer's serialization-format version: 24 on Julia 1.10, 30 on 1.12 and 1.13, 31 on
+# 1.14). Everything after it encodes plain data byte-identically on all of these, so
+# hashing the header as written moved every digest, and with it every cache directory,
+# whenever the Julia minor version changed (snag `canonical-hash-d-dfe422b5`). Pinning
+# the version byte to 1.10's keeps every digest a 1.10 process computes and gives later
+# Julia versions the same ones. These bytes are only hashed and compared, never
+# deserialized. `test/canonical_hash.jl` pins golden digests on every CI Julia, so a
+# Julia that changes the body encoding of a covered type fails there.
+const _SERIALIZED_VERSION_BYTE = 4
+const _DIGEST_SERIALIZATION_VERSION = 0x18
 _serialized_bytes(x) = begin
     b = IOBuffer()
     Serialization.serialize(b, x)
-    take!(b)
+    bytes = take!(b)
+    bytes[2] == UInt8('J') && bytes[3] == UInt8('L') || error(
+        "DynamicObjects: this Julia ($VERSION) writes a serialization header DynamicObjects " *
+        "does not know (bytes $(bytes2hex(bytes[1:min(end, 8)]))), so its digests cannot be " *
+        "made to match other Julia versions. Report it to DynamicObjects.")
+    bytes[_SERIALIZED_VERSION_BYTE] = _DIGEST_SERIALIZATION_VERSION
+    bytes
 end
 persistent_hash(x) = bytes2hex(SHA.sha1(_serialized_bytes(x)))
 
@@ -682,7 +700,16 @@ Dict entries and Set elements are order-independent; their concrete types and sc
 value types remain part of identity. Other containers, array wrappers and arbitrary
 structs are serialized as written; sparse or lazy arrays are never densified here.
 Repeated references are retained, so alias structure can affect a digest. Order-independent
-hashing of cyclic container graphs and stability across Julia versions are not promised.
+hashing of cyclic container graphs is not promised.
+
+Since 0.5.16 a digest is the same on every Julia version from 1.10 on: on 1.10 it is the
+digest earlier versions of DynamicObjects computed, and later Julia versions compute that
+same digest. This holds for strings, numbers, symbols, chars, `nothing`, `missing`, arrays,
+ranges, tuples, named tuples, pairs, Dicts, Sets, types, structs defined in packages,
+`@dynamicstruct` objects and DataFrames, and for containers of these. Two kinds of value
+are excluded: anonymous functions and closures, whose serialized form holds their code,
+and a Dict or Set inside a value that is serialized as written (an arbitrary struct, an
+array wrapper), because its iteration order changed in Julia 1.13.
 
 Since 0.5.9, identities containing Dicts/Sets or newly replaced nested values change once:
 their old disk entries miss and remain on disk until explicitly cleared. Plain scalar
