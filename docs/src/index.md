@@ -821,6 +821,15 @@ carry `worker=<pid>`), and it can send that caller messages:
 The worker's progress tree is rebuilt live under the computation's node here,
 so it renders where the value is read, and a Stop on it reaches the worker.
 DynamicObjects requires Treebars 0.1.6 or later for this integration.
+A computation that has to wait before the worker can run it shows each wait as
+a phase of its node, ahead of the worker's own phases and kept there once
+done: "Starting the worker process" while the worker starts (the first
+computation, the first after the worker exited or was restarted, or one
+arriving while `worker_start=:now` is still starting it), then "Loading
+packages: …" while the worker loads packages the computation needs, named.
+A page writes both in its own language (they are entries of
+`DynamicObjects.progress_notes`). Before 0.5.15 the node showed nothing during
+these waits, which can take minutes for a large application.
 
 In-process work inherits all requester `ScopedValue`s automatically. To carry a
 package's request context across the process boundary, register each named variable

@@ -601,3 +601,62 @@ with_worker() do
     DynamicObjects.on_requester_message!(identity, :counted_end)
 end
 end
+
+# Snag `open-bruno-s-web-e7aa5ae2`: a computation that has to wait for the worker process to
+# start, or for it to load packages, used to show nothing on its node until the worker ran it
+# (web-sim's first view: 296 s). The two waits are phases of the node, kept once done, in the
+# page's language.
+@testitem "workers: starting the worker and loading packages are phases of the computation" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects
+using WorkerToy
+import DynamicObjects.Treebars
+# The phases DO wrote on `node`, as a page in `lang` writes them.
+waits(node, lang) = [Treebars._note_text(c.impl.message, Treebars.treebar_texts(lang))
+                     for c in collect(node.children)
+                     if isempty(c.impl.description) && c.impl.message isa Treebars.TreebarNote]
+lines(node) = split(Treebars.render_text(node), '\n')
+with_worker() do
+    t = Toy(5, mktempdir())
+    dir = mktempdir()
+    # The first computation starts the worker: its node says so while it waits.
+    p = t.counted(10; dir, fetch=identity)
+    node() = getstatus(t.counted, 10; dir)
+    @test settles(() -> (n = node(); n !== nothing &&
+        occursin("▶ — Starting the worker process", Treebars.render_text(n))))
+    @test waitfor(joinpath(dir, "half_10"))
+    touch(joinpath(dir, "go_10"))
+    @test fetch(p) == 10
+    # Both waits stay, finished, ahead of the worker's own phases. The worker also loads the
+    # package of every registered requester scope (HTMXObjects', when a test loaded it).
+    l = lines(node())
+    @test startswith(l[2], "├─ ✓ — Starting the worker process [")
+    @test occursin(r"^├─ ✓ — Loading packages: (.*, )?WorkerToy(, .*)? \[", l[3])
+    @test startswith(l[4], "└─ ✓ Steps (10/10)")
+    en, de = waits(node(), :en), waits(node(), :de)
+    @test length(en) == length(de) == 2
+    @test en[1] == "Starting the worker process"
+    @test de[1] == "Rechenprozess wird gestartet"
+    @test occursin(r"^Loading packages: .*WorkerToy", en[2])
+    @test occursin(r"^Pakete werden geladen: .*WorkerToy", de[2])
+
+    # The worker runs and has the package: nothing to wait on, so no phase.
+    touch(joinpath(dir, "go_12"))
+    @test t.counted(12; dir) == 12
+    @test isempty(waits(getstatus(t.counted, 12; dir), :en))
+    # What the worker loaded as a dependency (Treebars, under DynamicObjects) is known to be
+    # loaded: naming it neither asks the worker nor shows a phase.
+    conn = DynamicObjects.job_queue().conn
+    probe = Treebars.initialize_progress!(:state; description="probe")
+    DynamicObjects._ensure_packages!(conn, conn.worker,
+        [Base.PkgId(Treebars), Base.PkgId(DynamicObjects), Base.PkgId(WorkerToy)], probe)
+    @test isempty(probe.children)
+
+    # A restarted worker starts again and loads the package again.
+    DynamicObjects.restart_worker!()
+    touch(joinpath(dir, "go_14"))
+    @test t.counted(14; dir) == 14
+    en = waits(getstatus(t.counted, 14; dir), :en)
+    @test length(en) == 2 && en[1] == "Starting the worker process"
+    @test occursin("WorkerToy", en[2])
+end
+end

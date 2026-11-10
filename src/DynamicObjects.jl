@@ -1013,16 +1013,24 @@ _start_substatus!(s::Treebars.ProgressNode) = (Treebars.start_progress!(s); noth
     DynamicObjects.progress_notes
 
 The words DynamicObjects writes into progress nodes, in English and German: `from_disk`, the
-running message of an explicit `@cached`/`@mmap` value read back from disk, and `cached`, the note on a
-documented property's node when a reader finds its value already in memory. A node is shared
+running message of an explicit `@cached`/`@mmap` value read back from disk; `cached`, the note on a
+documented property's node when a reader finds its value already in memory; and, for a
+computation sent to the job queue's worker process (`configure_queue!(; workers=1)`), the two
+phases it waits on before the worker runs it: `starting_worker` while the worker process starts,
+and `loading_packages` while the worker loads the packages the computation needs (`{packages}`,
+their names). A node is shared
 by every viewer, and a computation often runs on a background task, so DynamicObjects writes a
 `Treebars.TreebarNote` and each page renders it in its own language (`__lang__`, see Treebars'
 `treebar_texts`). An app rewords them by passing this table to `Treebars.treebar_texts`, e.g.
 `treebar_texts(:de, DynamicObjects.progress_notes => (from_disk = "von der Festplatte ({size})",))`.
 """
 const progress_notes = Treebars.treebar_notes(
-    en = (from_disk = "from disk: {size}", cached = "(cached)"),
-    de = (from_disk = "aus dem Zwischenspeicher ({size})", cached = "(zwischengespeichert)"))
+    en = (from_disk = "from disk: {size}", cached = "(cached)",
+          starting_worker = "Starting the worker process",
+          loading_packages = "Loading packages: {packages}"),
+    de = (from_disk = "aus dem Zwischenspeicher ({size})", cached = "(zwischengespeichert)",
+          starting_worker = "Rechenprozess wird gestartet",
+          loading_packages = "Pakete werden geladen: {packages}"))
 
 # Disk-load reporting — set the substatus message to "from disk: <size>" so
 # big-file loads show up in the tree instead of stalling silently. Description
@@ -2929,7 +2937,11 @@ The worker runs this process's Julia with its code-generation flags, active proj
 so its message loop keeps answering on the interactive thread while computations run on the
 default ones; `worker_exeflags` replaces that thread flag (pass e.g. `["--threads=8,1"]`).
 `worker_start=:lazy` (the default) starts it with the first computation sent to it,
-`worker_start=:now` at once, in the background (loading a large application takes a while).
+`worker_start=:now` at once, in the background; either way the worker loads the packages a
+computation needs when the first computation needing them arrives. A computation that waits for
+the worker to start, or for it to load packages, shows each wait as a phase of its progress
+node ("Starting the worker process", "Loading packages: …", from
+`DynamicObjects.progress_notes`), kept there ahead of the worker's own phases.
 See [`worker_status`](@ref DynamicObjects.worker_status) and
 [`restart_worker!`](@ref DynamicObjects.restart_worker!).
 

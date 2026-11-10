@@ -14,6 +14,23 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.15
+
+- A computation sent to the job queue's worker process
+  (`configure_queue!(; workers=1)`) that has to wait before the worker can run
+  it now shows the wait on its progress node, as phases of their own, ahead of
+  the worker's phases and kept once done: "Starting the worker process" while
+  the worker starts (the first computation, the first after the worker exited
+  or was restarted, or one arriving while `worker_start=:now` still starts
+  it), then "Loading packages: …", naming the packages the worker loads for it.
+  Before, the node showed nothing during these waits, which take minutes for a
+  large application on a busy host (Bruno's web-sim: 296 s for its first view).
+- `DynamicObjects.progress_notes` gains `starting_worker` and
+  `loading_packages` (`{packages}`), in English and German, so a page writes
+  these phases in its own language and an app can reword them.
+- The worker is no longer asked to load a package it already loaded as a
+  dependency of another; such a package shows no phase.
+
 ## 0.5.14
 
 - `property_signature` and `property_descriptor` now read an argument's or
