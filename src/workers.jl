@@ -501,12 +501,16 @@ function _worker_init!()
     configure_queue!(; max_running=0)
     # Pinned to the thread Malt's handlers run on, so control messages run in arrival order.
     errormonitor(@async _worker_control_loop())
-    (; pid=getpid(), threads=Threads.nthreads())
+    (; pid=getpid(), threads=Threads.nthreads(), loaded=_loaded_packages())
 end
+
+# Every package this process has loaded, dependencies included: the requester need not ask
+# for any of them again.
+_loaded_packages() = Base.PkgId[Base.PkgId(m) for m in Base.loaded_modules_array()]
 
 function _worker_require(ids::Vector{Base.PkgId})
     foreach(Base.require, ids)
-    nothing
+    _loaded_packages()
 end
 
 _worker_submit(msg...) = (put!(_W_CONTROL, (:submit, msg...)); nothing)
@@ -796,8 +800,10 @@ _remote_do(conn::_WorkerConn, w, f, args...) =
 
 _worker_alive(w) = w !== nothing && Malt.isrunning(w)
 
-# The running worker of `q`, spawned first if there is none.
-function _ensure_worker!(q)
+# The running worker of `q`, spawned first if there is none. A computation's progress node
+# `status` shows the wait for the worker to start as a phase, also when another computation or
+# `worker_start=:now` started it.
+function _ensure_worker!(q, status=nothing)
     conn = q.conn
     while true
         spawning = lock(conn.lock) do
@@ -807,7 +813,7 @@ function _ensure_worker!(q)
         end
         spawning isa Task || return spawning
         try
-            fetch(spawning)
+            _waiting_phase(() -> fetch(spawning), status, :starting_worker)
         catch err
             lock(conn.lock) do
                 conn.spawning === spawning && (conn.spawning = nothing)
@@ -850,7 +856,7 @@ function _spawn_worker!(q)
             conn.pid = info.pid
             conn.started_at = time()
             conn.last_message_at = NaN
-            empty!(conn.loaded)
+            union!(empty!(conn.loaded), info.loaded)
         end
         _on_actor(() -> errormonitor(@async _event_pump(conn, w)), conn)
     catch
@@ -906,12 +912,35 @@ _malt_stop_quietly(conn, w) = try
 catch
 end
 
-function _ensure_packages!(conn::_WorkerConn, w, ids)
+# Load the packages `ids` in worker `w`, those it has not loaded yet, shown on the
+# computation's progress node `status` as a phase naming them. `conn.loaded` then records
+# everything `w` has loaded, dependencies included, so a later computation naming one of them
+# neither asks again nor shows a phase.
+function _ensure_packages!(conn::_WorkerConn, w, ids, status=nothing)
     missing = lock(() -> setdiff(ids, conn.loaded), conn.lock)
     isempty(missing) && return
-    _remote_fetch(conn, w, _worker_require, collect(missing))
-    lock(() -> union!(conn.loaded, missing), conn.lock)
+    names = join(sort!([id.name for id in missing]), ", ")
+    loaded = _waiting_phase(status, :loading_packages; packages=names) do
+        _remote_fetch(conn, w, _worker_require, collect(missing))
+    end
+    lock(conn.lock) do
+        conn.worker === w && union!(conn.loaded, missing, loaded)
+    end
     nothing
+end
+
+# A step a computation sent to the worker waits on before the worker runs it (the worker
+# process starting, packages loading), shown on the computation's progress node `status` as a
+# phase of its own and kept there once done, as the computation's own `@progress "…"` phases
+# are. The replica of the worker's tree leaves it in place (it rebuilds only the children that
+# come from the worker). Its words are a note from `progress_notes`, so each page writes them
+# in its own language; a page renders a leaf node's note exactly as it renders a label.
+function _waiting_phase(f, status, note::Symbol; values...)
+    status isa Treebars.ProgressNode || return f()
+    Treebars.with_progress(status; description="") do phase
+        Treebars.update_progress!(phase, progress_notes(note; values...))
+        f()
+    end
 end
 
 # Whether this process sends `item`'s work to the worker of `q`.
@@ -991,7 +1020,7 @@ function _compute_in_worker(f::_WorkerCompute, o, name::Symbol, args::Tuple, kwa
     try
         w, pid = _submit!(q, req, o, name, args, kwargs, packages,
                           (req.id, address, name, wired_args, wired_kwargs, is_fresh, min_level,
-                           _mirrorable(status), scopes))
+                           _mirrorable(status), scopes), status)
         replica = _replica(status, conn, w, req.id)
         interrupter = replica === nothing ? _forward_interrupts(conn, w, req.id, status) : replica
         while true
@@ -1031,18 +1060,19 @@ end
 # Send `req` to the worker, starting one first if none runs. A worker found dead at the send
 # (it exited before this process noticed, or while the send waited on it) is replaced once:
 # nothing it ran survives it. Its exit still reaches `req` from the event pump as
-# `:abandoned`, naming it, which `_compute_in_worker` then ignores.
-function _submit!(q, req::_RemoteRequest, o, name, args, kwargs, packages, message)
+# `:abandoned`, naming it, which `_compute_in_worker` then ignores. Starting a worker and
+# loading packages show as phases on the computation's progress node `status`.
+function _submit!(q, req::_RemoteRequest, o, name, args, kwargs, packages, message, status=nothing)
     conn = q.conn
     for attempt in 1:2
         w = try
-            _ensure_worker!(q)
+            _ensure_worker!(q, status)
         catch err
             throw(ComputeAbandoned("the worker process could not be started: " * sprint(showerror, err), true))
         end
         lock(() -> req.worker = w, conn.lock)
         try
-            _ensure_packages!(conn, w, packages)
+            _ensure_packages!(conn, w, packages, status)
             _remote_fetch(conn, w, _worker_submit, message...)
             return w, w.proc_pid
         catch err
