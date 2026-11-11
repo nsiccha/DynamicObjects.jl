@@ -94,13 +94,67 @@ off. To label a root, provide a Treebars node as that keyword. The
 node when a caller needs explicit attachment. `@fetch!` threads those reads
 through a block; ordinary property bodies already attach their visible reads.
 
-## Executors and errors
+## Queued work
 
 `@queued` on an indexed property routes its computations through the package's
-job queue. Framework code can also supply a [`Deferred`](@ref) executor.
-Queueing changes where work runs, not which arguments identify a cached entry.
-Keep synchronous computations as ordinary properties unless the application
-needs a scheduling policy.
+process-wide [`job_queue`](@ref DynamicObjects.job_queue).
+[`configure_queue!`](@ref DynamicObjects.configure_queue!) sets its concurrency
+cap: `max_running=0` admits work immediately; a positive cap makes later work
+wait in FIFO order. Cached values never queue, and callers with the same
+arguments share one memoized computation. A queued computation gives back its
+slot when it waits for another queued computation, allowing its child to run.
+
+An application can also create a separate queue and submit a
+[`QueuedCall`](@ref DynamicObjects.QueuedCall). This call returns its computed
+value through `fetch` without creating a property cache entry.
+
+```@example polling
+queue = DynamicObjects.JobQueue(max_running=2)
+call = DynamicObjects.QueuedCall(() -> sum(abs2, [1, 2, 3]))
+DynamicObjects.enqueue!(queue, call)
+result = fetch(call)
+@assert result == 14 # hide
+__docs_output__ = begin # hide
+result
+end # hide
+show(stdout, MIME"text/plain"(), __docs_output__) # hide
+println() # hide
+```
+
+Use [`queue_settings`](@ref DynamicObjects.queue_settings) and
+[`queued_items`](@ref DynamicObjects.queued_items) to inspect admission.
+[`observe_queue!`](@ref DynamicObjects.observe_queue!) registers an enqueue
+observer; [`unobserve_queue!`](@ref DynamicObjects.unobserve_queue!) removes it.
+[`abandon_queued!`](@ref DynamicObjects.abandon_queued!) withdraws waiting work
+without interrupting computations already admitted.
+
+## Worker processes
+
+Set `workers=1` through
+[`configure_queue!`](@ref DynamicObjects.configure_queue!) to run admitted
+`@queued` property computations in a separate Julia process. The root object's
+type must belong to a package the worker can load. `workers=0` keeps execution
+in the requesting process. Queueing changes where work runs; it does not add
+context to cache keys.
+
+The configuration reference contains the complete `worker_start` and
+`worker_preload` contract, including eager and lazy startup, restart behavior,
+and the distinction between omitting the preload list and clearing it. Use
+[`worker_status`](@ref DynamicObjects.worker_status) to inspect the process and
+[`restart_worker!`](@ref DynamicObjects.restart_worker!) to replace it.
+[`carry_to_worker!`](@ref DynamicObjects.carry_to_worker!) registers named
+package scoped values for transport; unregistered scoped values do not travel.
+Worker computations can send messages through
+[`send_to_requester`](@ref DynamicObjects.send_to_requester) to a handler
+registered with [`on_requester_message!`](@ref DynamicObjects.on_requester_message!).
+
+## Executors and errors
+
+Framework code can supply a [`Deferred`](@ref) executor, with
+[`property_executor`](@ref DynamicObjects.property_executor) selecting it for
+a declaration. [`await_deferred`](@ref DynamicObjects.await_deferred) lets its
+blocking waits cooperate with the scheduler. Keep synchronous computations as
+ordinary properties unless the application needs a scheduling policy.
 
 A failed body is reported through [`PropertyComputationError`](@ref).
 [`unwrap_error`](@ref) retrieves the underlying exception for error reporting.
