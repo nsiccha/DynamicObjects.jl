@@ -14,6 +14,19 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.19
+
+- `declaration_selection(graph, roots; boundaries=())` selects local declaration
+  requirements without evaluating properties. It follows dependencies and domain
+  links, stops at explicit boundaries, and preserves containing declarations as
+  context without selecting their siblings. Results retain original records,
+  source/provenance, traversal reasons, and diagnostics for opaque, missing or
+  nested dependencies. Selections may overlap or leave declarations unselected.
+- `declaration_graph` now links a sibling dependency to every same-name method
+  declaration and records dependency-analysis uncertainty on properties and
+  domains. Selection remains a declaration plan, not a proof of purity or a
+  complete execution graph.
+
 ## 0.5.18
 
 - `configure_queue!(; worker_preload=[AppModule], worker_start=:now, workers=1)`
