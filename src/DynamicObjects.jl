@@ -1,50 +1,9 @@
 """
     DynamicObjects
 
-Provides the `@dynamicstruct` macro for defining structs with lazily computed,
-optionally disk-cached properties.
-
-# Exports
-- [`@dynamicstruct`](@ref): Define a struct with computed/cached properties.
-- [`@cache_status`](@ref): Get the disk-cache status of a property (`:unstarted`, `:started`, `:ready`).
-- [`@is_cached`](@ref): Check whether a property's disk cache is ready.
-- [`@cache_path`](@ref): Get the file path used for a property's disk cache.
-- [`@memo!`](@ref): Wrap a call site so `IndexableProperty` callees are cached (now the default; makes it explicit).
-- [`memoize!`](@ref): Explicit cached call into an `IndexableProperty`.
-- [`maybememoize!`](@ref): Dispatch helper behind `@memo!`; cached on IPs, plain call otherwise.
-- [`@fresh`](@ref): Wrap a call site so `IndexableProperty` callees are recomputed fresh (opt out of the default caching).
-- [`fresh`](@ref): Explicit uncached call into an `IndexableProperty`.
-- [`maybefresh`](@ref): Dispatch helper behind `@fresh`; uncached on IPs, plain call otherwise.
-- [`remake`](@ref): Create a new instance of a `@dynamicstruct` type with some fields changed.
-- [`remount`](@ref): Bind fresh request/context properties while retaining unrelated cache identity.
-- [`fetchindex`](@ref): Non-blocking access to `ThreadsafeDict`-backed properties with `(rv, status)` callback.
-- [`getstatus`](@ref): Read the status object for an in-flight computation.
-- [`@clear_cache!`](@ref): Drop a property and everything derived from it (or one indexed entry) from memory and disk.
-- [`invalidate!`](@ref): Drop one indexed-property entry (memory + disk) so the next access recomputes.
-- [`@persist`](@ref): Manually persist a property value to disk cache.
-- [`PropertyComputationError`](@ref): Exception wrapper for errors during property computation.
-- [`unwrap_error`](@ref): Dig through exception wrappers to find the root cause.
-- [`entries`](@ref): List all entries in a `ThreadsafeDict`-backed property with state info.
-- [`cached_entries`](@ref): Iterate completed entries of an indexed property.
-- [`clear_mem_caches!`](@ref): Clear in-memory memoized values (disk caches untouched).
-- [`clear_disk_caches!`](@ref): Delete on-disk cache files (in-memory values untouched).
-- [`clear_all_caches!`](@ref): Clear both in-memory and disk caches.
-- [`mem_cache_entries`](@ref): Walk the in-memory cache entries of an object graph, computing nothing.
-- [`prune_mem_caches!`](@ref): Evict the derived in-memory entries a predicate rejects (disk untouched).
-- [`PersistentSet`](@ref): Thread-safe, disk-persisted `Set`.
-- [`LazyPersistentDict`](@ref): Thread-safe, lazily-loaded, disk-persisted `Dict`.
-- [`KeyTracker`](@ref): Abstract type for pluggable accessed-keys persistence strategies.
-- [`SharedFileTracker`](@ref): Default strategy — single shared `_keys.sjl` file.
-- [`NoKeyTracker`](@ref): No-op strategy — never records or loads keys.
-- [`key_tracker`](@ref): Override to set the tracking strategy per object type / property.
-- [`record!`](@ref): Record an accessed key via a `KeyTracker`.
-- [`load_keys`](@ref): Load the full set of recorded keys via a `KeyTracker`.
-- [`property_descriptor`](@ref): Reflect semantic inputs, dependencies, and storage policy without execution.
-- [`declaration_graph`](@ref): Build a stable application declaration graph, with extension fragments, without execution.
-- [`declaration_observations`](@ref): Add a separate non-computing runtime-state overlay keyed by declaration IDs.
-- [`execute_materialization`](@ref): Framework-only governed semantic execution (applications call operations normally).
-- [`release_materialization!`](@ref): Release a retained semantic root without racing active executions.
-- [`materialization_gc!`](@ref): Collect only unreachable, provider-released storage with proven ownership.
+Define objects with lazily computed properties using [`@dynamicstruct`](@ref).
+Scalar and indexed properties share dependency tracking, memory caching, and
+optional disk storage.
 """
 module DynamicObjects
 export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, invalidate!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, remount, file_version, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, mem_cache_entries, prune_mem_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending, Deferred, DeferredCompute, ComputeAbandoned, BackgroundCache
@@ -1776,9 +1735,9 @@ _resolver(f, c, key, fetch, substatus, retry_failed) =
 """
     ComputeAbandoned(reason)
 
-Recorded as a key's failure when an executor [`abandon!`](@ref)s a queued compute instead of
+Recorded as a key's failure when an executor `abandon!`s a queued compute instead of
 running it, or when the worker process running it (see
-[`configure_queue!`](@ref DynamicObjects.configure_queue!)) exited or was restarted
+`configure_queue!`) exited or was restarted
 (`started` is then `true`). Waiters and pollers see it like any other failure; with the
 default `retry_failed=true` the next access starts a fresh compute.
 """
@@ -1838,12 +1797,12 @@ queue. Its progress node stays pending (`·`, no elapsed time) until `run!` star
 
 The executor must eventually call exactly one of:
 
-- [`run!(d)`](@ref run!) — run the compute on the calling task. Call it from a worker to run
+- `run!(d)` — run the compute on the calling task. Call it from a worker to run
   in the background; calling it synchronously inside the executor makes the originating
   `get!` behave like a blocking accessor — the value, not a `Pending`, comes back (the escape
   hatch for a compute started from inside one of the executor's own workers, where queueing
   behind yourself would deadlock).
-- [`abandon!(d, reason)`](@ref abandon!) — never run it; the key fails with
+- `abandon!(d, reason)` — never run it; the key fails with
   [`ComputeAbandoned`](@ref).
 
 Only the first of the two takes effect. Dropping a `DeferredCompute` without calling either
@@ -1913,34 +1872,16 @@ end
 """
     Deferred(executor)
 
-Two-phase `fetch` selector that behaves like `identity` — a first-arriving caller gets a
-[`Pending`](@ref) back immediately — but starts the compute by calling
-`executor(d::DeferredCompute)` instead of `Threads.@spawn`. Pass it wherever `fetch=identity`
-is accepted (`memoize!`, `fetchindex`, IP calls, `execute_materialization`).
+A nonblocking fetch selector that schedules work through
+`executor(work::DeferredCompute)`. The first caller receives a [`Pending`](@ref)
+handle while the work waits or runs. Use it where `fetch=identity` is accepted.
 
-Use it to put background computes behind a queue or a bounded worker pool so that many heavy
-computes do not all run at once. A minimal FIFO pool of `n` workers:
-
-```julia
-function bounded_executor(n)
-    queue = Channel{DynamicObjects.DeferredCompute}(Inf)
-    for _ in 1:n
-        worker = Threads.@spawn for d in queue
-            DynamicObjects.run!(d)
-        end
-        errormonitor(worker)
-    end
-    d -> put!(queue, d)
-end
-rv = ip(args...; fetch=Deferred(bounded_executor(2)))   # Pending while queued or running
-```
-
-The executor is called with the key's in-flight latch registered and no cache lock held; it
-should return promptly (enqueue, don't compute) unless it deliberately runs inline. See
-[`DeferredCompute`](@ref) for the contract. To choose the executor once at a property's
-declaration, for every caller, see
-[`property_executor`](@ref DynamicObjects.property_executor); blocking waits on the
-computation go through [`await_deferred`](@ref DynamicObjects.await_deferred).
+The executor is called after registering the in-flight entry, with no cache lock
+held. It should enqueue promptly, then eventually run or abandon the work under
+the [`DeferredCompute`](@ref) contract. A deliberately inline executor may run
+it immediately. Declaration-level scheduling uses
+`DynamicObjects.property_executor`; blocking waits cooperate through
+`DynamicObjects.await_deferred`.
 """
 struct Deferred{E}
     executor::E
@@ -2252,54 +2193,27 @@ _scope_has(::Nothing, ::ComputeTrace) = false
 _scope_has(s::_TraceScope, t::ComputeTrace) = s.trace === t || _scope_has(s.outer, t)
 
 """
-    with_compute_trace(f; events=0, invalidations=1000) -> (value, trace::ComputeTrace)
-    with_compute_trace(f, trace::ComputeTrace) -> value
+    with_compute_trace(f; events=0, invalidations=1000) -> (value, trace)
+    with_compute_trace(f, trace::ComputeTrace)
 
-Run `f()` and record what DynamicObjects property reads did meanwhile: on this task, on tasks
-it spawns, and in computations it hands to an executor or the `@queued` job queue. Show the
-returned [`ComputeTrace`](@ref) for a per-property table, sorted by own time, plus the
-invalidations issued:
+Run `f()` and record property reads in a [`ComputeTrace`](@ref). The scope follows
+spawned tasks and deferred work. Nested scopes also record in the outer trace.
+An existing trace can collect several calls and remains available if `f` throws.
 
-```julia
-value, trace = DynamicObjects.with_compute_trace() do
-    render_page(app)
-end
-trace
-```
+[`compute_trace_rows`](@ref) reports counts and times by type and property.
+Outcomes distinguish memory hits, memoized computations, fresh computations,
+disk reads, waits, pending polls and errors. Dunder-property reads and a direct
+`fetch` of a `Pending` handle are not recorded separately.
 
-Per `(type, property)` the table counts:
+`total_s` includes nested reads; `self_s` subtracts reads nested on the computing
+task. It does not subtract time spent waiting for separately spawned tasks.
+`hit_s` includes key hashing. These are measured durations, not estimates of
+execution time with compilation excluded.
 
-- `calls`: recorded reads. A blocking read of a property with a declared executor records
-  both its computation (on the worker) and its wait;
-- `hits`: reads served from memory; `hit s` is their time, including the hashing of the key;
-- `computed`: memoized computations whose body ran;
-- `disk`: reads served from a `@cached`/`@mmap` entry, with no body run. They are not counted
-  under `computed`, so a process that reloads everything from disk reads `computed` 0 and
-  `disk` N;
-- `fresh`: uncached computations (`@fresh`, `fresh`);
-- `waits`: reads that blocked on a computation running on another task, or in an executor;
-  `wait s` is the time blocked. A blocking `fetch` of a [`Pending`](@ref) handle is not a
-  read and is not recorded;
-- `pending`: polls that got a [`Pending`](@ref);
-- `errors`: computations that threw, and reads that surfaced a recorded failure.
-
-Each recorded read counts under exactly one of `hits`, `computed`, `disk`, `fresh`, `waits`,
-`pending` and `errors`, so they sum to `calls`.
-
-`total s` is the wall time of the property's computations and disk loads, including nested
-reads, and `max s` the slowest one. `self s` is `total s` minus the nested reads recorded on
-the computing task, so `self s`, `hit s` and `wait s` partition the traced time of one task.
-Time a computation spends blocked on tasks it spawned counts as its own.
-
-The second form records into an existing `trace`, which is still filled in when `f` throws,
-and can be reused to collect several calls. Traces nest: an inner scope also records into
-the enclosing traces. Properties named `__name__` (status, hashes, cache paths) are not
-recorded: their cost counts as the self time of the property that read them. Invalidations
-are logged in order: `clear_mem_caches!`, `clear_cache!`, `invalidate!` (also behind
-`fetchindex(…; force=true)`), `sync!` (per object whose memory values it dropped) and
-`clear_disk_caches!`.
-
-With no trace active, tracing costs one atomic load per property read.
+`events` retains at most that many individual reads in `trace.events`, holding
+arguments by reference. `invalidations` bounds the invalidation log, which records
+clears, entry invalidations and synchronization that drops values. The trace
+stops changing when all its scopes have ended.
 """
 function with_compute_trace(f; events::Integer=0, invalidations::Integer=1000)
     trace = ComputeTrace(; events, invalidations)
@@ -3719,31 +3633,15 @@ function invalidate!(c::BackgroundCache{K,V}, key::K) where {K,V}
 end
 
 """
-    fetchindex(fetch, ip, indices...; kwargs...)
+    fetchindex(callback, ip, indices...; force=false, retry_failed=force, kwargs...)
 
-Call `memoize!(ip, indices...; kwargs...)` with a custom `fetch` function.
+Request an indexed property without blocking. The callback receives
+`(result, status)`: `result` is a [`Pending`](@ref) handle while work is in flight,
+or the completed value; `status` is its progress node or `nothing`.
+Calling `fetch` on the handle blocks and rethrows a computation failure.
 
-For `IndexableProperty` backed by a `ThreadsafeDict`, the `fetch` callback receives
-`(rv, status)` where `rv` is a `Pending` handle (still computing) or the computed
-result (done), and `status` is the substatus object (from `__substatus__`) or
-`nothing`. `fetch(::Pending)` blocks for the value (rethrowing if the compute failed).
-
-Pass `force=true` to unconditionally recompute: runs [`invalidate!`](@ref) on
-the entry first (in-memory + on-disk dropped), so the access recomputes from
-scratch. See `invalidate!` for the in-flight semantics.
-
-# Example
-```julia
-fetchindex(app.results, key) do rv, status
-    if rv isa Pending
-        # still computing — status is the progress node
-        render_progress(status)
-    else
-        # done — render result
-        render(rv)
-    end
-end
-```
+`force=true` first calls [`invalidate!`](@ref) for the requested entry, removing
+its memory and disk value. See that function for in-flight behavior.
 """
 function fetchindex(fetch, ip::IndexableProperty{<:Any,<:Any,<:AbstractThreadsafeDict}, indices...;
                     force=false, retry_failed=force, kwargs...)
@@ -3955,7 +3853,7 @@ Base.show(io::IO, s::PersistentSet) = print(io, "PersistentSet(", length(s.data)
     LazyPersistentDict{D<:AbstractDict}(path[, empty_data]; seed!)
 
 Threadsafe dict backed by `Serialization.serialize`/`deserialize`. The backing
-file path is resolved **lazily** via a callable `path` so the constructor
+file path is resolved lazily via a callable `path` so the constructor
 itself is precompile-safe (no `mkpath`, no file I/O). The on-disk file is
 loaded on the first operation (double-checked under the lock), and the
 optional `seed!(data)` callback runs once after load if the dict is empty.
@@ -4129,53 +4027,25 @@ end
 # --- cache clearing ---
 
 """
-    clear_mem_caches!(obj)
+    clear_mem_caches!(object)
 
-Clear all in-memory memoized property values on a `@dynamicstruct` instance,
-leaving disk caches (`@cached` files) untouched. Every derived property —
-including child DOs stored as values — will be recomputed on next access.
+Remove derived in-memory values while keeping disk files, constructor inputs,
+and settled or in-flight `@state` values. A later read recomputes a derived value
+or reloads its disk entry. Constructor overrides and mounted request context
+are restored, so clearing does not change the object's inputs.
 
-Holders follow, as for `DynamicObjects.clear_cache!`: when the clear drops a
-derived value, `obj`'s `object_version` moves, so an object holding `obj` (as an
-indexed-property entry, a field or a property value, directly or in an array,
-tuple or dict) drops what it derived from `obj` on its next `sync!`, and so do
-the children that holder holds. A clear that drops nothing but inputs, `@state`
-values and DO's own `__…__` entries leaves the version where it was. To free
-memory without invalidating anything, use [`prune_mem_caches!`](@ref).
+Indexed wrappers remain attached and their subcaches are emptied in place.
+Held handles and remount views therefore observe subsequent computations and
+clears. Derived child objects are dropped and recreated on demand.
 
-Constructor-passed inputs are NOT dropped: the kwargs the instance was created
-with (`__parent__` wiring, inline-child index params, property overrides such
-as `__status__ = nothing`) are restored after the clear, so the instance keeps
-its meaning and only derived memos recompute. Without this a cleared parented
-child could never recompute: an undeclared `__parent__` has no
-`compute_property` fallback (`MethodError`), and a declared one falls back to
-`nothing`. The same holds for a [`remount`](@ref) view, whose request context
-is restored into the view-local overlay (and the retained object's own inputs
-back into the shared cache).
+Dropping derived values advances the object's version. Holders invalidate what
+they derived from it on their next [`sync!`](@ref). To free memory without that
+invalidation, use [`prune_mem_caches!`](@ref).
 
-`@state` properties are kept too: they hold per-instance state, not derived
-values, so a settled `@state` value (every computed entry of an indexed one)
-survives the clear, including through a [`remount`](@ref) view. Reset one with
-`DynamicObjects.clear_cache!(obj, :name)`.
-
-Indexed-property entries are dropped from the per-argument subcaches
-themselves, which stay attached to the object: a live [`remount`](@ref)
-request view, a destructured wrapper handle, and a waiter or `Pending` of a
-dropped computation all share the retained subcache object, so they re-read
-from scratch and share what the object computes afterwards, across any
-number of later clears.
-
-This is useful after hot-reloading code via Revise: property values computed by
-old method definitions stay memoized until the process restarts or this function
-is called.
-
-In-flight semantics: as with [`invalidate!`](@ref), a compute running at
-clear time stores nothing; its caller gets its value, and waiters re-resolve
-at once, without waiting for it to finish.
-A `@state` computation in flight is kept, like a settled `@state` value. This
-also drops the object's progress root (`__status__`) unless it was passed in;
-from inside a computation, prefer the narrower `sync!` after `notify_change!`,
-or `DynamicObjects.clear_cache!(obj, name)`.
+In-flight computations that were retracted cannot publish a value; their
+original callers may still receive it and waiters resolve against the current
+entry. The progress root is also dropped unless supplied as a constructor input.
+Inside a computation, prefer a narrower property clear or `sync!`.
 """
 function clear_mem_caches!(obj)
     forward = _invalidation_address(obj)   # while `obj`'s parent still holds it
@@ -4413,16 +4283,13 @@ load_keys(tracker::SharedFileTracker) =
 load_keys(tracker::NoKeyTracker) = Set()
 
 """
-    key_tracker(o, ::Val{name}) -> KeyTracker
+    key_tracker(object, ::Val{property}) -> KeyTracker
 
-Return the `KeyTracker` to use for property `name` on object `o`.
-Override this method on your type to change the tracking strategy.
-
-```julia
-# Example: disable accessed-key tracking for all properties on MyType
-DynamicObjects.key_tracker(o::MyType, ::Val{name}) where {name} =
-    DynamicObjects.NoKeyTracker()
-```
+Select the strategy for explicitly recorded disk-cache keys. The default is
+[`SharedFileTracker`](@ref) at the property's `_keys.sjl` path. Override this
+method for an object type and property to return [`NoKeyTracker`](@ref) or a
+custom tracker. Automatic property access does not currently record keys;
+[`record!`](@ref) remains available for explicit recording.
 """
 key_tracker(o, ::Val{name}) where {name} =
     SharedFileTracker(joinpath(o.__cache_path__, string(name) * "_keys.sjl"))
@@ -4913,86 +4780,38 @@ cache_f_expr(x; f) = begin
     end
 end
 """
-    @cache_status o.prop
-    @cache_status o.prop(indices...)
+    @cache_status object.property
+    @cache_status object.property(arguments...)
 
-Return the disk-cache status of a `@cached` property as a `Symbol`:
-- `:unstarted` — no cache file exists yet.
-- `:started`   — an empty placeholder file exists (previous run may have crashed).
-- `:ready`     — a complete cache file exists and can be deserialized.
-
-Can be used both outside and inside a `@dynamicstruct` body. Inside a struct
-definition, omit the object prefix — just use the property name (with parens
-for indexed properties).
-
-```julia
-# Outside the struct:
-@cache_status e.result          # :unstarted (before first access)
-e.result
-@cache_status e.result          # :ready
-@cache_status e.ci(2)           # for indexed properties — call syntax
-
-# Inside the struct body:
-@dynamicstruct struct App
-    @cached result(key) = expensive(key)
-    status(key) = @cache_status result(key)   # :unstarted, :started, or :ready
-end
-```
-
-The legacy bracket form (`@cache_status o.prop[indices...]`) still works for
-backward compatibility but is discouraged in new code — prefer call syntax,
-which mirrors the way the property is invoked.
+Report the disk entry's state: `:unstarted`, `:started`, or `:ready`.
+Use a call expression for one indexed entry and a dot expression for a scalar.
+This inspects disk state, not the in-memory memo table. Inside a
+`@dynamicstruct` body the object prefix may be omitted.
 """
 macro cache_status(x)
     cache_f_expr(x; f=get_cache_status) |> esc
 end
 
 """
-    @is_cached o.prop
-    @is_cached o.prop(indices...)
+    @is_cached object.property
+    @is_cached object.property(arguments...)
 
-Return `true` if the disk cache for `o.prop` (or `o.prop(indices...)`) is
-`:ready`, i.e. the cached value can be loaded from disk without recomputation.
-
-Can be used both outside and inside a `@dynamicstruct` body. Inside a struct
-definition, omit the object prefix — just use the property name (with parens
-for indexed properties).
-
-```julia
-# Outside the struct:
-@is_cached e.result   # false before first access, true afterwards
-
-# Inside the struct body:
-@dynamicstruct struct App
-    @cached result(key) = expensive(key)
-    summary(key) = if @is_cached result(key)
-        "cached: \$(@memo! result(key))"
-    else
-        "not yet computed"
-    end
-end
-```
-
-The legacy bracket form (`@is_cached o.prop[indices...]`) still works for
-backward compatibility but is discouraged in new code.
+Return whether the selected disk entry is ready, equivalent to comparing
+[`@cache_status`](@ref) with `:ready`. This is not a test for an in-memory hit.
+Inside a `@dynamicstruct` body the object prefix may be omitted.
 """
 macro is_cached(x)
     :($(cache_f_expr(x; f=get_cache_status)) == :ready) |> esc
 end
 
 """
-    @cache_path o.prop
-    @cache_path o.prop(indices...)
+    @cache_path object.property
+    @cache_path object.property(arguments...)
 
-Return the file path where the disk-cached value of `o.prop` (or
-`o.prop(indices...)`) is (or would be) stored.
-
-```julia
-@cache_path e.result          # e.g. "cache/<hash>/result.sjl"
-@cache_path e.ci(2)           # "cache/<hash>/ci_2.sjl"
-```
-
-The legacy bracket form is still accepted but discouraged.
+Return the selected property's disk-cache path without computing its value.
+An indexed call selects one argument tuple. The path depends on the object's
+identity and version. Inside a `@dynamicstruct` body the object prefix may be
+omitted.
 """
 macro cache_path(x)
     cache_f_expr(x; f=get_cache_path) |> esc
@@ -5047,62 +4866,27 @@ maybefresh(f, args...; kwargs...) = f(args...; kwargs...)
 maybefresh(p::IndexableProperty, args...; kwargs...) = fresh(p, args...; kwargs...)
 
 """
-    @memo! expr
+    @memo! expression
 
-Rewrite every call inside `expr` as `maybememoize!(callee, args…)`. At
-runtime `maybememoize!` dispatches: `IndexableProperty` callees go through
-[`memoize!`](@ref) (cached); everything else just calls normally.
-
-The bare call form `o.prop(i)` now caches by default, so `@memo!` is the
-explicit, reader-visible equivalent of a bare indexed-property call — and is
-still useful for making the caching intent obvious or for one-shot cached calls
-outside a `@dynamicstruct` body (where you can also call `memoize!` directly).
-To opt OUT and recompute fresh, use [`@fresh`](@ref) / [`fresh`](@ref).
-
-Inside a `@dynamicstruct`, an indexable property `prop(i) = ...` can be
-invoked these ways:
-
-- `o.prop(i)` — caches by default (look up in the in-memory cache, compute and cache on miss).
-- `@memo! o.prop(i)` — identical to the bare call, but makes the caching explicit at the call site.
-- `@fresh o.prop(i)` — recompute on every call, bypassing the cache entirely.
-
-```julia
-@memo! o.prop(i)                          # cached access
-@memo! o.prop(i; k=v)                     # kwargs participate in the cache key
-
-# Chained IP calls all get memoized; intermediate non-IP calls (e.g.
-# top-level helpers) just call normally:
-@memo! qt.loaded(dataset; data_version).filtered(; src).eda.counts
-@memo! sort(x.prop(i))
-```
-
-The bang on `@memo!` / `memoize!` / `maybememoize!` reflects that each
-mutates the per-key in-memory cache. There is no bracket access on
-`IndexableProperty` — `ip[args...]` and `ip[; kw...]` are unsupported
-(the latter never parsed in the first place); use the function forms.
+Rewrite calls in `expression` through [`maybememoize!`](@ref): indexed
+properties use their memoized path and other callables keep ordinary call
+behavior. This is redundant for ordinary indexed calls, which already memoize.
+Quoted code is left unchanged. Use [`@fresh`](@ref) to bypass the selected cache.
 """
 macro memo!(x)
     esc(_call_rewrite(x, :maybememoize!))
 end
 
 """
-    @fresh expr
+    @fresh expression
 
-Rewrite every call inside `expr` as `maybefresh(callee, args…)` — the dual of
-[`@memo!`](@ref). At runtime `maybefresh` dispatches: `IndexableProperty`
-callees go through [`fresh`](@ref) (uncached, recomputed); everything else just
-calls normally.
+Rewrite calls in `expression` through [`maybefresh`](@ref). An indexed property
+computes without reading or writing its cache; other callables are called
+normally. Quoted code is left unchanged. This does not recursively bypass the
+caches of dependencies read inside the selected property's body.
 
-`@fresh` is the call-site opt-out from the now-default memoized call form: the
-bare call `o.prop(i)` caches, and `@fresh o.prop(i)` recomputes fresh and
-bypasses the cache (no read, no store). For a one-shot fresh call outside a
-`@dynamicstruct` body, call [`fresh`](@ref) directly.
-
-```julia
-@fresh o.prop(i)                          # uncached access
-@fresh o.prop(i; k=v)                     # kwargs forwarded, not cached
-@fresh sort(x.prop(i))                    # the IP call is fresh; `sort` just calls
-```
+A declaration marked `@fresh` uses uncached access on every call. The function
+form [`fresh`](@ref) selects one indexed property explicitly.
 """
 macro fresh(x)
     esc(_call_rewrite(x, :maybefresh))
@@ -5224,29 +5008,16 @@ maybefresh(::typeof(_call_threaded), progress, f, args...; kwargs...) =
     _call_threaded(progress, f, args...; kwargs...)
 
 """
-    @fetch! progress expr
+    @fetch! progress expression
 
-Like [`@memo!`](@ref) but also attaches progress. Rewrites every call site
-to `maybefetchindex!(progress, callee, args…)` and every property access
-to `maybefetchproperty!(progress, obj, :name)`.
+Thread property reads in `expression` through the progress-aware fetch helpers.
+Indexed reads use [`fetchindex!`](@ref), scalar reads use [`fetchproperty!`](@ref),
+and declaration-marked fresh properties retain their uncached policy through
+[`maybeprogress!`](@ref). Non-property functions keep their ordinary call behavior.
 
-`progress` is required — pass the progress/status variable explicitly
-(typically `__progress__`, the variable bound by `Treebars.@progress`
-blocks and `@dynamic_progress`). A one-argument form is intentionally not
-provided: under Julia's outside-in macro expansion, `@progress` renames
-`__progress__` before `@fetch!` expands, so a `@fetch!`-introduced
-`__progress__` would dangle into an `UndefVarError` at runtime.
-
-```julia
-@fetch! __progress__ begin
-    data = loaded(dataset; data_version)   # IP → fetchindex!
-    result = data.dense_chains             # bare prop → fetchproperty!
-end
-
-@fetch! custom_progress begin
-    data = loaded(dataset; data_version)
-end
-```
+With a Treebars progress node these reads block and attach the computation's
+node beneath it. With `nothing` they use the ordinary access path. Property
+bodies already attach their source-visible reads automatically.
 """
 macro fetch!(progress_var, x)
     esc(_fetch_rewrite(progress_var, x))
@@ -5754,8 +5525,8 @@ end
 
 Rewrite every `:call` inside `body` as
 `maybeprogress!(progress_var, callee, args…)`. Returns the rewritten body
-unchanged otherwise. **The caller is responsible for binding
-`progress_var`** — e.g. via `Treebars.@progress progress_var body` — and
+unchanged otherwise. The caller is responsible for binding
+`progress_var` — e.g. via `Treebars.@progress progress_var body` — and
 for keeping DO free of a hard `Treebars` dependency.
 
 `maybeprogress!` dispatches on `progress_var`'s runtime type: a
@@ -5835,62 +5606,23 @@ function _clear_cache_entry!(o, name::Symbol, indices...; kwargs...)
     nothing
 end
 """
-    @clear_cache! o.prop
-    @clear_cache! o.prop(indices...)
+    @clear_cache! object.property
+    @clear_cache! object.property(arguments...)
 
-Drop a property, or one entry of an indexed property, from memory and disk so
-the next read recomputes it.
+The dot form clears the whole property and its transitive declared dependents,
+including memory values and disk files. The call form clears only the selected
+indexed entry, as [`invalidate!`](@ref) does. Inside a `@dynamicstruct` body the
+object prefix may be omitted.
 
-Without indices, drops the whole property **and every property derived from
-it** (its transitive `dependents`), and leaves every other property
-cached — a "force this stage" action for one branch of an object's dependency
-graph:
+A clear retracts in-flight entries without cancelling their running bodies.
+Their original callers may still receive a result, but those computations cannot
+publish into the cleared cache; waiters resolve against the current entry.
+Clearing an indexed property retains its wrapper and empties its subcache in place.
 
-```julia
-@dynamicstruct struct Prep
-    model::String
-    sb = emit_sb(model)
-    stan_source = stan_code(sb)
-    native_build = build(model)
-    native_query = prepare_query(native_build)
-end
-
-@clear_cache! p.native_build   # drops native_build and native_query;
-                               # sb and stan_source stay cached
-```
-
-- Memory: the value, every entry of an indexed property (emptied in place, so
-  a remount view or destructured handle sees it), and the shared remount work.
-- Disk: every entry of a `@cached` / `@mmap` property, including entries an
-  earlier process wrote; governed automatic entries once the object's cache path
-  is known.
-- Kept: fixed fields and constructor/`remake` overrides — they are inputs, as
-  for [`clear_mem_caches!`](@ref) (a fixed field `name` is an error; move it
-  with [`remake`](@ref)). A `@state` property is never derived from another
-  property, so it is never among the dependents; naming it (`@clear_cache!
-  o.state`) resets it, and the next read re-runs its initializer.
-- On an object with a computed `@versioned` property, the version and cache path
-  are re-derived on the next read, as for `sync!`.
-- The children this object holds drop what they read of a dropped property, and
-  what they derived from it, as for `sync!`; this object drops what it derived
-  from them in the same call.
-- A holder that derived from this object (a parent reading one of its children)
-  drops its own dependents on its next `sync!`: the object's
-  `object_version` moves. HTMXObjects calls `sync!` on every request root.
-- In flight: as for [`invalidate!`](@ref), there is no cancellation, but a
-  compute of a dropped property running at the time — including a dependent that
-  read the old value — stores nothing; its caller gets its value, and waiters
-  re-resolve.
-
-With indices (or kwargs), drops exactly that one entry, like
-[`invalidate!`](@ref); dependents are not dropped.
-
-```julia
-@clear_cache! e.ci(3)         # clear only the (3,) entry
-```
-
-The function form is [`DynamicObjects.clear_cache!`](@ref). The legacy bracket
-form is still accepted but discouraged.
+An explicit whole-property clear also resets state or constructor-seeded values
+for that property. By contrast, [`clear_mem_caches!`](@ref) retains instance state
+and restores constructor inputs. Use [`prune_mem_caches!`](@ref) for memory
+reclamation that does not invalidate dependents.
 """
 macro clear_cache!(x)
     cache_f_expr(x; f=clear_cache!) |> esc
@@ -6239,6 +5971,14 @@ end
 # automatic stderr/error emission from the macro; lints surface only when
 # you render the structure.
 
+"""
+    LintMessage
+
+A declaration diagnostic returned by [`lint_index`](@ref). Fields identify the
+`type`, optional `prop`, `severity` (`:warn` or `:error`), `short` and `long`
+messages, and optional source line node `lnn`. Rendering a structure exposes
+these diagnostics; defining a type does not print them automatically.
+"""
 struct LintMessage
     type::Type
     prop::Union{Symbol,Nothing}     # nothing = struct-level lint
@@ -7188,7 +6928,7 @@ end
 """
     property_options(o, parameter::Symbol)
 
-The declared domain for `parameter` **on this object** — the value of the
+The declared domain for `parameter` on this object — the value of the
 `@options` expression, computed against `o` and memoized like any other
 property. Returns `nothing` when no declaration governs `parameter`.
 
@@ -7233,45 +6973,17 @@ Base.show(io::IO, domain::OptionDomain) = print(io, "option_domain([",
     "])")
 
 """
-    option_domain(values) -> OptionDomain
+    option_domain(values)
 
-An `@options` domain whose values carry human labels. The labels travel *with*
-the values, in one declaration, so they can never disagree about how many
-options there are or what order they are in.
+Wrap a finite collection as a domain with presentation metadata. Each entry may
+be a bare value, a `value => label` pair, or a record with `value`, `label`,
+`group`, `help` and `disabled` fields. Missing labels default to `string(value)`.
+Membership is defined on the machine values, independently of their labels.
 
-```julia
-@dynamicstruct struct Gallery
-    study::Symbol
-    dose::Float64
-
-    @options(study) = option_domain([
-        :synthetic_depot_v1       => "Sparse depot PK",
-        :synthetic_depot_dense_v1 => "Dense depot PK",
-    ])
-    @options(dose) = option_domain(d => "\$(Int(d)) mg" for d in doses_for(study))
-end
-```
-
-Each element is normalized to the same option record `static_domain` produces —
-`(; value, label, group, help, disabled)` — from any of three spellings:
-
-- `value => label`, the usual case;
-- a `NamedTuple` with a `value` field plus any of `label`, `group`, `help`,
-  `disabled` (`label` defaults to `string(value)`); or
-- a bare value, which takes the default label.
-
-Nothing else about `@options` changes. The declaration is still an ordinary
-lazily computed property, so a *dependent* domain works exactly as before —
-`dose`'s labels are recomputed with `dose`'s values whenever `study` changes.
-Membership is still on machine values: `o.study in property_options(o, :study)`
-is true for the same values a bare vector would have accepted, which is why a
-domain may be labelled without touching validation.
-
-Labels are deliberately *not* on the descriptor's `domain`: an `@options` domain
-may depend on the object, so its labels are per-object too, and reflection never
-evaluates a declaration ([`option_declarations`](@ref)). `domain.kind` stays
-`:declared` with `options` empty; a renderer reads the labels from the evaluated
-value via [`property_options`](@ref) + [`option_records`](@ref).
+Use the result in an `@options` declaration. A dependent declaration recomputes
+when its inputs change. Reflection reports the declaration without evaluating
+it; read the evaluated domain through [`property_options`](@ref), then use
+[`option_records`](@ref) for its per-value metadata.
 """
 function option_domain(values)
     options = NamedTuple[_option_descriptor(value) for value in values]
@@ -7282,14 +6994,7 @@ end
     option_records(domain) -> Vector{NamedTuple} or nothing
 
 The option records of an evaluated domain — one `(; value, label, group, help,
-disabled)` per value, in domain order. This is the one call a renderer makes; it
-does not care how the domain was spelled:
-
-```julia
-for option in option_records(property_options(object, :study))
-    radio(option.value; label=option.label, checked=(option.value == object.study))
-end
-```
+disabled)` per value, in domain order. Use these records to render an evaluated domain.
 
 An [`option_domain`](@ref) returns its declared labels. Any other finite
 collection — a vector, tuple, range, or `Set` — is normalized with default
@@ -7908,8 +7613,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         # IndexableProperty, the bare form → a plain property). Their
         # parent-property names MUST be collected here so a sibling inline
         # `@struct` can reference them by bare name — those names are
-        # forwarded into each child scope via `(; …) = __parent__` (Bruno
-        # qt/fit: `ppc_view`'s body calls `dense_view(…)`). The
+        # forwarded into each child scope via `(; …) = __parent__`. The
         # `prop = struct …` / `prop(idx) = struct …` forms carry the name
         # on the LHS and fall through to the generic collector below; the
         # bare `struct Name … end` form carries it as the struct name. Each
@@ -8660,7 +8364,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     # move: it may read fixed fields and other `@state` properties, never a
     # computed property, and never hand `__self__` to other code. A disk or
     # never-cache marker contradicts in-memory state kept for the instance's
-    # life (snag `in-invoices-jl-a-6b1221ee`, decision `1oc1ssr`).
+    # life.
     state_names = Symbol[name for (name, info) in oproperties if Symbol("@state") in info.macros]
     for (name, info) in oproperties
         Symbol("@state") in info.macros || continue
@@ -9278,127 +8982,45 @@ end
 _parse_macro_opt(a) = error("@dynamicstruct: unsupported option `$a` — use a docstring or `name=value`.")
 
 """
-    @dynamicstruct [docstring] struct Name
-        field                     # fixed field (constructor argument)
-        prop = expr               # lazily computed property
-        @cached prop = expr       # lazily computed + disk-cached property
-        prop(idx) = expr          # indexable property (cached per args; `@fresh` to bypass)
-        prop(args...; kw...) = expr  # indexable property (cached per args; `@fresh` to bypass)
-        @cached prop(idx) = expr  # indexable + disk-cached property (cached per index)
-    end
+    @dynamicstruct struct Name ... end
 
-Define a struct whose *fixed fields* are set at construction time and whose
-*derived properties* are computed lazily on first access and then stored in an
-in-memory cache.
+Define a struct whose fields are constructor inputs and whose properties compute
+lazily. A declaration without `=` is a fixed field; `name = expression` is a
+scalar property; `name(arguments...; keywords...) = expression` is an indexed
+property. Property bodies may read sibling fields and properties by bare name.
+Constructor keywords override defaults and seed the instance cache.
 
-Derived properties may reference any other field or property by name; the
-reference is automatically rewritten to `__self__.<name>`.  Order of definition
-does not matter — cycles will result in a stack overflow at runtime.
+Ordinary reads memoize. Indexed calls match argument values with `isequal`.
+Treat inputs, arguments and cached results as immutable; use [`remake`](@ref)
+for changed inputs and [`@clear_cache!`](@ref) for explicit invalidation.
 
-The in-memory cache is always a `ThreadsafeDict` — safe to access from multiple
-tasks simultaneously; duplicate work is avoided by sharing in-flight `Task`s.
+Markers inside the struct body select additional behavior:
 
-Properties marked `@cached` are additionally persisted to disk under
-`__self__.__cache_path__` (which itself defaults to
-`joinpath(__self__.__cache_base__, __self__.__hash__)`).
+| Marker | Meaning |
+| --- | --- |
+| `@struct child = begin ... end` | Nested object, with parent properties in scope. |
+| `@struct child(arguments...) = begin ... end` | Nested object per argument tuple. |
+| `@cached [v"N"] name = expression` | Serialized disk storage, optionally versioned. |
+| `@mmap name = expression` | Disk storage using a supported memory-mapped format. |
+| `@fresh name(arguments...) = expression` | Uncached indexed computation. |
+| `@state name = expression` | Instance state retained by memory clears and synchronization. |
+| `@versioned name = expression` | Object-wide disk-cache version dimension. |
+| `@queued name(arguments...) = expression` | Indexed work submitted through the job queue. |
+| `@options(parameter) = expression` | Declared domain for an input name. |
 
-Keyword arguments passed to the constructor pre-populate the cache, so they act
-as overrides for any computed property.
+An indexed declaration may take no arguments. Disk storage is independent of
+indexing and polling. Both scalar and indexed properties support polling via
+[`fetchproperty`](@ref) and [`fetchindex`](@ref). Ordinary blocking reads compute
+inline unless an executor changes that policy; polling can start background work.
 
-`@state name = init` (or indexed `@state name(args...) = init`) declares
-per-instance state rather than a derived value: a lock, a rate limiter, an
-attempt log. It is computed on first read and memoized like any property, but
-[`clear_mem_caches!`](@ref) keeps it and `sync!` never drops it;
-`DynamicObjects.clear_cache!(obj, :name)` resets it. `init` may read fixed
-fields and other `@state` properties only, and cannot combine with `@cached`,
-`@mmap`, `@fresh`, `@versioned` or `@queued`.
+The default progress root is a Treebars node. Property docstrings label child
+nodes. Pass `__status__ = nothing` at construction to disable progress.
+`__cache_base__` selects the disk-cache directory. Use `__hash_fields__` only
+when the application needs an explicit content identity.
 
-# Examples
-```julia
-using DynamicObjects
-
-@dynamicstruct struct Point
-    x::Float64
-    y::Float64
-    r     = sqrt(x^2 + y^2)
-    theta = atan(y, x)
-end
-
-p = Point(3.0, 4.0)
-p.r      # 5.0
-p.theta  # atan(4, 3)
-```
-
-```julia
-# Disk-cached expensive computation.
-# cache_path defaults to joinpath("cache", hash(n)), so two Experiment(n)
-# instances with the same n share the same cache directory.
-@dynamicstruct struct Experiment
-    n::Int
-    @cached result = sum(rand(n))   # computed once, then loaded from disk
-end
-
-e = Experiment(1_000_000)
-e.result   # computed on first access, cached to disk
-e2 = Experiment(1_000_000)
-e2.result  # loaded from disk (same n → same hash → same cache path)
-```
-
-```julia
-# Indexed properties. `obj.prop(args)` caches by default; `@fresh obj.prop(args)` recomputes.
-# Properties reference each other by bare name (auto-rewritten to __self__.<name>).
-@dynamicstruct struct DataSet
-    items = ["apple", "banana", "cherry"]
-    matches(query)   = filter(x -> occursin(query, x), items)   # call: cached per query
-    top(query; n=1)  = first(matches(query), n)                 # call with kwargs
-end
-
-ds = DataSet()
-ds.matches("an")        # ["banana"] — cached in the per-property dict (keyed by args)
-@fresh ds.matches("an")  # ["banana"] — recomputed fresh, bypassing the cache
-fresh(ds.matches, "an")  # ["banana"] — explicit uncached call (outside a @dynamicstruct body)
-ds.top("a"; n=2)        # ["apple", "banana"] — kwargs supported
-```
-
-# Async progress with `__status__`
-
-Indexed properties spawn background `Task`s, and progress is wired into them
-automatically: `__status__` defaults to a `Treebars.initialize_progress!(:state;
-description="")` root, and the default `__substatus__` hangs a child node under
-it per property compute. Declare `__status__` only to *label* the root (an empty
-description makes it a structural node that renders nothing and hoists its
-children), or set it to `nothing` to switch progress off.
-
-Like any `x = y` in a struct body, that declaration is an overrideable default:
-a constructor kwarg seeds the cache and wins. `@include kid = Child()` therefore
-mounts the child under the parent's tree whatever `Child` declares; pass
-`@include kid = Child(; __status__ = nothing)` to silence that subtree instead.
-
-```julia
-@dynamicstruct struct MyApp
-    __status__ = initialize_progress!(:state; description="MyApp")  # optional: labels the root
-    results(key) = expensive_computation(__status__)  # __status__ is the substatus
-end
-app = MyApp()
-
-# Non-blocking access with progress:
-fetchindex(app.results, key) do rv, status
-    rv isa Pending ? render_progress(status) : render_result(rv)
-end
-```
-
-`__substatus__` is called before each compute begins.
-`name` is the property symbol, `args`/`kwargs` are the indices. The returned
-object is stored in `ThreadsafeDict.status` (accessible via `getstatus`) and
-passed to the computation body as the local `__status__`.
-
-`__substatus__` fires on every generated-property compute — indexed (`memoize!`)
-and bare scalar (`_bare_substatus_f`) alike. It is skipped for dunder properties
-(`__hash__`, `__status__`, …) and for fixed struct fields, which have no body.
-
-An undocumented property gets `description=""`, i.e. a structural node that
-renders nothing and hoists its children; add a docstring to make it a labelled
-row in the tree.
+A state initializer may read fixed fields and other state properties only.
+It cannot combine with disk, fresh, version or queue markers. Reset state with
+[`@clear_cache!`](@ref).
 """
 macro dynamicstruct(args...)
     isempty(args) && error("@dynamicstruct: missing struct definition.")
@@ -9431,49 +9053,21 @@ const _CARRY_MISS = _CarryMiss()
 end
 
 """
-    remake(obj; kwargs...)
+    remake(object; changes...)
 
-Create a new instance of the same `@dynamicstruct` type as `obj`, copying all
-fixed fields from `obj` and overriding any specified via keyword arguments.
+Construct a new object of the same type with replaced fields or property
+overrides. Settled scalar values whose declared dependencies are unaffected may
+be carried over. Changed inputs invalidate their transitive dependents.
+In-flight computations and indexed-property caches are not copied.
 
-Keyword arguments that correspond to fixed fields replace those field values in
-the new instance. Any remaining keyword arguments are forwarded to the
-constructor as cache pre-population overrides.
+Constructor overrides remain inputs unless replaced. A scalar `@state` value
+is carried unless a fixed field its initializer reads changed. An opaque
+property that passes `__self__` to uninspected code is carried only when no
+keyword changes were supplied.
 
-The new instance is also constructed with every keyword argument `obj` itself
-was constructed with (its `PropertyCache.seed`: property overrides, `__parent__`
-wiring, `__status__`, and, for a [`remount`](@ref) view, the retained object's
-inputs under the view's context) that `kwargs` does not name. Those overrides
-therefore stay inputs of the new instance: [`clear_mem_caches!`](@ref) keeps
-them, and an override keeps its value even when its default reads a changed
-fixed field.
-
-Because a `@dynamicstruct` is a pure function of its fixed fields and cache
-overrides, any already memoized property of `obj` whose transitive
-dependencies — fixed fields and rhs-declared properties alike — are all
-unchanged is **carried over** to the new instance instead of being recomputed —
-the per-type carry set is baked from the `dependson` graph at macro-expansion,
-so the decision costs nothing at runtime. Overriding an rhs-declared property
-therefore recomputes its dependents; properties whose dependency set is
-unprovable (an opaque reach of object state) recompute on any change. Impure
-properties (reading `rand`, the clock, or external mutable state) violate this
-contract and must not be relied on across `remake`.
-
-# Example
-```julia
-@dynamicstruct struct Config
-    n::Int
-    scale::Float64
-    base = sum(1:n)          # depends only on n
-    result = scale * base    # depends on scale (and, transitively, n)
-end
-
-c  = Config(100, 2.0); c.result   # memoizes base + result
-c2 = remake(c; scale=3.0)  # n unchanged → `base` CARRIED over; `result` recomputed
-c3 = remake(c; n=200)      # n changed → both base & result recomputed
-c4 = remake(c; result=0.0) # result pre-set to 0.0 (explicit override wins)
-c5 = remake(c4; n=200)     # result stays 0.0: c4's override is an input of c5
-```
+The original object remains available. Pass new input values rather than
+mutating fields, arguments or cached outputs. Use [`remount`](@ref) to bind
+request context while sharing retained work instead of constructing a new value.
 """
 remake(obj; kwargs...) = _remake(obj, values(kwargs))
 function _remake(obj::T, nt::NamedTuple{KW}) where {T,KW}
@@ -10131,7 +9725,7 @@ a guarded `__self__`: reading rebound context through it (or anything derived
 from that context) makes the key context-dependent, so the requesting view keeps
 the value it computed and every other view, now and later, computes the key
 itself. A shared value that retained its `__self__` cannot read request context
-through it afterwards ([`RemountSharedContextError`](@ref)). The retained
+through it afterwards (`RemountSharedContextError`). The retained
 object's own computations stay separate from its views'.
 
 A nested child instance is view-local because it holds its parent, but its own
@@ -10151,12 +9745,6 @@ built on context-independent parent state is reused too.
 Fixed fields, `@versioned` properties, and cache/hash/path dunders are rejected:
 changing any of those means the object identity changed, so use `remake`.
 
-# Example
-```julia
-routed = ModelGraph(...)
-request_a = remount(routed; __req__=req_a, __parent__=parent_a, __prefix__="/a")
-request_b = remount(routed; __req__=req_b, __parent__=parent_b, __prefix__="/b")
-```
 """
 function _remount_impl(obj, nt::NamedTuple, forced_local=(), parent_view=nothing,
                       local_seed::NamedTuple=(;))
@@ -11200,8 +10788,8 @@ Two entry points:
   `nothing` if `meta(T)` is undefined or `prop` isn't a property of `T`.
 - `property_signature(info, mod)` — parse an *already-selected* `meta` info
   against module `mod`, without re-looking it up. Use this when the caller
-  holds a specific declaration. The key case is **multi-verb / duplicate-name
-  routes**: several declarations can share one property name (e.g. a `@get` and
+  holds a specific declaration. The key case is multi-verb / duplicate-name
+  routes: several declarations can share one property name (e.g. a `@get` and
   a `@post` on `user`), so `meta(T)` carries duplicates and `metafirst` would
   collapse them to the first. Walk `metaall(T, prop)` and call this per
   declaration. Always returns a (possibly empty) `(; positional, kwargs)`.
@@ -11481,6 +11069,13 @@ function _resolve_arg_type(expr, mod)
     end
 end
 
+"""
+    property_doc(info::NamedTuple)
+
+Return the property's declared docstring, or `nothing`. Obtain the declaration
+record with [`metafirst`](@ref) or [`metaall`](@ref); this accessor computes no
+property value.
+"""
 property_doc(info::NamedTuple) = get(info, :doc, nothing)
 
 # ── Semantic property descriptors ──────────────────────────────────────────
@@ -14521,7 +14116,7 @@ end
     mem_cache_entries(root)
 
 Iterate the settled in-memory cache entries of `root` and of every `@dynamicstruct` object it
-derived, without computing anything. Each element is a [`DynamicObjects.MemCacheEntry`](@ref)
+derived, without computing anything. Each element is a `DynamicObjects.MemCacheEntry`
 `(; object, property, key, value, path, role)`:
 
 - `object`: the object holding the entry, `property` its property name, `value` the
@@ -14575,39 +14170,18 @@ Base.show(io::IO, entries::MemCacheEntries) =
     print(io, "mem_cache_entries(::", typeof(entries.root), ")")
 
 """
-    prune_mem_caches!(keep, root) -> (; objects, kept, evicted)
+    prune_mem_caches!(keep, root) -> (objects, kept, evicted)
 
-Evict from memory every `:derived` entry of [`mem_cache_entries(root)`](@ref mem_cache_entries)
-for which `keep(entry)` is `false`, to bound what a long-running process retains:
+Walk already materialized memory entries and evict derived entries for which
+`keep(entry)` is false. The entry record is the same as in
+[`mem_cache_entries`](@ref). Inputs, state, progress roots and in-flight work are
+kept. The traversal computes nothing and does not force disk or lazy loads.
 
-```julia
-prune_mem_caches!(app) do entry
-    entry.value isa Number || entry.value isa Array{Float64} || entry.value isa DataFrame
-end
-```
-
-`keep` sees each derived entry `(; object, property, key, value, path, role)` and must return
-a `Bool`. Everything else stays: constructor inputs, fixed fields, `@state`, DO's own
-`__…__` entries, computed `@versioned` properties, and each indexed property's wrapper,
-whose entries are pruned one by one in place. So held handles and remount views stay
-attached, as with [`clear_mem_caches!`](@ref).
-
-Eviction frees memory and changes no meaning:
-
-- an evicted value is recomputed on its next read (an explicit `@cached`/`@mmap` entry
-  reloads from disk), and that recompute settles again
-  (`DynamicObjects.property_settled` runs for it);
-- nothing that derived from an evicted value is dropped, no disk entry is touched, and
-  `object_version` does not move, so holders see no change on their next `sync!`;
-- objects held by an evicted entry are still walked and pruned: another holder may keep them.
-
-Safe at any time: each object is pruned under its own cache lock, a computation in flight is
-left alone (it is not an entry yet), and an entry recomputed or replaced since the walk
-listed it is not evicted. A `keep` that throws stops the prune; what it evicted so far stays
-evicted.
-
-Returns how many objects were walked, and how many derived entries `keep` kept and the prune
-evicted.
+Eviction leaves disk files and dependency versions unchanged: this is memory
+reclamation, not semantic invalidation. Values may still be referenced elsewhere,
+so eviction does not guarantee an immediate reduction in process memory.
+Removing an indexed value leaves its wrapper attached. Use
+[`@clear_cache!`](@ref) when dependents must also be invalidated.
 """
 function prune_mem_caches!(keep, root)
     walk = _mem_walk(root, :prune_mem_caches!)

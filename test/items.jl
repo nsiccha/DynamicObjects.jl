@@ -285,7 +285,7 @@ end
 # valid Julia), so `_fetch_rewrite` must keep it valid keyword syntax rather
 # than turning it into a bare `maybefetchproperty!(…)` call (which 500'd with
 # `invalid keyword argument syntax`). Reported by
-# Bruno:qt:super.dense-progress:worker, 2026-06-23. A regression fails this
+# A progress regression fails this
 # file at load time (the struct won't macroexpand).
 @dynamicstruct struct FetchKwargs
     n_grid = 100
@@ -558,9 +558,7 @@ end
 """
 Pins that `remake` with an rhs-declared (cache-override) kwarg invalidates the
 overridden property's memoized dependents — directly, transitively, and through
-an opaque reader — instead of carrying them stale (snag
-`remake-override-457e3bc5`, reporter `Bruno:fix-pkpd`: `healthy`/`diseased`
-reported `n_subjects=2` and reseeds were bit-identical, with no error). The
+an opaque reader — instead of carrying them stale. The
 source MUST be read before the remake: the stale-carry path only triggers for
 settled values, which is why the earlier `remake`-from-fresh-source coverage
 never caught it.
@@ -1887,9 +1885,7 @@ end
 Pins that `obj.prop = value` is refused on a `@dynamicstruct` — for a computed
 property, a fixed field, an undeclared name and an inline child alike — with a
 message naming the two supported override paths, construction kwargs and
-`remake`, and that those paths do land the override (decision `1srli5g`; snag
-`dynamicstruct-se-7099e55c`, reporter `Bruno:report`, which hit the former
-opaque `MethodError … setindex!(::ThreadsafeDict{Symbol,Any}, …)`).
+`remake`, and that those paths do land the override.
 """
 @testitem "setproperty! is refused; overrides go through construction or remake" tags=[:core] setup=[DOImports, DOFixtures] begin
     o = SetPropApp(1)

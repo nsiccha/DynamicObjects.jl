@@ -1,9 +1,7 @@
 using TestItemRunner
 
 # `@state`: per-instance state that whole-object clears keep and `sync!` never
-# drops (snag `in-invoices-jl-a-6b1221ee`, decision `1oc1ssr`). The shape is the
-# Invoices `AppData` singleton's ECB refresh throttle: a mutable record with a
-# lock that every mutating route's `clear_mem_caches!` used to rebuild.
+# drops. A synthetic throttle holds a lock and a timestamp across clears.
 @testmodule StateFixtures begin
 using DynamicObjects
 export Throttle, StateApp, StateIndexed, StateChained, StateReadsField,

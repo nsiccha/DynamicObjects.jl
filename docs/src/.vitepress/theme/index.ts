@@ -1,52 +1,5 @@
-// .vitepress/theme/index.ts
-import { h } from 'vue'
 import DefaultTheme from 'vitepress/theme'
-import type { Theme as ThemeConfig } from 'vitepress'
-import 'virtual:mathjax-styles.css';
+import './style.css'
+import './docstrings.css'
 
-import { 
-  NolebaseEnhancedReadabilitiesMenu, 
-  NolebaseEnhancedReadabilitiesScreenMenu, 
-} from '@nolebase/vitepress-plugin-enhanced-readabilities/client'
-
-import VersionPicker from "@/VersionPicker.vue"
-import AuthorBadge from '@/AuthorBadge.vue'
-import Authors from '@/Authors.vue'
-import Banner from '@/Banner.vue'
-
-import { enhanceAppWithTabs } from 'vitepress-plugin-tabs/client'
-
-// Static snapshot from HTMXObjects/assets/vitepress/htmxo-embed.ts at
-// 42dafa6f9527944a18fce5e5dfa2d8c80d596f99.
-// Re-sync this file and its companion CSS when the upstream assets change.
-import { setupHtmxoEmbed } from './htmxo-embed'
-
-import '@nolebase/vitepress-plugin-enhanced-readabilities/client/style.css'
-import './style.css' // You could setup your own, or else a default will be copied.
-import './docstrings.css' // You could setup your own, or else a default will be copied.
-
-export const Theme: ThemeConfig = {
-  extends: DefaultTheme,
-  Layout() {
-    return h(DefaultTheme.Layout, null, {
-      'layout-bottom': () => h(Banner),
-      'nav-bar-content-after': () => [
-        h(NolebaseEnhancedReadabilitiesMenu), // Enhanced Readabilities menu
-      ],
-      // A enhanced readabilities menu for narrower screens (usually smaller than iPad Mini)
-      'nav-screen-content-after': () => h(NolebaseEnhancedReadabilitiesScreenMenu),
-    })
-  },
-  enhanceApp({ app, router, siteData }) {
-    enhanceAppWithTabs(app);
-    app.component('VersionPicker', VersionPicker);
-    app.component('AuthorBadge', AuthorBadge)
-    app.component('Authors', Authors)
-    // HTMXObjects embed wiring: data-hx-base resolution + SPA route
-    // re-process + .htmxo-embed link rewriting. DO defaults the proxy
-    // prefix to `/live-do` (matches the Vite proxy in config.mts and
-    // the committed recordings under public/live-do/).
-    setupHtmxoEmbed(router, { proxyPrefix: '/live-do' });
-  }
-}
-export default Theme
+export default DefaultTheme

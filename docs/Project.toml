@@ -1,4 +1,5 @@
 [deps]
+AlgebraOfVega = "a2420894-485a-4f42-a4fc-c4323ec6fb2b"
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
 DocumenterTools = "35a29f4d-8980-5a13-9543-d66fff28ecb8"
 DocumenterVitepress = "4710194d-e776-4893-9690-8d956a29c365"
@@ -6,3 +7,10 @@ DynamicObjects = "23d02862-63fe-4c6e-8fdb-1d52cbbd39d5"
 
 [sources.DynamicObjects]
 path = ".."
+
+[sources.AlgebraOfVega]
+url = "https://github.com/nsiccha/AlgebraOfVega.jl"
+rev = "dev"
+
+[compat]
+AlgebraOfVega = "0.2.29"

@@ -203,7 +203,7 @@ end
 end
 
 # Model-shaped identity: the data dictionary is reached through another DO, as
-# in Bruno's compiled model, and includes a matrix wrapper in the regression.
+# a synthetic compiled object, with a matrix wrapper in the regression.
 @dynamicstruct struct HashCompiled
     code::String
     data
