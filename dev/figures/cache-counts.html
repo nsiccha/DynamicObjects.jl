@@ -3528,7 +3528,14 @@
             } else {
                 return;
             }
-            u.encoding = Object.assign({}, u.encoding, {opacity: next});
+            var extra = {opacity: next};
+            // A heatmap's cells are stroked in their own colour, reaching into
+            // their neighbours (`_heatmap_seams!`, src/to_vegalite.jl). Dimmed,
+            // that overlap would draw a lattice, so a dimmed cell drops it.
+            var style = typeof u.mark === 'object' ? u.mark.style : undefined;
+            if (enc.stroke && [].concat(style || []).indexOf('aov-heatmap') !== -1 && enc.strokeOpacity === undefined)
+                extra.strokeOpacity = {condition: {test: dimmed, value: 0}};
+            u.encoding = Object.assign({}, u.encoding, extra);
         });
         return spec;
     },
@@ -4409,6 +4416,18 @@
         return enc;
     },
 
+    // Explicit domains and category orders belong to the authored field.
+    // Each remap starts from the original spec, so choosing that field again
+    // restores them. Keep other scale settings and non-array sort policies.
+    _clearRemappedAxisDomain: function(enc, field) {
+        if (enc.field === field) return;
+        if (enc.scale && typeof enc.scale === 'object') {
+            delete enc.scale.domain;
+            if (Object.keys(enc.scale).length === 0) delete enc.scale;
+        }
+        if (Array.isArray(enc.sort)) delete enc.sort;
+    },
+
     // The `calculate` expression of a ribbon interval drawing's dodge on
     // the ribbon's own x axis: `field` moved by the step of the row's
     // `by` group in `domain`, added on a linear axis, multiplied in as
@@ -4530,7 +4549,6 @@
                         var encC = l.encoding[axis];
                         if (!encC || typeof encC !== 'object' || encC.field === undefined) return;
                         var oldField = encC.field;
-                        encC.field = newField;
                         if (newTypeC) {
                             encC.type = newTypeC;
                             if (newTypeC !== 'quantitative' && encC.scale && encC.scale.type) {
@@ -4538,6 +4556,8 @@
                                 if (stC === 'log' || stC === 'sqrt' || stC === 'pow') delete encC.scale.type;
                             }
                         }
+                        self._clearRemappedAxisDomain(encC, newField);
+                        encC.field = newField;
                         encC.title = _fieldTitleC(newField);
                         if (Array.isArray(encC.tooltip)) {
                             encC.tooltip.forEach(function(t) {
@@ -4729,7 +4749,8 @@
                             return t.type !== 'nominal' || t.field === (spec.facet && spec.facet.row && spec.facet.row.field) ||
                                    t.field === (spec.facet && spec.facet.column && spec.facet.column.field);
                         });
-                        if (cf) l.encoding.tooltip.push({field: cf, type: 'nominal'});
+                        // Named by its picker label, as the axis remap below names its row.
+                        if (cf) l.encoding.tooltip.push({field: cf, type: 'nominal', title: _fieldTitle(cf)});
                     }
                 });
             }
@@ -4937,7 +4958,6 @@
                 if (!enc || !enc[axis] || typeof enc[axis] !== 'object') return;
                 var oldField = enc[axis].field;
                 if (oldField === undefined) return;
-                enc[axis].field = newField;
                 if (newType) {
                     enc[axis].type = newType;
                     // When the axis type flips from quantitative to nominal, a log/sqrt
@@ -4950,6 +4970,8 @@
                         }
                     }
                 }
+                self._clearRemappedAxisDomain(enc[axis], newField);
+                enc[axis].field = newField;
                 enc[axis].title = _fieldTitle(newField);
                 var tt = enc.tooltip;
                 if (Array.isArray(tt)) {
@@ -8496,7 +8518,14 @@
             } else {
                 return;
             }
-            u.encoding = Object.assign({}, u.encoding, {opacity: next});
+            var extra = {opacity: next};
+            // A heatmap's cells are stroked in their own colour, reaching into
+            // their neighbours (`_heatmap_seams!`, src/to_vegalite.jl). Dimmed,
+            // that overlap would draw a lattice, so a dimmed cell drops it.
+            var style = typeof u.mark === 'object' ? u.mark.style : undefined;
+            if (enc.stroke && [].concat(style || []).indexOf('aov-heatmap') !== -1 && enc.strokeOpacity === undefined)
+                extra.strokeOpacity = {condition: {test: dimmed, value: 0}};
+            u.encoding = Object.assign({}, u.encoding, extra);
         });
         return spec;
     },
@@ -9377,6 +9406,18 @@
         return enc;
     },
 
+    // Explicit domains and category orders belong to the authored field.
+    // Each remap starts from the original spec, so choosing that field again
+    // restores them. Keep other scale settings and non-array sort policies.
+    _clearRemappedAxisDomain: function(enc, field) {
+        if (enc.field === field) return;
+        if (enc.scale && typeof enc.scale === 'object') {
+            delete enc.scale.domain;
+            if (Object.keys(enc.scale).length === 0) delete enc.scale;
+        }
+        if (Array.isArray(enc.sort)) delete enc.sort;
+    },
+
     // The `calculate` expression of a ribbon interval drawing's dodge on
     // the ribbon's own x axis: `field` moved by the step of the row's
     // `by` group in `domain`, added on a linear axis, multiplied in as
@@ -9498,7 +9539,6 @@
                         var encC = l.encoding[axis];
                         if (!encC || typeof encC !== 'object' || encC.field === undefined) return;
                         var oldField = encC.field;
-                        encC.field = newField;
                         if (newTypeC) {
                             encC.type = newTypeC;
                             if (newTypeC !== 'quantitative' && encC.scale && encC.scale.type) {
@@ -9506,6 +9546,8 @@
                                 if (stC === 'log' || stC === 'sqrt' || stC === 'pow') delete encC.scale.type;
                             }
                         }
+                        self._clearRemappedAxisDomain(encC, newField);
+                        encC.field = newField;
                         encC.title = _fieldTitleC(newField);
                         if (Array.isArray(encC.tooltip)) {
                             encC.tooltip.forEach(function(t) {
@@ -9697,7 +9739,8 @@
                             return t.type !== 'nominal' || t.field === (spec.facet && spec.facet.row && spec.facet.row.field) ||
                                    t.field === (spec.facet && spec.facet.column && spec.facet.column.field);
                         });
-                        if (cf) l.encoding.tooltip.push({field: cf, type: 'nominal'});
+                        // Named by its picker label, as the axis remap below names its row.
+                        if (cf) l.encoding.tooltip.push({field: cf, type: 'nominal', title: _fieldTitle(cf)});
                     }
                 });
             }
@@ -9905,7 +9948,6 @@
                 if (!enc || !enc[axis] || typeof enc[axis] !== 'object') return;
                 var oldField = enc[axis].field;
                 if (oldField === undefined) return;
-                enc[axis].field = newField;
                 if (newType) {
                     enc[axis].type = newType;
                     // When the axis type flips from quantitative to nominal, a log/sqrt
@@ -9918,6 +9960,8 @@
                         }
                     }
                 }
+                self._clearRemappedAxisDomain(enc[axis], newField);
+                enc[axis].field = newField;
                 enc[axis].title = _fieldTitle(newField);
                 var tt = enc.tooltip;
                 if (Array.isArray(tt)) {
@@ -13464,7 +13508,14 @@
             } else {
                 return;
             }
-            u.encoding = Object.assign({}, u.encoding, {opacity: next});
+            var extra = {opacity: next};
+            // A heatmap's cells are stroked in their own colour, reaching into
+            // their neighbours (`_heatmap_seams!`, src/to_vegalite.jl). Dimmed,
+            // that overlap would draw a lattice, so a dimmed cell drops it.
+            var style = typeof u.mark === 'object' ? u.mark.style : undefined;
+            if (enc.stroke && [].concat(style || []).indexOf('aov-heatmap') !== -1 && enc.strokeOpacity === undefined)
+                extra.strokeOpacity = {condition: {test: dimmed, value: 0}};
+            u.encoding = Object.assign({}, u.encoding, extra);
         });
         return spec;
     },
@@ -14345,6 +14396,18 @@
         return enc;
     },
 
+    // Explicit domains and category orders belong to the authored field.
+    // Each remap starts from the original spec, so choosing that field again
+    // restores them. Keep other scale settings and non-array sort policies.
+    _clearRemappedAxisDomain: function(enc, field) {
+        if (enc.field === field) return;
+        if (enc.scale && typeof enc.scale === 'object') {
+            delete enc.scale.domain;
+            if (Object.keys(enc.scale).length === 0) delete enc.scale;
+        }
+        if (Array.isArray(enc.sort)) delete enc.sort;
+    },
+
     // The `calculate` expression of a ribbon interval drawing's dodge on
     // the ribbon's own x axis: `field` moved by the step of the row's
     // `by` group in `domain`, added on a linear axis, multiplied in as
@@ -14466,7 +14529,6 @@
                         var encC = l.encoding[axis];
                         if (!encC || typeof encC !== 'object' || encC.field === undefined) return;
                         var oldField = encC.field;
-                        encC.field = newField;
                         if (newTypeC) {
                             encC.type = newTypeC;
                             if (newTypeC !== 'quantitative' && encC.scale && encC.scale.type) {
@@ -14474,6 +14536,8 @@
                                 if (stC === 'log' || stC === 'sqrt' || stC === 'pow') delete encC.scale.type;
                             }
                         }
+                        self._clearRemappedAxisDomain(encC, newField);
+                        encC.field = newField;
                         encC.title = _fieldTitleC(newField);
                         if (Array.isArray(encC.tooltip)) {
                             encC.tooltip.forEach(function(t) {
@@ -14665,7 +14729,8 @@
                             return t.type !== 'nominal' || t.field === (spec.facet && spec.facet.row && spec.facet.row.field) ||
                                    t.field === (spec.facet && spec.facet.column && spec.facet.column.field);
                         });
-                        if (cf) l.encoding.tooltip.push({field: cf, type: 'nominal'});
+                        // Named by its picker label, as the axis remap below names its row.
+                        if (cf) l.encoding.tooltip.push({field: cf, type: 'nominal', title: _fieldTitle(cf)});
                     }
                 });
             }
@@ -14873,7 +14938,6 @@
                 if (!enc || !enc[axis] || typeof enc[axis] !== 'object') return;
                 var oldField = enc[axis].field;
                 if (oldField === undefined) return;
-                enc[axis].field = newField;
                 if (newType) {
                     enc[axis].type = newType;
                     // When the axis type flips from quantitative to nominal, a log/sqrt
@@ -14886,6 +14950,8 @@
                         }
                     }
                 }
+                self._clearRemappedAxisDomain(enc[axis], newField);
+                enc[axis].field = newField;
                 enc[axis].title = _fieldTitle(newField);
                 var tt = enc.tooltip;
                 if (Array.isArray(tt)) {
@@ -18437,7 +18503,14 @@
             } else {
                 return;
             }
-            u.encoding = Object.assign({}, u.encoding, {opacity: next});
+            var extra = {opacity: next};
+            // A heatmap's cells are stroked in their own colour, reaching into
+            // their neighbours (`_heatmap_seams!`, src/to_vegalite.jl). Dimmed,
+            // that overlap would draw a lattice, so a dimmed cell drops it.
+            var style = typeof u.mark === 'object' ? u.mark.style : undefined;
+            if (enc.stroke && [].concat(style || []).indexOf('aov-heatmap') !== -1 && enc.strokeOpacity === undefined)
+                extra.strokeOpacity = {condition: {test: dimmed, value: 0}};
+            u.encoding = Object.assign({}, u.encoding, extra);
         });
         return spec;
     },
@@ -19318,6 +19391,18 @@
         return enc;
     },
 
+    // Explicit domains and category orders belong to the authored field.
+    // Each remap starts from the original spec, so choosing that field again
+    // restores them. Keep other scale settings and non-array sort policies.
+    _clearRemappedAxisDomain: function(enc, field) {
+        if (enc.field === field) return;
+        if (enc.scale && typeof enc.scale === 'object') {
+            delete enc.scale.domain;
+            if (Object.keys(enc.scale).length === 0) delete enc.scale;
+        }
+        if (Array.isArray(enc.sort)) delete enc.sort;
+    },
+
     // The `calculate` expression of a ribbon interval drawing's dodge on
     // the ribbon's own x axis: `field` moved by the step of the row's
     // `by` group in `domain`, added on a linear axis, multiplied in as
@@ -19439,7 +19524,6 @@
                         var encC = l.encoding[axis];
                         if (!encC || typeof encC !== 'object' || encC.field === undefined) return;
                         var oldField = encC.field;
-                        encC.field = newField;
                         if (newTypeC) {
                             encC.type = newTypeC;
                             if (newTypeC !== 'quantitative' && encC.scale && encC.scale.type) {
@@ -19447,6 +19531,8 @@
                                 if (stC === 'log' || stC === 'sqrt' || stC === 'pow') delete encC.scale.type;
                             }
                         }
+                        self._clearRemappedAxisDomain(encC, newField);
+                        encC.field = newField;
                         encC.title = _fieldTitleC(newField);
                         if (Array.isArray(encC.tooltip)) {
                             encC.tooltip.forEach(function(t) {
@@ -19638,7 +19724,8 @@
                             return t.type !== 'nominal' || t.field === (spec.facet && spec.facet.row && spec.facet.row.field) ||
                                    t.field === (spec.facet && spec.facet.column && spec.facet.column.field);
                         });
-                        if (cf) l.encoding.tooltip.push({field: cf, type: 'nominal'});
+                        // Named by its picker label, as the axis remap below names its row.
+                        if (cf) l.encoding.tooltip.push({field: cf, type: 'nominal', title: _fieldTitle(cf)});
                     }
                 });
             }
@@ -19846,7 +19933,6 @@
                 if (!enc || !enc[axis] || typeof enc[axis] !== 'object') return;
                 var oldField = enc[axis].field;
                 if (oldField === undefined) return;
-                enc[axis].field = newField;
                 if (newType) {
                     enc[axis].type = newType;
                     // When the axis type flips from quantitative to nominal, a log/sqrt
@@ -19859,6 +19945,8 @@
                         }
                     }
                 }
+                self._clearRemappedAxisDomain(enc[axis], newField);
+                enc[axis].field = newField;
                 enc[axis].title = _fieldTitle(newField);
                 var tt = enc.tooltip;
                 if (Array.isArray(tt)) {
@@ -23584,7 +23672,14 @@
             } else {
                 return;
             }
-            u.encoding = Object.assign({}, u.encoding, {opacity: next});
+            var extra = {opacity: next};
+            // A heatmap's cells are stroked in their own colour, reaching into
+            // their neighbours (`_heatmap_seams!`, src/to_vegalite.jl). Dimmed,
+            // that overlap would draw a lattice, so a dimmed cell drops it.
+            var style = typeof u.mark === 'object' ? u.mark.style : undefined;
+            if (enc.stroke && [].concat(style || []).indexOf('aov-heatmap') !== -1 && enc.strokeOpacity === undefined)
+                extra.strokeOpacity = {condition: {test: dimmed, value: 0}};
+            u.encoding = Object.assign({}, u.encoding, extra);
         });
         return spec;
     },
@@ -24465,6 +24560,18 @@
         return enc;
     },
 
+    // Explicit domains and category orders belong to the authored field.
+    // Each remap starts from the original spec, so choosing that field again
+    // restores them. Keep other scale settings and non-array sort policies.
+    _clearRemappedAxisDomain: function(enc, field) {
+        if (enc.field === field) return;
+        if (enc.scale && typeof enc.scale === 'object') {
+            delete enc.scale.domain;
+            if (Object.keys(enc.scale).length === 0) delete enc.scale;
+        }
+        if (Array.isArray(enc.sort)) delete enc.sort;
+    },
+
     // The `calculate` expression of a ribbon interval drawing's dodge on
     // the ribbon's own x axis: `field` moved by the step of the row's
     // `by` group in `domain`, added on a linear axis, multiplied in as
@@ -24586,7 +24693,6 @@
                         var encC = l.encoding[axis];
                         if (!encC || typeof encC !== 'object' || encC.field === undefined) return;
                         var oldField = encC.field;
-                        encC.field = newField;
                         if (newTypeC) {
                             encC.type = newTypeC;
                             if (newTypeC !== 'quantitative' && encC.scale && encC.scale.type) {
@@ -24594,6 +24700,8 @@
                                 if (stC === 'log' || stC === 'sqrt' || stC === 'pow') delete encC.scale.type;
                             }
                         }
+                        self._clearRemappedAxisDomain(encC, newField);
+                        encC.field = newField;
                         encC.title = _fieldTitleC(newField);
                         if (Array.isArray(encC.tooltip)) {
                             encC.tooltip.forEach(function(t) {
@@ -24785,7 +24893,8 @@
                             return t.type !== 'nominal' || t.field === (spec.facet && spec.facet.row && spec.facet.row.field) ||
                                    t.field === (spec.facet && spec.facet.column && spec.facet.column.field);
                         });
-                        if (cf) l.encoding.tooltip.push({field: cf, type: 'nominal'});
+                        // Named by its picker label, as the axis remap below names its row.
+                        if (cf) l.encoding.tooltip.push({field: cf, type: 'nominal', title: _fieldTitle(cf)});
                     }
                 });
             }
@@ -24993,7 +25102,6 @@
                 if (!enc || !enc[axis] || typeof enc[axis] !== 'object') return;
                 var oldField = enc[axis].field;
                 if (oldField === undefined) return;
-                enc[axis].field = newField;
                 if (newType) {
                     enc[axis].type = newType;
                     // When the axis type flips from quantitative to nominal, a log/sqrt
@@ -25006,6 +25114,8 @@
                         }
                     }
                 }
+                self._clearRemappedAxisDomain(enc[axis], newField);
+                enc[axis].field = newField;
                 enc[axis].title = _fieldTitle(newField);
                 var tt = enc.tooltip;
                 if (Array.isArray(tt)) {
@@ -28360,7 +28470,14 @@
             } else {
                 return;
             }
-            u.encoding = Object.assign({}, u.encoding, {opacity: next});
+            var extra = {opacity: next};
+            // A heatmap's cells are stroked in their own colour, reaching into
+            // their neighbours (`_heatmap_seams!`, src/to_vegalite.jl). Dimmed,
+            // that overlap would draw a lattice, so a dimmed cell drops it.
+            var style = typeof u.mark === 'object' ? u.mark.style : undefined;
+            if (enc.stroke && [].concat(style || []).indexOf('aov-heatmap') !== -1 && enc.strokeOpacity === undefined)
+                extra.strokeOpacity = {condition: {test: dimmed, value: 0}};
+            u.encoding = Object.assign({}, u.encoding, extra);
         });
         return spec;
     },
@@ -29241,6 +29358,18 @@
         return enc;
     },
 
+    // Explicit domains and category orders belong to the authored field.
+    // Each remap starts from the original spec, so choosing that field again
+    // restores them. Keep other scale settings and non-array sort policies.
+    _clearRemappedAxisDomain: function(enc, field) {
+        if (enc.field === field) return;
+        if (enc.scale && typeof enc.scale === 'object') {
+            delete enc.scale.domain;
+            if (Object.keys(enc.scale).length === 0) delete enc.scale;
+        }
+        if (Array.isArray(enc.sort)) delete enc.sort;
+    },
+
     // The `calculate` expression of a ribbon interval drawing's dodge on
     // the ribbon's own x axis: `field` moved by the step of the row's
     // `by` group in `domain`, added on a linear axis, multiplied in as
@@ -29362,7 +29491,6 @@
                         var encC = l.encoding[axis];
                         if (!encC || typeof encC !== 'object' || encC.field === undefined) return;
                         var oldField = encC.field;
-                        encC.field = newField;
                         if (newTypeC) {
                             encC.type = newTypeC;
                             if (newTypeC !== 'quantitative' && encC.scale && encC.scale.type) {
@@ -29370,6 +29498,8 @@
                                 if (stC === 'log' || stC === 'sqrt' || stC === 'pow') delete encC.scale.type;
                             }
                         }
+                        self._clearRemappedAxisDomain(encC, newField);
+                        encC.field = newField;
                         encC.title = _fieldTitleC(newField);
                         if (Array.isArray(encC.tooltip)) {
                             encC.tooltip.forEach(function(t) {
@@ -29561,7 +29691,8 @@
                             return t.type !== 'nominal' || t.field === (spec.facet && spec.facet.row && spec.facet.row.field) ||
                                    t.field === (spec.facet && spec.facet.column && spec.facet.column.field);
                         });
-                        if (cf) l.encoding.tooltip.push({field: cf, type: 'nominal'});
+                        // Named by its picker label, as the axis remap below names its row.
+                        if (cf) l.encoding.tooltip.push({field: cf, type: 'nominal', title: _fieldTitle(cf)});
                     }
                 });
             }
@@ -29769,7 +29900,6 @@
                 if (!enc || !enc[axis] || typeof enc[axis] !== 'object') return;
                 var oldField = enc[axis].field;
                 if (oldField === undefined) return;
-                enc[axis].field = newField;
                 if (newType) {
                     enc[axis].type = newType;
                     // When the axis type flips from quantitative to nominal, a log/sqrt
@@ -29782,6 +29912,8 @@
                         }
                     }
                 }
+                self._clearRemappedAxisDomain(enc[axis], newField);
+                enc[axis].field = newField;
                 enc[axis].title = _fieldTitle(newField);
                 var tt = enc.tooltip;
                 if (Array.isArray(tt)) {
@@ -33323,7 +33455,14 @@
             } else {
                 return;
             }
-            u.encoding = Object.assign({}, u.encoding, {opacity: next});
+            var extra = {opacity: next};
+            // A heatmap's cells are stroked in their own colour, reaching into
+            // their neighbours (`_heatmap_seams!`, src/to_vegalite.jl). Dimmed,
+            // that overlap would draw a lattice, so a dimmed cell drops it.
+            var style = typeof u.mark === 'object' ? u.mark.style : undefined;
+            if (enc.stroke && [].concat(style || []).indexOf('aov-heatmap') !== -1 && enc.strokeOpacity === undefined)
+                extra.strokeOpacity = {condition: {test: dimmed, value: 0}};
+            u.encoding = Object.assign({}, u.encoding, extra);
         });
         return spec;
     },
@@ -34204,6 +34343,18 @@
         return enc;
     },
 
+    // Explicit domains and category orders belong to the authored field.
+    // Each remap starts from the original spec, so choosing that field again
+    // restores them. Keep other scale settings and non-array sort policies.
+    _clearRemappedAxisDomain: function(enc, field) {
+        if (enc.field === field) return;
+        if (enc.scale && typeof enc.scale === 'object') {
+            delete enc.scale.domain;
+            if (Object.keys(enc.scale).length === 0) delete enc.scale;
+        }
+        if (Array.isArray(enc.sort)) delete enc.sort;
+    },
+
     // The `calculate` expression of a ribbon interval drawing's dodge on
     // the ribbon's own x axis: `field` moved by the step of the row's
     // `by` group in `domain`, added on a linear axis, multiplied in as
@@ -34325,7 +34476,6 @@
                         var encC = l.encoding[axis];
                         if (!encC || typeof encC !== 'object' || encC.field === undefined) return;
                         var oldField = encC.field;
-                        encC.field = newField;
                         if (newTypeC) {
                             encC.type = newTypeC;
                             if (newTypeC !== 'quantitative' && encC.scale && encC.scale.type) {
@@ -34333,6 +34483,8 @@
                                 if (stC === 'log' || stC === 'sqrt' || stC === 'pow') delete encC.scale.type;
                             }
                         }
+                        self._clearRemappedAxisDomain(encC, newField);
+                        encC.field = newField;
                         encC.title = _fieldTitleC(newField);
                         if (Array.isArray(encC.tooltip)) {
                             encC.tooltip.forEach(function(t) {
@@ -34524,7 +34676,8 @@
                             return t.type !== 'nominal' || t.field === (spec.facet && spec.facet.row && spec.facet.row.field) ||
                                    t.field === (spec.facet && spec.facet.column && spec.facet.column.field);
                         });
-                        if (cf) l.encoding.tooltip.push({field: cf, type: 'nominal'});
+                        // Named by its picker label, as the axis remap below names its row.
+                        if (cf) l.encoding.tooltip.push({field: cf, type: 'nominal', title: _fieldTitle(cf)});
                     }
                 });
             }
@@ -34732,7 +34885,6 @@
                 if (!enc || !enc[axis] || typeof enc[axis] !== 'object') return;
                 var oldField = enc[axis].field;
                 if (oldField === undefined) return;
-                enc[axis].field = newField;
                 if (newType) {
                     enc[axis].type = newType;
                     // When the axis type flips from quantitative to nominal, a log/sqrt
@@ -34745,6 +34897,8 @@
                         }
                     }
                 }
+                self._clearRemappedAxisDomain(enc[axis], newField);
+                enc[axis].field = newField;
                 enc[axis].title = _fieldTitle(newField);
                 var tt = enc.tooltip;
                 if (Array.isArray(tt)) {
@@ -34771,7 +34925,7 @@
 </script>
 </head>
 <body>
-<div class="aov-plot-area"><div id="vega-50944197a087b587" class="u-w-full"></div><script>AoV.embed('vega-50944197a087b587', {"$schema":"https://vega.github.io/schema/vega-lite/v5.json","_aov":{"legendInteraction":"highlight"},"_aovLegend":{"dimmed":true,"filtered":false,"opacity":null,"params":["legend_selection"],"transform":[]},"autosize":{"contains":"padding","type":"fit"},"config":{"axis":{"labelAngle":0,"labelFontSize":14,"labelLimit":0,"titleFontSize":14},"header":{"labelLimit":0},"legend":{"labelLimit":0}},"data":{"values":{"n":8,"columns":{"outcome":["Computed","Memory hit","Computed","Memory hit","Computed","Memory hit","Computed","Memory hit"],"property":{"runs":["centered","energy","offset","scaled"],"lengths":[2,2,2,2]},"calls":[1,1,1,0,1,0,2,2]}}},"encoding":{"color":{"field":"outcome","scale":{"domain":["Computed","Memory hit"],"range":["#2a78d6","#eb6834"]},"title":"Outcome","type":"nominal"},"opacity":{"condition":{"test":{"and":[{"or":["!isValid(datum[\"outcome\"])",{"empty":true,"param":"legend_selection"}]}]},"value":1},"value":0.15},"tooltip":[{"field":"property","type":"nominal"},{"field":"calls","type":"quantitative"},{"field":"outcome","type":"nominal"},{"field":"outcome","type":"nominal"}],"x":{"field":"property","title":"Property","type":"nominal"},"xOffset":{"field":"outcome","type":"nominal"},"y":{"field":"calls","scale":{"zero":true},"title":"Reads (count)","type":"quantitative"}},"height":260,"mark":"bar","params":[{"bind":"scales","name":"grid","select":{"encodings":["y"],"type":"interval"}},{"bind":"legend","name":"legend_selection","select":{"fields":["outcome"],"type":"point"}}],"width":"container"}, {actions: false}).then(function(){});</script></div>
+<div class="aov-plot-area"><div id="vega-ad49dafdd509f5cc" class="u-w-full"></div><script>AoV.embed('vega-ad49dafdd509f5cc', {"$schema":"https://vega.github.io/schema/vega-lite/v5.json","_aov":{"legendInteraction":"highlight"},"_aovLegend":{"dimmed":true,"filtered":false,"opacity":null,"params":["legend_selection"],"transform":[]},"autosize":{"contains":"padding","type":"fit"},"config":{"axis":{"labelAngle":0,"labelFontSize":14,"labelLimit":0,"titleFontSize":14},"header":{"labelLimit":0},"legend":{"labelLimit":0}},"data":{"values":{"n":8,"columns":{"outcome":["Computed","Memory hit","Computed","Memory hit","Computed","Memory hit","Computed","Memory hit"],"property":{"runs":["centered","energy","offset","scaled"],"lengths":[2,2,2,2]},"calls":[1,1,1,0,1,0,2,2]}}},"encoding":{"color":{"field":"outcome","scale":{"domain":["Computed","Memory hit"],"range":["#2a78d6","#eb6834"]},"title":"Outcome","type":"nominal"},"opacity":{"condition":{"test":{"and":[{"or":["!isValid(datum[\"outcome\"])",{"empty":true,"param":"legend_selection"}]}]},"value":1},"value":0.15},"tooltip":[{"field":"property","title":"Property","type":"nominal"},{"field":"calls","title":"Reads (count)","type":"quantitative"},{"field":"outcome","type":"nominal"}],"x":{"field":"property","title":"Property","type":"nominal"},"xOffset":{"field":"outcome","type":"nominal"},"y":{"field":"calls","scale":{"zero":true},"title":"Reads (count)","type":"quantitative"}},"height":260,"mark":"bar","params":[{"bind":"scales","name":"grid","select":{"encodings":["y"],"type":"interval"}},{"bind":"legend","name":"legend_selection","select":{"fields":["outcome"],"type":"point"}}],"width":"container"}, {actions: false}).then(function(){});</script></div>
 </body>
 </html>
 </body></html>
