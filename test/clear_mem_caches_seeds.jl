@@ -16,7 +16,7 @@ _seed_bump!(k) = (SEED_CALLS[k] = get(SEED_CALLS, k, 0) + 1)
 end
 
 # Standalone child: `__parent__` is NOT declared, wired purely via a
-# constructor kwarg — the Bruno `FitResolver(; __parent__=__self__)` shape.
+# constructor kwarg on a parented child.
 @dynamicstruct struct SeedChild
     val = (_seed_bump!(:val); __self__.__parent__.svc + SEED_GEN[])
 end

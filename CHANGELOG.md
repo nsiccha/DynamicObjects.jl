@@ -23,8 +23,7 @@ failing or silently behaving differently at run time.
   the worker starts (the first computation, the first after the worker exited
   or was restarted, or one arriving while `worker_start=:now` still starts
   it), then "Loading packages: …", naming the packages the worker loads for it.
-  Before, the node showed nothing during these waits, which take minutes for a
-  large application on a busy host (Bruno's web-sim: 296 s for its first view).
+  Before, the node showed nothing during these waits.
 - `DynamicObjects.progress_notes` gains `starting_worker` and
   `loading_packages` (`{packages}`), in English and German, so a page writes
   these phases in its own language and an app can reword them.

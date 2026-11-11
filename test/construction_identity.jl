@@ -5,8 +5,7 @@ using TestItemRunner
 # `include-child-em-c6b53d27`, decision `0e4o8w2`). Before, only fixed fields
 # counted. A struct mounted with `@include` that read everything from its
 # parent had an empty identity, so the children of every parent shared one disk
-# cache: Bruno's prior, PK-only and joint fits were all served the prior's
-# entry. Two objects differing only in an override, and plain inline children
+# cache. Two objects differing only in an override, and plain inline children
 # used as cache-key arguments, collided the same way.
 
 @testmodule ConstructionIdentityFixtures begin
@@ -17,7 +16,7 @@ export CI_BASE, CIChild, CIBareChild, CIDeclaredChild, CIShared, CIOwner,
 
 const CI_BASE = mktempdir()
 
-# Bruno's `QTJointPKData` shape: no fixed fields, every input from the parent.
+# No fixed fields: every input comes from the parent.
 @dynamicstruct struct CIChild
     (; regime) = __self__.__parent__
     __cache_base__ = CI_BASE
@@ -319,7 +318,7 @@ end
     @cached val = counted(string("computed:", tag))
     @cached idx(k) = counted(string("computed:", tag, ":", k))
 end
-# The reported shape: `ODLPlaus.FitPin`, whose key moved off its data directory.
+# A versioned value whose identity includes placement and a tag.
 @dynamicstruct struct VersionedFields
     placement::String
     tag::String

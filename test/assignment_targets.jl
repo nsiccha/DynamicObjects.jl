@@ -1,6 +1,6 @@
 using TestItemRunner
 
-# Snag `in-invoices-jl-s-8ee4cf2f`: a destructuring assignment whose targets are
+# Regression: a destructuring assignment whose targets are
 # fields of a sibling (`fetch.day, fetch.at = …`) left the sibling name bare, so
 # computing the property threw `UndefVarError`. Every read inside an assignment
 # target resolves like any other read: the container of a field or index target

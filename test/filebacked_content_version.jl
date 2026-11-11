@@ -25,7 +25,7 @@ fixed field and use remake to invalidate cached reads at mutation boundaries.
             isfile(path) ? readlines(path) : String[]
         end
         line_count() = length(load_lines())
-        # Inline child exactly like Invoices' `period`: reads the parent's file-backed
+        # Inline child: reads the parent's file-backed
         # loader via __parent__. Plain @struct (NOT @fresh) → caches, rebuilt by remake.
         @struct tagged(tag::String) = begin
             n = __parent__.line_count()

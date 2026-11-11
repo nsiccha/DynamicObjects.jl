@@ -26,16 +26,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Configure git for private repos
-        run: git config --global url."https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - uses: julia-actions/setup-julia@v2
         with:
           version: '1'
       - uses: julia-actions/cache@v2
       - name: Install dependencies
         run: |
-          git clone -b main https://github.com/nsiccha/Treebars.jl.git
-          julia --project=docs -e 'using Pkg; Pkg.develop([PackageSpec(path=pwd()), PackageSpec(path="Treebars.jl")]); Pkg.instantiate()'
+          git clone -b main https://github.com/nsiccha/Treebars.jl.git "$RUNNER_TEMP/Treebars.jl"
+          git clone -b dev https://github.com/nsiccha/AlgebraOfVega.jl.git "$RUNNER_TEMP/AlgebraOfVega.jl"
+          git clone -b dev https://github.com/nsiccha/HTMX.jl.git "$RUNNER_TEMP/HTMX.jl"
+          git clone -b devibe https://github.com/nsiccha/HTMXObjects.jl.git "$RUNNER_TEMP/HTMXObjects.jl"
+          julia --project=docs -e '
+            using Pkg, TOML
+            project = Base.active_project()
+            config = TOML.parsefile(project)
+            pop!(config, "sources", nothing)
+            open(io -> TOML.print(io, config), project, "w")
+            dependencies = ["Treebars", "AlgebraOfVega", "HTMX", "HTMXObjects"]
+            Pkg.develop(vcat([PackageSpec(path=pwd())],
+              [PackageSpec(path=joinpath(ENV["RUNNER_TEMP"], name * ".jl")) for name in dependencies]))
+            Pkg.instantiate()'
       - name: Build and deploy
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

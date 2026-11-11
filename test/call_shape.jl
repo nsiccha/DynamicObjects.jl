@@ -1,7 +1,6 @@
 using TestItemRunner
 
-# DynamicObjects' body rewrites keep a call as it was written (snag
-# `bump-bruno-to-dy-9b97054b`). `fixcall` used to give every call it touched a keyword
+# DynamicObjects' body rewrites keep a call as it was written. `fixcall` used to give every call it touched a keyword
 # block and sort splats after named keywords. The always-on rewrite (`ed0f8bc`) runs every
 # call in an unmarked body through it, so a macro reading its argument saw a `;` the author
 # never wrote: Treebars' `@progress "label" map(itr) do … end` spliced the empty block into
@@ -17,7 +16,7 @@ export render_text, node_of, CSMapSugar
 node_of(o, name::Symbol) = DynamicObjects._status_of(getfield(o, :cache).cache, name)
 
 # Treebars' map-sugar in an unmarked body, with a product iterable read from siblings and
-# a destructured do-argument (the reported Bruno shape).
+# a destructured do-argument.
 @dynamicstruct struct CSMapSugar
     xs = [1, 2]
     ys = [3, 4]

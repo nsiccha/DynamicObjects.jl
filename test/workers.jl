@@ -602,10 +602,8 @@ with_worker() do
 end
 end
 
-# Snag `open-bruno-s-web-e7aa5ae2`: a computation that has to wait for the worker process to
-# start, or for it to load packages, used to show nothing on its node until the worker ran it
-# (web-sim's first view: 296 s). The two waits are phases of the node, kept once done, in the
-# page's language.
+# Worker startup and package loading appear as phases of the computation node.
+# Both phases remain visible after completion, in the page's language.
 @testitem "workers: starting the worker and loading packages are phases of the computation" setup=[WorkerFixtures] tags=[:core, :workers] begin
 using DynamicObjects
 using WorkerToy
