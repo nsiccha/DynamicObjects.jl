@@ -14,6 +14,18 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.17
+
+- A process with a worker (`configure_queue!(; workers=1)`) no longer waits on the
+  worker when it exits: its exit hooks kill the worker (`SIGKILL`) and return at
+  once, whatever state the worker is in. Before, Malt's exit hook asked the worker
+  to exit and waited for it, up to 50 s, so a stuck worker held the exit 30 s and
+  more, and on Julia 1.10 a `SIGTERM` could leave the process spinning at full CPU
+  forever instead of exiting. A deployed app restarted by `SIGTERM` exits within
+  seconds now. The worker no longer runs its own exit hooks when the process
+  exits. A process that ends without running its exit hooks (a crash, `SIGKILL`)
+  leaves the worker to exit by itself once the connection closes, as before.
+
 ## 0.5.16
 
 - `DynamicObjects.canonical_hash`, and with it every `__hash__`, cache directory,
