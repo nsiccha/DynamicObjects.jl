@@ -841,10 +841,31 @@ function _worker_env()
     env
 end
 
+# Malt registers `atexit(() -> stop(w))` for each worker it starts. That hook waits for the
+# worker to exit (asked to, then `SIGTERM`, then `SIGKILL`: up to 50 s), so this process's exit
+# waits on the worker, 30 s and more for a stuck one. On Julia 1.10 a `SIGTERM` can also hang
+# the exit for good: the signal runs the exit hooks on thread 1's interrupted task, which may
+# hold libuv's lock, and a hook that waits then spins on that lock forever (snag
+# `worker-executor-6b472ad3`). So the worker's Malt hook is replaced by one that kills the
+# worker and returns at once. It kills rather than asks: a stuck worker would never act on a
+# request, and once this process is gone nothing is left to follow one up. A worker whose host
+# ends without exit hooks (a crash, `SIGKILL`) still exits by itself when the connection closes.
+function _exit_without_waiting!(w::Malt.Worker)
+    Base.@lock Base._atexit_hooks_lock filter!(f -> !_stops_worker(f, w), Base.atexit_hooks)
+    proc, pid = w.proc, w.proc_pid
+    # `uv_kill` is a plain `kill` (`TerminateProcess` on Windows) and takes no lock. A child
+    # libuv has not reaped keeps its pid, so `process_running` guards against a reused one.
+    atexit(() -> (Base.process_running(proc) && ccall(:uv_kill, Cint, (Cint, Cint), pid, Base.SIGKILL); nothing))
+    w
+end
+
+# Whether the exit hook `f` is Malt's for `w`: a closure of Malt's that holds `w`.
+_stops_worker(f, w) = parentmodule(typeof(f)) === Malt && any(i -> getfield(f, i) === w, 1:nfields(f))
+
 function _spawn_worker!(q)
     conn = q.conn
     exeflags = _worker_exeflags(q)
-    w = _on_actor(() -> Malt.Worker(; exeflags, env=_worker_env()), conn)
+    w = _on_actor(() -> _exit_without_waiting!(Malt.Worker(; exeflags, env=_worker_env())), conn)
     try
         id = _DYNAMICOBJECTS_PKGID
         load = :(Base.require(Base.PkgId(Base.UUID($(string(id.uuid))), $(id.name))); nothing)

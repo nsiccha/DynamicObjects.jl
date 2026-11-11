@@ -2872,6 +2872,8 @@ as a [`PropertyComputationError`](@ref) caused by a
 printout, and [`unwrap_error`](@ref) returns the exception itself wherever it can cross; a worker
 that exits fails every computation it ran with [`ComputeAbandoned`](@ref), and the next one starts
 a fresh worker. `workers=0` (the default) runs everything here; switching to it stops the worker.
+When this process exits, its exit hooks kill the worker at once instead of waiting for it, so a
+stuck worker never holds the exit up.
 
 The worker runs this process's Julia with its code-generation flags, active project,
 `LOAD_PATH` and `DEPOT_PATH`, and by default `--threads=<this process's default threads>,1`,

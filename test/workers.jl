@@ -658,3 +658,76 @@ with_worker() do
     @test occursin("WorkerToy", en[2])
 end
 end
+
+# Malt registers an exit hook per worker that waits for the worker to exit; DO replaces it with
+# one that kills the worker at once (snag `worker-executor-6b472ad3`). Malt's half is pinned
+# too, so a Malt release that registers its hook differently fails here instead of leaving a
+# waiting hook in place.
+@testitem "workers: a worker's exit hook kills it without waiting; Malt's waiting hook is gone" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects
+const DO = DynamicObjects
+const Malt = DO.Malt
+added(before) = filter(f -> !any(g -> g === f, before), Base.atexit_hooks)
+
+# Malt's hook: one per worker, a closure of Malt's that holds the worker.
+before = copy(Base.atexit_hooks)
+w = Malt.Worker()
+try
+    hooks = added(before)
+    @test length(hooks) == 1 && DO._stops_worker(only(hooks), w)
+    DO._exit_without_waiting!(w)
+    hooks = added(before)
+    @test length(hooks) == 1 && parentmodule(typeof(only(hooks))) === DO
+    # Run at exit, DO's hook kills the worker and returns without waiting for it to go.
+    @test (@elapsed only(hooks)()) < 1
+    @test settles(() -> !Malt.isrunning(w), 10.0)
+finally
+    Malt.isrunning(w) && Malt.stop(w)
+end
+
+# DO's own worker: starting it leaves one exit hook, DO's.
+before = copy(Base.atexit_hooks)
+with_worker() do
+    Toy(2, mktempdir()).square(3)
+    hooks = added(before)
+    @test length(hooks) == 1 && parentmodule(typeof(only(hooks))) === DO
+end
+end
+
+# On Julia 1.10, SIGTERM ran Malt's waiting exit hook on an interrupted task holding libuv's
+# lock, and the process spun forever; on any version a stuck worker held the exit 30 s. The
+# worker is stopped (`SIGSTOP`) to stand for a stuck one: it acts on nothing, only a kill ends
+# it. `--threads=2` puts the actor on the default pool, where the hang was most frequent.
+@testitem "workers: SIGTERM ends a process holding a stuck worker at once, and the worker with it" tags=[:core, :workers] begin
+using DynamicObjects
+if Sys.iswindows()
+    @test_skip "no SIGTERM on Windows"
+else
+    script = normpath(joinpath(dirname(pathof(DynamicObjects)), "..", "test", "fixtures", "worker_exit_process.jl"))
+    project = dirname(Base.active_project())
+    out, err = tempname(), tempname()
+    alive(pid) = (s = strip(readchomp(ignorestatus(`ps -o stat= -p $pid`))); !isempty(s) && !startswith(s, "Z"))
+    proc = run(pipeline(`$(Base.julia_cmd()) --startup-file=no --threads=2 --project=$project $script`;
+                        stdout=out, stderr=err); wait=false)
+    wpid = nothing
+    ok = false
+    try
+        ready = timedwait(() -> process_exited(proc) || occursin(r"^ready$"m, read(out, String)), 300.0; pollint=0.2)
+        m = match(r"^worker pid (\d+)$"m, read(out, String))
+        @test ready === :ok && process_running(proc) && m !== nothing
+        if m !== nothing && process_running(proc)
+            wpid = parse(Int, m[1])
+            run(`kill -STOP $wpid`)
+            sleep(1)
+            kill(proc, Base.SIGTERM)
+            exited = @test timedwait(() -> process_exited(proc), 15.0; pollint=0.05) === :ok
+            gone = @test timedwait(() -> !alive(wpid), 10.0; pollint=0.05) === :ok
+            ok = exited isa Test.Pass && gone isa Test.Pass
+        end
+    finally
+        process_running(proc) && kill(proc, Base.SIGKILL)
+        wpid !== nothing && alive(wpid) && run(ignorestatus(`kill -KILL $wpid`))
+        ok || println(read(out, String), read(err, String))
+    end
+end
+end
