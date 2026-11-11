@@ -702,9 +702,9 @@ structs are serialized as written; sparse or lazy arrays are never densified her
 Repeated references are retained, so alias structure can affect a digest. Order-independent
 hashing of cyclic container graphs is not promised.
 
-Since 0.5.16 a digest is the same on every Julia version from 1.10 on: on 1.10 it is the
-digest earlier versions of DynamicObjects computed, and later Julia versions compute that
-same digest. This holds for strings, numbers, symbols, chars, `nothing`, `missing`, arrays,
+A digest is the same on every Julia version from 1.10 on: on 1.10 it is the digest
+DynamicObjects computed before it made this promise, and later Julia versions compute that
+same digest (see `CHANGELOG.md`). This holds for strings, numbers, symbols, chars, `nothing`, `missing`, arrays,
 ranges, tuples, named tuples, pairs, Dicts, Sets, types, structs defined in packages,
 `@dynamicstruct` objects and DataFrames, and for containers of these. Two kinds of value
 are excluded: anonymous functions and closures, whose serialized form holds their code,
