@@ -825,6 +825,14 @@ end
 
 const _DYNAMICOBJECTS_PKGID = Base.PkgId(@__MODULE__)
 
+_preload_pkgid(m::Module) = _preload_pkgid(Base.PkgId(Base.moduleroot(m)))
+function _preload_pkgid(id::Base.PkgId)
+    id.uuid === nothing && throw(ArgumentError("worker_preload needs a loadable package, got $(repr(id))"))
+    id
+end
+_preload_pkgid(x) = throw(ArgumentError("worker_preload entries must be package modules or Base.PkgIds, got $(repr(x))"))
+_worker_preload(q) = lock(() -> q.worker_preload, q.lock)
+
 function _worker_exeflags(q)
     flags = String[c for c in Base.julia_cmd().exec[2:end]]
     project = Base.active_project()
@@ -1093,7 +1101,7 @@ function _submit!(q, req::_RemoteRequest, o, name, args, kwargs, packages, messa
         end
         lock(() -> req.worker = w, conn.lock)
         try
-            _ensure_packages!(conn, w, packages, status)
+            _ensure_packages!(conn, w, union(_worker_preload(q), packages), status)
             _remote_fetch(conn, w, _worker_submit, message...)
             return w, w.proc_pid
         catch err
@@ -1289,9 +1297,11 @@ function _stop_worker!(q)
 end
 
 _start_worker_soon!(q) = errormonitor(Threads.@spawn try
-    _ensure_worker!(q)
+    q.workers > 0 || return
+    w = _ensure_worker!(q)
+    _ensure_packages!(q.conn, w, _worker_preload(q))
 catch err
-    @error "DynamicObjects: starting the worker process failed" exception = (err, catch_backtrace())
+    @error "DynamicObjects: starting or preloading the worker process failed" exception = (err, catch_backtrace())
 end)
 
 """

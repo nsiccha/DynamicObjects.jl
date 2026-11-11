@@ -2816,11 +2816,13 @@ mutable struct JobQueue
     workers::Int    # 0: admitted items run here; 1: in the worker process
     worker_start::Symbol
     worker_exeflags::Union{Nothing,Vector{String}}
+    worker_preload::Vector{Base.PkgId}
     const conn::_WorkerConn
 end
 function JobQueue(; max_running::Integer=0)
     _check_max_running(max_running)
-    JobQueue(ReentrantLock(), QueuedItem[], Any[], Int(max_running), 0, 0, :lazy, nothing, _WorkerConn())
+    JobQueue(ReentrantLock(), QueuedItem[], Any[], Int(max_running), 0, 0, :lazy, nothing,
+             Base.PkgId[], _WorkerConn())
 end
 
 _check_max_running(n) =
@@ -2848,7 +2850,8 @@ job_queue() = _JOB_QUEUE
 
 """
     DynamicObjects.configure_queue!(q=job_queue(); max_running=nothing, workers=nothing,
-                                    worker_start=nothing, worker_exeflags=nothing) -> NamedTuple
+                                    worker_start=nothing, worker_exeflags=nothing,
+                                    worker_preload=nothing) -> NamedTuple
 
 Bound how many queued computations run at once. Off by default (`max_running=0`): a
 `@queued` computation starts on `:default` at once. With `max_running=n` at most `n` run at a
@@ -2880,8 +2883,16 @@ The worker runs this process's Julia with its code-generation flags, active proj
 so its message loop keeps answering on the interactive thread while computations run on the
 default ones; `worker_exeflags` replaces that thread flag (pass e.g. `["--threads=8,1"]`).
 `worker_start=:lazy` (the default) starts it with the first computation sent to it,
-`worker_start=:now` at once, in the background; either way the worker loads the packages a
-computation needs when the first computation needing them arrives. A computation that waits for
+`worker_start=:now` at once, in the background. Set `worker_preload=[AppModule]` to also load
+the application's packages at startup, before any computation is submitted. The list accepts
+package modules (a nested module selects its root package) or `Base.PkgId`s, and is reapplied
+after a restart. With `:lazy`, these packages load with the first worker-bound computation.
+Changing the list under `:now` also loads its packages into an already-running worker;
+`worker_preload=[]` clears the list for future starts but cannot unload packages. An omitted
+list stays unchanged. Preload failures are logged during background startup and fail a
+computation that still needs the preload; they are never treated as successful loads.
+Packages outside the list load when a computation first needs them. Preloading runs package
+initializers; it does not run properties or compile their first calls. A computation that waits for
 the worker to start, or for it to load packages, shows each wait as a phase of its progress
 node ("Starting the worker process", "Loading packages: …", from
 `DynamicObjects.progress_notes`), kept there ahead of the worker's own phases.
@@ -2892,7 +2903,7 @@ Returns [`queue_settings(q)`](@ref DynamicObjects.queue_settings); an omitted se
 unchanged.
 """
 function configure_queue!(q::JobQueue=job_queue(); max_running=nothing, workers=nothing,
-                          worker_start=nothing, worker_exeflags=nothing)
+                          worker_start=nothing, worker_exeflags=nothing, worker_preload=nothing)
     if workers !== nothing
         workers in (0, 1) || throw(ArgumentError(
             "workers must be 0 or 1 (one worker process per queue), got $(workers)"))
@@ -2901,6 +2912,7 @@ function configure_queue!(q::JobQueue=job_queue(); max_running=nothing, workers=
     worker_start === nothing || worker_start in (:lazy, :now) || throw(ArgumentError(
         "worker_start must be :lazy or :now, got $(repr(worker_start))"))
     worker_exeflags === nothing || (worker_exeflags = String[string(f) for f in worker_exeflags])
+    worker_preload === nothing || (worker_preload = unique!(Base.PkgId[_preload_pkgid(p) for p in worker_preload]))
     if max_running !== nothing
         _check_max_running(max_running)
         admitted = lock(q.lock) do
@@ -2911,12 +2923,16 @@ function configure_queue!(q::JobQueue=job_queue(); max_running=nothing, workers=
     end
     worker_start === nothing || (q.worker_start = worker_start)
     worker_exeflags === nothing || (q.worker_exeflags = worker_exeflags)
+    worker_preload === nothing || lock(q.lock) do
+        q.worker_preload = worker_preload
+    end
     if workers !== nothing
         q.workers = Int(workers)
         q.workers > 0 && (_WORKERS_ACTIVE[] = true)
         q.workers == 0 && _stop_worker!(q)
     end
-    q.workers > 0 && q.worker_start === :now && !_worker_alive(q.conn.worker) && _start_worker_soon!(q)
+    q.workers > 0 && q.worker_start === :now &&
+        (!_worker_alive(q.conn.worker) || !isempty(_worker_preload(q))) && _start_worker_soon!(q)
     queue_settings(q)
 end
 
