@@ -25,4 +25,5 @@ maybefresh
 ```@docs
 PropertyComputationError
 unwrap_error
+DynamicObjects.RemountSharedContextError
 ```

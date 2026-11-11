@@ -9,12 +9,14 @@
 entries
 cached_entries
 mem_cache_entries
+DynamicObjects.MemCacheEntry
 ```
 
 ## Invalidation
 
 ```@docs
 @clear_cache!
+DynamicObjects.clear_cache!
 invalidate!
 clear_mem_caches!
 clear_disk_caches!
@@ -28,6 +30,7 @@ prune_mem_caches!
 @persist
 PersistentSet
 LazyPersistentDict
+DynamicObjects.canonical_hash
 ```
 
 ## Key tracking
