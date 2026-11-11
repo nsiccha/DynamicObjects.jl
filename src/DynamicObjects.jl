@@ -11587,7 +11587,7 @@ function _base_declaration_graph(root::Type)
     edges = NamedTuple[]
     property_records = NamedTuple[]
     domain_records = NamedTuple[]
-    first_property_ids = Dict{Tuple{String,Symbol},String}()
+    property_ids = Dict{Tuple{String,Symbol},Vector{String}}()
 
     type_lookup = NamedTuple[]
     property_lookup = NamedTuple[]
@@ -11596,6 +11596,10 @@ function _base_declaration_graph(root::Type)
     for T in types
         type_id = type_ids[T]
         type_key = _declaration_type_key(T)
+        opaque = _remount_opaque_properties(T)
+        declared_names = Set(name for (name, _) in _declaration_properties(T))
+        nested_names = Set(name for name in declared_names
+            if haskey(type_ids, _walk_nested_type(T, name)))
         extensions = _checked_declaration_metadata(
             declaration_metadata(T), "type $T")
         push!(nodes, _declaration_node(type_id, :type, string(nameof(T)), (;
@@ -11610,7 +11614,7 @@ function _base_declaration_graph(root::Type)
             declaration = get(occurrences, name, 0) + 1
             occurrences[name] = declaration
             property_id = _declaration_property_id(type_id, name, declaration)
-            get!(first_property_ids, (type_id, name), property_id)
+            push!(get!(() -> String[], property_ids, (type_id, name)), property_id)
             descriptor = property_descriptor(T, name, info)
             source = _declaration_source(name, info)
             extensions = _checked_declaration_metadata(
@@ -11625,6 +11629,14 @@ function _base_declaration_graph(root::Type)
                 signature=property_signature(info, parentmodule(T)),
                 source,
                 extensions,
+                dependency_analysis=(;
+                    opaque=descriptor.fixed ? false :
+                        opaque === nothing ? nothing : name in opaque,
+                    missing=Symbol[dependency for dependency in descriptor.dependencies
+                        if !(dependency in declared_names)],
+                    nested=Symbol[dependency for dependency in descriptor.dependencies
+                        if dependency === :__parent__ || dependency in nested_names],
+                ),
             )
             push!(nodes, _declaration_node(
                 property_id, :property, source.signature, metadata))
@@ -11654,6 +11666,13 @@ function _base_declaration_graph(root::Type)
                     owner_type_key=type_key,
                     parameter,
                     declaration,
+                    dependency_analysis=(;
+                        opaque=opaque === nothing ? nothing : :__options__ in opaque,
+                        missing=Symbol[dependency for dependency in declaration.dependencies
+                            if !(dependency in declared_names)],
+                        nested=Symbol[dependency for dependency in declaration.dependencies
+                            if dependency === :__parent__ || dependency in nested_names],
+                    ),
                 )))
             push!(domain_records, (;
                 type=T,
@@ -11693,14 +11712,16 @@ function _base_declaration_graph(root::Type)
         end
 
         for dependency in record.descriptor.dependencies
-            dependency_id = get(
-                first_property_ids, (record.owner, dependency), nothing)
-            dependency_id === nothing && continue
-            edge_id = _declaration_edge_id(
-                :depends_on, record.id, dependency_id, dependency)
-            push!(edges, _declaration_edge(
-                edge_id, :depends_on, record.id, dependency_id,
-                (;declared=true)))
+            # A sibling read names a property, not a dispatch signature. Keep
+            # every declaration of that name; choosing only the first loses
+            # requirements of other methods before a selector can see them.
+            for dependency_id in get(property_ids, (record.owner, dependency), String[])
+                edge_id = _declaration_edge_id(
+                    :depends_on, record.id, dependency_id, dependency)
+                push!(edges, _declaration_edge(
+                    edge_id, :depends_on, record.id, dependency_id,
+                    (;declared=true)))
+            end
         end
 
         domain_sites = Dict{String,Vector{NamedTuple}}()
@@ -11738,14 +11759,13 @@ function _base_declaration_graph(root::Type)
         push!(edges, _declaration_edge(
             contains_id, :contains, record.owner, record.id, (;role=:domain)))
         for dependency in record.declaration.dependencies
-            dependency_id = get(
-                first_property_ids, (record.owner, dependency), nothing)
-            dependency_id === nothing && continue
-            edge_id = _declaration_edge_id(
-                :depends_on, record.id, dependency_id, dependency)
-            push!(edges, _declaration_edge(
-                edge_id, :depends_on, record.id, dependency_id,
-                (;declared=true, source=:options)))
+            for dependency_id in get(property_ids, (record.owner, dependency), String[])
+                edge_id = _declaration_edge_id(
+                    :depends_on, record.id, dependency_id, dependency)
+                push!(edges, _declaration_edge(
+                    edge_id, :depends_on, record.id, dependency_id,
+                    (;declared=true, source=:options)))
+            end
         end
     end
 
@@ -11841,7 +11861,11 @@ nodes, connected only by explicit `:contains`, direct `:depends_on`, and
 `:describes` relations. Property metadata includes its owner type ID, semantic
 name, duplicate-declaration occurrence, normalized semantic descriptor,
 structured signature, declaration extensions, and full captured source AST,
-code, and file/line provenance.
+code, and file/line provenance. Property and domain metadata also include
+`dependency_analysis=(;opaque, missing, nested)` for unresolved declared reads.
+Sibling dependency edges target every same-name declaration conservatively;
+the graph does not determine runtime dispatch. Use [`declaration_selection`](@ref)
+to select requirements and explicit boundaries without computing properties.
 
 Each contribution is a pure-data
 `(;namespace::String, nodes, edges)` fragment using the same envelopes. Base DO
@@ -11911,6 +11935,163 @@ end
 
 declaration_graph(object; contributions=()) =
     declaration_graph(typeof(object); contributions)
+
+function _declaration_selection_ids(ids, known, label)
+    selected = Set{String}()
+    for id in (ids isa AbstractString ? (ids,) : ids)
+        id isa AbstractString || throw(ArgumentError("$label must contain node ID strings"))
+        haskey(known, id) || throw(ArgumentError("unknown $label node `$id`"))
+        push!(selected, String(id))
+    end
+    selected
+end
+
+function _declaration_selection_diagnostics!(unresolved, node)
+    node.fragment == _DECLARATION_FRAGMENT && node.kind in (:property, :domain) || return
+    metadata = node.metadata
+    analysis = metadata isa NamedTuple ? get(metadata, :dependency_analysis, nothing) : nothing
+    if analysis === nothing
+        push!(unresolved, (;node=node.id, kind=:unavailable_analysis, dependency=nothing))
+        return
+    end
+    opaque = analysis.opaque
+    if opaque !== false
+        push!(unresolved, (;node=node.id,
+            kind=opaque === true ? :opaque_dependencies : :unavailable_analysis,
+            dependency=nothing))
+    end
+    for dependency in analysis.missing
+        push!(unresolved, (;node=node.id, kind=:missing_dependency, dependency))
+    end
+    for dependency in analysis.nested
+        push!(unresolved, (;node=node.id, kind=:nested_dependency, dependency))
+    end
+end
+
+"""
+    declaration_selection(graph, roots; boundaries=())
+
+Select declarations without reading properties or executing their bodies. `graph`
+is a [`declaration_graph`](@ref) result; `roots` and `boundaries` are node ID
+strings (a single string is also accepted). Use [`declaration_node_id`](@ref)
+to identify DO declarations, and the contributed IDs for framework nodes.
+
+Follow outgoing `:depends_on` and `:describes` edges. A reached explicit boundary
+is reported but its outgoing edges are not followed. For `A → B → C`, selecting
+`A` with boundary `B` requires `A`, reports `B`, and omits `C`; a separate local
+path to `C` still retains it. A root cannot also be a boundary. Boundary IDs
+which are not reached are omitted. Selections may overlap and need not exhaust
+the graph. Duplicate IDs in either input are harmless; unknown IDs are errors.
+
+Return pure data with schema `"dynamicobjects.declaration-selection/v1"`:
+
+- `graph`: the original graph's root ID; `roots`: normalized root IDs.
+- `required`: IDs of the roots and their transitive local requirements.
+- `boundaries`: IDs of the reached explicit boundaries, excluded from `required`.
+- `context`: additional ancestor IDs reached by following `:contains` backwards.
+  These preserve owner/mount context, not an assertion that their computations
+  are selected. Containment never selects siblings or descendants, even for a
+  type root. Select an owning/mount property as a root too when its computation
+  must be included, rather than merely described.
+- `nodes`: original records for the union of those three disjoint ID sets;
+  `edges`: original edges whose endpoints are in that union. Their source,
+  metadata and fragment provenance are preserved, with no rewriting of IDs.
+- `reasons`: `(;node, kind, from, edge)` records for roots, traversed requirement
+  edges, and containing context. A root has `from=edge=nothing`; other reasons
+  cite an original edge. These distinguish traversal from merely retained edges.
+- `unresolved`: `(;node, kind, dependency)` diagnostics on local requirements.
+  DO reports opaque self access, unrepresented dependency names, known nested/parent
+  reads whose member-level requirements are not in the graph, and unavailable
+  analysis from older graphs. Explicit boundaries suppress these diagnostics
+  for the external node. Arbitrary helpers, runtime dispatch and effects are
+  not inferred: an empty vector is not a proof of purity or whole-program
+  completeness. Contributed nodes are governed by their supplied edges.
+
+ID vectors, nodes and edges keep graph order, independent of input order.
+Reasons keep root order then edge order. Work is linear in graph size plus
+diagnostics; cycles terminate. Inputs are never mutated. Node and edge metadata
+remain shared read-only data; this is a plan, not executable source pruning or
+automatic remote-call rewriting. Same-name dependency declarations are retained
+conservatively because a declared edge does not determine runtime dispatch.
+"""
+function declaration_selection(graph, roots; boundaries=())
+    get(graph, :schema, nothing) == _DECLARATION_GRAPH_SCHEMA ||
+        throw(ArgumentError("expected a dynamicobjects.declaration-graph/v1 graph"))
+    _validate_declaration_graph(graph.root, graph.nodes, graph.edges)
+    known = Dict(node.id => node for node in graph.nodes)
+    root_ids = _declaration_selection_ids(roots, known, "root")
+    stops = _declaration_selection_ids(boundaries, known, "boundary")
+    isdisjoint(root_ids, stops) ||
+        throw(ArgumentError("a selection root cannot also be an explicit boundary"))
+
+    requirements = Dict{String,Vector{String}}()
+    parents = Dict{String,Vector{String}}()
+    for edge in graph.edges
+        if edge.kind in (:depends_on, :describes)
+            push!(get!(() -> String[], requirements, edge.from), edge.to)
+        elseif edge.kind === :contains
+            push!(get!(() -> String[], parents, edge.to), edge.from)
+        end
+    end
+    ordered_roots = String[node.id for node in graph.nodes if node.id in root_ids]
+    queue = copy(ordered_roots)
+    reached = copy(root_ids)
+    cursor = 1
+    while cursor <= length(queue)
+        id = queue[cursor]
+        cursor += 1
+        id in stops && continue
+        for dependency in get(requirements, id, ())
+            dependency in reached && continue
+            push!(reached, dependency)
+            push!(queue, dependency)
+        end
+    end
+    boundary_ids = intersect(reached, stops)
+    required = setdiff(reached, boundary_ids)
+
+    # Ancestors supply structural context only. Never feed them back into the
+    # requirement queue: that would silently select unrelated local work.
+    retained = copy(reached)
+    cursor = 1
+    while cursor <= length(queue)
+        id = queue[cursor]
+        cursor += 1
+        for parent in get(parents, id, ())
+            parent in retained && continue
+            push!(retained, parent)
+            push!(queue, parent)
+        end
+    end
+    context = setdiff(retained, reached)
+    reasons = NamedTuple[(;node=id, kind=:root, from=nothing, edge=nothing)
+        for id in ordered_roots]
+    for edge in graph.edges
+        if edge.kind in (:depends_on, :describes) && edge.from in required
+            push!(reasons, (;node=edge.to, kind=edge.kind, from=edge.from, edge=edge.id))
+        elseif edge.kind === :contains && edge.to in retained
+            push!(reasons, (;node=edge.from, kind=:context, from=edge.to, edge=edge.id))
+        end
+    end
+    unresolved = NamedTuple[]
+    for node in graph.nodes
+        node.id in required || continue
+        _declaration_selection_diagnostics!(unresolved, node)
+    end
+    (;
+        schema="dynamicobjects.declaration-selection/v1",
+        graph=graph.root,
+        roots=ordered_roots,
+        required=String[node.id for node in graph.nodes if node.id in required],
+        boundaries=String[node.id for node in graph.nodes if node.id in boundary_ids],
+        context=String[node.id for node in graph.nodes if node.id in context],
+        nodes=NamedTuple[node for node in graph.nodes if node.id in retained],
+        edges=NamedTuple[edge for edge in graph.edges
+            if edge.from in retained && edge.to in retained],
+        reasons,
+        unresolved,
+    )
+end
 
 """
     declaration_node_id(graph, T::Type) -> Union{String,Nothing}
@@ -14222,7 +14403,7 @@ export metafirst, metaall
 export static_domain, property_descriptor, property_descriptors, type_descriptor,
     option_declarations, has_option_declaration, property_options,
     option_domain, option_records
-export declaration_metadata, declaration_graph, declaration_node_id,
+export declaration_metadata, declaration_graph, declaration_selection, declaration_node_id,
     declaration_observations
 export materialization_observation
 export with_compute_trace, ComputeTrace, compute_trace_rows

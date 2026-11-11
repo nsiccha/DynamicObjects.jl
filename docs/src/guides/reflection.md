@@ -76,6 +76,51 @@ stable identifiers. [`declaration_observations`](@ref) adds a separate state
 overlay. Consumers use [`declaration_node_id`](@ref) to connect their own
 records to this graph instead of reproducing its identifier encoding.
 
+## Selecting declarations
+
+[`declaration_selection`](@ref) follows dependencies and domain links from
+chosen declaration IDs. For the `Analysis` definition above, selecting `scaled`
+normally retains `total`, `enabled`, and `values`. If another service supplies
+`total`, mark it as an explicit boundary:
+
+```@example reflection
+graph = declaration_graph(Analysis)
+scaled = declaration_node_id(graph, Analysis, :scaled)
+total = declaration_node_id(graph, Analysis, :total)
+selection = declaration_selection(graph, scaled; boundaries=[total])
+@assert selection.required == [scaled] # hide
+@assert selection.boundaries == [total] # hide
+@assert selection.context == [graph.root] # hide
+__docs_output__ = begin # hide
+(local_declarations = length(selection.required),
+ external_boundaries = length(selection.boundaries),
+ unresolved = selection.unresolved)
+end # hide
+show(stdout, MIME"text/plain"(), __docs_output__) # hide
+println() # hide
+```
+
+The boundary is reported but its dependencies are not followed. A separate local
+path to one of those dependencies still retains it. Selections can overlap and
+need not cover every declaration. No property body is run.
+
+`required`, `boundaries`, and `context` contain disjoint ID sets. `context`
+preserves containing types and mount properties; it does not select their
+computations, siblings, or children. Even a type root selects only itself.
+Select a mount property explicitly too if its computation belongs in the plan.
+`nodes` and `edges` preserve original source and fragment metadata; `reasons`
+identify the roots and edges responsible for selection. Output keeps graph
+order regardless of root order.
+
+Read `unresolved` before treating a selection as an execution plan: it reports
+opaque self access, missing dependency names, known nested or parent reads whose
+member requirements are not represented, and unavailable analysis from older
+graphs. Dependencies with multiple same-name methods retain all declarations
+conservatively. Even an empty diagnostic list cannot prove completeness or
+purity for arbitrary helpers and runtime dispatch. Contributed framework nodes
+use their supplied edges; the selector neither prunes source nor rewrites calls
+across services.
+
 ## Source information
 
 `property_signature`, `property_doc`, and `property_source_info` expose the

@@ -42,6 +42,7 @@ metaall
 declaration_metadata
 declaration_graph
 declaration_node_id
+declaration_selection
 declaration_observations
 materialization_observation
 ```
