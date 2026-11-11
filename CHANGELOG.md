@@ -14,6 +14,22 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.16
+
+- `DynamicObjects.canonical_hash`, and with it every `__hash__`, cache directory,
+  `@versioned` tag and hashed `@cached` file name, is now the same on every Julia
+  version from 1.10 on. On Julia 1.10 every digest is the one earlier versions
+  computed; Julia 1.11 and later now compute those same digests, where before
+  every digest changed with the Julia minor version (a key computed on a 1.10
+  host and in a 1.12 CI job never agreed). This holds for strings, numbers,
+  symbols, chars, `nothing`, `missing`, arrays, ranges, tuples, named tuples,
+  pairs, Dicts, Sets, types, structs defined in packages, `@dynamicstruct`
+  objects and DataFrames, and containers of these. Anonymous functions and
+  closures are excluded, and so is a Dict or Set inside a value hashed as
+  serialized (an arbitrary struct, an array wrapper), whose iteration order
+  changed in Julia 1.13. Digests computed on Julia 1.11 or later move once, to
+  the 1.10 values. `file_version(path; by = :hash)` follows the same rule.
+
 ## 0.5.15
 
 - A computation sent to the job queue's worker process
