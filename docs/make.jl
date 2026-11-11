@@ -2,6 +2,16 @@ using Documenter, DocumenterVitepress, DynamicObjects
 include("figures.jl")
 include("lint.jl")
 
+# Pages register figure assets while their examples run. This step writes them into
+# the build directory after ExpandTemplates; rendering then moves `public/` into the
+# VitePress source, so `vitepress build` publishes them beside the pages.
+abstract type WriteFigureAssets <: Documenter.Builder.DocumentPipeline end
+Documenter.Selectors.order(::Type{WriteFigureAssets}) = 5.5
+function Documenter.Selectors.runner(::Type{WriteFigureAssets}, doc::Documenter.Document)
+    build = isabspath(doc.user.build) ? doc.user.build : joinpath(doc.user.root, doc.user.build)
+    DocsFigures.write_assets(joinpath(build, "public", "figures"))
+end
+
 makedocs(
     sitename = "DynamicObjects.jl",
     modules  = [DynamicObjects],
@@ -9,7 +19,6 @@ makedocs(
         repo = "github.com/nsiccha/DynamicObjects.jl",
         devurl = "dev",
         devbranch = "pre-inference",
-        build_vitepress = false,
     ),
     pages = let pages = [
         "Start" => ["First object" => "index.md"],
@@ -35,9 +44,6 @@ makedocs(
     checkdocs = :exports,
     warnonly = false,
 )
-
-DocsFigures.write_assets(joinpath(@__DIR__, "build", ".documenter", "public", "figures"))
-DocumenterVitepress.build_docs(joinpath(@__DIR__, "build"))
 
 # Ensure a root index.html redirect exists for when no stable version is deployed
 let redirect = joinpath(@__DIR__, "build", "index.html")
