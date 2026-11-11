@@ -14,6 +14,18 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.18
+
+- `configure_queue!(; worker_preload=[AppModule], worker_start=:now, workers=1)`
+  loads the selected packages in the background worker at boot and after a
+  restart, moving their package load off the first computation. Entries may be
+  package modules or `Base.PkgId`s. Under `:lazy` they load with the first
+  computation; updating the list under `:now` also preloads a running worker.
+  The default list is empty, an omitted list is unchanged, and `[]` clears it
+  without unloading packages. Failures are logged and remain failures for
+  computations requiring the preload. Property evaluation and first-call
+  compilation still happen when requested.
+
 ## 0.5.17
 
 - A process with a worker (`configure_queue!(; workers=1)`) no longer waits on the
