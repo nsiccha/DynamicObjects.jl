@@ -159,9 +159,27 @@ function _child_step(parent, o)
         _nested_struct_type(typeof(parent), Val(name)) === nothing && continue
         value === o && return (name, false, (), (;))
         value isa IndexableProperty || continue
-        for ((args, kwargs), w) in cached_entries(value)
-            w === o && return (name, true, _wire(args), _wire(kwargs))
+        key = _held_entry_key(value, o)
+        key === nothing || return (name, true, _wire(key[1]), _wire(key[2]))
+    end
+    nothing
+end
+
+# Match under the cache lock, retaining only the matching key. Wiring happens
+# after release: it can recurse into other objects' addresses and locks.
+function _held_entry_key(ip::IndexableProperty{<:Any,<:Any,<:ThreadsafeDict}, value)
+    lock(ip.cache.lock) do
+        for (key, held) in ip.cache.cache
+            held === value && return _plain_key(key)
         end
+        nothing
+    end
+end
+function _held_entry_key(ip::IndexableProperty, value)
+    # Specialized caches (notably opaque remount namespaces) own their view
+    # of visible entries; preserve that contract through their public reader.
+    for (key, held) in cached_entries(ip)
+        held === value && return key
     end
     nothing
 end
@@ -293,13 +311,27 @@ end
 function _resolve_existing(a::_ChildAddress, objects)
     parent = _resolve_existing(a.parent, objects)
     parent === nothing && return nothing
-    held = _held_values(getfield(parent, :cache).cache)
-    i = findfirst(p -> first(p) === a.name, held)
-    i === nothing && return nothing
-    value = last(held[i])
+    value = _held_value(getfield(parent, :cache).cache, a.name)
     a.indexed || return value
     value isa IndexableProperty || return nothing
     key = (_unwire(a.args, objects), _unwire(a.kwargs, objects))
+    _held_entry(value, key)
+end
+
+function _held_value(c::AbstractThreadsafeDict, name)
+    lock(c.lock) do
+        for (cache, _, _) in _clear_parts(c)
+            value = get(cache, name, _missing_sentinel)
+            value === _missing_sentinel || return value
+        end
+        nothing
+    end
+end
+_held_value(c::AbstractDict, name) = get(c, name, nothing)
+
+_held_entry(ip::IndexableProperty{<:Any,<:Any,<:ThreadsafeDict}, key) =
+    get(ip.cache, _memo_key(key[1], key[2]), nothing)
+function _held_entry(value::IndexableProperty, key)
     for (k, w) in cached_entries(value)
         _key_isequal(k[1], key[1]) && _key_isequal(k[2], key[2]) && return w
     end
