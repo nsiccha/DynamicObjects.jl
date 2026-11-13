@@ -1,7 +1,7 @@
 name = "DynamicObjects"
 uuid = "23d02862-63fe-4c6e-8fdb-1d52cbbd39d5"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com> and contributors"]
-version = "0.5.20"
+version = "0.5.21"
 
 [deps]
 PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"

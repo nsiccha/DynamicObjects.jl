@@ -149,6 +149,11 @@ The worker runs this process's Julia with its code-generation flags, active proj
 `LOAD_PATH` and `DEPOT_PATH`, and by default `--threads=<this process's default threads>,1`,
 so its message loop keeps answering on the interactive thread while computations run on the
 default ones; `worker_exeflags` replaces that thread flag (pass e.g. `["--threads=8,1"]`).
+The worker also inherits this process's full `--heap-size-hint`, when set, unless
+`worker_exeflags` supplies one explicitly. This is a per-process garbage-collection hint,
+not a shared memory cap: the parent, worker and other processes still need their own headroom.
+These flags apply at worker startup and restart; changing them does not reconfigure a
+running worker.
 `worker_start=:lazy` (the default) starts it with the first computation sent to it,
 `worker_start=:now` at once, in the background. Set `worker_preload=[AppModule]` to also load
 the application's packages at startup, before any computation is submitted. The list accepts

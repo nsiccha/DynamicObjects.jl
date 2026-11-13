@@ -1,5 +1,16 @@
 using TestItemRunner
 
+@testitem "workers: heap hints follow the parent unless explicitly overridden" tags=[:core, :workers] begin
+# The parent must itself start with each hint: JLOptions describes startup options.
+script = joinpath(@__DIR__, "fixtures", "worker_heap_hint.jl")
+for hint in (0, 2 * 1024^3)
+    # Start from the executable, so the no-hint case cannot inherit a runner's hint.
+    flags = hint == 0 ? String[] : ["--heap-size-hint=$hint"]
+    cmd = `$(first(Base.julia_cmd().exec)) --startup-file=no --project=$(Base.active_project()) --threads=1,1 $flags $script $hint`
+    @test success(cmd)
+end
+end
+
 # The worker process behind `@queued` (`configure_queue!(; workers=1)`). The toy application
 # is a real package, `test/fixtures/workers/WorkerToy`, because the worker loads the package
 # that defines the root object's type. Its values carry the computing process's id and a
