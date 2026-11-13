@@ -3421,7 +3421,16 @@ elseif !isempty(indices) || !isempty(kwargs)
     # owns kwargs-keyed caching for indexed properties; we just hand off.
     _computeproperty(o, name, indices...; __status__, kwargs...)
 else
-    _getorcompute_bare(getfield(o, :cache), o, name)
+    _getorcompute_bare(o, name)
+end
+@inline function _getorcompute_bare(o, name::Symbol; link=nothing)
+    cache = getfield(o, :cache)
+    # The field accepts mounted caches too. Narrow the ordinary constructor's
+    # cache here so its dispatch does not box the owner on every cached read.
+    if cache isa PropertyCache{ThreadsafeDict{Symbol,Any}}
+        return _getorcompute_bare(cache, o, name; link)
+    end
+    _getorcompute_bare(cache, o, name; link)
 end
 function _getorcompute_bare(cache::PropertyCache, o, name::Symbol; link=nothing)
     # Fast hit path: a cached bare property returns WITHOUT building the
@@ -3894,7 +3903,7 @@ _call_threaded_ip(progress, ip::IndexableProperty{name}, args...; kwargs...) whe
 # name, its computation shown under `link`.
 _getorcompute_linked(o, name::Symbol, link) =
     hasfield(typeof(o), name) ? getfield(o, name) :
-                                _getorcompute_bare(getfield(o, :cache), o, name; link)
+                                _getorcompute_bare(o, name; link)
 
 # Call-site `@memo!` / `@fresh` inside a rewritten body expand after the rewrite, so they
 # see `_call_threaded(progress, callee, args…)`. Keep their meaning.
