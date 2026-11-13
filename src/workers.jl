@@ -871,6 +871,12 @@ function _worker_exeflags(q)
     project === nothing || push!(flags, "--project=" * project)
     append!(flags, something(q.worker_exeflags,
         ["--threads=$(Threads.nthreads(:default)),1"]))
+    # julia_cmd() does not carry the heap hint on every supported Julia version.
+    # A flag already supplied by Julia or the caller takes precedence.
+    hint = Base.JLOptions().heap_size_hint
+    if hint != 0 && !any(f -> f == "--heap-size-hint" || startswith(f, "--heap-size-hint="), flags)
+        push!(flags, "--heap-size-hint=$hint")
+    end
     flags
 end
 

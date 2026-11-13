@@ -14,6 +14,14 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.21
+
+- Queue workers inherit the parent's full `--heap-size-hint` at startup and
+  restart, including on Julia versions whose `Base.julia_cmd()` omits it.
+  An explicit hint in `worker_exeflags` takes precedence.
+  Automatic inheritance preserves the default worker thread settings. The hint
+  applies to each process separately and is not a combined memory cap.
+
 ## 0.5.20
 
 - Declaration reflection shares dependency analysis, preserving declaration order
