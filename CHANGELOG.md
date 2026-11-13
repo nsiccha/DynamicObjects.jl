@@ -14,6 +14,21 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.20
+
+- Declaration reflection shares dependency analysis, preserving declaration order
+  and overloaded-property metadata while avoiding repeated transitive walks.
+  Invalidation uses direct reverse edges instead of repeated whole-graph scans.
+- `remake` copies settled values directly using a bounded carry plan. Hash/path
+  reads no longer hide other dependencies, so overrides invalidate those values
+  correctly even when a property also reads an object hash or an opaque property.
+- Constant fixed-field reads infer their declared type. Indexed cache hits avoid
+  constructing computation/progress closures; constructor overrides, trace events,
+  and attached progress retain their existing behavior.
+- Macro lowering reuses each declaration's lowered body for analysis and emission.
+  Saturated queues update only the appended item's position, and worker child
+  lookup avoids copying all indexed entries.
+
 ## 0.5.19
 
 - `declaration_selection(graph, roots; boundaries=())` selects local declaration

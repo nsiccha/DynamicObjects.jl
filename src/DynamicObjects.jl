@@ -1582,6 +1582,17 @@ memoize!(ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...;
 _memoize_linked!(link, ip::IndexableProperty, indices...; kwargs...) = memoize!(ip, indices...; kwargs...)
 _memoize_linked!(link, ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict}, indices...; fetch=Base.fetch, retry_failed=true, kwargs...) where {name} = begin
     (;o, cache) = ip
+    t0 = _trace_clock()   # traced hits include key construction and hashing
+    args_key = _memo_key(indices, (;kwargs...))
+    fetch = _declared_fetch(fetch, o, Val(name))
+    hit = _peek_hit(cache, args_key)
+    if hit !== _missing_sentinel
+        t0 == 0 || _trace_read!(o, name, _trace_args(indices, args_key.kwargs), Val(:hit), t0)
+        _link_hit!(link, cache, args_key, hit)
+        return hit
+    end
+    # Only a miss needs the computation and progress factories. `get!` still
+    # arbitrates under its lock if another caller publishes after this peek.
     substatus_f = if name != :__substatus__ && name != :__status__
         () -> begin
             root = o.__status__
@@ -1590,9 +1601,6 @@ _memoize_linked!(link, ip::IndexableProperty{name,<:Any,<:AbstractThreadsafeDict
     else
         nothing
     end
-    t0 = _trace_clock()   # before the key, so a traced hit's time includes hashing it
-    args_key = _memo_key(indices, (;kwargs...))
-    fetch = _declared_fetch(fetch, o, Val(name))
     compute = _Settling(o, name, indices, args_key.kwargs) do s
         # Call `_computeproperty` directly, NOT `getorcomputeproperty`:
         # the latter, when `indices` and `kwargs` are both empty AND
@@ -2991,7 +2999,14 @@ function enqueue!(q::JobQueue, work; property::Union{Nothing,Symbol}=nothing, ta
     end
     admitted = lock(q.lock) do
         push!(q.waiting, item)
-        _admit!(q)
+        if q.max_running > 0 && q.running >= q.max_running
+            # Appending changes only this item's position. Renumbering the
+            # whole waiting queue here made a burst of N arrivals quadratic.
+            _note_position!(item, length(q.waiting))
+            _Admitted[]
+        else
+            _admit!(q)
+        end
     end
     foreach(_start_admitted, admitted)
     item
@@ -4512,19 +4527,21 @@ end
 # miss. Uses explicit lock/unlock (not `lock() do`) to keep the hot hit path
 # allocation-free; mirrors the fast-path read in `get!(::AbstractThreadsafeDict)`.
 _peek_hit(pc::PropertyCache, name::Symbol) = _peek_hit(getfield(pc, :cache), name)
-function _peek_hit(c::AbstractThreadsafeDict, name::Symbol)
+function _peek_hit(c::AbstractThreadsafeDict, key)
     lock(c.lock)
     try
-        return get(c.cache, name, _missing_sentinel)
+        value = get(c.cache, key, _missing_sentinel)
+        value === _missing_sentinel || _on_hit!(c, key)
+        return value
     finally
         unlock(c.lock)
     end
 end
-_peek_hit(c::AbstractDict, name::Symbol) = get(c, name, _missing_sentinel)
+_peek_hit(c::AbstractDict, key) = get(c, key, _missing_sentinel)
 _peek_hit(c::MountedThreadsafeDict, name::Symbol) =
     (_revalidate_alias!(c, name); invoke(_peek_hit, Tuple{AbstractThreadsafeDict,Symbol}, c, name))
 
-getorcomputeproperty(o, name, indices...; kwargs...) = if hasfield(typeof(o), name)
+Base.@constprop :aggressive getorcomputeproperty(o, name, indices...; kwargs...) = if hasfield(typeof(o), name)
     @assert length(indices) == length(kwargs) == 0
     getfield(o, name)
 elseif !isempty(indices) || !isempty(kwargs)
@@ -5945,42 +5962,6 @@ function _collect_child_reads!(paths, e, children)
     paths
 end
 
-# Names that (transitively) invalidate `prop`'s value: every fixed-field AND
-# rhs-declared name reachable from `prop` in the direct-dependency graph. A
-# `remake` kwarg may override an rhs-declared property (a cache override, not
-# just a fixed field), so restricting this set to fixed fields serves the
-# overridden property's memoized dependents STALE — silent wrong values. The
-# `isdisjoint(changed_kwargs, invalidators)` gate compares against ALL remake
-# kwargs, so the invalidators must span every overridable name.
-#
-# Returns `(inv, tainted)`. An opaque reach — `prop` itself opaque or an
-# opaque property in the closure — means the dependency set is NOT a sound
-# over-approximation, so NO kwarg change can be proven independent: `tainted`
-# carries only when `remake` changed nothing at all. A content-hash dunder in
-# the closure is taint-free but unprovable from the property's own reads, so
-# every identity name invalidates: the fixed fields plus the construction
-# inputs the default identity covers (`_identity_input_names`), which the
-# caller passes as `identity_set`.
-const _HASH_DUNDERS = (:__hash__, :__hash_fields__, :__cache_base__, :__cache_path__)
-function _carry_invalidators(prop::Symbol, direct_deps::AbstractDict, identity_set, opaque_props)
-    (prop in opaque_props) && return (Set{Symbol}(), true)
-    inv = Set{Symbol}()
-    seen = Set{Symbol}()
-    stack = Symbol[prop]
-    while !isempty(stack)
-        n = pop!(stack)
-        (n in seen) && continue
-        push!(seen, n)
-        for d in get(direct_deps, n, ())
-            (d in opaque_props) && return (Set{Symbol}(), true)
-            (d in _HASH_DUNDERS) && return (Set{Symbol}(identity_set), false)
-            push!(inv, d)
-            push!(stack, d)
-        end
-    end
-    (inv, false)
-end
-
 # --- Linter ----------------------------------------------------------------
 #
 # Lints are computed by `analyze_structure(T)` — a tree-walk over `meta(T)`
@@ -6689,6 +6670,8 @@ function compute_property end
 function iscached end
 function resumes end
 function meta end
+
+include("declaration_analysis.jl")
 
 """
     metafirst(T, name::Symbol) -> Union{Nothing, NamedTuple}
@@ -8282,17 +8265,16 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         :($DynamicObjects._version_hash_fields(__self__::$type) = $(Expr(:tuple, [(n in versioned_fixed ? :(getfield(__self__, $(QuoteNode(n)))) : :($DynamicObjects.getorcomputeproperty(__self__, $(QuoteNode(n))))) for n in versioned_names]...))),
     ]
     # ── Static dependency graph ──────────────────────────────────────────────
-    # Populate each computed property's `dependson` set (empty until now — the
-    # field was a placeholder). Walk a COPY of the RHS: `walk_rhs` mutates `:let`
-    # blocks in place, and the real per-property emission re-walks `info.rhs`
-    # later. The `dependson` Sets are shared by reference into the emitted `meta`
-    # (below), so mutating them here ships them populated — un-stubbing
-    # `property_source_info`/`reflect(T)` and feeding the `remake` carry-over bake.
+    # Lower each declaration once, keeping its authored RHS in metadata.
+    # Analysis and method emission use the same lowered body. Index by
+    # declaration, not name: overloaded properties have distinct bodies.
     opaque_props = Set{Symbol}()
     child_reads = Dict{Symbol,Set{Tuple{Vararg{Symbol}}}}()
-    for (name, info) in properties
+    lowered_rhs = Vector{Any}(undef, length(properties))
+    for (declaration_index, (name, info)) in enumerate(properties)
         (info.rhs === nothing) && continue        # fixed fields have no RHS
         walked = walk_rhs(deepcopy(info.rhs); locals=copy(info.locals), properties=walk_props, lnn=info.lnn)
+        lowered_rhs[declaration_index] = walked
         _collect_self_deps!(info.dependson, walked) && push!(opaque_props, name)
         isempty(source_shared_children) && continue
         _collect_child_reads!(get!(() -> Set{Tuple{Vararg{Symbol}}}(), child_reads, name),
@@ -8421,42 +8403,21 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     identity_defs = isempty(identity_inputs) ? Any[] : Any[
         :($DynamicObjects._identity_input_names(::Type{$type_dispatch}) = $(Tuple(identity_inputs))),
     ]
-    # ── `remake` carry-over bake (decision yf4z8x) ───────────────────────────
-    # A memoized bare property may be reused verbatim by `remake` when NONE of
-    # the names it (transitively) depends on — fixed fields AND rhs-declared
-    # properties — is among the changed kwargs. Compute each carry-eligible
-    # property's invalidating names and emit a per-type `_carryover` with them
-    # baked as a literal, so the per-property `isdisjoint(changed_kwargs,
-    # invalidators)` gate const-folds at each call. Opaque-tainted properties
-    # (whose dependency set is unsound) carry only when nothing changed at all.
-    # Excluded (v1): fixed fields, indexed props (not PropertyCache-backed),
-    # inline `@struct` children (they wire `__parent__` to the SOURCE object),
-    # and the `__…__` machinery/status properties.
-    fixed_set = Set{Symbol}(fixed_names)
+    # Carry eligibility and direct edges are data, not generated Val tuples
+    # containing every property's transitive closure. One traversal handles a
+    # remake's changed inputs; the copy loop has no per-property methods.
     inline_child_names = Set{Symbol}(first(p) for p in inline_child_pairs)
     direct_deps = Dict{Symbol,Set{Symbol}}()
     for (name, info) in properties
         isnothing(info.dependson) && continue
         union!(get!(() -> Set{Symbol}(), direct_deps, name), info.dependson)
     end
-    _carry_calls = Any[]
-    _seen_carry = Set{Symbol}()
-    for (name, info) in properties
-        (isfixed(info) || info.indexed || name in inline_child_names ||
-            name in _seen_carry || startswith(String(name), "__")) && continue
-        push!(_seen_carry, name)
-        _inv, _tainted = _carry_invalidators(name, direct_deps, union(fixed_set, identity_inputs), opaque_props)
-        if _tainted
-            push!(_carry_calls, :($DynamicObjects._carry1_tainted(__obj__, Val(__KW__), Val($(QuoteNode(name))))))
-        else
-            _inv_sorted = sort!(collect(_inv))
-            push!(_carry_calls, :($DynamicObjects._carry1(__obj__, Val(__KW__), Val($(QuoteNode(name))),
-                Val($(Expr(:tuple, (QuoteNode(f) for f in _inv_sorted)...))))))
-        end
-    end
-    _carryover_expr = isempty(_carry_calls) ?
-        :($DynamicObjects._carryover(__obj__::$type, ::Val) = (;)) :
-        :($DynamicObjects._carryover(__obj__::$type, ::Val{__KW__}) where {__KW__} = merge($(_carry_calls...)))
+    carry_names = unique!(Symbol[name for (name, info) in properties
+        if !(isfixed(info) || info.indexed || name in inline_child_names ||
+             startswith(String(name), "__"))])
+    carry_plan = _CarryPlan(carry_names, direct_deps,
+                           union(Set{Symbol}(fixed_names), identity_inputs), opaque_props)
+    carry_plan_expr = :($DynamicObjects._carry_plan(::Type{$type_dispatch}) = $carry_plan)
     # An inner constructor whose signature does not mention the type parameters
     # cannot use a bare `new` — Julia rejects the definition outright ("too few
     # type parameters specified in new{...}"), which is why a parametric
@@ -8566,11 +8527,13 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         (is_child ? :($type) : :(Base.@__doc__ $type)),
         quote
             $Base.hasproperty(__self__::$type, name::Symbol) = name in $(Tuple(prop_names))
-            $Base.getproperty(__self__::$type, name::Symbol) = $getorcomputeproperty(__self__, name)
+            $Base.@inline $Base.getproperty(__self__::$type, name::Symbol) =
+                hasfield(typeof(__self__), name) ? getfield(__self__, name) :
+                    $getorcomputeproperty(__self__, name)
             $Base.setproperty!(__self__::$type, name::Symbol, value) = $_reject_setproperty(__self__, name)
             $DynamicObjects.meta(::Type{$type_dispatch}) = $properties
             $(option_declaration_defs...)
-            $_carryover_expr
+            $carry_plan_expr
             $DynamicObjects._remount_opaque_properties(::Type{$type_dispatch}) = $(Tuple(sort!(collect(opaque_props))))
             $DynamicObjects._remount_child_reads(::Type{$type_dispatch}) = $(Tuple(
                 (name, Tuple(sort!(collect(paths)))) for (name, paths) in sort!(collect(child_reads); by=first)))
@@ -8756,7 +8719,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 else
                     nothing
                 end
-                walked_rhs = walk_rhs(info.rhs; info.locals, properties=walk_props, lnn=info.lnn)
+                walked_rhs = lowered_rhs[declaration_index]
                 # `@dynamic_progress`-marked: emit the 2-arg form
                 # `@dynamic_progress __status__ <body>`. The macro (defined
                 # above) handles both the call-site rewrite AND the Tb
@@ -8911,7 +8874,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                 !isnothing(desc_expr) && push!(block.args, desc_expr...)
                 block
             end
-            for (name, info) in oproperties if !isfixed(info)
+            for (declaration_index, (name, info)) in enumerate(oproperties) if !isfixed(info)
         ]...,
         # IndexableProperty wrappers for indexed properties are now created
         # directly in getorcomputeproperty (via meta check), so no zero-arg
@@ -9047,70 +9010,7 @@ macro dynamicstruct(args...)
     dynamicstruct(expr; kwargs...)
 end
 
-# --- `remake` carry-over machinery (decision yf4z8x) ---
-# `_carryover(obj, Val(KW))` returns a NamedTuple of the source's memoized
-# bare-property values that survive a `remake` whose changed kwargs are `KW` —
-# every carry-eligible property none of whose invalidating names (fixed or
-# rhs-declared) is in `KW`. `@dynamicstruct` bakes a per-type method with each
-# property's invalidators as a literal, so the `isdisjoint` gate below
-# const-folds per call; this generic fallback (untyped `Val`) carries nothing.
-# Opaque-tainted properties carry only when NOTHING changed: their dependency
-# set is unsound, so no kwarg change can be proven independent.
-_carryover(obj, ::Val) = (;)
-@inline _carry1(obj, ::Val{KW}, ::Val{P}, ::Val{INV}) where {KW,P,INV} =
-    isdisjoint(KW, INV) ? _carry_if_settled(obj, Val(P)) : (;)
-@inline _carry1_tainted(obj, ::Val{KW}, ::Val{P}) where {KW,P} =
-    isempty(KW) ? _carry_if_settled(obj, Val(P)) : (;)
-struct _CarryMiss end
-const _CARRY_MISS = _CarryMiss()
-# Peek the source cache without triggering compute/wait; carry only a settled
-# value (skip an in-flight `Pending` handle from the compute-at-most-once latch).
-@inline function _carry_if_settled(obj, ::Val{P}) where {P}
-    v = get(getfield(obj, :cache).cache, P, _CARRY_MISS)
-    (v === _CARRY_MISS || v isa Pending) ? (;) : NamedTuple{(P,)}((v,))
-end
-
-"""
-    remake(object; changes...)
-
-Construct a new object of the same type with replaced fields or property
-overrides. Settled scalar values whose declared dependencies are unaffected may
-be carried over. Changed inputs invalidate their transitive dependents.
-In-flight computations and indexed-property caches are not copied.
-
-Constructor overrides remain inputs unless replaced. A scalar `@state` value
-is carried unless a fixed field its initializer reads changed. An opaque
-property that passes `__self__` to uninspected code is carried only when no
-keyword changes were supplied.
-
-The original object remains available. Pass new input values rather than
-mutating fields, arguments or cached outputs. Use [`remount`](@ref) to bind
-request context while sharing retained work instead of constructing a new value.
-"""
-remake(obj; kwargs...) = _remake(obj, values(kwargs))
-function _remake(obj::T, nt::NamedTuple{KW}) where {T,KW}
-    fixed = fieldnames(T)[1:end-1]               # all fields except :cache
-    args = Any[haskey(nt, n) ? nt[n] : getfield(obj, n) for n in fixed]
-    # The source's own construction kwargs are inputs, not memos: pass them to
-    # the constructor (unless this call names them) so they become the new
-    # instance's seeds. Reuse the source's still-valid memoized properties;
-    # constructor kwargs override any carried value. Carried values are
-    # written into the new cache AFTER construction rather than passed as
-    # constructor kwargs: they are still-valid memos, not instance inputs, so
-    # a later `clear_mem_caches!` must drop (recompute) them while the seeds
-    # survive.
-    carried = _carryover(obj, Val(KW))
-    explicit = Base.structdiff(nt, NamedTuple{fixed})
-    inputs = merge(Base.structdiff(_construction_seed(obj), nt), explicit)
-    remade = T(args...; inputs...)
-    if !isempty(carried)
-        c = getfield(remade, :cache).cache
-        for (key, value) in pairs(carried)
-            haskey(inputs, key) || _seed_store!(c, key, value)
-        end
-    end
-    remade
-end
+include("remake.jl")
 
 # The keyword arguments `obj` was constructed with. A remount view's own seed
 # is its context, layered over the retained object's seed: `_restore_seeds!`
@@ -9282,8 +9182,9 @@ function _compute_remount_context(::Type{T}, changed, forced_local, parent_conte
         deps = get(dependencies, name, nothing)
         deps === nothing || foreach(path -> delete!(deps, first(path)), paths)
     end
+    graph = _DependencyGraph(dependencies)
     while true
-        _close_dependents!(invalidated, dependencies, shared_aliases)
+        _close_dependents!(invalidated, graph, shared_aliases)
         grew = false
         for (name, paths) in child_reads
             (name in invalidated || name in shared_aliases) && continue
@@ -9295,7 +9196,7 @@ function _compute_remount_context(::Type{T}, changed, forced_local, parent_conte
     end
     opaque = declared_opaque === nothing ? Set{Symbol}() :
         setdiff!(Set{Symbol}(declared_opaque), invalidated)
-    _close_dependents!(opaque, dependencies, union(invalidated, shared_aliases))
+    _close_dependents!(opaque, graph, union(invalidated, shared_aliases))
     union!(invalidated, opaque)
     invalidated, opaque, aliases
 end
@@ -9322,23 +9223,6 @@ function _child_read_is_context(::Type{T}, path, parent_names) where {T}
         return _child_read_is_context(C, path[2:end], context)
     end
     member in context
-end
-
-# Grow `names` by every property that transitively depends on one of them,
-# never adding a name in `excluded`.
-function _close_dependents!(names::Set{Symbol}, dependencies, excluded=())
-    changed_graph = true
-    while changed_graph
-        changed_graph = false
-        for (name, deps) in dependencies
-            (name in names || name in excluded) && continue
-            if !isdisjoint(deps, names)
-                push!(names, name)
-                changed_graph = true
-            end
-        end
-    end
-    names
 end
 
 # The names a parent routes per view: none unless it is itself a remount view.
@@ -11202,49 +11086,6 @@ _descriptor_input(arg::NamedTuple, kind::Symbol, declarations=nothing) = (;
     domain=_input_domain(arg, declarations),
 )
 
-function _semantic_dependency_closure(T::Type, roots)
-    closure = Set{Symbol}()
-    seen = Set{Symbol}()
-    function visit(name::Symbol)
-        name in seen && return
-        push!(seen, name)
-        info = metafirst(T, name)
-        info === nothing && return
-        push!(closure, name)
-        dependencies = get(info, :dependson, nothing)
-        dependencies === nothing && return
-        for dependency in dependencies
-            dependency isa Symbol && visit(dependency)
-        end
-    end
-    for root in roots
-        root isa Symbol && visit(root)
-    end
-    # Declaration order is the schema/rendering order; `dependson` itself is a
-    # Set and therefore cannot provide a stable public order.
-    unique!(Symbol[name for (name, _) in meta(T) if name in closure])
-end
-
-function _semantic_fixed_dependencies(T::Type, roots)
-    Symbol[name for name in _semantic_dependency_closure(T, roots)
-        if isnothing(get(metafirst(T, name), :rhs, nothing))]
-end
-
-function _semantic_dependency_inputs(T::Type, dependencies)
-    inputs = NamedTuple[]
-    for name in _semantic_fixed_dependencies(T, dependencies)
-        descriptor = property_descriptor(T, name)
-        descriptor === nothing && continue
-        input = only(descriptor.inputs)
-        push!(inputs, merge(input, (;
-            kind=:context,
-            source=(;type=T, property=name),
-            scope=:object,
-        )))
-    end
-    inputs
-end
-
 function _merge_semantic_dependency_inputs(context_inputs, direct_inputs)
     merged = NamedTuple[]
     direct_by_name = Dict(input.name => input for input in direct_inputs)
@@ -11279,12 +11120,11 @@ _progress_mode(macros) =
     Symbol("@PROGRESS") in macros || Symbol("@progress") in macros || Symbol("@dynamic_progress") in macros ? :instrumented :
     Symbol("@fetch!") in macros ? :forwarded : :automatic
 
-_descriptor_version_dependencies(T::Type) = unique!(Symbol[
-    name for (name, entry) in meta(T)
-    if Symbol("@versioned") in get(entry, :macros, Set{Symbol}())
-])
+property_descriptor(T::Type, prop::Symbol, info::NamedTuple) =
+    property_descriptor(_DeclarationAnalysis(T), prop, info)
 
-function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
+function property_descriptor(analysis::_DeclarationAnalysis, prop::Symbol, info::NamedTuple)
+    T = analysis.type
     mod = parentmodule(T)
     fixed = isnothing(get(info, :rhs, nothing))
     indexed = get(info, :indexed, !isempty(get(info, :indices, ())))
@@ -11294,7 +11134,7 @@ function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
     cached = Symbol("@cached") in macros
     mmap = Symbol("@mmap") in macros
     declared_versioned = Symbol("@versioned") in macros
-    version_dependencies = _descriptor_version_dependencies(T)
+    version_dependencies = copy(analysis.versions)
     versioned = has_versioned_fields(T) || !isempty(version_dependencies)
     computed = !fixed
     memoized = computed && !fresh
@@ -11302,7 +11142,7 @@ function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
     progress = computed
     result_type = _resolve_arg_type(_descriptor_result_type_expr(info), mod)
     signature = property_signature(info, mod)
-    declarations = _option_declaration_map(T)
+    declarations = analysis.options
     inferred_inputs = if fixed
         NamedTuple[_descriptor_input((;
             name=prop,
@@ -11320,7 +11160,7 @@ function property_descriptor(T::Type, prop::Symbol, info::NamedTuple)
     dependencies = get(info, :dependson, nothing)
     dependencies = dependencies === nothing ? Symbol[] : sort!(collect(dependencies))
     context_inputs = fixed ? NamedTuple[] :
-        _semantic_dependency_inputs(T, dependencies)
+        _semantic_dependency_inputs(analysis, dependencies)
     inputs = _merge_semantic_dependency_inputs(context_inputs, inferred_inputs)
     # `@state` lives in memory for the instance's life: never promoted to disk.
     tier = state ? :memory : _materialization_tier(Val(fixed), Val(fresh), Val(mmap), Val(cached))
@@ -11398,8 +11238,9 @@ checks every element and offers a multiple-choice control.
 """
 function property_descriptor(T::Type, prop::Symbol)
     applicable(meta, T) || return nothing
-    info = metafirst(T, prop)
-    info === nothing ? nothing : property_descriptor(T, prop, info)
+    analysis = _DeclarationAnalysis(T)
+    info = get(analysis.first, prop, nothing)
+    info === nothing ? nothing : property_descriptor(analysis, prop, info)
 end
 
 """
@@ -11410,7 +11251,8 @@ preserved so consumers can inspect multiple indexed signatures.
 """
 function property_descriptors(T::Type)
     applicable(meta, T) || return NamedTuple[]
-    NamedTuple[property_descriptor(T, name, info) for (name, info) in meta(T)]
+    analysis = _DeclarationAnalysis(T)
+    NamedTuple[property_descriptor(analysis, name, info) for (name, info) in analysis.entries]
 end
 
 """
@@ -11595,9 +11437,10 @@ function _base_declaration_graph(root::Type)
 
     for T in types
         type_id = type_ids[T]
+        analysis = _DeclarationAnalysis(T)
         type_key = _declaration_type_key(T)
         opaque = _remount_opaque_properties(T)
-        declared_names = Set(name for (name, _) in _declaration_properties(T))
+        declared_names = Set(first(entry) for entry in analysis.entries)
         nested_names = Set(name for name in declared_names
             if haskey(type_ids, _walk_nested_type(T, name)))
         extensions = _checked_declaration_metadata(
@@ -11610,12 +11453,12 @@ function _base_declaration_graph(root::Type)
         push!(type_lookup, (;type_key, id=type_id))
 
         occurrences = Dict{Symbol,Int}()
-        for (name, info) in _declaration_properties(T)
+        for (name, info) in analysis.entries
             declaration = get(occurrences, name, 0) + 1
             occurrences[name] = declaration
             property_id = _declaration_property_id(type_id, name, declaration)
             push!(get!(() -> String[], property_ids, (type_id, name)), property_id)
-            descriptor = property_descriptor(T, name, info)
+            descriptor = property_descriptor(analysis, name, info)
             source = _declaration_source(name, info)
             extensions = _checked_declaration_metadata(
                 declaration_metadata(T, Val(name), Val(declaration)),
@@ -13434,16 +13277,6 @@ function _dependency_map(T::Type)
     dependencies
 end
 
-function _dependents_in(dependencies, names)
-    result = Set{Symbol}()
-    for name in names
-        closure = _close_dependents!(Set{Symbol}((name,)), dependencies)
-        delete!(closure, name)
-        union!(result, closure)
-    end
-    result
-end
-
 # Per-object sync state, anchored on the retained cache's lock: a DO object is an
 # immutable struct and cannot be weakly referenced, its cache lock can. A remount
 # view resolves to its retained source, so the source and every view share one
@@ -13702,14 +13535,14 @@ end
 
 # What the drop step needs of a type, computed once per `sync!` / `clear_cache!`.
 struct _TypeFacts
-    dependencies::Dict{Symbol,Set{Symbol}}
+    dependencies::_DependencyGraph
     reads::Vector{Tuple{Symbol,Set{Symbol},Union{Symbol,Nothing}}}
     state::Vector{Symbol}
     derives_path::Bool
 end
 
 _type_facts(facts::IdDict{Type,Any}, T::Type) = get!(facts, T) do
-    _TypeFacts(_dependency_map(T), _parent_read_table(T), collect(Symbol, _state_names(T)),
+    _TypeFacts(_DependencyGraph(_dependency_map(T)), _parent_read_table(T), collect(Symbol, _state_names(T)),
                _derives_parent_path(T))
 end::_TypeFacts
 
