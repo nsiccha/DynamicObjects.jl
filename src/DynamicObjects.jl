@@ -8422,4 +8422,6 @@ export TrackedFile, TrackedDirectory, tracked_version, tracked_path, tracked_pat
 
 include("workers.jl")
 
+include("precompile.jl")
+
 end

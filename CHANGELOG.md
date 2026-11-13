@@ -28,6 +28,11 @@ failing or silently behaving differently at run time.
 - Macro lowering reuses each declaration's lowered body for analysis and emission.
   Saturated queues update only the appended item's position, and worker child
   lookup avoids copying all indexed entries.
+- A small synthetic precompile workload warms shared declaration, reflection,
+  property-access and remake paths to reduce first-use compilation for user types.
+- Tracing, queues, macro expansion, structure traversal, reflection and invalidation
+  now live in separate source files. Retained performance probes cover wide,
+  chained and nested declarations, partial/full caches and fresh-process startup.
 
 ## 0.5.19
 

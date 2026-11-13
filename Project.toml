@@ -4,6 +4,7 @@ authors = ["Nikolas Siccha <nikolassiccha@gmail.com> and contributors"]
 version = "0.5.20"
 
 [deps]
+PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 Malt = "36869731-bdee-424d-aa32-cab38c994e3b"
 Mmap = "a63ad114-7e13-5084-954f-fe012c677804"
 SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
@@ -22,6 +23,7 @@ DataFramesArrowExt = ["Arrow", "DataFrames"]
 Treebars = {url = "https://github.com/nsiccha/Treebars.jl"}
 
 [compat]
+PrecompileTools = "1"
 Arrow = "2"
 DataFrames = "1"
 Malt = "1.5"

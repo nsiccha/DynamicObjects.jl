@@ -1,6 +1,6 @@
 # Run in a resolved environment developing this checkout:
 #   julia --startup-file=no --threads=1 --project=<env> benchmark/performance.jl
-# Optional groups: scaling, runtime, bookkeeping (default: all).
+# Optional groups: scaling, nested, runtime, bookkeeping (default: all).
 # Fresh-process first-call times include compilation; warm samples do not.
 # Compare allocations and size scaling before interpreting shared-host timings.
 using DynamicObjects
@@ -72,6 +72,48 @@ function scaling()
                     "; bytes=", result.bytes)
             Base.invokelatest(sample, "warm-remake/$shape/$n/changed=$changed", operation; n=30)
         end
+        partial = Base.invokelatest(T, 1000; __status__=nothing)
+        for i in 1:(n ÷ 2)
+            Base.invokelatest(getproperty, partial, Symbol(:p, i))
+        end
+        for changed in (false, true)
+            operation = changed ? (() -> remake(partial; input=2000)) : (() -> remake(partial))
+            Base.invokelatest(sample, "warm-remake-partial/$shape/$n/changed=$changed", operation; n=30)
+        end
+    end
+end
+
+function nested_definition(depth)
+    body = :(value = input + 1)
+    for _ in 1:depth
+        body = :(@struct child = begin $body end)
+    end
+    Expr(:struct, false, gensym(:NestedProbe), Expr(:block, :(input::Int), body))
+end
+
+function nested_value(object, depth)
+    for _ in 1:depth
+        object = object.child
+    end
+    object.value
+end
+
+function nested()
+    for depth in (2, 4, 8, 16)
+        expr = nested_definition(depth)
+        expanded = DO.dynamicstruct(deepcopy(expr))
+        sample("expand/nested/$depth", () -> DO.dynamicstruct(deepcopy(expr)); n=1)
+        println("ast/nested/$depth: nodes/symbols=", astcounts(expanded),
+                "; bytes=", Base.summarysize(expanded))
+        mod = Module(gensym(:Nested))
+        result = @timed Core.eval(mod, expanded.args[1])
+        println("define/nested/$depth: seconds=", result.time, "; bytes=", result.bytes)
+        T = getfield(mod, expr.args[2])
+        object = Base.invokelatest(T, 1000; __status__=nothing)
+        result = @timed Base.invokelatest(nested_value, object, depth)
+        @assert result.value == 1001
+        println("first-read/nested/$depth: seconds=", result.time, "; bytes=", result.bytes)
+        Base.invokelatest(sample, "warm-read/nested/$depth", () -> nested_value(object, depth))
     end
 end
 
@@ -128,9 +170,9 @@ function bookkeeping()
 end
 
 groups = isempty(ARGS) ? ["all"] : ARGS
-all(group -> group in ("all", "scaling", "runtime", "bookkeeping"), groups) ||
-    error("Expected all, scaling, runtime or bookkeeping")
-for (group, run) in (("scaling", scaling), ("runtime", runtime), ("bookkeeping", bookkeeping))
+all(group -> group in ("all", "scaling", "nested", "runtime", "bookkeeping"), groups) ||
+    error("Expected all, scaling, nested, runtime or bookkeeping")
+for (group, run) in (("scaling", scaling), ("nested", nested), ("runtime", runtime), ("bookkeeping", bookkeeping))
     ("all" in groups || group in groups) && run()
 end
 println("PERFORMANCE_PROBE_COMPLETE")
