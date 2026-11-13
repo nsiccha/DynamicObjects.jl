@@ -2,7 +2,7 @@ using TestItemRunner
 
 @testmodule PerformanceFixtures begin
 using DynamicObjects
-export AccessInference, AddressLookup
+export AccessInference, AddressLookup, CachedReads
 @dynamicstruct struct AccessInference
     input::Int
     annotated::Int = input + 1
@@ -12,6 +12,13 @@ end
     @struct child(i::Int) = begin
         value = i
     end
+end
+@dynamicstruct struct CachedReads
+    input::Int
+    context = :default
+    value = input + 1
+    selected = (context, value)
+    indexed(i::Int) = value + i
 end
 end
 
@@ -28,6 +35,30 @@ end
     end
     @test fetch.(tasks) == collect(2:17)
     @test o.annotated == 1001
+end
+
+@testitem "ordinary cached reads do not allocate the owner" tags=[:core] setup=[PerformanceFixtures] begin
+    read_value(o) = o.value
+    function read_allocations(o, n)
+        @allocated for _ in 1:n
+            read_value(o)
+        end
+    end
+    object = CachedReads(1000; __status__=nothing)
+    @test read_value(object) == 1001
+    read_allocations(object, 1) # compile the caller before measuring
+    @test read_allocations(object, 1000) == 0
+
+    overridden = CachedReads(1000; value="configured", indexed=identity, __status__=nothing)
+    @test read_value(overridden) == "configured"
+    @test overridden.indexed(:configured) === :configured
+    view = remount(object; context=:request)
+    @test read_value(view) == 1001
+    @test view.selected == (:request, 1001)
+    @test object.selected == (:default, 1001)
+    @test view.indexed(3) == object.indexed(3) == 1004
+    clear_mem_caches!(object)
+    @test read_value(view) == read_value(object) == 1001
 end
 
 @testitem "worker child lookup retains only the matching key" tags=[:core] setup=[PerformanceFixtures] begin
