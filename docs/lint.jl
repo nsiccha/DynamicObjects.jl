@@ -46,3 +46,8 @@ function lint_docs(pages)
     isempty(missing) || error("Missing qualified public API docstrings: " * join(missing, ", "))
     println("DOCS_QUALIFIED_API\t", length(QUALIFIED_PUBLIC_DOCS), " contracts covered")
 end
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    include("pages.jl")
+    lint_docs(DOCS_PAGES)
+end
