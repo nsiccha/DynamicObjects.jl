@@ -14,6 +14,17 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.22
+
+- `sync!` keeps a property the object was constructed with a keyword for, as
+  `clear_cache!` and `clear_mem_caches!` already did. Before, a `sync!` that
+  dropped what read a changed tracked value dropped the keyword too when its
+  declared default read that value, and the next read recomputed the default.
+  The same holds wherever the drop step meets an input: what a holder derived
+  from a child that dropped something (for `sync!` and `clear_cache!`), a
+  computed `@versioned` version given as a keyword, which `sync!` no longer
+  re-keys, and the context a `remount` view rebinds.
+
 ## 0.5.21
 
 - Queue workers inherit the parent's full `--heap-size-hint` at startup and
