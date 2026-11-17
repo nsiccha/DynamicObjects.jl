@@ -99,7 +99,12 @@ settled entry of an indexed property — is examined:
 Where a version moved, the transitive [`dependents`](@ref) of that property are
 dropped — memory, and the disk entry of a `@cached` / `@mmap` dependent — so the
 next read recomputes them. The changed slot itself is kept: it is the same
-container (or object) that observed the change.
+container (or object) that observed the change. So is every input of `o`: a
+property `o` was constructed with a keyword for (`T(root; mode = "kept")`, or
+one [`remake`](@ref) kept) holds that value until `o` is rebuilt, even where its
+declared default reads the changed value, a child or a computed `@versioned`
+version; on a [`remount`](@ref) view, so is the context the view rebinds. The
+properties declared to read such an input still drop with the other dependents.
 
 The children `o` holds — inline `@struct` children, and any object constructed
 with `__parent__ = o` held where `sync!` looks — drop what they read of a dropped
@@ -199,13 +204,18 @@ end
 # re-keyed object, or one whose parent's cache path moved (`repath`), drops its
 # cache path after every disk drop, and so do the children whose path derives
 # from it. `stored` also removes the disk entries that are not in memory, as
-# `clear_cache!` does. Returns `(dropped, stale)`: the names that held a value
-# (in memory, or on disk with `stored`), and every name now unset.
+# `clear_cache!` does. The object's inputs (`PropertyCache.seed`: construction
+# keywords, the overrides `remake` kept, `__parent__`) are never dropped, whichever
+# of these steps names them: their declared bodies never ran, and
+# `clear_mem_caches!` restores them. Returns `(dropped, stale)`: the names that
+# held a value (in memory, or on disk with `stored`), and every name now unset.
 function _drop_targets!(o, shared::ThreadsafeDict, record::_SyncRecord, targets;
                         moved=(), stored::Bool=false, repath::Bool=false, verb::Symbol=:sync!,
                         facts=IdDict{Type,Any}())
     T = typeof(o)
     f = _type_facts(facts, T)
+    inputs = keys(getfield(o, :cache).seed)
+    targets = setdiff(targets, inputs)
     dropped = Symbol[]
     stale = Set{Symbol}()
     reach = union(Set{Symbol}(moved), targets)
@@ -216,7 +226,7 @@ function _drop_targets!(o, shared::ThreadsafeDict, record::_SyncRecord, targets;
         append!(dropped, (n for n in sort!(collect(targets)) if _drop_property!(o, shared, n)))
         union!(stale, targets)
         # After the drops above: their disk entries live under the current cache path.
-        rekey = rekeyed || isempty(stale) ? nothing : _version_rekey(T, stale)
+        rekey = rekeyed || isempty(stale) ? nothing : _version_rekey(T, stale, inputs)
         if rekey !== nothing
             filter!(p -> !(_slot_name(first(p)) in rekey), record.stamps)
             append!(dropped, (n for n in sort!(collect(rekey)) if _drop_property!(o, shared, n; disk=false)))
@@ -225,7 +235,7 @@ function _drop_targets!(o, shared::ThreadsafeDict, record::_SyncRecord, targets;
             rekeyed = true
         end
         holders = _drop_child_reads!(o, shared, record, reach; stored, verb, facts)
-        targets = setdiff!(setdiff!(_dependents_in(f.dependencies, holders), f.state), stale)
+        targets = setdiff!(_dependents_in(f.dependencies, holders), f.state, inputs, stale)
         reach = copy(targets)
     end
     repath = repath && f.derives_path
@@ -412,8 +422,8 @@ function _invalidate_property!(o, name::Symbol)
     source, shared = _remount_source(o)
     T = typeof(source)
     _check_invalidatable(T, name)
-    inputs = keys(getfield(source, :cache).seed)
-    targets = setdiff!(push!(_dependents_of(T, (name,)), name), inputs)
+    # `_drop_targets!` keeps the inputs, and `_drop_view_copies!` a view's own.
+    targets = push!(_dependents_of(T, (name,)), name)
     result = lock(_SYNC_LOCK) do
         record = _sync_record(shared)
         dropped, stale = _drop_targets!(source, shared, record, targets; stored=true, verb=:clear_cache!)
@@ -496,13 +506,14 @@ end
 # only — their disk entries are valid for the old version), then the cache path:
 # the next read re-derives the version and publishes under it. A fixed `@versioned`
 # field is the caller's claim and cannot be re-derived (`remake` moves it).
-# Returns the names to drop besides `targets`, or `nothing` when there is no
-# computed version to re-derive.
-function _version_rekey(T::Type, targets)
+# A computed version the object was constructed with a keyword for is an input
+# (`inputs`), kept like a fixed one. Returns the names to drop besides `targets`,
+# or `nothing` when there is no computed version to re-derive.
+function _version_rekey(T::Type, targets, inputs=())
     isempty(targets) && return nothing
-    versions = _computed_version_names(T)
+    versions = setdiff(_computed_version_names(T), inputs)
     isempty(versions) && return nothing
-    setdiff!(union!(Set{Symbol}(versions), _dependents_of(T, versions)), targets)
+    setdiff!(union!(Set{Symbol}(versions), _dependents_of(T, versions)), targets, inputs)
 end
 
 # `T`'s computed `@versioned` properties: what its cache path derives from besides the
@@ -554,11 +565,14 @@ function _view_children(view, c::MountedThreadsafeDict)
 end
 _view_children(view, ::AbstractThreadsafeDict) = ()
 
+# A view's seed (its rebound context, and the inputs it keeps of its retained
+# object) is its own input: kept like the retained object's.
 function _drop_view_copies!(view, targets)
-    c = getfield(view, :cache).cache
+    pc = getfield(view, :cache)
+    c = pc.cache
     local_dropped = Symbol[]
     for name in targets
-        name in c.local_names || continue
+        (name in c.local_names && !haskey(pc.seed, name)) || continue
         value, in_flight = lock(c.lock) do
             (get(c.cache.overlay, name, _missing_sentinel), haskey(c.computing.overlay, name))
         end
