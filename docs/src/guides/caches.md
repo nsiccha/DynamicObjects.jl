@@ -142,7 +142,9 @@ println() # hide
 Reset an individual state property with `@clear_cache! session.requests`.
 For a retained application's request context, [`remount`](@ref) creates a view
 that shares unrelated cached work while rebinding that context; it is distinct
-from replacing data inputs with `remake`.
+from replacing data inputs with `remake`. The view keeps the keywords the
+retained object was constructed with, also for a property whose declared default
+reads the rebound context.
 
 ```@example caches
 rm(cache_directory; recursive = true) # hide
