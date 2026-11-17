@@ -1439,6 +1439,9 @@ struct MountedThreadsafeDict{S<:ThreadsafeDict{Symbol,Any},O} <: AbstractThreads
     probe::Union{Nothing,_OpaqueProbe}
     # Shared parent aliases (`_shared_parent_aliases`) => the parent name each copies.
     aliases::Dict{Symbol,Symbol}
+    # The retained object's construction inputs this view keeps (`_kept_inputs`):
+    # part of the view's seed, but not of the context it was created with.
+    inputs::Tuple{Vararg{Symbol}}
 end
 
 # Private inner-constructor discriminator emitted by `@dynamicstruct`. A public
@@ -1449,7 +1452,8 @@ const _REMOUNT_TOKEN = _RemountToken()
 
 function MountedThreadsafeDict(shared::ThreadsafeDict{Symbol,Any}, source,
                                local_names, invalidated, seed::NamedTuple,
-                               opaque=(), namespace=nothing, aliases=Dict{Symbol,Symbol}())
+                               opaque=(), namespace=nothing, aliases=Dict{Symbol,Symbol}(),
+                               inputs=())
     names = Set{Symbol}(local_names)
     union!(names, keys(seed))
     local_cache = Dict{Symbol,Any}(pairs(seed))
@@ -1470,6 +1474,7 @@ function MountedThreadsafeDict(shared::ThreadsafeDict{Symbol,Any}, source,
         namespace,
         nothing,
         Dict{Symbol,Symbol}(aliases),
+        Tuple(inputs),
     )
 end
 
@@ -1480,7 +1485,7 @@ end
 _probe_dict(c::MountedThreadsafeDict, probe::_OpaqueProbe) = MountedThreadsafeDict(
     c.lock, _tainting(c.cache, probe), _tainting(c.status, probe),
     _tainting(c.computing, probe), _tainting(c.errors, probe), c.shared, c.source,
-    c.invalidated, c.local_names, c.opaque, c.namespace, probe, c.aliases)
+    c.invalidated, c.local_names, c.opaque, c.namespace, probe, c.aliases, c.inputs)
 _tainting(d::MountedDict, probe::_OpaqueProbe) =
     MountedDict(d.shared, _TaintingDict(d.overlay, probe), d.local_names)
 
@@ -6949,6 +6954,15 @@ Context-dependent `@cached`/`@mmap` properties bypass their intrinsic disk entry
 because the rebound context is intentionally not part of the retained disk
 identity.
 
+A keyword `obj` was constructed with is an input, not a computed value, and a
+view keeps it: `remount(T(; a=0.4); ctx=1).a` is `0.4`, also when the declared
+default of `a` reads `ctx`, hands `__self__` to other code, copies a parent
+property or builds a nested child. A name the call rebinds takes the rebound
+value, and the request-scoped `__status__`, `__req__` and `__prefix__` are
+always the view's own. What reads a kept keyword is routed as its declared
+dependencies say: a property that depends on `a` is computed per view when the
+default of `a` reads rebound context.
+
 What reads a nested child is decided by the read. Reading a member of a memoized
 inline `@struct` child, `pins.ap3`, makes a property per view only when that member
 reaches rebound context, directly, through a forwarded parent name, or through a
@@ -6996,14 +7010,25 @@ function _remount_impl(obj, nt::NamedTuple, forced_local=(), parent_view=nothing
     # like forced keys it is view-specific: local and invalidated.
     invalidated, local_names, opaque, aliases = _remount_partition(source, shared, changed,
         (forced_local..., keys(local_seed)...), parent_view)
+    # A keyword the retained object was constructed with is an input, not a
+    # computed value: its declared body never runs, so here it is neither opaque
+    # nor an alias, and the view holds the retained object's value.
+    kept = _kept_inputs(getfield(source, :cache).seed, local_names, nt, forced_local, local_seed)
+    if kept !== nothing
+        any(in(opaque), keys(kept)) && (opaque = setdiff(opaque, keys(kept)))
+        any(name -> haskey(aliases, name), keys(kept)) &&
+            (aliases = filter(p -> !haskey(kept, first(p)), aliases))
+    end
     # Views rebinding the same context share one namespace for their opaque work.
     namespace = isempty(opaque) ? nothing :
         _opaque_namespace(shared, setdiff(invalidated, opaque))
-    seed = merge(nt, local_seed)
+    seed = kept === nothing ? merge(nt, local_seed) : merge(kept, nt, local_seed)
     mounted = MountedThreadsafeDict(shared, source, local_names, invalidated, seed,
-                                    opaque, namespace, aliases)
-    # The request context is this view's creation input: record it as the
-    # seed so `clear_mem_caches!` on the view restores it into the overlay.
+                                    opaque, namespace, aliases,
+                                    kept === nothing ? () : keys(kept))
+    # The request context and the kept inputs are this view's creation inputs:
+    # record them as the seed so `clear_mem_caches!` on the view restores them
+    # into the overlay, and no invalidation drops them.
     pc = PropertyCache(mounted, seed)
     T = typeof(source)
     fixed = fieldnames(T)[1:end-1]
@@ -7011,6 +7036,28 @@ function _remount_impl(obj, nt::NamedTuple, forced_local=(), parent_view=nothing
     applicable(T, _REMOUNT_TOKEN, pc, args...) || error(
         "remount: $(nameof(T)) was expanded before remount support; re-expand its @dynamicstruct/@htmx definition")
     T(_REMOUNT_TOKEN, pc, args...)
+end
+
+# The construction inputs of the retained object (`inputs`, its `PropertyCache.seed`)
+# that a view keeps. A name the view shares needs nothing: the view reads the
+# retained object's seeded value. A name it routes locally (`local_names`) would
+# be recomputed from its declared default, read again through the view's parent,
+# or rebuilt as a nested child, so the view is seeded with the retained object's
+# value instead. What the view binds itself stays the view's own: the rebound
+# context (`nt`), masked names (`forced_local`), its own construction state
+# (`local_seed`) and request-scoped state (`_CHILD_CONTEXT_SEEDS`, progress).
+# `nothing` when the view keeps none, which is what most views do.
+function _kept_inputs(inputs::NamedTuple, local_names, nt::NamedTuple, forced_local,
+                      local_seed::NamedTuple)
+    names = nothing
+    for name in keys(inputs)
+        name in local_names || continue
+        (haskey(nt, name) || haskey(local_seed, name) || name in forced_local ||
+         name in _CHILD_CONTEXT_SEEDS || name in _REMOUNT_STATUS_NAMES) && continue
+        names === nothing ? (names = Symbol[name]) : push!(names, name)
+    end
+    names === nothing && return nothing
+    NamedTuple{Tuple(names)}(Tuple(inputs[name] for name in names))
 end
 
 function remount(obj; kwargs...)

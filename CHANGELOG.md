@@ -14,6 +14,19 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.23
+
+- A `remount` view keeps the keywords its retained object was constructed with.
+  Before, a view recomputed such a property from its declared default whenever
+  that default read rebound context, handed `__self__` to other code, copied a
+  parent property or built a nested child: `remount(T(; a=0.4); ctx=1).a`
+  returned the default's value, while `T(; a=0.4).a`, `remake` and
+  `clear_mem_caches!` kept `0.4`. An external `@include` child that a view shares
+  with its retained object keeps the keywords of its constructor call the same
+  way. A name the `remount` call rebinds still takes the rebound value, and the
+  request-scoped `__status__`, `__req__` and `__prefix__` stay the view's own.
+  Properties that depend on a kept keyword are routed as before.
+
 ## 0.5.22
 
 - `sync!` keeps a property the object was constructed with a keyword for, as

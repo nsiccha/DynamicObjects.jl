@@ -199,6 +199,26 @@ with_worker() do
 end
 end
 
+@testitem "workers: a remount view's kept construction keyword is the worker root's" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects
+const DO = DynamicObjects
+with_worker() do
+    root = mktempdir()
+    # The default of `label` reads the prefix each view rebinds.
+    t = Toy(2, root; label="kept")
+    view = remount(t; __prefix__="/a")
+    @test view.label == "kept"
+    # The view's address carries its context only: the keyword travels with the root.
+    address = DO._address(view)
+    @test keys(address.context) == (:__prefix__,)
+    @test address.base.seed.label == "kept"
+    @test view.labelled(1) == (pid=worker_pid(), value="kept1")
+    @test view.prefixed(1) == (pid=worker_pid(), value="/a1")
+    # Without the keyword the worker's view computes the default from its own context.
+    @test remount(Toy(2, root); __prefix__="/b").labelled(1) == (pid=worker_pid(), value="/blabel1")
+end
+end
+
 @testitem "workers: a constructor __hash__ names one directory in both processes" setup=[WorkerFixtures] tags=[:core, :workers] begin
 using DynamicObjects
 using WorkerToy: HashVersioned, HashVersionedOwn

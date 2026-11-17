@@ -188,6 +188,10 @@ end
     end
     "Prefix-reading item"
     @queued prefixed(x::Int) = (pid=getpid(), value=string(__prefix__, x))
+    "A label whose default reads the prefix"
+    label = string(__prefix__, "label")
+    "Label-reading item"
+    @queued labelled(x::Int) = (pid=getpid(), value=string(label, x))
     "Child-returning item"
     @queued kid(k::Int) = child(k)
     @struct child(k::Int) = begin

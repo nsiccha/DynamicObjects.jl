@@ -94,7 +94,9 @@ function _address(o; strict::Bool=false)
     end
     c = pc.cache
     if c isa MountedThreadsafeDict
-        return _ViewAddress(_address(c.source; strict), _wire(_without_local(pc.seed)))
+        # The inputs a view keeps are its retained object's, which the base address carries.
+        context = Base.structdiff(pc.seed, NamedTuple{c.inputs})
+        return _ViewAddress(_address(c.source; strict), _wire(_without_local(context)))
     end
     strict && parent !== nothing && _is_dynamic_object(parent) && throw(_NotAddressable(
         "$(typeof(o)) is not held by its parent"))
