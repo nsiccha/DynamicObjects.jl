@@ -398,16 +398,27 @@ with_worker() do
     # A crash: `abort()` raises `SIGABRT`, which Julia's handler reports and then re-raises.
     @test t.square(1).pid == worker_pid()
     pid = worker_pid()
+    dir = mktempdir()
+    other = t.gated(40; dir, fetch=identity)
+    @test waitfor(joinpath(dir, "started_40_1"))
     err = abandoned(() -> t.crashes(1))
     @test err isa ComputeAbandoned && err.started
     @test occursin("the worker process (pid $pid) exited while computing it, " *
         (Sys.iswindows() ? "with exit code" : "killed by signal 6 (SIGABRT)"), sprint(showerror, err))
+    @test !occursin('\n', err.reason)
+    @test abandoned(() -> fetch(other)).worker_stderr === err.worker_stderr
+    if Sys.islinux()
+        @test occursin("signal (6", err.worker_stderr)
+        @test occursin("WorkerToy.jl", err.worker_stderr)
+        @test endswith(sprint(showerror, err), "\nlast stderr lines of the worker:\n" * err.worker_stderr)
+    end
     # An exit: its exit code, and no signal.
     @test t.square(2).pid == worker_pid() != pid
     pid = worker_pid()
     err = abandoned(() -> t.exits(3))
     @test err isa ComputeAbandoned && err.started
     @test occursin("the worker process (pid $pid) exited while computing it, with exit code 3", sprint(showerror, err))
+    @test !occursin("WorkerToy.jl", err.worker_stderr)
     @test t.square(3).value == 36
 end
 end
@@ -434,12 +445,37 @@ else
         close(io)
         @test err isa ComputeAbandoned
         @test occursin("killed by signal 9 (SIGKILL)", sprint(showerror, err))
+        @test split(err.worker_stderr, '\n') ==
+            ["[earlier worker stderr omitted]"; ["toy line $i of $n" for i in 101:n]]
         got = lines()
         @test length(got) == n
         @test got[end] == "[Worker $pid]: toy line $n of $n"
         @test t.square(2).pid == worker_pid() != pid
     end
 end
+end
+
+@testitem "workers: stderr excerpts respect the byte budget and existing abandonments print as before" tags=[:core, :workers] begin
+using DynamicObjects
+const DO = DynamicObjects
+tail = DO._WorkerStderr()
+@test isempty(DO._stderr_excerpt(tail))
+DO._record_stderr!(tail, "before the long line")
+huge = repeat("🙂", 30_000) * " final frame"
+DO._record_stderr!(tail, huge)
+DO._record_stderr!(tail, "last line")
+excerpt = DO._stderr_excerpt(tail)
+@test isvalid(excerpt)
+@test sizeof(excerpt) <= 64 * 1024
+@test startswith(excerpt, "[earlier worker stderr omitted]\n🙂")
+@test endswith(excerpt, " final frame\nlast line")
+@test !occursin("before the long line", excerpt)
+@test sizeof(only(filter(l -> endswith(l, "final frame"), tail.lines))) <= 64 * 1024
+@test ComputeAbandoned("cancelled").worker_stderr == ""
+@test sprint(showerror, ComputeAbandoned("cancelled")) ==
+    "ComputeAbandoned: the queued compute was abandoned before it started: cancelled"
+@test sprint(showerror, ComputeAbandoned("cancelled", true)) ==
+    "ComputeAbandoned: the compute was abandoned while it ran: cancelled"
 end
 
 @testitem "workers: _exit_status names the terminating signal before the exit code" tags=[:core, :workers] begin

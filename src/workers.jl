@@ -822,7 +822,7 @@ end
 # calls `f` from a task that runs in the world it started in, before DynamicObjects and the
 # application were loaded there: every call goes through `invokelatest`.
 function _remote_fetch(conn::_WorkerConn, w, f, args...)
-    task = _on_actor(() -> Malt.remote_call(Base.invokelatest, w, f, args...), conn)
+    task = _on_actor(() -> Malt.remote_call(Base.invokelatest, w.handle, f, args...), conn)
     try
         fetch(task)
     catch err
@@ -830,9 +830,9 @@ function _remote_fetch(conn::_WorkerConn, w, f, args...)
     end
 end
 _remote_do(conn::_WorkerConn, w, f, args...) =
-    _on_actor(() -> Malt.remote_do(Base.invokelatest, w, f, args...), conn)
+    _on_actor(() -> Malt.remote_do(Base.invokelatest, w.handle, f, args...), conn)
 
-_worker_alive(w) = w !== nothing && Malt.isrunning(w)
+_worker_alive(w) = w !== nothing && Malt.isrunning(w.handle)
 
 # The running worker of `q`, spawned first if there is none. A computation's progress node
 # `status` shows the wait for the worker to start as a phase, also when another computation or
@@ -910,18 +910,68 @@ end
 # Whether the exit hook `f` is Malt's for `w`: a closure of Malt's that holds `w`.
 _stops_worker(f, w) = parentmodule(typeof(f)) === Malt && any(i -> getfield(f, i) === w, 1:nfields(f))
 
+const _STDERR_MAX_LINES = 100
+const _STDERR_MAX_BYTES = 64 * 1024
+const _STDERR_OMITTED = "[earlier worker stderr omitted]\n"
+
+mutable struct _WorkerStderr
+    const lock::ReentrantLock
+    const lines::Vector{String}
+    nbytes::Int             # includes a newline for each line
+    omitted::Bool
+end
+_WorkerStderr() = _WorkerStderr(ReentrantLock(), String[], 0, false)
+
+function _record_stderr!(tail::_WorkerStderr, line::String)
+    lock(tail.lock) do
+        push!(tail.lines, line)
+        tail.nbytes += sizeof(line) + 1
+        tail.omitted |= length(tail.lines) > _STDERR_MAX_LINES || tail.nbytes > _STDERR_MAX_BYTES
+        budget = _STDERR_MAX_BYTES - (tail.omitted ? sizeof(_STDERR_OMITTED) : 0)
+        while length(tail.lines) > _STDERR_MAX_LINES || tail.nbytes - sizeof(first(tail.lines)) - 1 >= budget
+            tail.nbytes -= sizeof(popfirst!(tail.lines)) + 1
+        end
+        # The byte boundary can fall inside the oldest line, even inside a UTF-8 character.
+        # Copy its suffix so a single huge line cannot keep its original allocation alive.
+        excess = tail.nbytes - budget
+        if excess > 0
+            oldest = first(tail.lines)
+            suffix = String(SubString(oldest, nextind(oldest, excess)))
+            tail.lines[1] = suffix
+            tail.nbytes -= sizeof(oldest) - sizeof(suffix)
+        end
+    end
+    nothing
+end
+
+_stderr_excerpt(tail::_WorkerStderr) = lock(tail.lock) do
+    (tail.omitted ? _STDERR_OMITTED : "") * join(tail.lines, '\n')
+end
+
+struct _QueueWorker
+    handle::Malt.Worker
+    stderr::_WorkerStderr
+    stderr_task::Task
+end
+
 # Print the worker's stdout and stderr on this process's, each line prefixed with
 # `[Worker <pid>]: ` as Malt prints it. Malt's own forwarding reads only while the process
 # runs, so it drops what a dying worker wrote last: of 200 stderr lines written right before
 # a `SIGKILL`, 2 arrived (snag `computeabandoned-90a7dcd7`). These tasks read to the pipe's
 # end, so what a worker wrote before it died, a crash report included, is all printed.
 function _forward_output!(w::Malt.Worker)
+    # The child has its own write handles. Keeping the parent's copies open prevents EOF,
+    # leaving eachline waiting forever on a final line without a newline.
+    close(w.stdout.in)
+    close(w.stderr.in)
+    tail = _WorkerStderr()
     errormonitor(@async _forward_lines(w.stdout, :stdout, w.proc_pid))
-    errormonitor(@async _forward_lines(w.stderr, :stderr, w.proc_pid))
-    w
+    reader = errormonitor(@async _forward_lines(w.stderr, :stderr, w.proc_pid, tail))
+    _QueueWorker(w, tail, reader)
 end
-function _forward_lines(pipe, which::Symbol, pid)
+function _forward_lines(pipe, which::Symbol, pid, tail=nothing)
     for line in eachline(pipe)
+        tail === nothing || _record_stderr!(tail, line)
         io = which === :stdout ? stdout : stderr   # looked up per line: a redirect applies
         prefix = "[Worker $pid]: "
         get(io, :color, false) === true &&
@@ -929,6 +979,14 @@ function _forward_lines(pipe, which::Symbol, pid)
         write(io, prefix, line, '\n')
         flush(io)
     end
+end
+
+# A process can exit before its stderr task has read the final crash report. A descendant
+# holding the pipe open or a blocked console must not keep requests waiting indefinitely.
+function _worker_death(w::_QueueWorker, reason)
+    summary = reason * ", " * _exit_status(w.handle.proc)
+    istaskdone(w.stderr_task) || timedwait(() -> istaskdone(w.stderr_task), 2.0; pollint=0.01)
+    ComputeAbandoned(summary, true, _stderr_excerpt(w.stderr))
 end
 
 function _spawn_worker!(q)
@@ -941,7 +999,7 @@ function _spawn_worker!(q)
     try
         id = _DYNAMICOBJECTS_PKGID
         load = :(Base.require(Base.PkgId(Base.UUID($(string(id.uuid))), $(id.name))); nothing)
-        fetch(_on_actor(() -> Malt.remote_eval(w, load), conn))
+        fetch(_on_actor(() -> Malt.remote_eval(w.handle, load), conn))
         info = _remote_fetch(conn, w, _worker_init!)
         lock(conn.lock) do
             conn.worker = w
@@ -956,7 +1014,7 @@ function _spawn_worker!(q)
         _stop_process(conn, w)
         (err isa TaskFailedException ? err.task.exception : err) isa Malt.TerminatedWorkerException ||
             rethrow()
-        error("the worker process (pid $(w.proc_pid)) exited during its start-up, ", _exit_status(w.proc))
+        throw(_worker_death(w, "the worker process could not be started: the worker process (pid $(w.handle.proc_pid)) exited during its start-up"))
     end
     w
 end
@@ -964,15 +1022,15 @@ end
 # Deliver the worker's events to their requests until the worker exits; then fail every
 # request still in flight with `ComputeAbandoned`.
 function _event_pump(conn::_WorkerConn, w)
-    reason = nothing
+    failure = nothing
     while true
         batch = try
-            fetch(Malt.remote_call(Base.invokelatest, w, _worker_take_events))
+            fetch(Malt.remote_call(Base.invokelatest, w.handle, _worker_take_events))
         catch err
             err = err isa TaskFailedException ? err.task.exception : err
-            reason = err isa Malt.TerminatedWorkerException ?
-                "the worker process (pid $(w.proc_pid)) exited while computing it, " * _exit_status(w.proc) :
-                "the connection to the worker process failed: " * sprint(showerror, err)
+            failure = err isa Malt.TerminatedWorkerException ?
+                _worker_death(w, "the worker process (pid $(w.handle.proc_pid)) exited while computing it") :
+                ComputeAbandoned("the connection to the worker process failed: " * sprint(showerror, err), true)
             break
         end
         lock(conn.lock) do
@@ -983,15 +1041,15 @@ function _event_pump(conn::_WorkerConn, w)
             end
         end
     end
-    _abandon_inflight!(conn, w, reason)
+    _abandon_inflight!(conn, w, failure)
 end
 
-function _abandon_inflight!(conn::_WorkerConn, w, reason)
+function _abandon_inflight!(conn::_WorkerConn, w, failure::ComputeAbandoned)
     lock(conn.lock) do
         conn.worker === w && (conn.worker = nothing)
         for req in values(conn.inflight)
             # Names the worker: `_submit!` may send `req` on to a fresh one before it is read.
-            req.worker === w && put!(req.events, (:abandoned, (w, reason)))
+            req.worker === w && put!(req.events, (:abandoned, (w, failure)))
         end
     end
     _malt_stop_quietly(conn, w)
@@ -1000,7 +1058,7 @@ end
 
 # Stop `w` through its own process handle: asked to exit, then `SIGTERM`, then `SIGKILL`. A
 # stuck worker never runs the exit it is asked for, so the signals follow within seconds.
-_stop_process(conn, w) = _on_actor(() -> Malt.stop(w; exit_timeout=3.0, term_timeout=3.0), conn)
+_stop_process(conn, w) = _on_actor(() -> Malt.stop(w.handle; exit_timeout=3.0, term_timeout=3.0), conn)
 
 # How a worker process ended, for the reasons its computations fail with: the signal that
 # killed it, or its exit code. A memory killer's or `kill -9`'s `SIGKILL`, a crash's `SIGSEGV`
@@ -1030,7 +1088,7 @@ const _SIGNAL_NAMES = let names = Dict(1 => "SIGHUP", 2 => "SIGINT", 3 => "SIGQU
 end
 
 _malt_stop_quietly(conn, w) = try
-    Malt.isrunning(w) && _stop_process(conn, w)
+    _worker_alive(w) && _stop_process(conn, w)
 catch
 end
 
@@ -1164,13 +1222,13 @@ function _compute_in_worker(f::_WorkerCompute, o, name::Symbol, args::Tuple, kwa
             elseif kind === :failed
                 _throw_remote(o, name, args, kwargs, pid, _deserialized(payload))
             elseif kind === :abandoned
-                gone, reason = payload
+                gone, failure = payload
                 # The worker died while `req` was being sent to it, and `_submit!` sent it on
                 # to a fresh one: that one computes it, so keep receiving its events. Failing
                 # here left it computing for nobody, its log records, messages and value
                 # dropped, and a retry joined it there (snag `worker-log-recor-d660d227`).
                 lock(() -> req.worker !== gone, conn.lock) && continue
-                throw(ComputeAbandoned(reason, true))
+                throw(failure)
             end
         end
     finally
@@ -1190,21 +1248,21 @@ function _submit!(q, req::_RemoteRequest, o, name, args, kwargs, packages, messa
         w = try
             _ensure_worker!(q, status)
         catch err
+            err isa ComputeAbandoned && rethrow()
             throw(ComputeAbandoned("the worker process could not be started: " * sprint(showerror, err), true))
         end
         lock(() -> req.worker = w, conn.lock)
         try
             _ensure_packages!(conn, w, union(_worker_preload(q), packages), status)
             _remote_fetch(conn, w, _worker_submit, message...)
-            return w, w.proc_pid
+            return w, w.handle.proc_pid
         catch err
             if err isa Malt.TerminatedWorkerException
                 lock(() -> conn.worker === w && (conn.worker = nothing), conn.lock)
                 attempt == 1 && continue
-                throw(ComputeAbandoned("the worker process (pid $(w.proc_pid)) exited before it started, " *
-                                       _exit_status(w.proc), true))
+                throw(_worker_death(w, "the worker process (pid $(w.handle.proc_pid)) exited before it started"))
             end
-            _throw_remote(o, name, args, kwargs, w.proc_pid,
+            _throw_remote(o, name, args, kwargs, w.handle.proc_pid,
                           err isa Malt.RemoteException ? err.message : sprint(showerror, err))
         end
     end
@@ -1386,7 +1444,7 @@ function _stop_worker!(q)
     w = lock(() -> conn.worker, conn.lock)
     w === nothing && return nothing
     _stop_process(conn, w)
-    _abandon_inflight!(conn, w, "the worker process (pid $(w.proc_pid)) was stopped, " * _exit_status(w.proc))
+    _abandon_inflight!(conn, w, _worker_death(w, "the worker process (pid $(w.handle.proc_pid)) was stopped"))
     nothing
 end
 

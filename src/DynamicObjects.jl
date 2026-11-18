@@ -1757,16 +1757,24 @@ default `retry_failed=true` the next access starts a fresh compute.
 A worker process's end is named at the end of `reason`: `killed by signal 9 (SIGKILL)` (a
 `kill -9`, or a system memory killer), another signal such as `SIGSEGV` or `SIGABRT` for a
 crash, or `with exit code N` for an exit, as in `the worker process (pid 14783) exited while
-computing it, killed by signal 9 (SIGKILL)`.
+computing it, killed by signal 9 (SIGKILL)`. `worker_stderr` contains the last lines of
+that process's standard error (up to 100 lines and 64 KiB), or an empty string when there
+is none. Printing the exception includes this excerpt below the reason. The excerpt can
+contain output from any computation on that worker.
 """
 struct ComputeAbandoned <: Exception
     reason::String
     started::Bool
+    worker_stderr::String
 end
+ComputeAbandoned(reason, started) = ComputeAbandoned(reason, started, "")
 ComputeAbandoned(reason::AbstractString) = ComputeAbandoned(String(reason), false)
-Base.showerror(io::IO, e::ComputeAbandoned) = e.started ?
-    print(io, "ComputeAbandoned: the compute was abandoned while it ran: ", e.reason) :
-    print(io, "ComputeAbandoned: the queued compute was abandoned before it started: ", e.reason)
+function Base.showerror(io::IO, e::ComputeAbandoned)
+    print(io, e.started ? "ComputeAbandoned: the compute was abandoned while it ran: " :
+                          "ComputeAbandoned: the queued compute was abandoned before it started: ", e.reason)
+    isempty(e.worker_stderr) || print(io, "\nlast stderr lines of the worker:\n", e.worker_stderr)
+    nothing
+end
 
 # Deferred work runs as its requester — whoever created the `DeferredCompute` or `QueuedCall`
 # — would have run it. A task does not inherit task-local storage, and inherits its scoped

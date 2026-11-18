@@ -45,14 +45,14 @@ mutable struct _RemoteRequest
 end
 
 """
-Connection to one worker process: its Malt handle (`worker`), the actor task that makes
+Connection to one worker process: its handle and output reader (`worker`), the actor task that makes
 every Malt call, and the requests in flight.
 """
 mutable struct _WorkerConn
     const lock::ReentrantLock
     const ops::Channel{Any}
     actor::Union{Nothing,Task}
-    worker::Any                 # a `Malt.Worker`, `nothing` while none runs
+    worker::Any                 # a `_QueueWorker`, `nothing` while none runs
     spawning::Union{Nothing,Task}
     pid::Int
     started_at::Float64
