@@ -99,6 +99,18 @@ end
     end
     "Failing item"
     @queued doomed(x::Int) = error("doomed $x")
+    "Item that crashes its worker process (`abort`, so `SIGABRT`)"
+    @queued crashes(x::Int) = ccall(:abort, Cvoid, ())
+    "Item that ends its worker process with exit code `x` (`_exit`: no exit hooks, from any thread)"
+    @queued exits(x::Int) = ccall(:_exit, Cvoid, (Cint,), x)
+    "Item that writes `n` lines to stderr, then kills its worker process (`SIGKILL`; not on Windows)"
+    @queued shouts(n::Int) = begin
+        for i in 1:n
+            println(stderr, "toy line ", i, " of ", n)
+        end
+        flush(stderr)
+        ccall(:kill, Cint, (Cint, Cint), getpid(), 9)
+    end
     "A property that refuses"
     refusal = throw(ToyFault(422, "refused by a property"))
     "Refusing item"

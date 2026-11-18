@@ -14,6 +14,26 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.24
+
+- A computation that fails with `ComputeAbandoned` because its worker process
+  ended now says how the process ended: the signal that killed it, by number
+  and, for the common ones, by name, or its exit code. For example
+  `the worker process (pid 14783) exited while computing it, killed by signal 9
+  (SIGKILL)`, which a `kill -9` or a system memory killer sends, against
+  `killed by signal 6 (SIGABRT)` or `killed by signal 11 (SIGSEGV)` for a crash
+  and `with exit code 1` for an exit. The same goes for a worker that dies before
+  a computation starts there or during its own start-up, and for one
+  `restart_worker!` stops (`was stopped, with exit code 0`, or the signal that
+  stop needed). Before, the reason ended at `exited while computing it`, so a
+  route log could not tell a memory kill from a crash. The text before the comma
+  is unchanged, so a check that matches it still does.
+- Everything a worker process writes to its stdout and stderr is printed on this
+  process's, prefixed `[Worker <pid>]: ` as before, including what it wrote just
+  before it died, such as Julia's crash report. Before, the forwarding stopped as
+  soon as the process was gone: of 200 lines a worker wrote to stderr right
+  before a `SIGKILL`, 2 were printed.
+
 ## 0.5.23
 
 - A `remount` view keeps the keywords its retained object was constructed with.

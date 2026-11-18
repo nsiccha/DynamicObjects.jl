@@ -363,7 +363,11 @@ with_worker() do
         e
     end
     @test err isa ComputeAbandoned && err.started
-    @test occursin("exited", sprint(showerror, err))
+    # The reason says how the worker ended: a `kill -9` is a `SIGKILL`, which an
+    # out-of-memory kill also is, while a crash names its own signal (snag
+    # `computeabandoned-90a7dcd7`).
+    @test occursin("the worker process (pid $pid) exited while computing it, " *
+        (Sys.iswindows() ? "with exit code 1" : "killed by signal 9 (SIGKILL)"), sprint(showerror, err))
     r = t.square(2)
     @test r.value == 12
     @test r.pid == worker_pid() != pid
@@ -375,10 +379,89 @@ with_worker() do
     stopped = @elapsed status = DynamicObjects.restart_worker!()
     @test status.running == false
     @test stopped < 15
-    @test (try fetch(p); false catch e; e isa ComputeAbandoned end)
+    err = try fetch(p); nothing catch e; e end
+    @test err isa ComputeAbandoned
+    # The stop's own reason or the event pump's, whichever reached the computation first.
+    @test occursin(r"the worker process \(pid \d+\) (was stopped|exited while computing it), (with exit code \d+|killed by signal \d+)",
+                   sprint(showerror, err))
     @test settles(() -> DynamicObjects.worker_status().in_flight == 0)
     touch(joinpath(dir, "go_8"))
     @test t.gated(8; dir).pid != old
+end
+end
+
+@testitem "workers: the reason a dead worker fails a computation with names its exit code or signal" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects
+abandoned(f) = try f(); nothing catch e; unwrap_error(e) end
+with_worker() do
+    t = Toy(4, mktempdir())
+    # A crash: `abort()` raises `SIGABRT`, which Julia's handler reports and then re-raises.
+    @test t.square(1).pid == worker_pid()
+    pid = worker_pid()
+    err = abandoned(() -> t.crashes(1))
+    @test err isa ComputeAbandoned && err.started
+    @test occursin("the worker process (pid $pid) exited while computing it, " *
+        (Sys.iswindows() ? "with exit code" : "killed by signal 6 (SIGABRT)"), sprint(showerror, err))
+    # An exit: its exit code, and no signal.
+    @test t.square(2).pid == worker_pid() != pid
+    pid = worker_pid()
+    err = abandoned(() -> t.exits(3))
+    @test err isa ComputeAbandoned && err.started
+    @test occursin("the worker process (pid $pid) exited while computing it, with exit code 3", sprint(showerror, err))
+    @test t.square(3).value == 36
+end
+end
+
+# Malt's own forwarding stopped reading once the worker was gone: of 200 lines written right
+# before a `SIGKILL`, 2 arrived. A crash report is written the same way.
+@testitem "workers: what a worker wrote to stderr before it was killed is all printed here" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects
+if Sys.iswindows()
+    @test_skip "the toy kills its worker with POSIX kill"
+else
+    with_worker() do
+        t = Toy(5, mktempdir())
+        @test t.square(1).pid == worker_pid()
+        pid = worker_pid()
+        n = 200
+        path, io = mktemp()
+        lines() = filter(l -> occursin("toy line", l), readlines(path))
+        err = redirect_stderr(io) do
+            e = try t.shouts(n); nothing catch e; unwrap_error(e) end
+            settles(() -> length(lines()) == n, 30.0)
+            e
+        end
+        close(io)
+        @test err isa ComputeAbandoned
+        @test occursin("killed by signal 9 (SIGKILL)", sprint(showerror, err))
+        got = lines()
+        @test length(got) == n
+        @test got[end] == "[Worker $pid]: toy line $n of $n"
+        @test t.square(2).pid == worker_pid() != pid
+    end
+end
+end
+
+@testitem "workers: _exit_status names the terminating signal before the exit code" tags=[:core, :workers] begin
+using DynamicObjects
+if Sys.iswindows()
+    @test_skip "no POSIX signals on Windows"
+else
+    status = DynamicObjects._exit_status
+    killed(signal) = (p = run(`sleep 60`; wait=false); kill(p, signal); status(p))
+    @test killed(Base.SIGKILL) == "killed by signal 9 (SIGKILL)"
+    @test killed(Base.SIGTERM) == "killed by signal 15 (SIGTERM)"
+    @test killed(11) == "killed by signal 11 (SIGSEGV)"
+    @test killed(Sys.islinux() ? 7 : 10) == "killed by signal $(Sys.islinux() ? 7 : 10) (SIGBUS)"
+    @test killed(Sys.islinux() ? 10 : 30) == "killed by signal $(Sys.islinux() ? 10 : 30)"   # SIGUSR1: unnamed
+    @test status(run(ignorestatus(`sh -c "exit 3"`))) == "with exit code 3"
+    @test status(run(`true`)) == "with exit code 0"
+    running = run(`sleep 60`; wait=false)
+    try
+        @test status(running; timeout=0.1) == "with an unknown exit status"
+    finally
+        kill(running, Base.SIGKILL)
+    end
 end
 end
 
