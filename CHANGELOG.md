@@ -14,6 +14,15 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.25
+
+- When a queue worker dies, each affected request's `ComputeAbandoned` prints
+  the worker's last stderr lines below the exit reason. This puts Julia crash
+  reports in per-request error logs. The `worker_stderr` field holds the excerpt
+  (up to 100 lines of output and 64 KiB, with an omission notice when needed).
+  The `reason` field keeps its one-line summary. A worker that writes no stderr
+  produces no stderr section.
+
 ## 0.5.24
 
 - A computation that fails with `ComputeAbandoned` because its worker process

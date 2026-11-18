@@ -9,7 +9,7 @@ function worker_options(q)
     code = :((hint=Base.JLOptions().heap_size_hint,
               threads=(Threads.nthreads(:default), Threads.nthreads(:interactive)),
               project=Base.active_project(), pid=getpid()))
-    task = DO._on_actor(() -> DO.Malt.remote_eval(w, code), q.conn)
+    task = DO._on_actor(() -> DO.Malt.remote_eval(w.handle, code), q.conn)
     fetch(task)
 end
 

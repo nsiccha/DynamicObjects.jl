@@ -105,9 +105,11 @@ end
     @queued exits(x::Int) = ccall(:_exit, Cvoid, (Cint,), x)
     "Item that writes `n` lines to stderr, then kills its worker process (`SIGKILL`; not on Windows)"
     @queued shouts(n::Int) = begin
-        for i in 1:n
+        println(stdout, "toy stdout only")
+        for i in 1:n-1
             println(stderr, "toy line ", i, " of ", n)
         end
+        print(stderr, "toy line ", n, " of ", n)  # a crash need not end its last line
         flush(stderr)
         ccall(:kill, Cint, (Cint, Cint), getpid(), 9)
     end
