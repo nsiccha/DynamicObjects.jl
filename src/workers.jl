@@ -471,6 +471,65 @@ function _with_worker_scopes(f, values)
     ScopedValues.with(f, scoped...)
 end
 
+# A remote scope belongs to a particular worker process. Its token is allocated by
+# that worker; a replacement starts with an empty registry and gets a fresh scope.
+const _WORKER_COMPUTE_SCOPES = Dict{UInt,_ComputeScope}()
+const _NEXT_WORKER_SCOPE = Threads.Atomic{UInt}(0)
+
+function _open_worker_scope!(lifetimes, target)
+    token = Threads.atomic_add!(_NEXT_WORKER_SCOPE, UInt(1)) + UInt(1)
+    scope = _new_compute_scope(lifetimes, target)
+    lock(() -> _WORKER_COMPUTE_SCOPES[token] = scope, _SCOPE_LOCK)
+    token
+end
+
+function _close_worker_scope!(token)
+    scope = lock(() -> pop!(_WORKER_COMPUTE_SCOPES, token), _SCOPE_LOCK)
+    _close_compute_scope!(scope)
+end
+
+function _worker_scope_token(conn, w)
+    scope = _COMPUTE_SCOPE[]
+    scope === nothing && return nothing
+    # The outermost live report owns the remote lifetime. A queued job that
+    # starts after its report closed owns a fresh, job-local remote lifetime.
+    scope = lock(_SCOPE_LOCK) do
+        owner = scope
+        while owner.parent !== nothing && !owner.parent.closed
+            owner = owner.parent
+        end
+        owner
+    end
+    lock(scope.remote_lock) do
+        lock(() -> scope.closed, _SCOPE_LOCK) && return UInt(0)
+        _, token = get!(scope.workers, w) do
+            (conn, _remote_fetch(conn, w, _open_worker_scope!, scope.lifetimes, scope.target))
+        end
+        token
+    end
+end
+
+function _worker_target_delivered!(token)
+    scope = lock(() -> _WORKER_COMPUTE_SCOPES[token], _SCOPE_LOCK)
+    _target_delivered!(scope)
+end
+
+_release_scope_workers!(scope) = _on_scope_workers!(scope, _close_worker_scope!)
+function _on_scope_workers!(scope, operation)
+    lock(scope.remote_lock) do
+        isempty(scope.workers) && return
+        @sync for (w, (conn, token)) in scope.workers
+            @async try
+                _worker_alive(w) && _remote_fetch(conn, w, operation, token)
+            catch err
+                err isa Malt.TerminatedWorkerException || rethrow()
+            end
+        end
+        operation === _close_worker_scope! && empty!(scope.workers)
+    end
+    nothing
+end
+
 # --- Requester messages ----------------------------------------------------------------------
 
 const _WORKER_REQUEST = ScopedValues.ScopedValue{Union{Nothing,Int}}(nothing)
@@ -588,14 +647,20 @@ function _worker_control_loop()
 end
 
 function _worker_control(::Val{:submit}, id::Int, address, name::Symbol, args, kwargs, is_fresh::Bool,
-                         min_level::Int32, mirrored::Bool, scopes)
+                         min_level::Int32, mirrored::Bool, scopes, scope_token=nothing)
+    # Keep this request's values until its result is ready even if its report
+    # closed while the control message was waiting in the worker mailbox.
+    scope = if scope_token !== nothing
+        parent = lock(() -> get(_WORKER_COMPUTE_SCOPES, scope_token, nothing), _SCOPE_LOCK)
+        _new_compute_scope(; parent)
+    end
     logger = _ForwardLogger(id, Base.CoreLogging.LogLevel(min_level))
     pinned = _kept_keys(address)
     _pin!(_W_OBJECTS, pinned, 1)
     started = try
         _with_worker_scopes(scopes) do
             ScopedValues.with_logger(logger) do
-                ScopedValues.with(_WORKER_REQUEST => id) do
+                ScopedValues.with(_WORKER_REQUEST => id, _COMPUTE_SCOPE => scope) do
                     o = _resolve(address, _W_OBJECTS)
                     sync!(_retained_object(_root_of(o)))
                     args = _unwire(args, _W_OBJECTS)
@@ -617,13 +682,16 @@ function _worker_control(::Val{:submit}, id::Int, address, name::Symbol, args, k
         end
     catch err
         _pin!(_W_OBJECTS, pinned, -1)
+        scope === nothing || _close_compute_scope!(scope)
         _push_event!(id, :failed, _remote_failure(err, catch_backtrace()))
         return
     end
     o, handle, node, mirror = started
     node === nothing || lock(() -> _W_NODES[id] = (node, mirror), _W_NODES_LOCK)
-    errormonitor(Threads.@spawn Base.invokelatest(_worker_finish, id, o, name, args, kwargs, is_fresh,
-                                                  handle, mirror, pinned))
+    ScopedValues.with(_COMPUTE_SCOPE => scope) do
+        errormonitor(Threads.@spawn Base.invokelatest(_worker_finish, id, o, name, args, kwargs,
+                                                      is_fresh, handle, mirror, pinned))
+    end
     nothing
 end
 
@@ -655,18 +723,20 @@ end
 function _worker_finish(id, o, name, args, kwargs, is_fresh, handle, mirror, pinned)
     try
         succeeded = false
-        value = try
+        payload = try
             result = handle isa Union{Pending,Task} ? fetch(handle) : handle
             succeeded = true
-            result
+            is_fresh ? _wire_result(result) : _result_payload(o, name, args, kwargs, result)
         finally
             # The closing frame (the whole final tree) goes out before the outcome.
             if mirror !== nothing
                 close(mirror)
                 _push_event!(id, :progress_closed, succeeded ? :done : :failed)
             end
+            scope = _COMPUTE_SCOPE[]
+            scope === nothing || _close_compute_scope!(scope)
         end
-        _push_event!(id, :done, is_fresh ? _wire_result(value) : _result_payload(o, name, args, kwargs, value))
+        _push_event!(id, :done, payload)
     catch err
         _push_event!(id, :failed, _remote_failure(err, catch_backtrace()))
     finally
@@ -1254,7 +1324,7 @@ function _submit!(q, req::_RemoteRequest, o, name, args, kwargs, packages, messa
         lock(() -> req.worker = w, conn.lock)
         try
             _ensure_packages!(conn, w, union(_worker_preload(q), packages), status)
-            _remote_fetch(conn, w, _worker_submit, message...)
+            _remote_fetch(conn, w, _worker_submit, message..., _worker_scope_token(conn, w))
             return w, w.handle.proc_pid
         catch err
             if err isa Malt.TerminatedWorkerException
@@ -1401,6 +1471,34 @@ function _invalidation_address(o)
         err isa _NotAddressable || @debug "DynamicObjects: no worker address for an invalidation" exception = err
         nothing
     end
+end
+
+"""
+    prune_worker_mem_caches!(keep, root; queue=DynamicObjects.job_queue())
+
+Run the ordinary memory-cache prune on the existing queue worker's copy of
+`root` and wait for its counts `(; objects, kept, evicted)`. A stopped worker
+or absent root returns zero counts. This never starts a worker or builds the
+object. The predicate travels to the worker and executes there; use a callable
+available in its environment, such as `Returns(false)` or an application
+package function. Predicate and transport failures are reported to the caller.
+To prune the calling process as well, call [`prune_mem_caches!`](@ref) there.
+"""
+function prune_worker_mem_caches!(keep, root; queue=job_queue())
+    _is_dynamic_object(root) || throw(ArgumentError("expected a @dynamicstruct root"))
+    conn = queue.conn
+    w = lock(() -> conn.worker, conn.lock)
+    _worker_alive(w) || return (objects=0, kept=0, evicted=0)
+    address = _address(root; strict=true)
+    packages = _packages!(_packages!(Set{Base.PkgId}(), address), keep)
+    _ensure_packages!(conn, w, packages)
+    _remote_fetch(conn, w, _prune_worker_root!, keep, address)
+end
+
+function _prune_worker_root!(keep, address)
+    root = _resolve_existing(address, _W_OBJECTS)
+    root === nothing && return (objects=0, kept=0, evicted=0)
+    prune_mem_caches!(keep, root)
 end
 
 # --- Status and control -------------------------------------------------------------------------

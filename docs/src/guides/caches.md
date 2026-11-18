@@ -37,6 +37,38 @@ indexed calls already memoize.
 Treat returned arrays and other mutable results as read-only. Make a copy
 before changing them. Mutation would also change what later cache hits return.
 
+## Computing a report
+
+Put the reads for one report in `with_compute_scope`. Its targets can share an
+expensive intermediate. The cache drops derived entries created solely for
+that scope on return or error, including in the queue worker. The returned
+values remain usable. A value that was already warm stays warm. A concurrent
+ordinary reader keeps the value it reads, and overlapping scopes release
+shared work after their last claim ends.
+
+```@example caches
+report = with_compute_scope() do
+    (; normal=transform.scaled(1.0), double=transform.scaled(2.0))
+end
+@assert report.double == [2.0, 4.0] # hide
+@assert length(cached_entries(transform.scaled)) == 1 # only the earlier gain of 3 survives; hide
+show(stdout, MIME"text/plain"(), report) # hide
+println() # hide
+```
+
+For a known sequence use `compute_targets(root, [:table, :figure])`. Pass
+`(; property=:scaled, args=(2.0,))` for an indexed call. The planner uses the
+declared reads of the remaining targets to release entries earlier where it
+can establish their last use. If a target calls arbitrary Julia code, the scope
+keeps uncertain inputs for it. Join asynchronous reads inside the report to
+include their whole lifetime. Each explicitly nested scope can mark an earlier
+boundary for work that only its own targets need.
+
+Use `prune_worker_mem_caches!(keep, root)` for a maintenance operation on an
+existing worker root. The predicate runs there and returns counts to the caller.
+Ordinary `prune_mem_caches!(keep, root)` runs in the caller. Each operation
+preserves disk entries, object versions and work in flight.
+
 ## Disk
 
 Mark a property `@cached` to serialize its value. Put the cache in a location

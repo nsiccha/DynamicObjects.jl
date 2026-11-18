@@ -492,7 +492,6 @@ function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condit
         published = existing === _missing_sentinel
         if published
             c.cache[key] = v
-            _on_store!(c, key)
             existing = v
         else
             _on_hit!(c, key)          # defensive: someone published first
@@ -605,7 +604,12 @@ Pending(cache, key, slot, executor) = Pending(cache, key, slot, executor, nothin
 _blocking_selector(p::Pending) = p.executor === nothing ? Base.fetch : _BlockingDeferred(p.executor)
 
 # Non-blocking readiness probe — a `Task`-like surface for callers migrating off `rv isa Task`.
-Base.isready(p::Pending) = p.slot === nothing ? haskey(p.cache, p.key) : (@atomic :acquire p.slot.set)
+function Base.isready(p::Pending)
+    p.slot === nothing || return (@atomic :acquire p.slot.set)
+    lock(p.cache.lock) do
+        _pending_saved(p.resolve) !== _missing_sentinel || haskey(p.cache.cache, p.key)
+    end
+end
 
 # Would `fetch(p)` return or throw without waiting?
 _settled(p::Pending) = isready(p) || lock(p.cache.lock) do
@@ -637,11 +641,14 @@ function _fetch_pending(p::Pending)
     end
     while true
         step = lock(c.lock) do
+            saved = _pending_saved(p.resolve)
+            saved !== _missing_sentinel && return (:value, saved)
             v = get(c.cache, p.key, _missing_sentinel)
-            v !== _missing_sentinel && return (:value, v)
+            v !== _missing_sentinel && (_on_hit!(c, p.key); return (:value, v))
             haskey(c.errors, p.key) && return (:error, c.errors[p.key])
             cnd = get(c.computing, p.key, nothing)
             cnd === nothing && return (:gone, nothing)
+            _on_hit!(c, p.key)
             wait(cnd::Threads.Condition)
             (:retry, nothing)
         end

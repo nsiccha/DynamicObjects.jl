@@ -1677,12 +1677,14 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
         end
         cnd = get(c.computing, key, nothing)
         if cnd !== nothing
+            _on_hit!(c, key)
             # A compute is already in flight (inline, or a prior poller's fire-and-forget).
             return sync ? (:wait, cnd) : (:pending, nothing)
         end
         # Nobody computing — WE become the sole computer. Register the latch + (optional)
         # status so concurrent accessors dedup onto us and getstatus/pollers see progress.
         cnd = Threads.Condition(c.lock)
+        _scope_new_generation!(c, key, f)
         c.computing[key] = cnd
         !isnothing(s) && (c.status[key] = s)
         return sync && executor === nothing ? (:inline, cnd) : (:start, cnd)
@@ -1741,7 +1743,7 @@ end
 # What a `Pending` handle runs when its computation was retracted mid-flight: the same
 # access, blocking.
 _resolver(f, c, key, fetch, substatus, retry_failed) =
-    () -> get!(f, c, key; fetch=_blocking_selector(fetch), substatus, retry_failed)
+    _scope_resolver(() -> get!(f, c, key; fetch=_blocking_selector(fetch), substatus, retry_failed), c, key)
 
 # --- Deferred compute starts -------------------------------------------------------------
 
@@ -1790,7 +1792,7 @@ mutable struct _RequesterRun
     holder::Any   # the running task's queue slot; read when it runs
 end
 (r::_RequesterRun)() =
-    _in_logger(() -> ScopedValues.with(r.work, _QUEUE_HOLDER => r.holder), r.logger)
+    _in_logger(() -> ScopedValues.with(() -> _in_compute_work(r.work), _QUEUE_HOLDER => r.holder), r.logger)
 
 struct _Requester
     run::_RequesterRun
@@ -2105,9 +2107,6 @@ include("compute_trace.jl")
 
 include("job_queue.jl")
 
-# `_on_hit!` / `_on_store!` are ThreadsafeDict-layer bookkeeping hooks — no-ops.
-_on_hit!(::AbstractThreadsafeDict, key) = nothing
-_on_store!(::AbstractThreadsafeDict, key) = nothing
 _drop_order!(::AbstractThreadsafeDict, key) = nothing
 
 Base.pop!(c::AbstractThreadsafeDict, key) = begin
@@ -3454,8 +3453,7 @@ function _getorcompute_bare(cache::PropertyCache, o, name::Symbol; link=nothing)
     # Fast hit path: a cached bare property returns WITHOUT building the
     # `substatus` factory or the `get!` do-block closure below — both allocate
     # on every access and were the dominant warm-access cost. Hit bookkeeping is
-    # a no-op (`_on_hit!`), so returning the cached value
-    # directly is behaviourally identical to routing through `get!`. Only misses
+    # handled by `_peek_hit` under the owning lock. Only misses
     # pay the closures.
     t0 = _trace_clock()
     hit = _peek_hit(cache, name)
@@ -6649,14 +6647,15 @@ _opaque_local!(oc::_OpaqueSubcache, (indices, kwargs); fetch=Base.fetch, retry_f
                      fetch, retry_failed, kwargs...)
 # Opaque names are view-local, so a bare value lands in the requester's overlay.
 # Returns whether it stored `value` (a value already there is kept).
-_store_local!(oc::_OpaqueBare, key, value) =
-    _store_new!(oc.local_dict.cache.overlay, oc.name, value, oc.local_dict.lock)
-_store_local!(oc::_OpaqueSubcache, key, value) =
-    _store_new!(oc.local_dict.cache, key, value, oc.local_dict.lock)
-_store_new!(dict, key, value, dict_lock) = lock(dict_lock) do
-    haskey(dict, key) && return false
-    dict[key] = value
-    true
+function _store_local!(oc::_OpaqueSubcache, key, value)
+    c = oc.local_dict
+    lock(c.lock) do
+        cache = _scope_dict(c.cache, key)
+        haskey(cache, key) && return false
+        _scope_new_generation!(c, key, _Settling(identity, oc.requester, oc.name))
+        cache[key] = value
+        true
+    end
 end
 
 _local_bare!(o, name::Symbol; fetch=Base.fetch, retry_failed=true, link=nothing) =
@@ -6681,7 +6680,7 @@ end
 # other accessor computes the key in its own view.
 function _opaque_shared!(oc::_OpaqueSubcache, key; fetch=Base.fetch, retry_failed=true, trace_t0=_trace_clock(), link=nothing)
     t0 = trace_t0
-    hit = get(oc, key, _missing_sentinel)
+    hit = _peek_hit(oc, key)
     args, kwargs = _opaque_call(oc, key)
     if hit !== _missing_sentinel
         t0 == 0 || _trace_read!(oc.requester, oc.name, _trace_args(args, kwargs), Val(:hit), t0)
@@ -6798,7 +6797,7 @@ function Base.fetch(p::Pending{<:_OpaqueSubcache})
         _opaque_local!(p.cache, p.key; fetch=_blocking_selector(p))
     end
 end
-Base.isready(p::Pending{<:_OpaqueSubcache}) = haskey(p.cache, p.key) ||
+Base.isready(p::Pending{<:_OpaqueSubcache}) = invoke(isready, Tuple{Pending}, p) ||
     (_ns_tainted(p.cache.ns, _taint_key(p.cache, p.key)) && haskey(p.cache.local_dict, p.key))
 
 # Observers see each key where it lives: shared until it read context, then local.
@@ -7546,8 +7545,12 @@ function _set_automatic_materialization_cache!(target, name, descriptor,
         # preserve shared-vs-request-local routing, and plain ThreadsafeDicts do
         # not expose a public `setindex!` mutation path.
         lock(cache.lock) do
+            if haskey(cache.cache, key) || haskey(cache.computing, key)
+                _on_hit!(cache, key)
+            else
+                _scope_new_generation!(cache, key, _Settling(identity, target, name))
+            end
             cache.cache[key] = value
-            _on_store!(cache, key)
         end
     else
         cache[key] = value
@@ -7568,8 +7571,10 @@ function _swap_automatic_slot!(target, name, descriptor, args, kwargs, value, re
             maybepop!(cache, key)
         elseif replacement !== value
             if cache isa AbstractThreadsafeDict
+                # Replacing a value with its mmap representation keeps the
+                # ownership of the original generation, including other readers.
+                _on_hit!(cache, key)
                 cache.cache[key] = replacement
-                _on_store!(cache, key)
             else
                 cache[key] = replacement
             end
@@ -8489,7 +8494,9 @@ export execute_materialization, release_materialization!, materialization_owners
 export TrackedFile, TrackedDirectory, tracked_version, tracked_path, tracked_paths,
     on_change!, notify_change!, sync!, object_version, dependents
 
+include("compute_scope.jl")
 include("workers.jl")
+export with_compute_scope, compute_targets, prune_worker_mem_caches!
 
 include("precompile.jl")
 

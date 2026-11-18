@@ -22,6 +22,14 @@ clear_mem_caches!
 clear_disk_caches!
 clear_all_caches!
 prune_mem_caches!
+prune_worker_mem_caches!
+```
+
+## Scoped computations
+
+```@docs
+with_compute_scope
+compute_targets
 ```
 
 ## Persistence

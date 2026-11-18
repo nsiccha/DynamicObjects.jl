@@ -261,4 +261,14 @@ end
     @queued @cached saved(k::Int) = (pid=getpid(), revision=revision, value=k + length(data))
 end
 
+# Scalar targets keep their large inputs exclusively in the worker.
+@dynamicstruct struct ScopedReport
+    id::Int
+    buffer(i::Int) = fill(UInt8(i), 1024^2)
+    @queued @fresh render(i::Int) = sum(buffer(i))
+    @queued @fresh census() = buffer_census(__self__)
+end
+
+buffer_census(o) = sum((sizeof(e.value) for e in mem_cache_entries(o) if e.property === :buffer); init=0)
+
 end
