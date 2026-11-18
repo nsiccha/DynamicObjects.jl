@@ -910,10 +910,34 @@ end
 # Whether the exit hook `f` is Malt's for `w`: a closure of Malt's that holds `w`.
 _stops_worker(f, w) = parentmodule(typeof(f)) === Malt && any(i -> getfield(f, i) === w, 1:nfields(f))
 
+# Print the worker's stdout and stderr on this process's, each line prefixed with
+# `[Worker <pid>]: ` as Malt prints it. Malt's own forwarding reads only while the process
+# runs, so it drops what a dying worker wrote last: of 200 stderr lines written right before
+# a `SIGKILL`, 2 arrived (snag `computeabandoned-90a7dcd7`). These tasks read to the pipe's
+# end, so what a worker wrote before it died, a crash report included, is all printed.
+function _forward_output!(w::Malt.Worker)
+    errormonitor(@async _forward_lines(w.stdout, :stdout, w.proc_pid))
+    errormonitor(@async _forward_lines(w.stderr, :stderr, w.proc_pid))
+    w
+end
+function _forward_lines(pipe, which::Symbol, pid)
+    for line in eachline(pipe)
+        io = which === :stdout ? stdout : stderr   # looked up per line: a redirect applies
+        prefix = "[Worker $pid]: "
+        get(io, :color, false) === true &&
+            (prefix = (which === :stdout ? "\e[34m" : "\e[33m") * "[Worker $pid]:\e[39m ")
+        write(io, prefix, line, '\n')
+        flush(io)
+    end
+end
+
 function _spawn_worker!(q)
     conn = q.conn
     exeflags = _worker_exeflags(q)
-    w = _on_actor(() -> _exit_without_waiting!(Malt.Worker(; exeflags, env=_worker_env())), conn)
+    w = _on_actor(conn) do
+        worker = Malt.Worker(; exeflags, env=_worker_env(), monitor_stdout=false, monitor_stderr=false)
+        _forward_output!(_exit_without_waiting!(worker))
+    end
     try
         id = _DYNAMICOBJECTS_PKGID
         load = :(Base.require(Base.PkgId(Base.UUID($(string(id.uuid))), $(id.name))); nothing)
@@ -928,9 +952,11 @@ function _spawn_worker!(q)
             union!(empty!(conn.loaded), info.loaded)
         end
         _on_actor(() -> errormonitor(@async _event_pump(conn, w)), conn)
-    catch
+    catch err
         _stop_process(conn, w)
-        rethrow()
+        (err isa TaskFailedException ? err.task.exception : err) isa Malt.TerminatedWorkerException ||
+            rethrow()
+        error("the worker process (pid $(w.proc_pid)) exited during its start-up, ", _exit_status(w.proc))
     end
     w
 end
@@ -945,7 +971,7 @@ function _event_pump(conn::_WorkerConn, w)
         catch err
             err = err isa TaskFailedException ? err.task.exception : err
             reason = err isa Malt.TerminatedWorkerException ?
-                "the worker process (pid $(w.proc_pid)) exited while computing it" :
+                "the worker process (pid $(w.proc_pid)) exited while computing it, " * _exit_status(w.proc) :
                 "the connection to the worker process failed: " * sprint(showerror, err)
             break
         end
@@ -975,6 +1001,33 @@ end
 # Stop `w` through its own process handle: asked to exit, then `SIGTERM`, then `SIGKILL`. A
 # stuck worker never runs the exit it is asked for, so the signals follow within seconds.
 _stop_process(conn, w) = _on_actor(() -> Malt.stop(w; exit_timeout=3.0, term_timeout=3.0), conn)
+
+# How a worker process ended, for the reasons its computations fail with: the signal that
+# killed it, or its exit code. A memory killer's or `kill -9`'s `SIGKILL`, a crash's `SIGSEGV`
+# and an orderly exit all reach this process as the same `Malt.TerminatedWorkerException`;
+# only the process handle tells them apart (snag `computeabandoned-90a7dcd7`). A killed
+# process has exit code 0, so the signal is read first. Malt reports a worker dead once
+# `process_running(proc)` is false, so the wait returns at once there. libuv's exit callback
+# sets `exitcode` before `termsignal`, under the I/O lock, so taking that lock makes both
+# visible on this thread.
+function _exit_status(proc::Base.Process; timeout::Real=5.0)
+    timedwait(() -> process_exited(proc), timeout; pollint=0.01) === :ok ||
+        return "with an unknown exit status"
+    Base.iolock_begin(); Base.iolock_end()
+    signal = proc.termsignal
+    signal == 0 && return "with exit code $(proc.exitcode)"
+    name = get(_SIGNAL_NAMES, signal, nothing)
+    "killed by signal $signal" * (name === nothing ? "" : " ($name)")
+end
+
+# The signals whose numbers Linux and macOS share, and `SIGBUS`, whose number they do not.
+const _SIGNAL_NAMES = let names = Dict(1 => "SIGHUP", 2 => "SIGINT", 3 => "SIGQUIT",
+        4 => "SIGILL", 5 => "SIGTRAP", 6 => "SIGABRT", 8 => "SIGFPE", 9 => "SIGKILL",
+        11 => "SIGSEGV", 13 => "SIGPIPE", 14 => "SIGALRM", 15 => "SIGTERM")
+    Sys.islinux() && (names[7] = "SIGBUS")
+    Sys.isbsd() && (names[10] = "SIGBUS")
+    names
+end
 
 _malt_stop_quietly(conn, w) = try
     Malt.isrunning(w) && _stop_process(conn, w)
@@ -1148,7 +1201,8 @@ function _submit!(q, req::_RemoteRequest, o, name, args, kwargs, packages, messa
             if err isa Malt.TerminatedWorkerException
                 lock(() -> conn.worker === w && (conn.worker = nothing), conn.lock)
                 attempt == 1 && continue
-                throw(ComputeAbandoned("the worker process (pid $(w.proc_pid)) exited before it started", true))
+                throw(ComputeAbandoned("the worker process (pid $(w.proc_pid)) exited before it started, " *
+                                       _exit_status(w.proc), true))
             end
             _throw_remote(o, name, args, kwargs, w.proc_pid,
                           err isa Malt.RemoteException ? err.message : sprint(showerror, err))
@@ -1332,7 +1386,7 @@ function _stop_worker!(q)
     w = lock(() -> conn.worker, conn.lock)
     w === nothing && return nothing
     _stop_process(conn, w)
-    _abandon_inflight!(conn, w, "the worker process (pid $(w.proc_pid)) was stopped")
+    _abandon_inflight!(conn, w, "the worker process (pid $(w.proc_pid)) was stopped, " * _exit_status(w.proc))
     nothing
 end
 

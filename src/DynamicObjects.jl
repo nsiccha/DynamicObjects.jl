@@ -1753,6 +1753,11 @@ running it, or when the worker process running it (see
 `configure_queue!`) exited or was restarted
 (`started` is then `true`). Waiters and pollers see it like any other failure; with the
 default `retry_failed=true` the next access starts a fresh compute.
+
+A worker process's end is named at the end of `reason`: `killed by signal 9 (SIGKILL)` (a
+`kill -9`, or a system memory killer), another signal such as `SIGSEGV` or `SIGABRT` for a
+crash, or `with exit code N` for an exit, as in `the worker process (pid 14783) exited while
+computing it, killed by signal 9 (SIGKILL)`.
 """
 struct ComputeAbandoned <: Exception
     reason::String
