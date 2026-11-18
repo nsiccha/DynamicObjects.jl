@@ -267,6 +267,8 @@ end
     buffer(i::Int) = fill(UInt8(i), 1024^2)
     @queued @fresh render(i::Int) = sum(buffer(i))
     @queued @fresh census() = buffer_census(__self__)
+    @queued fit(i::Int) = computed!(:scoped_fit)
+    @queued @fresh plot_fit(i::Int) = fit(i)
 end
 
 buffer_census(o) = sum((sizeof(e.value) for e in mem_cache_entries(o) if e.property === :buffer); init=0)

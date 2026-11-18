@@ -155,6 +155,42 @@ mktempdir() do dir
 end
 end
 
+@testitem "a caller cache hit keeps the same fit available to worker-side plots" setup=[WorkerFixtures] tags=[:core,:workers] begin
+using DynamicObjects, WorkerToy
+report = WorkerToy.ScopedReport(21)
+with_worker() do
+    function worker_pins()
+        conn = DynamicObjects.job_queue().conn
+        DynamicObjects._remote_fetch(conn, conn.worker, Core.eval, DynamicObjects,
+                                     :(length(_WORKER_RESULT_PINS)))
+    end
+    function start_report(i)
+        ready, finish = Channel{Int}(1), Channel{Nothing}(1)
+        task = Threads.@spawn with_compute_scope() do
+            put!(ready, report.fit(i))
+            take!(finish)
+        end
+        take!(ready), () -> (put!(finish, nothing); fetch(task))
+    end
+
+    fit, close_first = start_report(1)
+    with_compute_scope() do
+        @test report.fit(1) == fit  # served entirely in the caller
+        close_first()
+        @test report.plot_fit(1) == fit
+    end
+    @test isempty(cached_entries(report.fit))
+    @test worker_pins() == 0
+    @test report.plot_fit(1) != fit  # both scope claims ended
+
+    fit, close_first = start_report(2)
+    @test report.fit(2) == fit       # an ordinary caller adopts the warm result
+    close_first()
+    @test report.plot_fit(2) == fit
+    @test worker_pins() == 0
+end
+end
+
 @testitem "planned targets release last uses and preserve unknown future reads" tags=[:core] begin
 using DynamicObjects
 @dynamicstruct struct Batch

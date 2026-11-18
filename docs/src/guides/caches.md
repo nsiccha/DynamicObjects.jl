@@ -44,7 +44,8 @@ expensive intermediate. The cache drops derived entries created solely for
 that scope on return or error, including in the queue worker. The returned
 values remain usable. A value that was already warm stays warm. A concurrent
 ordinary reader keeps the value it reads, and overlapping scopes release
-shared work after their last claim ends.
+shared work after their last claim ends. A caller-side hit on a queued fit
+also keeps the same fit available to a worker-side plot.
 
 ```@example caches
 report = with_compute_scope() do

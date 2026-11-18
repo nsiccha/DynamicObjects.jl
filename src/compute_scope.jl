@@ -5,6 +5,14 @@ struct _TargetLifetimes
     uncertain_until::Int
 end
 
+# A queued result can be read in two processes. Its caller cache generation
+# owns one claim on the worker generation, including across caller-only hits.
+struct _WorkerResultPin
+    conn::_WorkerConn
+    worker::Any
+    request::Int
+end
+
 mutable struct _ComputeScope
     # Each claim goes directly into its last target's bucket. Finishing a
     # target never scans the other targets' intermediates.
@@ -14,6 +22,7 @@ mutable struct _ComputeScope
     parent::Union{Nothing,_ComputeScope}  # executing queued/deferred job inside a scope
     protected_names::IdDict{Type,Set{Symbol}}
     workers::IdDict{Any,Any}
+    releases::Vector{Tuple{_WorkerResultPin,Bool}}
     closed::Bool
     remote_lock::ReentrantLock
 end
@@ -27,6 +36,7 @@ mutable struct _ScopeEntry
     name::Symbol
     owners::IdDict{_ComputeScope,Int}
     pending_result::Union{Nothing,Base.RefValue{Any}}
+    worker_result::Union{Nothing,_WorkerResultPin}
 end
 
 const _SCOPE_SLOTS = IdDict{Any,Dict{Any,_ScopeEntry}}()
@@ -35,16 +45,27 @@ _scope_dict(d, key) = d
 _scope_dict(d::MountedDict, key) = _scope_dict(_mounted_dict(d, key), key)
 _scope_dict(d::_TaintingDict, key) = d.inner
 
+# Called under _SCOPE_LOCK. The cache lock guards its physical dictionary.
+function _scope_entry(c, key)
+    entries = get(_SCOPE_SLOTS, _scope_dict(c.cache, key), nothing)
+    entries === nothing ? nothing : get(entries, key, nothing)
+end
+
 function _new_compute_scope(lifetimes=nothing, target=1; parent=nothing)
     protected = parent === nothing ? IdDict{Type,Set{Symbol}}() : parent.protected_names
     scope = _ComputeScope(Dict{Int,Base.IdSet{Any}}(), lifetimes, target, parent,
-                          protected, IdDict{Any,Any}(), false, ReentrantLock())
+                          protected, IdDict{Any,Any}(), Tuple{_WorkerResultPin,Bool}[], false, ReentrantLock())
     Threads.atomic_add!(_OPEN_SCOPE_COUNT, 1)
     scope
 end
 
 # Caller holds _SCOPE_LOCK. A new writer or an ordinary reader adopts the slot.
-function _forget_scope_entry!(entry)
+function _forget_scope_entry!(entry; adopt=false, releasing=nothing)
+    if entry.worker_result !== nothing
+        owner = releasing === nothing ? first(keys(entry.owners)) : releasing
+        push!(owner.releases, (entry.worker_result, adopt))
+        entry.worker_result = nothing
+    end
     slot = entry.slot
     entries = _SCOPE_SLOTS[slot.cache]
     delete!(entries, slot.key)
@@ -58,7 +79,7 @@ end
 
 function _claim_scope_entry!(entry, scope)
     if scope === nothing || scope.closed
-        _forget_scope_entry!(entry)
+        _forget_scope_entry!(entry; adopt=true)
         return
     end
     # A managed job can outlive its enclosing scope. Its own claim lasts until
@@ -85,9 +106,7 @@ end
 
 function _share_scope_entry!(c, key)
     lock(_SCOPE_LOCK) do
-        entries = get(_SCOPE_SLOTS, _scope_dict(c.cache, key), nothing)
-        entries === nothing && return
-        entry = get(entries, key, nothing)
+        entry = _scope_entry(c, key)
         entry === nothing || _claim_scope_entry!(entry, _COMPUTE_SCOPE[])
     end
 end
@@ -121,7 +140,7 @@ function _record_scope_generation!(c, key, f)
         scope !== nothing && !scope.closed && _scope_eligible(scope, f, key) || return
         entries = get!(() -> Dict{Any,_ScopeEntry}(), _SCOPE_SLOTS, cache)
         slot = _MemSlot(c.lock, cache, _scope_dict(c.computing, key), _scope_dict(c.status, key), key)
-        entry = _ScopeEntry(slot, f.name, IdDict{_ComputeScope,Int}(), nothing)
+        entry = _ScopeEntry(slot, f.name, IdDict{_ComputeScope,Int}(), nothing, nothing)
         entries[key] = entry
         _claim_scope_entry!(entry, scope)
     end
@@ -142,9 +161,7 @@ function _scope_resolver(retry, c, key)
     _OPEN_SCOPE_COUNT[] == 0 && return retry
     lock(c.lock) do
         lock(_SCOPE_LOCK) do
-            entries = get(_SCOPE_SLOTS, _scope_dict(c.cache, key), nothing)
-            entries === nothing && return retry
-            entry = get(entries, key, nothing)
+            entry = _scope_entry(c, key)
             entry === nothing && return retry
             if entry.pending_result === nothing
                 entry.pending_result = Ref{Any}(_missing_sentinel)
@@ -163,9 +180,10 @@ function _release_scope_entry!(scope, entry)
             delete!(scope.entries[deadline], entry)
             delete!(entry.owners, scope)
             isempty(entry.owners) || return
-            _forget_scope_entry!(entry)
             # An escaped computation still owns its latch and must publish for its callers.
-            haskey(slot.computing, slot.key) && return
+            computing = haskey(slot.computing, slot.key)
+            _forget_scope_entry!(entry; adopt=computing, releasing=scope)
+            computing && return
             haskey(slot.cache, slot.key) || return
             if entry.pending_result !== nothing
                 entry.pending_result[] = slot.cache[slot.key]
@@ -277,6 +295,7 @@ function _target_delivered!(scope)
     end
     foreach(entry -> _release_scope_entry!(scope, entry), entries)
     lock(() -> delete!(scope.entries, step), _SCOPE_LOCK)
+    _flush_worker_results!(scope)
     _on_scope_workers!(scope, _worker_target_delivered!)
     nothing
 end
