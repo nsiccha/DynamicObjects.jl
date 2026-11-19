@@ -14,6 +14,14 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.33
+
+- Queue workers warn before sending a result larger than 64 MiB. The warning
+  identifies the call and its serialized byte count. Adjust the threshold on a
+  running queue with `configure_queue!(; worker_reply_warn_bytes=n)`.
+- When a worker disconnects, the requester logs its outstanding calls and the
+  total size of any event whose transfer was interrupted.
+
 ## 0.5.32
 
 - Queue workers deliver large in-memory results across multiple socket replies

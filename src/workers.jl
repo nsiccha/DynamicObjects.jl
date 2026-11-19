@@ -743,7 +743,7 @@ end
 
 # Events are serialized where they are queued, one by one: one that cannot be serialized
 # fails its own request instead of the whole batch.
-function _push_event!(id::Int, kind::Symbol, payload)
+function _push_event!(id::Int, kind::Symbol, payload, call=nothing, warn_bytes=typemax(Int))
     io = try
         _serialized_buffer(payload)
     catch err
@@ -751,6 +751,14 @@ function _push_event!(id::Int, kind::Symbol, payload)
         kind === :pinned_result && _release_worker_results!(((id, false),))
         kind = :failed
         _serialized_buffer("the worker could not send the result back: " * sprint(showerror, err))
+    end
+    n = bytesavailable(io)
+    if kind in (:done, :pinned_result) && n > warn_bytes
+        # The worker's stderr has a separate pipe to the parent. This line travels
+        # even if the result socket fails before the requester reads its first header.
+        Base.CoreLogging.with_logger(Base.CoreLogging.SimpleLogger(stderr)) do
+            @warn "DynamicObjects: large worker result" worker=getpid() request=id computation=call serialized_bytes=n
+        end
     end
     put!(_W_EVENTS, (id, kind, io))
     nothing
@@ -775,7 +783,7 @@ function _worker_control_loop()
 end
 
 function _worker_control(::Val{:submit}, id::Int, address, name::Symbol, args, kwargs, is_fresh::Bool,
-                         min_level::Int32, mirrored::Bool, scopes, scope_token=nothing)
+                         min_level::Int32, mirrored::Bool, scopes, call, warn_bytes, scope_token=nothing)
     # Keep this request's values until its result is ready even if its report
     # closed while the control message was waiting in the worker mailbox.
     scope = if scope_token !== nothing
@@ -818,7 +826,7 @@ function _worker_control(::Val{:submit}, id::Int, address, name::Symbol, args, k
     node === nothing || lock(() -> _W_NODES[id] = (node, mirror), _W_NODES_LOCK)
     ScopedValues.with(_COMPUTE_SCOPE => scope) do
         errormonitor(Threads.@spawn Base.invokelatest(_worker_finish, id, o, name, args, kwargs,
-                                                      is_fresh, handle, mirror, pinned))
+                                                      is_fresh, handle, mirror, pinned, call, warn_bytes))
     end
     nothing
 end
@@ -848,7 +856,7 @@ function _mirror(id::Int, node::Treebars.ProgressNode)
     end
 end
 
-function _worker_finish(id, o, name, args, kwargs, is_fresh, handle, mirror, pinned)
+function _worker_finish(id, o, name, args, kwargs, is_fresh, handle, mirror, pinned, call, warn_bytes)
     result_pinned = false
     try
         succeeded = false
@@ -868,7 +876,7 @@ function _worker_finish(id, o, name, args, kwargs, is_fresh, handle, mirror, pin
             end
             scope === nothing || _close_compute_scope!(scope)
         end
-        _push_event!(id, result_pinned ? :pinned_result : :done, payload)
+        _push_event!(id, result_pinned ? :pinned_result : :done, payload, call, warn_bytes)
     catch err
         result_pinned && _release_worker_results!(((id, false),))
         _push_event!(id, :failed, _remote_failure(err, catch_backtrace()))
@@ -1321,7 +1329,9 @@ function _deliver_worker_events!(conn, w, batch)
     for (id, kind, offset, total, bytes) in batch
         req = get(conn.inflight, id, nothing)
         complete = offset + length(bytes) == total
-        if req !== nothing && req.worker === w
+        if req !== nothing && req.worker === w && !req.settled
+            req.receiving = complete ? nothing : (kind, total)
+            req.settled = complete && kind in (:done, :pinned_result, :failed)
             put!(req.events, (complete ? kind : :fragment, (offset, total, bytes)))
         elseif complete && kind === :pinned_result
             orphaned === nothing && (orphaned = Tuple{Int,Bool}[])
@@ -1369,12 +1379,21 @@ function _event_pump(conn::_WorkerConn, w)
 end
 
 function _abandon_inflight!(conn::_WorkerConn, w, failure::ComputeAbandoned)
-    lock(conn.lock) do
+    lost = lock(conn.lock) do
         _detach_worker!(conn, w)
+        calls = Tuple{Int,String,Union{Nothing,Tuple{Symbol,Int}}}[]
         for req in values(conn.inflight)
             # Names the worker: `_submit!` may send `req` on to a fresh one before it is read.
-            req.worker === w && put!(req.events, (:abandoned, (w, failure)))
+            req.worker === w && !req.settled || continue
+            push!(calls, (req.id, req.call, req.receiving))
+            req.settled = true
+            put!(req.events, (:abandoned, (w, failure)))
         end
+        calls
+    end
+    for (id, call, receiving) in lost
+        event, bytes = something(receiving, (:unknown, :unknown))
+        @warn "DynamicObjects: worker disconnected with a request in flight" worker=w.handle.proc_pid request=id computation=call event serialized_bytes=bytes reason=failure.reason
     end
     _malt_stop_quietly(conn, w)
     nothing
@@ -1508,7 +1527,7 @@ end
 
 # Serialize selection and reservation so two simultaneous cold calls see each other's
 # assignments before either has a PID. Transport and package loading stay off q.lock.
-function _reserve_worker!(q, root)
+function _reserve_worker!(q, root, call)
     lock(q.lock) do
         isempty(q.conns) && throw(ComputeAbandoned("queue workers were disabled", true))
         conn = argmin(q.conns) do c
@@ -1520,12 +1539,36 @@ function _reserve_worker!(q, root)
         _cancel_idle!(conn)
         req = lock(conn.lock) do
             conn.next_id += 1
-            r = _RemoteRequest(conn.next_id, Channel{Any}(Inf), nothing)
+            r = _RemoteRequest(conn.next_id, call)
             conn.inflight[r.id] = r
             r
         end
-        conn, req
+        conn, req, q.worker_reply_warn_bytes
     end
+end
+
+# Keep the same small call label on both sides. Avoid walking a collection or
+# invoking application-defined show methods just to submit a computation.
+function _worker_arg(v)
+    if v isa Union{String,Symbol}
+        s = String(v)
+        short = ncodeunits(s) > 48 ? _truncate_codeunits(s, 48) * "…" : s
+        return v isa Symbol && short === s ? repr(v) : repr(short)
+    elseif v isa Array
+        return string(nameof(typeof(v)), size(v))
+    elseif v isa Union{Nothing,Missing,Char,Bool,Base.BitInteger,Float16,Float32,Float64}
+        return repr(v)
+    end
+    string(nameof(typeof(v)))
+end
+
+function _worker_call(o, name, args, kwargs)
+    pos = [_worker_arg(v) for v in Iterators.take(args, 4)]
+    kw = [string(k, "=", _worker_arg(v)) for (k, v) in Iterators.take(pairs(kwargs), 4)]
+    length(args) > 4 && push!(pos, "…")
+    length(kwargs) > 4 && push!(kw, "…")
+    string(nameof(typeof(o)), ".", name, "(", join(pos, ", "),
+           isempty(kw) ? "" : "; " * join(kw, ", "), ")")
 end
 
 function _compute_in_worker(f::_WorkerCompute, o, name::Symbol, args::Tuple, kwargs::NamedTuple, status)
@@ -1547,12 +1590,13 @@ function _compute_in_worker(f::_WorkerCompute, o, name::Symbol, args::Tuple, kwa
     end
     min_level = Int32(Base.CoreLogging.min_enabled_level(ScopedValues.current_logger()).level)
     root = first(_kept_keys(address))
-    conn, req = _reserve_worker!(q, root)
+    call = _worker_call(o, name, args, kwargs)
+    conn, req, warn_bytes = _reserve_worker!(q, root, call)
     interrupter = nothing
     try
         w, pid = _submit!(q, conn, req, root, o, name, args, kwargs, packages,
                           (req.id, address, name, wired_args, wired_kwargs, is_fresh, min_level,
-                           _mirrorable(status), scopes), status)
+                           _mirrorable(status), scopes, call, warn_bytes), status)
         lock(conn.lock) do
             if conn.worker === w
                 filter!(!isequal(root), conn.recent_roots)
@@ -1639,7 +1683,11 @@ function _submit!(q, conn, req::_RemoteRequest, root, o, name, args, kwargs, pac
             err isa ComputeAbandoned && rethrow()
             throw(ComputeAbandoned("the worker process could not be started: " * sprint(showerror, err), true))
         end
-        lock(() -> req.worker = w, conn.lock)
+        lock(conn.lock) do
+            req.worker = w
+            req.receiving = nothing
+            req.settled = false
+        end
         try
             _ensure_packages!(conn, w, union(_worker_preload(q), packages), status)
             _wait_for_invalidation(root)

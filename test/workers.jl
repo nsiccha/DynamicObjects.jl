@@ -56,8 +56,9 @@ end
 
 conn = DO._WorkerConn(1)
 worker = :original
-requests = [DO._RemoteRequest(i, Channel{Any}(Inf), worker) for i in 1:2]
+requests = [DO._RemoteRequest(i, "Toy.test($i)") for i in 1:2]
 for req in requests
+    req.worker = worker
     conn.inflight[req.id] = req
 end
 events = Channel{Tuple{Int,Symbol,IOBuffer}}(Inf)
@@ -111,6 +112,83 @@ first_batch = DO._worker_take_events(events)
 @test first.(first_batch) == 1:DO._WORKER_REPLY_PARTS
 @test bytesavailable(DO._serialized_buffer(first_batch)) < 64 * 1024
 @test only(DO._worker_take_events(events))[1] == DO._WORKER_REPLY_PARTS + 1
+end
+
+@testitem "workers: large results warn once at the current queue threshold" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects, WorkerToy
+const DO = DynamicObjects
+q = DO.job_queue()
+previous = q.worker_reply_warn_bytes
+other = DO.JobQueue()
+@test other.worker_reply_warn_bytes == 64 * 1024^2
+@test_throws ArgumentError DO.configure_queue!(other; worker_reply_warn_bytes=-1)
+@test_throws ArgumentError DO.configure_queue!(other; worker_reply_warn_bytes=1.5)
+label = DO._worker_call(other, :plot, (:a, repeat("界", 32), zeros(500), 4, 5), (; page=2))
+@test startswith(label, "JobQueue.plot(:a, ")
+@test occursin(repeat("界", 16) * "…", label)
+@test occursin("Array(500,), 4, …; page=2)", label)
+path, io = mktemp()
+n = DO._WORKER_REPLY_BYTES + 17
+sizes = Dict{Int,Int}()
+try
+    redirect_stderr(io) do
+        with_worker() do
+            t = Toy(2, mktempdir())
+            pid = t.square(0).pid
+            threshold = bytesavailable(DO._serialized_buffer((pid=pid, bytes=zeros(UInt8, 4096))))
+            DO.configure_queue!(; worker_reply_warn_bytes=threshold)
+            for k in (4095, 4096, 4097, n)
+                r = k == n ? with_compute_scope(() -> t.byte_pattern(k)) : t.byte_pattern(k)
+                @test r.pid == pid
+                @test length(r.bytes) == k
+                sizes[k] = bytesavailable(DO._serialized_buffer(r))
+            end
+            @test sizes[4096] == threshold
+            @test other.worker_reply_warn_bytes == previous
+            # A 1 MiB on-disk result sends only its small published-file reference.
+            @test length(WorkerToy.RetentionRoot(mktempdir()).saved(1)) == 1024^2
+        end
+    end
+finally
+    close(io)
+    DO.configure_queue!(; worker_reply_warn_bytes=previous)
+end
+warnings = split(read(path, String), "DynamicObjects: large worker result")[2:end]
+@test length(warnings) == 2
+for (record, k) in zip(warnings, (4097, n))
+    @test occursin("Toy.byte_pattern($k)", record)
+    @test occursin("serialized_bytes = $(sizes[k])", record)
+end
+end
+
+@testitem "workers: a disconnect identifies only outstanding calls on the lost process" tags=[:core, :workers] begin
+using DynamicObjects, Logging
+const DO = DynamicObjects
+conn = DO._WorkerConn(1)
+w = (; handle=(; proc_pid=101))
+conn.worker = w
+for id in 1:4
+    req = DO._RemoteRequest(id, "Toy.item($id)")
+    req.worker = id == 4 ? :replacement : w
+    conn.inflight[id] = req
+end
+# One result is partly received, one has no result header, one is complete.
+DO._deliver_worker_events!(conn, w, [(1, :done, 0, 20, UInt8[1]), (3, :done, 0, 1, UInt8[2])])
+logger = Test.TestLogger()
+failure = ComputeAbandoned("test worker exited", true)
+with_logger(logger) do
+    DO._abandon_inflight!(conn, w, failure)
+    DO._abandon_inflight!(conn, w, failure)  # the stop and event pump can both observe the exit
+end
+@test length(logger.logs) == 2
+records = sort!([Dict(r.kwargs) for r in logger.logs]; by=r -> r[:request])
+@test [r[:computation] for r in records] == ["Toy.item(1)", "Toy.item(2)"]
+@test all(r -> r[:worker] == 101, records)
+@test [(r[:event], r[:serialized_bytes]) for r in records] == [(:done, 20), (:unknown, :unknown)]
+@test DO._take_worker_event(conn.inflight[1].events) == (:abandoned, (w, failure))
+@test DO._take_worker_event(conn.inflight[2].events) == (:abandoned, (w, failure))
+@test DO._take_worker_event(conn.inflight[3].events) == (:done, UInt8[2])
+@test !isready(conn.inflight[4].events)
 end
 
 @testitem "workers: @queued values come back from the worker, memory and disk tier" setup=[WorkerFixtures] tags=[:core, :workers] begin
