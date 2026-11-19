@@ -49,6 +49,11 @@ Connection to one worker process: its handle and output reader (`worker`), the a
 every Malt call, and the requests in flight.
 """
 mutable struct _WorkerConn
+    const index::Int
+    retired::Bool
+    holds::Int    # eager preload, cache maintenance and open compute scopes
+    idle_timer::Union{Nothing,Timer}
+    const recent_roots::Vector{Any}
     const lock::ReentrantLock
     const ops::Channel{Any}
     actor::Union{Nothing,Task}
@@ -61,8 +66,9 @@ mutable struct _WorkerConn
     const inflight::Dict{Int,_RemoteRequest}
     const loaded::Set{Base.PkgId}
 end
-_WorkerConn() = _WorkerConn(ReentrantLock(), Channel{Any}(Inf), nothing, nothing, nothing, 0, NaN, NaN, 0,
-                            Dict{Int,_RemoteRequest}(), Set{Base.PkgId}())
+_WorkerConn(index) = _WorkerConn(index, false, 0, nothing, Any[], ReentrantLock(), Channel{Any}(Inf),
+                                 nothing, nothing, nothing, 0, NaN, NaN, 0,
+                                 Dict{Int,_RemoteRequest}(), Set{Base.PkgId}())
 
 """
     DynamicObjects.JobQueue(; max_running=0)
@@ -80,16 +86,17 @@ mutable struct JobQueue
     const observers::Vector{Any}
     max_running::Int
     running::Int    # slots held
-    workers::Int    # 0: admitted items run here; 1: in the worker process
+    @atomic workers::Int    # zero runs locally
     worker_start::Symbol
     worker_exeflags::Union{Nothing,Vector{String}}
     worker_preload::Vector{Base.PkgId}
-    const conn::_WorkerConn
+    worker_idle_timeout::Float64
+    const conns::Vector{_WorkerConn}
 end
 function JobQueue(; max_running::Integer=0)
     _check_max_running(max_running)
     JobQueue(ReentrantLock(), QueuedItem[], Any[], Int(max_running), 0, 0, :lazy, nothing,
-             Base.PkgId[], _WorkerConn())
+             Base.PkgId[], 300.0, _WorkerConn[])
 end
 
 _check_max_running(n) =
@@ -118,7 +125,7 @@ job_queue() = _JOB_QUEUE
 """
     DynamicObjects.configure_queue!(q=job_queue(); max_running=nothing, workers=nothing,
                                     worker_start=nothing, worker_exeflags=nothing,
-                                    worker_preload=nothing) -> NamedTuple
+                                    worker_preload=nothing, worker_idle_timeout=nothing) -> NamedTuple
 
 Bound how many queued computations run at once. Off by default (`max_running=0`): a
 `@queued` computation starts on `:default` at once. With `max_running=n` at most `n` run at a
@@ -127,15 +134,17 @@ time and the rest wait in FIFO order, their progress node pending (`·`, no cloc
 as earlier ones finish or give their slot back. Raising the cap starts more of what waits;
 `max_running=0` starts everything still waiting. Running computations are never interrupted.
 
-With `workers=1` every computation the queue admits — each memoized or fresh computation of
-a `@queued` property — runs in a separate, long-lived Julia worker process instead of on a
+With a positive worker count every computation the queue admits — each memoized or fresh computation of
+a `@queued` property — runs in a child Julia process instead of on a
 `:default` task of this one, so a compile, a GC pause or a deadlock there never stalls this
 process. Slots, FIFO order and the "queued · #k" note are unchanged; an admitted computation
 holds its slot while the worker runs it. The worker builds the same object from the same
 inputs (the root object's type must be defined in a package, which the worker loads), computes
 the property through its own memoized path, and hands the value back: a `@cached` / `@mmap`
 value through its disk entry, which this process then loads; any other value serialized. The
-worker's memo stays warm across computations. A computation whose body reads the request
+queue selects the worker with the fewest assigned requests, including ones starting or loading
+packages. Ties favor a worker that recently computed from the same root. Nested reads run in
+the same process as their caller. Workers have independent memory caches. A computation whose body reads the request
 (`__req__`) stays in this process, with one warning per property. A worker's exception arrives
 as a [`PropertyComputationError`](@ref) caused by a
 [`RemoteComputationError`](@ref DynamicObjects.RemoteComputationError) that holds the worker's
@@ -146,19 +155,22 @@ When this process exits, its exit hooks kill the worker at once instead of waiti
 stuck worker never holds the exit up.
 
 The worker runs this process's Julia with its code-generation flags, active project,
-`LOAD_PATH` and `DEPOT_PATH`, and by default `--threads=<this process's default threads>,1`,
+`LOAD_PATH` and `DEPOT_PATH`. By default the pool divides this process's default threads
+among its configured workers (at least one each), plus one interactive thread each,
 so its message loop keeps answering on the interactive thread while computations run on the
 default ones; `worker_exeflags` replaces that thread flag (pass e.g. `["--threads=8,1"]`).
-The worker also inherits this process's full `--heap-size-hint`, when set, unless
+The worker also inherits an equal share of this process's `--heap-size-hint`, when set, unless
 `worker_exeflags` supplies one explicitly. This is a per-process garbage-collection hint,
 not a shared memory cap: the parent, worker and other processes still need their own headroom.
-These flags apply at worker startup and restart; changing them does not reconfigure a
-running worker.
+Flags apply at process startup. After resizing a live pool, restart existing processes
+to apply the new per-process budgets.
 `worker_start=:lazy` (the default) starts it with the first computation sent to it,
 `worker_start=:now` at once, in the background. Set `worker_preload=[AppModule]` to also load
 the application's packages at startup, before any computation is submitted. The list accepts
 package modules (a nested module selects its root package) or `Base.PkgId`s, and is reapplied
-after a restart. With `:lazy`, these packages load with the first worker-bound computation.
+after a restart. Additional workers exit after `worker_idle_timeout` seconds idle (default
+300, `Inf` keeps them warm) and start again on demand. Open compute scopes keep the workers
+they use. With `:lazy`, packages load with the first worker-bound computation.
 Changing the list under `:now` also loads its packages into an already-running worker;
 `worker_preload=[]` clears the list for future starts but cannot unload packages. An omitted
 list stays unchanged. Preload failures are logged during background startup and fail a
@@ -175,36 +187,55 @@ Returns [`queue_settings(q)`](@ref DynamicObjects.queue_settings); an omitted se
 unchanged.
 """
 function configure_queue!(q::JobQueue=job_queue(); max_running=nothing, workers=nothing,
-                          worker_start=nothing, worker_exeflags=nothing, worker_preload=nothing)
+                          worker_start=nothing, worker_exeflags=nothing, worker_preload=nothing,
+                          worker_idle_timeout=nothing)
     if workers !== nothing
-        workers in (0, 1) || throw(ArgumentError(
-            "workers must be 0 or 1 (one worker process per queue), got $(workers)"))
-        _IS_WORKER[] && workers > 0 && (workers = 0)   # a worker never spawns its own
+        workers isa Real && isinteger(workers) && 0 <= workers <= typemax(Int) || throw(ArgumentError(
+            "workers must be a non-negative integer, got $(workers)"))
+        workers = _IS_WORKER[] ? 0 : Int(workers)   # a worker never spawns its own
     end
     worker_start === nothing || worker_start in (:lazy, :now) || throw(ArgumentError(
         "worker_start must be :lazy or :now, got $(repr(worker_start))"))
     worker_exeflags === nothing || (worker_exeflags = String[string(f) for f in worker_exeflags])
     worker_preload === nothing || (worker_preload = unique!(Base.PkgId[_preload_pkgid(p) for p in worker_preload]))
-    if max_running !== nothing
-        _check_max_running(max_running)
-        admitted = lock(q.lock) do
-            q.max_running = Int(max_running)
-            _admit!(q)
+    worker_idle_timeout === nothing || (worker_idle_timeout isa Real && worker_idle_timeout >= 0) ||
+        throw(ArgumentError("worker_idle_timeout must be non-negative, got $(worker_idle_timeout)"))
+    max_running === nothing || _check_max_running(max_running)
+    removed, eager, admitted = lock(q.lock) do
+        worker_start === nothing || (q.worker_start = worker_start)
+        worker_exeflags === nothing || (q.worker_exeflags = worker_exeflags)
+        worker_preload === nothing || (q.worker_preload = worker_preload)
+        worker_idle_timeout === nothing || (q.worker_idle_timeout = worker_idle_timeout)
+        previous = length(q.conns)
+        n = something(workers, previous)
+        removed = n < length(q.conns) ? q.conns[n+1:end] : _WorkerConn[]
+        foreach(_retire_connection!, removed)
+        resize!(q.conns, min(n, length(q.conns)))
+        for i in length(q.conns)+1:n
+            push!(q.conns, _WorkerConn(i))
         end
-        foreach(_start_admitted, admitted)
+        @atomic q.workers = Int(n)
+        _register_worker_queue!(q)
+        eager = _WorkerConn[]
+        if q.worker_start === :now
+            for conn in q.conns
+                live = lock(() -> _worker_alive(conn.worker), conn.lock)
+                # Adjusting admission alone should not resurrect an idle surplus process.
+                if conn.index > previous || worker_start === :now ||
+                        (live && worker_preload !== nothing) || (conn.index == 1 && !live)
+                    push!(eager, conn)
+                end
+            end
+        end
+        if worker_idle_timeout !== nothing
+            foreach(c -> _schedule_idle!(q, c), q.conns)
+        end
+        max_running === nothing || (q.max_running = Int(max_running))
+        removed, eager, max_running === nothing ? _Admitted[] : _admit!(q)
     end
-    worker_start === nothing || (q.worker_start = worker_start)
-    worker_exeflags === nothing || (q.worker_exeflags = worker_exeflags)
-    worker_preload === nothing || lock(q.lock) do
-        q.worker_preload = worker_preload
-    end
-    if workers !== nothing
-        q.workers = Int(workers)
-        q.workers > 0 && (_WORKERS_ACTIVE[] = true)
-        q.workers == 0 && _stop_worker!(q)
-    end
-    q.workers > 0 && q.worker_start === :now &&
-        (!_worker_alive(q.conn.worker) || !isempty(_worker_preload(q))) && _start_worker_soon!(q)
+    foreach(_start_admitted, admitted)
+    foreach(_stop_worker!, removed)
+    foreach(c -> _start_worker_soon!(q, c), eager)
     queue_settings(q)
 end
 

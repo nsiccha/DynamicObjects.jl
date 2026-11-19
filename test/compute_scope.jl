@@ -160,7 +160,7 @@ using DynamicObjects, WorkerToy
 report = WorkerToy.ScopedReport(21)
 with_worker() do
     function worker_pins()
-        conn = DynamicObjects.job_queue().conn
+        conn = only(DynamicObjects.job_queue().conns)
         DynamicObjects._remote_fetch(conn, conn.worker, Core.eval, DynamicObjects,
                                      :(length(_WORKER_RESULT_PINS)))
     end

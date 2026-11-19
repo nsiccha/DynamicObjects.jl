@@ -29,12 +29,12 @@ const DO = DynamicObjects
 const TB = DO.Treebars
 q = DO.job_queue()
 id = Base.PkgId(WorkerToy)
-loaded() = lock(() -> id in q.conn.loaded && DO._worker_alive(q.conn.worker), q.conn.lock)
+loaded() = lock(() -> id in q.conns[1].loaded && DO._worker_alive(q.conns[1].worker), q.conns[1].lock)
 try
     DO.configure_queue!(; workers=1, worker_start=:now, worker_preload=[WorkerToy])
     # No computation has been submitted: package initialization is background startup work.
     settles(loaded, 120.0) || error("background startup did not preload WorkerToy")
-    @test id in DO._remote_fetch(q.conn, q.conn.worker, DO._loaded_packages)
+    @test id in DO._remote_fetch(q.conns[1], q.conns[1].worker, DO._loaded_packages)
     @test DO.worker_status().in_flight == 0
     for attempt in 1:2
         t = Toy(3, mktempdir())
@@ -59,11 +59,11 @@ using DynamicObjects, WorkerToy
 const DO = DynamicObjects
 q = DO.job_queue()
 extra = Base.PkgId(Base.UUID("f6d9a3c2-1e0b-4c57-8a44-7d2e9b6c1f30"), "WorkerOnlyFault")
-loaded(id) = lock(() -> id in q.conn.loaded, q.conn.lock)
+loaded(id) = lock(() -> id in q.conns[1].loaded, q.conns[1].lock)
 try
     DO.configure_queue!(; workers=1, worker_start=:lazy, worker_preload=[extra])
     @test !DO.worker_status().running
-    @test q.conn.spawning === nothing
+    @test q.conns[1].spawning === nothing
     @test Toy(2, mktempdir()).square(3).value == 18
     @test loaded(extra)
     # A fresh worker has not loaded the extra package; an update preloads it without a job
@@ -76,7 +76,7 @@ try
     DO.configure_queue!(; worker_start=:now, worker_preload=[extra])
     settles(() -> loaded(extra), 120.0) || error("running worker did not preload the new list")
     @test DO.worker_status().pid == pid
-    @test extra in DO._remote_fetch(q.conn, q.conn.worker, DO._loaded_packages)
+    @test extra in DO._remote_fetch(q.conns[1], q.conns[1].worker, DO._loaded_packages)
     DO.configure_queue!(; worker_preload=[])
     @test loaded(extra)  # clearing configuration cannot unload an initialized package
 finally
@@ -119,11 +119,11 @@ missing = Base.PkgId(Base.UUID("afc73367-81fa-47d7-aee3-02262ce07276"), "Missing
 try
     DO.configure_queue!(; workers=1, worker_start=:lazy, worker_preload=[missing])
     @test_logs (:error, r"preloading the worker process failed") begin
-        task = DO._start_worker_soon!(q)
+        task = DO._start_worker_soon!(q, only(q.conns))
         settles(() -> istaskdone(task), 120.0) || error("failed preload did not settle")
         fetch(task)
     end
-    @test !(missing in lock(() -> copy(q.conn.loaded), q.conn.lock))
+    @test !(missing in lock(() -> copy(q.conns[1].loaded), q.conns[1].lock))
     t = Toy(2, mktempdir())
     err = try
         t.square(3)

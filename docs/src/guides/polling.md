@@ -130,12 +130,23 @@ without interrupting computations already admitted.
 
 ## Worker processes
 
-Set `workers=1` through
-[`configure_queue!`](@ref DynamicObjects.configure_queue!) to run admitted
-`@queued` property computations in a separate Julia process. The root object's
-type must belong to a package the worker can load. `workers=0` keeps execution
-in the requesting process. Queueing changes where work runs; it does not add
-context to cache keys.
+Use `DynamicObjects.configure_queue!(; workers=2, max_running=2)` to run two
+independently submitted `@queued` computations concurrently. For example,
+while a fit runs on one process, a figure from the same root can use the idle
+process. A nested read in the fit runs on the fit's process. Each process
+keeps its own memory cache. Disk-backed results are available to both.
+
+The queue counts requests from assignment through completion, including time
+spent starting a process or loading packages. When workers have equal loads,
+the queue prefers one that recently used the root. The root type must belong to
+a package each worker can load. `workers=1` uses one child and `workers=0`
+runs admitted work in the requester.
+
+In a pool, `DynamicObjects.worker_status().processes` lists each process's PID
+and outstanding request count. Pass the observed PID to
+`DynamicObjects.restart_worker!(; pid)` to replace that process. The other
+processes continue their work. Surplus processes retire after five minutes idle
+by default. An open compute scope keeps the processes it used until it closes.
 
 The configuration reference contains the complete `worker_start` and
 `worker_preload` contract, including eager and lazy startup, restart behavior,

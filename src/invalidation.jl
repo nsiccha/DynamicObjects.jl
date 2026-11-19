@@ -145,12 +145,13 @@ recomputes.
 """
 function sync!(o)
     (_TRACKED_IN_USE[] && _is_dynamic_object(o)) || return Symbol[]
-    forward = _invalidation_address(o)
-    dropped = lock(_SYNC_LOCK) do
-        copy(first(_sync!(o, IdDict{Any,Any}())))
+    _with_worker_invalidation(o) do address
+        dropped = lock(_SYNC_LOCK) do
+            copy(first(_sync!(o, IdDict{Any,Any}())))
+        end
+        isempty(dropped) || _forward_invalidation(address, :sync!)
+        dropped
     end
-    isempty(dropped) || _forward_invalidation(forward, :sync!)
-    dropped
 end
 
 const _SYNC_BACKREFS = (:__parent__, :__self__)

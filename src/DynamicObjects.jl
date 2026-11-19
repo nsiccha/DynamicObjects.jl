@@ -103,24 +103,31 @@ load(fmt::Val, path::AbstractString, ::Any) = error("no `load` method for format
 save(::Val{:serial}, path::AbstractString, x) = Serialization.serialize(path, x)
 load(::Val{:serial}, path::AbstractString, ::Any) = Serialization.deserialize(path)
 
-# Every disk-cache write goes through `_atomic_save`: the format payload is
-# written to a unique sibling temp file, then `mv(...; force=true)` renames it
-# over `path`. `tempname(dirname(path))` is guaranteed same-filesystem, so the
-# `mv` is a `rename(2)` — atomic. Consequences: a reader (`get_cache_status` /
-# `load`) never observes a half-written file (it sees either the prior complete
-# file or the new one), a crash mid-`save` leaves the old cache intact instead
-# of a truncated one, and an in-flight READONLY `@mmap` mapping keeps the old
-# inode alive until unmapped (a plain in-place overwrite would corrupt it).
-function _atomic_save(fmt::Val, path::AbstractString, x)
+# Serialize to a sibling file, then atomically replace the destination. Julia's
+# mv(force=true) first unlinks the destination, which a reader in another worker can see.
+function _atomic_save(fmt::Val, path::AbstractString, x, guard=nothing)
     tmp = tempname(dirname(path); cleanup=false)
     try
-        r = save(fmt, tmp, x)
-        mv(tmp, path; force=true)
-        r
-    catch
+        save(fmt, tmp, x)
+        if guard === nothing
+            _replace_cache_file(tmp, path)
+        else
+            # Retraction and publication share the latch lock only for the rename.
+            # An invalidated writer discards its own temp, never a sibling's new value.
+            lock(guard.cache.lock) do
+                _publishable(guard) || return false
+                _replace_cache_file(tmp, path)
+            end
+        end
+    finally
         rm(tmp; force=true)
-        rethrow()
     end
+end
+
+function _replace_cache_file(tmp, path)
+    err = ccall(:jl_fs_rename, Int32, (Cstring, Cstring), tmp, path)
+    err < 0 && Base.uv_error("renaming cache file to $path", err)
+    true
 end
 
 # --- `Val{:mmap}` format (D2-v2, D3, layout) ---
@@ -2208,14 +2215,16 @@ This holds wherever the invalidation is issued from, including the body of a
 computation of the same object.
 """
 function invalidate!(ip::IndexableProperty, indices...; kwargs...)
-    key = _memo_key(indices, (;kwargs...))
-    traced = _trace_scope() !== nothing
-    held = traced && haskey(ip.cache, key)
-    maybepop!(ip.cache, key)
-    on_disk = _remove_disk_entry!(ip.o, name(ip), indices...; kwargs...)
-    traced && _trace_invalidation!(:invalidate!, ip.o, held || on_disk ? (name(ip),) : (), _plain_key(key))
-    _forward_entry_invalidation(ip.o, name(ip), indices, (; kwargs...))
-    nothing
+    _with_worker_invalidation(ip.o) do address
+        key = _memo_key(indices, (;kwargs...))
+        traced = _trace_scope() !== nothing
+        held = traced && haskey(ip.cache, key)
+        maybepop!(ip.cache, key)
+        on_disk = _remove_disk_entry!(ip.o, name(ip), indices...; kwargs...)
+        traced && _trace_invalidation!(:invalidate!, ip.o, held || on_disk ? (name(ip),) : (), _plain_key(key))
+        _forward_entry_invalidation(address, name(ip), indices, (; kwargs...))
+        nothing
+    end
 end
 
 # Remove one entry's disk payload (explicit `@cached`/`@mmap` or automatic) and
@@ -2223,9 +2232,9 @@ end
 function _remove_disk_entry!(o, name::Symbol, indices...; kwargs...)
     path = get_cache_path(o, name, indices...; kwargs...)
     removed = isfile(path)
-    removed && rm(path)
+    removed && rm(path; force=true)
     metadata_path = _automatic_materialization_path(path)
-    isfile(metadata_path) && rm(metadata_path)
+    rm(metadata_path; force=true)
     removed
 end
 
@@ -2999,7 +3008,13 @@ entry. The progress root is also dropped unless supplied as a constructor input.
 Inside a computation, prefer a narrower property clear or `sync!`.
 """
 function clear_mem_caches!(obj)
-    forward = _invalidation_address(obj)   # while `obj`'s parent still holds it
+    _with_worker_invalidation(obj) do address
+        _clear_mem_caches_local!(obj)
+        _forward_invalidation(address, :clear_mem_caches!)
+    end
+end
+
+function _clear_mem_caches_local!(obj)
     pc = getfield(obj, :cache)
     c = pc.cache
     state = _state_names(typeof(obj))
@@ -3048,7 +3063,6 @@ function clear_mem_caches!(obj)
     _restore_seeds!(pc)
     isempty(dropped) || _object_cleared!(obj, unique!(dropped))
     held === nothing || _trace_invalidation!(:clear_mem_caches!, obj, _trace_cleared(held, c, state))
-    _forward_invalidation(forward, :clear_mem_caches!)
     nothing
 end
 
@@ -3273,21 +3287,10 @@ function _record_accessed_key(o, name::Symbol, indices, kwargs)
     nothing
 end
 
-# Publish a computed disk entry unless an invalidation retracted the computation (`guard`):
-# not before the save, and if one lands during it, the entry is removed again — invalidations
-# retract the latch before removing disk entries, so either side sees the other. Returns
-# whether the entry stands; if not, the caller keeps the computed value itself.
-function _save_if_publishable!(guard, fmt::Val, path::AbstractString, value)
-    if !_publishable(guard)
-        # The non-strict flow's empty placeholder would read as an interrupted write.
-        get_cache_status(path) === :started && rm(path; force=true)
-        return false
-    end
-    _atomic_save(fmt, path, value)
-    _publishable(guard) && return true
-    rm(path; force=true)
-    false
-end
+# Skip serialization if the computation has already been retracted. The final check
+# inside _atomic_save also covers invalidation during serialization.
+_save_if_publishable!(guard, fmt::Val, path::AbstractString, value) =
+    _publishable(guard) && _atomic_save(fmt, path, value, guard)
 
 # Every computation of a property goes through here: memoized, fresh, or loaded from disk.
 # Under an active compute trace it runs as a traced computation (`_traced_compute`); a
@@ -4548,10 +4551,11 @@ With indices or kwargs it drops exactly that one entry, as
 clear_cache!(o, name::Symbol; kwargs...) =
     isempty(kwargs) ? _clear_property!(o, name) : _clear_cache_entry!(o, name; kwargs...)
 function _clear_property!(o, name::Symbol)
-    forward = _invalidation_address(o)
-    names = _invalidate_property!(o, name)
-    _forward_invalidation(forward, :clear_cache!, name)
-    names
+    _with_worker_invalidation(o) do address
+        names = _invalidate_property!(o, name)
+        _forward_invalidation(address, :clear_cache!, name)
+        names
+    end
 end
 clear_cache!(o, name::Symbol, index, indices...; kwargs...) =
     _clear_cache_entry!(o, name, index, indices...; kwargs...)
@@ -4563,9 +4567,11 @@ function _clear_cache_entry!(o, name::Symbol, indices...; kwargs...)
     if v isa IndexableProperty
         invalidate!(v, indices...; kwargs...)
     else
-        on_disk = _remove_disk_entry!(o, name, indices...; kwargs...)
-        _trace_invalidation!(:invalidate!, o, on_disk ? (name,) : (), (indices, (;kwargs...)))
-        _forward_entry_invalidation(o, name, indices, (; kwargs...))
+        _with_worker_invalidation(o) do address
+            on_disk = _remove_disk_entry!(o, name, indices...; kwargs...)
+            _trace_invalidation!(:invalidate!, o, on_disk ? (name,) : (), (indices, (;kwargs...)))
+            _forward_entry_invalidation(address, name, indices, (; kwargs...))
+        end
     end
     nothing
 end
