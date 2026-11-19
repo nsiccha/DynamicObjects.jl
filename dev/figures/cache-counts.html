@@ -261,6 +261,9 @@
     _tipThemes: {},
     _tipStyle: null,
     _cellTips: {},
+    // vega-embed's tooltip handler per tooltip option, for a plot whose
+    // tooltips name each facet panel's own axis title (_panelTooltip).
+    _tipHandlers: {},
     // Keyed highlights (AoV.highlight): each plot's match test and the
     // revision its view's `aov_highlight` signal shows. Hovers: the mark
     // under the pointer, and the key it announced to its link group.
@@ -1371,7 +1374,17 @@
             // Host theme, read now: a theme change re-runs this embed.
             var embedOpts = self._withFrame(id, self._themedOpts(id, s, opts), plan);
             var fonts = self._fontsPending((s.config && s.config.font) || (embedOpts.config && embedOpts.config.font));
-            return fonts ? fonts.then(function() { return render(s, embedOpts); }) : render(s, embedOpts);
+            // Per-panel axis titles (src/panel_labels.jl): the tooltip names
+            // each panel's title, through a handler vega-embed installs
+            // before the view first draws (setting one later resets the
+            // renderer). Other plots embed as before, in the same tick.
+            var labels = self._panelLabelsOf(s);
+            var draw = !labels ? function() { return render(s, embedOpts); } : function() {
+                return self._tooltipHandler(embedOpts.tooltip).then(function(base) {
+                    return render(s, base ? Object.assign({}, embedOpts, {tooltip: self._panelTooltip(base, labels)}) : embedOpts);
+                });
+            };
+            return fonts ? fonts.then(draw) : draw();
         };
         var render = function(s, embedOpts) {
             // Superseded while its font loaded.
@@ -3582,6 +3595,116 @@
         }
         return this._cellTips[theme];
     },
+    // The handler vega-embed installs for tooltip option `t` (a theme's
+    // options, the default `undefined`, or an app's own handler), obtained as
+    // _cellTooltip does; null when `t` turns tooltips off.
+    _tooltipHandler: function(t) {
+        if (t === false) return Promise.resolve(null);
+        if (typeof t === 'function') return Promise.resolve(t);
+        var opts = t && typeof t === 'object' ? t : {}, key = JSON.stringify(opts);
+        if (!this._tipHandlers[key]) {
+            this._tipHandlers[key] = vegaEmbed(document.createElement('div'), {},
+                    {mode: 'vega', renderer: 'none', actions: false, tooltip: opts})
+                .then(function(r) { var handler = r.view.tooltip(); r.finalize(); return handler; })
+                .catch(function(err) { console.error('AoV: tooltips do not name each panel\'s axis title:', err); return null; });
+        }
+        return this._tipHandlers[key];
+    },
+    // Per-panel axis titles (`config(facet=(; ylabels, xlabels))`,
+    // src/panel_labels.jl): `_aov.panelLabels` maps a channel to the column
+    // whose value titles each panel's axis, the facet fields the panels were
+    // written for, the axis titles they replace and the fields they title.
+    _panelLabelsOf: function(spec) {
+        var labels = spec && spec._aov && spec._aov.panelLabels;
+        return labels && typeof labels === 'object' && Object.keys(labels).length ? labels : null;
+    },
+    // A row's panel title on channel record `L`, or `fallback` where the row
+    // has none.
+    _panelTitle: function(L, d, fallback) {
+        var t = L && d ? d[L.field] : undefined;
+        return t === null || t === undefined || t !== t || t === '' ? fallback : String(t);
+    },
+    // The tooltip of a hovered item, its rows named by the item's panel
+    // title in place of the axis title they were written with: the estimate
+    // row `Level (cm): median (95% interval)` reads `Cmax (ng/mL): median
+    // (95% interval)`, a value row `Level (cm)` reads `Cmax (ng/mL)`. A
+    // Vega-Lite tooltip's row titles are fixed text, and a Vega expression
+    // cannot build an object key, so the rows are renamed here.
+    _panelTooltip: function(base, labels) {
+        var self = this;
+        return function(handler, event, item, value) {
+            return base.call(this, handler, event, item, self._panelTooltipValue(labels, item, value));
+        };
+    },
+    _panelTooltipValue: function(labels, item, value) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+        var self = this, d = item && item.datum, renames = [];
+        Object.keys(labels).forEach(function(ch) {
+            var L = labels[ch], t = self._panelTitle(L, d, null);
+            if (t !== null) (L.titles || []).forEach(function(from) { if (from) renames.push([String(from), t]); });
+        });
+        if (!renames.length) return value;
+        var out = {};
+        Object.keys(value).forEach(function(k) {
+            var nk = k;
+            for (var i = 0; i < renames.length; i++) {
+                var from = renames[i][0], to = renames[i][1];
+                if (k === from) { nk = to; break; }
+                if (k.indexOf(from + ': ') === 0) { nk = to + k.slice(from.length); break; }
+            }
+            // A row whose new name another row already has keeps its own.
+            if (nk !== k && (nk in value || nk in out)) nk = k;
+            out[nk] = value[k];
+        });
+        return out;
+    },
+    // After a picker remap: per-panel titles hold while their panels are the
+    // ones they were written for (their facet fields are still facets) and the
+    // axis still shows a field they were written for. Otherwise the axes read
+    // their mapping's title again, and tooltips and the readout no longer
+    // rename: an unfaceted plot has no panel, and another field's axis is not
+    // the quantity the label column names.
+    _fitPanelLabels: function(spec) {
+        var labels = this._panelLabelsOf(spec);
+        if (!labels) return spec;
+        var self = this, facets = self._specFacetFields(spec);
+        Object.keys(labels).forEach(function(ch) {
+            var L = labels[ch], titled = [];
+            self._eachEncoding(spec, ch, function(e) {
+                if (e.axis && e.axis.title && typeof e.axis.title === 'object' && e.axis.title.expr !== undefined) titled.push(e);
+            });
+            var keep = (L.facet || []).every(function(f) { return facets.indexOf(f) !== -1; }) &&
+                titled.every(function(e) { return (L.fields || []).indexOf(e.field) !== -1; });
+            if (keep) return;
+            titled.forEach(function(e) { delete e.axis.title; });
+            delete labels[ch];
+        });
+        if (!Object.keys(labels).length) delete spec._aov.panelLabels;
+        return spec;
+    },
+    // The facet fields of a spec: its facet operator's or facet encodings',
+    // and each per-column-Y child's.
+    _specFacetFields: function(spec) {
+        var out = [];
+        var push = function(d) { if (d && typeof d === 'object' && d.field !== undefined) out.push(String(d.field)); };
+        (function view(v) {
+            if (!v || typeof v !== 'object') return;
+            if (v.facet) { push(v.facet); push(v.facet.row); push(v.facet.column); }
+            else if (v.encoding) { push(v.encoding.facet); push(v.encoding.row); push(v.encoding.column); }
+            (v.hconcat || []).forEach(view);
+        })(spec);
+        return out;
+    },
+    // Call f(encoding) on every `ch` encoding of a spec's units.
+    _eachEncoding: function(node, ch, f) {
+        var self = this;
+        if (!node || typeof node !== 'object') return;
+        if (node.encoding && node.encoding[ch] && typeof node.encoding[ch] === 'object') f(node.encoding[ch]);
+        ['layer', 'hconcat', 'vconcat', 'concat'].forEach(function(k) {
+            if (Array.isArray(node[k])) node[k].forEach(function(n) { self._eachEncoding(n, ch, f); });
+        });
+        if (node.spec) self._eachEncoding(node.spec, ch, f);
+    },
     _cellView: function(col, colId, el, key, plan, tooltip) {
         var self = this;
         if (!el.isConnected) return;
@@ -4439,7 +4562,8 @@
         var faceted = !!(spec.facet || spec.spec || top.column || top.row || top.facet);
         var layered = Array.isArray(inner.layer), units = layered ? inner.layer : [inner];
         var prefix = (namePrefix || '') + (faceted ? 'child_' : ''), dodge = aov.dodgeX;
-        var plan = {units: {}, order: [], x: null, xType: null, xTitle: null, faceted: faceted, series: null};
+        var plan = {units: {}, order: [], x: null, xType: null, xTitle: null, faceted: faceted, series: null,
+            panel: this._panelLabelsOf(spec)};
         var paths = false;
         units.forEach(function(u, i) {
             if (!u || u.layer) return;
@@ -4647,16 +4771,19 @@
     // entry per panel and series, panel by panel from the top: a name shared
     // by two panels (a scenario in each) is two series of two quantities.
     _readoutEntries: function(view, plan, at) {
-        var series = {}, list = [], stacked = !!plan.stacked;
+        var self = this, series = {}, list = [], stacked = !!plan.stacked;
         at.forEach(function(c) {
             var u = c.unit, d = c.datum, field = stacked ? u.series : plan.series;
+            // A panel with its own axis title (`config(facet=(; ylabels))`)
+            // names its uncoloured series by it.
+            var title = self._panelTitle(plan.panel && plan.panel.y, d, u.title);
             var name = u.color ? d[u.color] : u.label !== null ? u.label :
-                (field && d[field] !== undefined ? d[field] : u.title);
+                (field && d[field] !== undefined ? d[field] : title);
             name = String(name);
             var key = stacked ? u.panel + '\u0000' + name : name;
             var s = series[key];
             if (!s) {
-                s = series[key] = {name: name, panel: stacked ? u.panel : null, coloured: name !== String(u.title),
+                s = series[key] = {name: name, panel: stacked ? u.panel : null, coloured: name !== String(title),
                     first: u.index, colour: null, units: {}};
                 list.push(s);
             }
@@ -4714,7 +4841,7 @@
     // date (Vega reads a Julia Date as UTC midnight), else a time as
     // `2026-03-15 17:00` in the local time Vega read it in; a number with
     // the x axis title.
-    _readoutHeading: function(view, plan, v, dateOnly) {
+    _readoutHeading: function(view, plan, v, dateOnly, datum) {
         var loc = view.locale ? view.locale() : null;
         if (loc && !loc.format) loc = null;
         if (plan.xType === 'temporal') {
@@ -4723,7 +4850,7 @@
             var spec = d.getSeconds() ? '%Y-%m-%d %H:%M:%S' : '%Y-%m-%d %H:%M';
             return loc ? loc.timeFormat(spec)(d) : d.toString();
         }
-        return plan.xTitle + ': ' + (loc ? loc.format('.4~r')(v) : String(v));
+        return this._panelTitle(plan.panel && plan.panel.x, datum, plan.xTitle) + ': ' + (loc ? loc.format('.4~r')(v) : String(v));
     },
     _readoutShow: function(id, view, f, scope, at, all, fromPointer) {
         var self = this, st = self._readouts[id], el = self._els[id];
@@ -4756,7 +4883,7 @@
         var link = self._link(id), DAY = 86400000;
         var dateOnly = link && link.key === st.plan.x && link.temporal ? link.temporal === 'date' :
             all.every(function(c) { return c.value % DAY === 0; });
-        head.textContent = self._readoutHeading(view, st.plan, at[0].value, dateOnly);
+        head.textContent = self._readoutHeading(view, st.plan, at[0].value, dateOnly, at[0].datum);
         box.appendChild(head);
         // A stack's panels, top to bottom: a panel's rows sit indented under
         // its y title, unless that title already names every row (one
@@ -6094,7 +6221,7 @@
             // Re-broadcast cross-source layers after row mutations
             this._broadcastCrossSource(spec);
 
-            return spec;
+            return this._fitPanelLabels(spec);
         }
 
         // Find layers in either simple or faceted structure
@@ -6511,7 +6638,7 @@
         // (color mutations need no broadcast — see _broadcastCrossSource).
         this._broadcastCrossSource(spec);
 
-        return spec;
+        return this._fitPanelLabels(spec);
     }
 };
 </script>
@@ -6770,6 +6897,9 @@
     _tipThemes: {},
     _tipStyle: null,
     _cellTips: {},
+    // vega-embed's tooltip handler per tooltip option, for a plot whose
+    // tooltips name each facet panel's own axis title (_panelTooltip).
+    _tipHandlers: {},
     // Keyed highlights (AoV.highlight): each plot's match test and the
     // revision its view's `aov_highlight` signal shows. Hovers: the mark
     // under the pointer, and the key it announced to its link group.
@@ -7880,7 +8010,17 @@
             // Host theme, read now: a theme change re-runs this embed.
             var embedOpts = self._withFrame(id, self._themedOpts(id, s, opts), plan);
             var fonts = self._fontsPending((s.config && s.config.font) || (embedOpts.config && embedOpts.config.font));
-            return fonts ? fonts.then(function() { return render(s, embedOpts); }) : render(s, embedOpts);
+            // Per-panel axis titles (src/panel_labels.jl): the tooltip names
+            // each panel's title, through a handler vega-embed installs
+            // before the view first draws (setting one later resets the
+            // renderer). Other plots embed as before, in the same tick.
+            var labels = self._panelLabelsOf(s);
+            var draw = !labels ? function() { return render(s, embedOpts); } : function() {
+                return self._tooltipHandler(embedOpts.tooltip).then(function(base) {
+                    return render(s, base ? Object.assign({}, embedOpts, {tooltip: self._panelTooltip(base, labels)}) : embedOpts);
+                });
+            };
+            return fonts ? fonts.then(draw) : draw();
         };
         var render = function(s, embedOpts) {
             // Superseded while its font loaded.
@@ -10091,6 +10231,116 @@
         }
         return this._cellTips[theme];
     },
+    // The handler vega-embed installs for tooltip option `t` (a theme's
+    // options, the default `undefined`, or an app's own handler), obtained as
+    // _cellTooltip does; null when `t` turns tooltips off.
+    _tooltipHandler: function(t) {
+        if (t === false) return Promise.resolve(null);
+        if (typeof t === 'function') return Promise.resolve(t);
+        var opts = t && typeof t === 'object' ? t : {}, key = JSON.stringify(opts);
+        if (!this._tipHandlers[key]) {
+            this._tipHandlers[key] = vegaEmbed(document.createElement('div'), {},
+                    {mode: 'vega', renderer: 'none', actions: false, tooltip: opts})
+                .then(function(r) { var handler = r.view.tooltip(); r.finalize(); return handler; })
+                .catch(function(err) { console.error('AoV: tooltips do not name each panel\'s axis title:', err); return null; });
+        }
+        return this._tipHandlers[key];
+    },
+    // Per-panel axis titles (`config(facet=(; ylabels, xlabels))`,
+    // src/panel_labels.jl): `_aov.panelLabels` maps a channel to the column
+    // whose value titles each panel's axis, the facet fields the panels were
+    // written for, the axis titles they replace and the fields they title.
+    _panelLabelsOf: function(spec) {
+        var labels = spec && spec._aov && spec._aov.panelLabels;
+        return labels && typeof labels === 'object' && Object.keys(labels).length ? labels : null;
+    },
+    // A row's panel title on channel record `L`, or `fallback` where the row
+    // has none.
+    _panelTitle: function(L, d, fallback) {
+        var t = L && d ? d[L.field] : undefined;
+        return t === null || t === undefined || t !== t || t === '' ? fallback : String(t);
+    },
+    // The tooltip of a hovered item, its rows named by the item's panel
+    // title in place of the axis title they were written with: the estimate
+    // row `Level (cm): median (95% interval)` reads `Cmax (ng/mL): median
+    // (95% interval)`, a value row `Level (cm)` reads `Cmax (ng/mL)`. A
+    // Vega-Lite tooltip's row titles are fixed text, and a Vega expression
+    // cannot build an object key, so the rows are renamed here.
+    _panelTooltip: function(base, labels) {
+        var self = this;
+        return function(handler, event, item, value) {
+            return base.call(this, handler, event, item, self._panelTooltipValue(labels, item, value));
+        };
+    },
+    _panelTooltipValue: function(labels, item, value) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+        var self = this, d = item && item.datum, renames = [];
+        Object.keys(labels).forEach(function(ch) {
+            var L = labels[ch], t = self._panelTitle(L, d, null);
+            if (t !== null) (L.titles || []).forEach(function(from) { if (from) renames.push([String(from), t]); });
+        });
+        if (!renames.length) return value;
+        var out = {};
+        Object.keys(value).forEach(function(k) {
+            var nk = k;
+            for (var i = 0; i < renames.length; i++) {
+                var from = renames[i][0], to = renames[i][1];
+                if (k === from) { nk = to; break; }
+                if (k.indexOf(from + ': ') === 0) { nk = to + k.slice(from.length); break; }
+            }
+            // A row whose new name another row already has keeps its own.
+            if (nk !== k && (nk in value || nk in out)) nk = k;
+            out[nk] = value[k];
+        });
+        return out;
+    },
+    // After a picker remap: per-panel titles hold while their panels are the
+    // ones they were written for (their facet fields are still facets) and the
+    // axis still shows a field they were written for. Otherwise the axes read
+    // their mapping's title again, and tooltips and the readout no longer
+    // rename: an unfaceted plot has no panel, and another field's axis is not
+    // the quantity the label column names.
+    _fitPanelLabels: function(spec) {
+        var labels = this._panelLabelsOf(spec);
+        if (!labels) return spec;
+        var self = this, facets = self._specFacetFields(spec);
+        Object.keys(labels).forEach(function(ch) {
+            var L = labels[ch], titled = [];
+            self._eachEncoding(spec, ch, function(e) {
+                if (e.axis && e.axis.title && typeof e.axis.title === 'object' && e.axis.title.expr !== undefined) titled.push(e);
+            });
+            var keep = (L.facet || []).every(function(f) { return facets.indexOf(f) !== -1; }) &&
+                titled.every(function(e) { return (L.fields || []).indexOf(e.field) !== -1; });
+            if (keep) return;
+            titled.forEach(function(e) { delete e.axis.title; });
+            delete labels[ch];
+        });
+        if (!Object.keys(labels).length) delete spec._aov.panelLabels;
+        return spec;
+    },
+    // The facet fields of a spec: its facet operator's or facet encodings',
+    // and each per-column-Y child's.
+    _specFacetFields: function(spec) {
+        var out = [];
+        var push = function(d) { if (d && typeof d === 'object' && d.field !== undefined) out.push(String(d.field)); };
+        (function view(v) {
+            if (!v || typeof v !== 'object') return;
+            if (v.facet) { push(v.facet); push(v.facet.row); push(v.facet.column); }
+            else if (v.encoding) { push(v.encoding.facet); push(v.encoding.row); push(v.encoding.column); }
+            (v.hconcat || []).forEach(view);
+        })(spec);
+        return out;
+    },
+    // Call f(encoding) on every `ch` encoding of a spec's units.
+    _eachEncoding: function(node, ch, f) {
+        var self = this;
+        if (!node || typeof node !== 'object') return;
+        if (node.encoding && node.encoding[ch] && typeof node.encoding[ch] === 'object') f(node.encoding[ch]);
+        ['layer', 'hconcat', 'vconcat', 'concat'].forEach(function(k) {
+            if (Array.isArray(node[k])) node[k].forEach(function(n) { self._eachEncoding(n, ch, f); });
+        });
+        if (node.spec) self._eachEncoding(node.spec, ch, f);
+    },
     _cellView: function(col, colId, el, key, plan, tooltip) {
         var self = this;
         if (!el.isConnected) return;
@@ -10948,7 +11198,8 @@
         var faceted = !!(spec.facet || spec.spec || top.column || top.row || top.facet);
         var layered = Array.isArray(inner.layer), units = layered ? inner.layer : [inner];
         var prefix = (namePrefix || '') + (faceted ? 'child_' : ''), dodge = aov.dodgeX;
-        var plan = {units: {}, order: [], x: null, xType: null, xTitle: null, faceted: faceted, series: null};
+        var plan = {units: {}, order: [], x: null, xType: null, xTitle: null, faceted: faceted, series: null,
+            panel: this._panelLabelsOf(spec)};
         var paths = false;
         units.forEach(function(u, i) {
             if (!u || u.layer) return;
@@ -11156,16 +11407,19 @@
     // entry per panel and series, panel by panel from the top: a name shared
     // by two panels (a scenario in each) is two series of two quantities.
     _readoutEntries: function(view, plan, at) {
-        var series = {}, list = [], stacked = !!plan.stacked;
+        var self = this, series = {}, list = [], stacked = !!plan.stacked;
         at.forEach(function(c) {
             var u = c.unit, d = c.datum, field = stacked ? u.series : plan.series;
+            // A panel with its own axis title (`config(facet=(; ylabels))`)
+            // names its uncoloured series by it.
+            var title = self._panelTitle(plan.panel && plan.panel.y, d, u.title);
             var name = u.color ? d[u.color] : u.label !== null ? u.label :
-                (field && d[field] !== undefined ? d[field] : u.title);
+                (field && d[field] !== undefined ? d[field] : title);
             name = String(name);
             var key = stacked ? u.panel + '\u0000' + name : name;
             var s = series[key];
             if (!s) {
-                s = series[key] = {name: name, panel: stacked ? u.panel : null, coloured: name !== String(u.title),
+                s = series[key] = {name: name, panel: stacked ? u.panel : null, coloured: name !== String(title),
                     first: u.index, colour: null, units: {}};
                 list.push(s);
             }
@@ -11223,7 +11477,7 @@
     // date (Vega reads a Julia Date as UTC midnight), else a time as
     // `2026-03-15 17:00` in the local time Vega read it in; a number with
     // the x axis title.
-    _readoutHeading: function(view, plan, v, dateOnly) {
+    _readoutHeading: function(view, plan, v, dateOnly, datum) {
         var loc = view.locale ? view.locale() : null;
         if (loc && !loc.format) loc = null;
         if (plan.xType === 'temporal') {
@@ -11232,7 +11486,7 @@
             var spec = d.getSeconds() ? '%Y-%m-%d %H:%M:%S' : '%Y-%m-%d %H:%M';
             return loc ? loc.timeFormat(spec)(d) : d.toString();
         }
-        return plan.xTitle + ': ' + (loc ? loc.format('.4~r')(v) : String(v));
+        return this._panelTitle(plan.panel && plan.panel.x, datum, plan.xTitle) + ': ' + (loc ? loc.format('.4~r')(v) : String(v));
     },
     _readoutShow: function(id, view, f, scope, at, all, fromPointer) {
         var self = this, st = self._readouts[id], el = self._els[id];
@@ -11265,7 +11519,7 @@
         var link = self._link(id), DAY = 86400000;
         var dateOnly = link && link.key === st.plan.x && link.temporal ? link.temporal === 'date' :
             all.every(function(c) { return c.value % DAY === 0; });
-        head.textContent = self._readoutHeading(view, st.plan, at[0].value, dateOnly);
+        head.textContent = self._readoutHeading(view, st.plan, at[0].value, dateOnly, at[0].datum);
         box.appendChild(head);
         // A stack's panels, top to bottom: a panel's rows sit indented under
         // its y title, unless that title already names every row (one
@@ -12603,7 +12857,7 @@
             // Re-broadcast cross-source layers after row mutations
             this._broadcastCrossSource(spec);
 
-            return spec;
+            return this._fitPanelLabels(spec);
         }
 
         // Find layers in either simple or faceted structure
@@ -13020,7 +13274,7 @@
         // (color mutations need no broadcast — see _broadcastCrossSource).
         this._broadcastCrossSource(spec);
 
-        return spec;
+        return this._fitPanelLabels(spec);
     }
 };
 </script>
@@ -13279,6 +13533,9 @@
     _tipThemes: {},
     _tipStyle: null,
     _cellTips: {},
+    // vega-embed's tooltip handler per tooltip option, for a plot whose
+    // tooltips name each facet panel's own axis title (_panelTooltip).
+    _tipHandlers: {},
     // Keyed highlights (AoV.highlight): each plot's match test and the
     // revision its view's `aov_highlight` signal shows. Hovers: the mark
     // under the pointer, and the key it announced to its link group.
@@ -14389,7 +14646,17 @@
             // Host theme, read now: a theme change re-runs this embed.
             var embedOpts = self._withFrame(id, self._themedOpts(id, s, opts), plan);
             var fonts = self._fontsPending((s.config && s.config.font) || (embedOpts.config && embedOpts.config.font));
-            return fonts ? fonts.then(function() { return render(s, embedOpts); }) : render(s, embedOpts);
+            // Per-panel axis titles (src/panel_labels.jl): the tooltip names
+            // each panel's title, through a handler vega-embed installs
+            // before the view first draws (setting one later resets the
+            // renderer). Other plots embed as before, in the same tick.
+            var labels = self._panelLabelsOf(s);
+            var draw = !labels ? function() { return render(s, embedOpts); } : function() {
+                return self._tooltipHandler(embedOpts.tooltip).then(function(base) {
+                    return render(s, base ? Object.assign({}, embedOpts, {tooltip: self._panelTooltip(base, labels)}) : embedOpts);
+                });
+            };
+            return fonts ? fonts.then(draw) : draw();
         };
         var render = function(s, embedOpts) {
             // Superseded while its font loaded.
@@ -16600,6 +16867,116 @@
         }
         return this._cellTips[theme];
     },
+    // The handler vega-embed installs for tooltip option `t` (a theme's
+    // options, the default `undefined`, or an app's own handler), obtained as
+    // _cellTooltip does; null when `t` turns tooltips off.
+    _tooltipHandler: function(t) {
+        if (t === false) return Promise.resolve(null);
+        if (typeof t === 'function') return Promise.resolve(t);
+        var opts = t && typeof t === 'object' ? t : {}, key = JSON.stringify(opts);
+        if (!this._tipHandlers[key]) {
+            this._tipHandlers[key] = vegaEmbed(document.createElement('div'), {},
+                    {mode: 'vega', renderer: 'none', actions: false, tooltip: opts})
+                .then(function(r) { var handler = r.view.tooltip(); r.finalize(); return handler; })
+                .catch(function(err) { console.error('AoV: tooltips do not name each panel\'s axis title:', err); return null; });
+        }
+        return this._tipHandlers[key];
+    },
+    // Per-panel axis titles (`config(facet=(; ylabels, xlabels))`,
+    // src/panel_labels.jl): `_aov.panelLabels` maps a channel to the column
+    // whose value titles each panel's axis, the facet fields the panels were
+    // written for, the axis titles they replace and the fields they title.
+    _panelLabelsOf: function(spec) {
+        var labels = spec && spec._aov && spec._aov.panelLabels;
+        return labels && typeof labels === 'object' && Object.keys(labels).length ? labels : null;
+    },
+    // A row's panel title on channel record `L`, or `fallback` where the row
+    // has none.
+    _panelTitle: function(L, d, fallback) {
+        var t = L && d ? d[L.field] : undefined;
+        return t === null || t === undefined || t !== t || t === '' ? fallback : String(t);
+    },
+    // The tooltip of a hovered item, its rows named by the item's panel
+    // title in place of the axis title they were written with: the estimate
+    // row `Level (cm): median (95% interval)` reads `Cmax (ng/mL): median
+    // (95% interval)`, a value row `Level (cm)` reads `Cmax (ng/mL)`. A
+    // Vega-Lite tooltip's row titles are fixed text, and a Vega expression
+    // cannot build an object key, so the rows are renamed here.
+    _panelTooltip: function(base, labels) {
+        var self = this;
+        return function(handler, event, item, value) {
+            return base.call(this, handler, event, item, self._panelTooltipValue(labels, item, value));
+        };
+    },
+    _panelTooltipValue: function(labels, item, value) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+        var self = this, d = item && item.datum, renames = [];
+        Object.keys(labels).forEach(function(ch) {
+            var L = labels[ch], t = self._panelTitle(L, d, null);
+            if (t !== null) (L.titles || []).forEach(function(from) { if (from) renames.push([String(from), t]); });
+        });
+        if (!renames.length) return value;
+        var out = {};
+        Object.keys(value).forEach(function(k) {
+            var nk = k;
+            for (var i = 0; i < renames.length; i++) {
+                var from = renames[i][0], to = renames[i][1];
+                if (k === from) { nk = to; break; }
+                if (k.indexOf(from + ': ') === 0) { nk = to + k.slice(from.length); break; }
+            }
+            // A row whose new name another row already has keeps its own.
+            if (nk !== k && (nk in value || nk in out)) nk = k;
+            out[nk] = value[k];
+        });
+        return out;
+    },
+    // After a picker remap: per-panel titles hold while their panels are the
+    // ones they were written for (their facet fields are still facets) and the
+    // axis still shows a field they were written for. Otherwise the axes read
+    // their mapping's title again, and tooltips and the readout no longer
+    // rename: an unfaceted plot has no panel, and another field's axis is not
+    // the quantity the label column names.
+    _fitPanelLabels: function(spec) {
+        var labels = this._panelLabelsOf(spec);
+        if (!labels) return spec;
+        var self = this, facets = self._specFacetFields(spec);
+        Object.keys(labels).forEach(function(ch) {
+            var L = labels[ch], titled = [];
+            self._eachEncoding(spec, ch, function(e) {
+                if (e.axis && e.axis.title && typeof e.axis.title === 'object' && e.axis.title.expr !== undefined) titled.push(e);
+            });
+            var keep = (L.facet || []).every(function(f) { return facets.indexOf(f) !== -1; }) &&
+                titled.every(function(e) { return (L.fields || []).indexOf(e.field) !== -1; });
+            if (keep) return;
+            titled.forEach(function(e) { delete e.axis.title; });
+            delete labels[ch];
+        });
+        if (!Object.keys(labels).length) delete spec._aov.panelLabels;
+        return spec;
+    },
+    // The facet fields of a spec: its facet operator's or facet encodings',
+    // and each per-column-Y child's.
+    _specFacetFields: function(spec) {
+        var out = [];
+        var push = function(d) { if (d && typeof d === 'object' && d.field !== undefined) out.push(String(d.field)); };
+        (function view(v) {
+            if (!v || typeof v !== 'object') return;
+            if (v.facet) { push(v.facet); push(v.facet.row); push(v.facet.column); }
+            else if (v.encoding) { push(v.encoding.facet); push(v.encoding.row); push(v.encoding.column); }
+            (v.hconcat || []).forEach(view);
+        })(spec);
+        return out;
+    },
+    // Call f(encoding) on every `ch` encoding of a spec's units.
+    _eachEncoding: function(node, ch, f) {
+        var self = this;
+        if (!node || typeof node !== 'object') return;
+        if (node.encoding && node.encoding[ch] && typeof node.encoding[ch] === 'object') f(node.encoding[ch]);
+        ['layer', 'hconcat', 'vconcat', 'concat'].forEach(function(k) {
+            if (Array.isArray(node[k])) node[k].forEach(function(n) { self._eachEncoding(n, ch, f); });
+        });
+        if (node.spec) self._eachEncoding(node.spec, ch, f);
+    },
     _cellView: function(col, colId, el, key, plan, tooltip) {
         var self = this;
         if (!el.isConnected) return;
@@ -17457,7 +17834,8 @@
         var faceted = !!(spec.facet || spec.spec || top.column || top.row || top.facet);
         var layered = Array.isArray(inner.layer), units = layered ? inner.layer : [inner];
         var prefix = (namePrefix || '') + (faceted ? 'child_' : ''), dodge = aov.dodgeX;
-        var plan = {units: {}, order: [], x: null, xType: null, xTitle: null, faceted: faceted, series: null};
+        var plan = {units: {}, order: [], x: null, xType: null, xTitle: null, faceted: faceted, series: null,
+            panel: this._panelLabelsOf(spec)};
         var paths = false;
         units.forEach(function(u, i) {
             if (!u || u.layer) return;
@@ -17665,16 +18043,19 @@
     // entry per panel and series, panel by panel from the top: a name shared
     // by two panels (a scenario in each) is two series of two quantities.
     _readoutEntries: function(view, plan, at) {
-        var series = {}, list = [], stacked = !!plan.stacked;
+        var self = this, series = {}, list = [], stacked = !!plan.stacked;
         at.forEach(function(c) {
             var u = c.unit, d = c.datum, field = stacked ? u.series : plan.series;
+            // A panel with its own axis title (`config(facet=(; ylabels))`)
+            // names its uncoloured series by it.
+            var title = self._panelTitle(plan.panel && plan.panel.y, d, u.title);
             var name = u.color ? d[u.color] : u.label !== null ? u.label :
-                (field && d[field] !== undefined ? d[field] : u.title);
+                (field && d[field] !== undefined ? d[field] : title);
             name = String(name);
             var key = stacked ? u.panel + '\u0000' + name : name;
             var s = series[key];
             if (!s) {
-                s = series[key] = {name: name, panel: stacked ? u.panel : null, coloured: name !== String(u.title),
+                s = series[key] = {name: name, panel: stacked ? u.panel : null, coloured: name !== String(title),
                     first: u.index, colour: null, units: {}};
                 list.push(s);
             }
@@ -17732,7 +18113,7 @@
     // date (Vega reads a Julia Date as UTC midnight), else a time as
     // `2026-03-15 17:00` in the local time Vega read it in; a number with
     // the x axis title.
-    _readoutHeading: function(view, plan, v, dateOnly) {
+    _readoutHeading: function(view, plan, v, dateOnly, datum) {
         var loc = view.locale ? view.locale() : null;
         if (loc && !loc.format) loc = null;
         if (plan.xType === 'temporal') {
@@ -17741,7 +18122,7 @@
             var spec = d.getSeconds() ? '%Y-%m-%d %H:%M:%S' : '%Y-%m-%d %H:%M';
             return loc ? loc.timeFormat(spec)(d) : d.toString();
         }
-        return plan.xTitle + ': ' + (loc ? loc.format('.4~r')(v) : String(v));
+        return this._panelTitle(plan.panel && plan.panel.x, datum, plan.xTitle) + ': ' + (loc ? loc.format('.4~r')(v) : String(v));
     },
     _readoutShow: function(id, view, f, scope, at, all, fromPointer) {
         var self = this, st = self._readouts[id], el = self._els[id];
@@ -17774,7 +18155,7 @@
         var link = self._link(id), DAY = 86400000;
         var dateOnly = link && link.key === st.plan.x && link.temporal ? link.temporal === 'date' :
             all.every(function(c) { return c.value % DAY === 0; });
-        head.textContent = self._readoutHeading(view, st.plan, at[0].value, dateOnly);
+        head.textContent = self._readoutHeading(view, st.plan, at[0].value, dateOnly, at[0].datum);
         box.appendChild(head);
         // A stack's panels, top to bottom: a panel's rows sit indented under
         // its y title, unless that title already names every row (one
@@ -19112,7 +19493,7 @@
             // Re-broadcast cross-source layers after row mutations
             this._broadcastCrossSource(spec);
 
-            return spec;
+            return this._fitPanelLabels(spec);
         }
 
         // Find layers in either simple or faceted structure
@@ -19529,7 +19910,7 @@
         // (color mutations need no broadcast — see _broadcastCrossSource).
         this._broadcastCrossSource(spec);
 
-        return spec;
+        return this._fitPanelLabels(spec);
     }
 };
 </script>
@@ -19793,6 +20174,9 @@
     _tipThemes: {},
     _tipStyle: null,
     _cellTips: {},
+    // vega-embed's tooltip handler per tooltip option, for a plot whose
+    // tooltips name each facet panel's own axis title (_panelTooltip).
+    _tipHandlers: {},
     // Keyed highlights (AoV.highlight): each plot's match test and the
     // revision its view's `aov_highlight` signal shows. Hovers: the mark
     // under the pointer, and the key it announced to its link group.
@@ -20903,7 +21287,17 @@
             // Host theme, read now: a theme change re-runs this embed.
             var embedOpts = self._withFrame(id, self._themedOpts(id, s, opts), plan);
             var fonts = self._fontsPending((s.config && s.config.font) || (embedOpts.config && embedOpts.config.font));
-            return fonts ? fonts.then(function() { return render(s, embedOpts); }) : render(s, embedOpts);
+            // Per-panel axis titles (src/panel_labels.jl): the tooltip names
+            // each panel's title, through a handler vega-embed installs
+            // before the view first draws (setting one later resets the
+            // renderer). Other plots embed as before, in the same tick.
+            var labels = self._panelLabelsOf(s);
+            var draw = !labels ? function() { return render(s, embedOpts); } : function() {
+                return self._tooltipHandler(embedOpts.tooltip).then(function(base) {
+                    return render(s, base ? Object.assign({}, embedOpts, {tooltip: self._panelTooltip(base, labels)}) : embedOpts);
+                });
+            };
+            return fonts ? fonts.then(draw) : draw();
         };
         var render = function(s, embedOpts) {
             // Superseded while its font loaded.
@@ -23114,6 +23508,116 @@
         }
         return this._cellTips[theme];
     },
+    // The handler vega-embed installs for tooltip option `t` (a theme's
+    // options, the default `undefined`, or an app's own handler), obtained as
+    // _cellTooltip does; null when `t` turns tooltips off.
+    _tooltipHandler: function(t) {
+        if (t === false) return Promise.resolve(null);
+        if (typeof t === 'function') return Promise.resolve(t);
+        var opts = t && typeof t === 'object' ? t : {}, key = JSON.stringify(opts);
+        if (!this._tipHandlers[key]) {
+            this._tipHandlers[key] = vegaEmbed(document.createElement('div'), {},
+                    {mode: 'vega', renderer: 'none', actions: false, tooltip: opts})
+                .then(function(r) { var handler = r.view.tooltip(); r.finalize(); return handler; })
+                .catch(function(err) { console.error('AoV: tooltips do not name each panel\'s axis title:', err); return null; });
+        }
+        return this._tipHandlers[key];
+    },
+    // Per-panel axis titles (`config(facet=(; ylabels, xlabels))`,
+    // src/panel_labels.jl): `_aov.panelLabels` maps a channel to the column
+    // whose value titles each panel's axis, the facet fields the panels were
+    // written for, the axis titles they replace and the fields they title.
+    _panelLabelsOf: function(spec) {
+        var labels = spec && spec._aov && spec._aov.panelLabels;
+        return labels && typeof labels === 'object' && Object.keys(labels).length ? labels : null;
+    },
+    // A row's panel title on channel record `L`, or `fallback` where the row
+    // has none.
+    _panelTitle: function(L, d, fallback) {
+        var t = L && d ? d[L.field] : undefined;
+        return t === null || t === undefined || t !== t || t === '' ? fallback : String(t);
+    },
+    // The tooltip of a hovered item, its rows named by the item's panel
+    // title in place of the axis title they were written with: the estimate
+    // row `Level (cm): median (95% interval)` reads `Cmax (ng/mL): median
+    // (95% interval)`, a value row `Level (cm)` reads `Cmax (ng/mL)`. A
+    // Vega-Lite tooltip's row titles are fixed text, and a Vega expression
+    // cannot build an object key, so the rows are renamed here.
+    _panelTooltip: function(base, labels) {
+        var self = this;
+        return function(handler, event, item, value) {
+            return base.call(this, handler, event, item, self._panelTooltipValue(labels, item, value));
+        };
+    },
+    _panelTooltipValue: function(labels, item, value) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+        var self = this, d = item && item.datum, renames = [];
+        Object.keys(labels).forEach(function(ch) {
+            var L = labels[ch], t = self._panelTitle(L, d, null);
+            if (t !== null) (L.titles || []).forEach(function(from) { if (from) renames.push([String(from), t]); });
+        });
+        if (!renames.length) return value;
+        var out = {};
+        Object.keys(value).forEach(function(k) {
+            var nk = k;
+            for (var i = 0; i < renames.length; i++) {
+                var from = renames[i][0], to = renames[i][1];
+                if (k === from) { nk = to; break; }
+                if (k.indexOf(from + ': ') === 0) { nk = to + k.slice(from.length); break; }
+            }
+            // A row whose new name another row already has keeps its own.
+            if (nk !== k && (nk in value || nk in out)) nk = k;
+            out[nk] = value[k];
+        });
+        return out;
+    },
+    // After a picker remap: per-panel titles hold while their panels are the
+    // ones they were written for (their facet fields are still facets) and the
+    // axis still shows a field they were written for. Otherwise the axes read
+    // their mapping's title again, and tooltips and the readout no longer
+    // rename: an unfaceted plot has no panel, and another field's axis is not
+    // the quantity the label column names.
+    _fitPanelLabels: function(spec) {
+        var labels = this._panelLabelsOf(spec);
+        if (!labels) return spec;
+        var self = this, facets = self._specFacetFields(spec);
+        Object.keys(labels).forEach(function(ch) {
+            var L = labels[ch], titled = [];
+            self._eachEncoding(spec, ch, function(e) {
+                if (e.axis && e.axis.title && typeof e.axis.title === 'object' && e.axis.title.expr !== undefined) titled.push(e);
+            });
+            var keep = (L.facet || []).every(function(f) { return facets.indexOf(f) !== -1; }) &&
+                titled.every(function(e) { return (L.fields || []).indexOf(e.field) !== -1; });
+            if (keep) return;
+            titled.forEach(function(e) { delete e.axis.title; });
+            delete labels[ch];
+        });
+        if (!Object.keys(labels).length) delete spec._aov.panelLabels;
+        return spec;
+    },
+    // The facet fields of a spec: its facet operator's or facet encodings',
+    // and each per-column-Y child's.
+    _specFacetFields: function(spec) {
+        var out = [];
+        var push = function(d) { if (d && typeof d === 'object' && d.field !== undefined) out.push(String(d.field)); };
+        (function view(v) {
+            if (!v || typeof v !== 'object') return;
+            if (v.facet) { push(v.facet); push(v.facet.row); push(v.facet.column); }
+            else if (v.encoding) { push(v.encoding.facet); push(v.encoding.row); push(v.encoding.column); }
+            (v.hconcat || []).forEach(view);
+        })(spec);
+        return out;
+    },
+    // Call f(encoding) on every `ch` encoding of a spec's units.
+    _eachEncoding: function(node, ch, f) {
+        var self = this;
+        if (!node || typeof node !== 'object') return;
+        if (node.encoding && node.encoding[ch] && typeof node.encoding[ch] === 'object') f(node.encoding[ch]);
+        ['layer', 'hconcat', 'vconcat', 'concat'].forEach(function(k) {
+            if (Array.isArray(node[k])) node[k].forEach(function(n) { self._eachEncoding(n, ch, f); });
+        });
+        if (node.spec) self._eachEncoding(node.spec, ch, f);
+    },
     _cellView: function(col, colId, el, key, plan, tooltip) {
         var self = this;
         if (!el.isConnected) return;
@@ -23971,7 +24475,8 @@
         var faceted = !!(spec.facet || spec.spec || top.column || top.row || top.facet);
         var layered = Array.isArray(inner.layer), units = layered ? inner.layer : [inner];
         var prefix = (namePrefix || '') + (faceted ? 'child_' : ''), dodge = aov.dodgeX;
-        var plan = {units: {}, order: [], x: null, xType: null, xTitle: null, faceted: faceted, series: null};
+        var plan = {units: {}, order: [], x: null, xType: null, xTitle: null, faceted: faceted, series: null,
+            panel: this._panelLabelsOf(spec)};
         var paths = false;
         units.forEach(function(u, i) {
             if (!u || u.layer) return;
@@ -24179,16 +24684,19 @@
     // entry per panel and series, panel by panel from the top: a name shared
     // by two panels (a scenario in each) is two series of two quantities.
     _readoutEntries: function(view, plan, at) {
-        var series = {}, list = [], stacked = !!plan.stacked;
+        var self = this, series = {}, list = [], stacked = !!plan.stacked;
         at.forEach(function(c) {
             var u = c.unit, d = c.datum, field = stacked ? u.series : plan.series;
+            // A panel with its own axis title (`config(facet=(; ylabels))`)
+            // names its uncoloured series by it.
+            var title = self._panelTitle(plan.panel && plan.panel.y, d, u.title);
             var name = u.color ? d[u.color] : u.label !== null ? u.label :
-                (field && d[field] !== undefined ? d[field] : u.title);
+                (field && d[field] !== undefined ? d[field] : title);
             name = String(name);
             var key = stacked ? u.panel + '\u0000' + name : name;
             var s = series[key];
             if (!s) {
-                s = series[key] = {name: name, panel: stacked ? u.panel : null, coloured: name !== String(u.title),
+                s = series[key] = {name: name, panel: stacked ? u.panel : null, coloured: name !== String(title),
                     first: u.index, colour: null, units: {}};
                 list.push(s);
             }
@@ -24246,7 +24754,7 @@
     // date (Vega reads a Julia Date as UTC midnight), else a time as
     // `2026-03-15 17:00` in the local time Vega read it in; a number with
     // the x axis title.
-    _readoutHeading: function(view, plan, v, dateOnly) {
+    _readoutHeading: function(view, plan, v, dateOnly, datum) {
         var loc = view.locale ? view.locale() : null;
         if (loc && !loc.format) loc = null;
         if (plan.xType === 'temporal') {
@@ -24255,7 +24763,7 @@
             var spec = d.getSeconds() ? '%Y-%m-%d %H:%M:%S' : '%Y-%m-%d %H:%M';
             return loc ? loc.timeFormat(spec)(d) : d.toString();
         }
-        return plan.xTitle + ': ' + (loc ? loc.format('.4~r')(v) : String(v));
+        return this._panelTitle(plan.panel && plan.panel.x, datum, plan.xTitle) + ': ' + (loc ? loc.format('.4~r')(v) : String(v));
     },
     _readoutShow: function(id, view, f, scope, at, all, fromPointer) {
         var self = this, st = self._readouts[id], el = self._els[id];
@@ -24288,7 +24796,7 @@
         var link = self._link(id), DAY = 86400000;
         var dateOnly = link && link.key === st.plan.x && link.temporal ? link.temporal === 'date' :
             all.every(function(c) { return c.value % DAY === 0; });
-        head.textContent = self._readoutHeading(view, st.plan, at[0].value, dateOnly);
+        head.textContent = self._readoutHeading(view, st.plan, at[0].value, dateOnly, at[0].datum);
         box.appendChild(head);
         // A stack's panels, top to bottom: a panel's rows sit indented under
         // its y title, unless that title already names every row (one
@@ -25626,7 +26134,7 @@
             // Re-broadcast cross-source layers after row mutations
             this._broadcastCrossSource(spec);
 
-            return spec;
+            return this._fitPanelLabels(spec);
         }
 
         // Find layers in either simple or faceted structure
@@ -26043,7 +26551,7 @@
         // (color mutations need no broadcast — see _broadcastCrossSource).
         this._broadcastCrossSource(spec);
 
-        return spec;
+        return this._fitPanelLabels(spec);
     }
 };
 </script>
@@ -26510,6 +27018,9 @@
     _tipThemes: {},
     _tipStyle: null,
     _cellTips: {},
+    // vega-embed's tooltip handler per tooltip option, for a plot whose
+    // tooltips name each facet panel's own axis title (_panelTooltip).
+    _tipHandlers: {},
     // Keyed highlights (AoV.highlight): each plot's match test and the
     // revision its view's `aov_highlight` signal shows. Hovers: the mark
     // under the pointer, and the key it announced to its link group.
@@ -27620,7 +28131,17 @@
             // Host theme, read now: a theme change re-runs this embed.
             var embedOpts = self._withFrame(id, self._themedOpts(id, s, opts), plan);
             var fonts = self._fontsPending((s.config && s.config.font) || (embedOpts.config && embedOpts.config.font));
-            return fonts ? fonts.then(function() { return render(s, embedOpts); }) : render(s, embedOpts);
+            // Per-panel axis titles (src/panel_labels.jl): the tooltip names
+            // each panel's title, through a handler vega-embed installs
+            // before the view first draws (setting one later resets the
+            // renderer). Other plots embed as before, in the same tick.
+            var labels = self._panelLabelsOf(s);
+            var draw = !labels ? function() { return render(s, embedOpts); } : function() {
+                return self._tooltipHandler(embedOpts.tooltip).then(function(base) {
+                    return render(s, base ? Object.assign({}, embedOpts, {tooltip: self._panelTooltip(base, labels)}) : embedOpts);
+                });
+            };
+            return fonts ? fonts.then(draw) : draw();
         };
         var render = function(s, embedOpts) {
             // Superseded while its font loaded.
@@ -29831,6 +30352,116 @@
         }
         return this._cellTips[theme];
     },
+    // The handler vega-embed installs for tooltip option `t` (a theme's
+    // options, the default `undefined`, or an app's own handler), obtained as
+    // _cellTooltip does; null when `t` turns tooltips off.
+    _tooltipHandler: function(t) {
+        if (t === false) return Promise.resolve(null);
+        if (typeof t === 'function') return Promise.resolve(t);
+        var opts = t && typeof t === 'object' ? t : {}, key = JSON.stringify(opts);
+        if (!this._tipHandlers[key]) {
+            this._tipHandlers[key] = vegaEmbed(document.createElement('div'), {},
+                    {mode: 'vega', renderer: 'none', actions: false, tooltip: opts})
+                .then(function(r) { var handler = r.view.tooltip(); r.finalize(); return handler; })
+                .catch(function(err) { console.error('AoV: tooltips do not name each panel\'s axis title:', err); return null; });
+        }
+        return this._tipHandlers[key];
+    },
+    // Per-panel axis titles (`config(facet=(; ylabels, xlabels))`,
+    // src/panel_labels.jl): `_aov.panelLabels` maps a channel to the column
+    // whose value titles each panel's axis, the facet fields the panels were
+    // written for, the axis titles they replace and the fields they title.
+    _panelLabelsOf: function(spec) {
+        var labels = spec && spec._aov && spec._aov.panelLabels;
+        return labels && typeof labels === 'object' && Object.keys(labels).length ? labels : null;
+    },
+    // A row's panel title on channel record `L`, or `fallback` where the row
+    // has none.
+    _panelTitle: function(L, d, fallback) {
+        var t = L && d ? d[L.field] : undefined;
+        return t === null || t === undefined || t !== t || t === '' ? fallback : String(t);
+    },
+    // The tooltip of a hovered item, its rows named by the item's panel
+    // title in place of the axis title they were written with: the estimate
+    // row `Level (cm): median (95% interval)` reads `Cmax (ng/mL): median
+    // (95% interval)`, a value row `Level (cm)` reads `Cmax (ng/mL)`. A
+    // Vega-Lite tooltip's row titles are fixed text, and a Vega expression
+    // cannot build an object key, so the rows are renamed here.
+    _panelTooltip: function(base, labels) {
+        var self = this;
+        return function(handler, event, item, value) {
+            return base.call(this, handler, event, item, self._panelTooltipValue(labels, item, value));
+        };
+    },
+    _panelTooltipValue: function(labels, item, value) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+        var self = this, d = item && item.datum, renames = [];
+        Object.keys(labels).forEach(function(ch) {
+            var L = labels[ch], t = self._panelTitle(L, d, null);
+            if (t !== null) (L.titles || []).forEach(function(from) { if (from) renames.push([String(from), t]); });
+        });
+        if (!renames.length) return value;
+        var out = {};
+        Object.keys(value).forEach(function(k) {
+            var nk = k;
+            for (var i = 0; i < renames.length; i++) {
+                var from = renames[i][0], to = renames[i][1];
+                if (k === from) { nk = to; break; }
+                if (k.indexOf(from + ': ') === 0) { nk = to + k.slice(from.length); break; }
+            }
+            // A row whose new name another row already has keeps its own.
+            if (nk !== k && (nk in value || nk in out)) nk = k;
+            out[nk] = value[k];
+        });
+        return out;
+    },
+    // After a picker remap: per-panel titles hold while their panels are the
+    // ones they were written for (their facet fields are still facets) and the
+    // axis still shows a field they were written for. Otherwise the axes read
+    // their mapping's title again, and tooltips and the readout no longer
+    // rename: an unfaceted plot has no panel, and another field's axis is not
+    // the quantity the label column names.
+    _fitPanelLabels: function(spec) {
+        var labels = this._panelLabelsOf(spec);
+        if (!labels) return spec;
+        var self = this, facets = self._specFacetFields(spec);
+        Object.keys(labels).forEach(function(ch) {
+            var L = labels[ch], titled = [];
+            self._eachEncoding(spec, ch, function(e) {
+                if (e.axis && e.axis.title && typeof e.axis.title === 'object' && e.axis.title.expr !== undefined) titled.push(e);
+            });
+            var keep = (L.facet || []).every(function(f) { return facets.indexOf(f) !== -1; }) &&
+                titled.every(function(e) { return (L.fields || []).indexOf(e.field) !== -1; });
+            if (keep) return;
+            titled.forEach(function(e) { delete e.axis.title; });
+            delete labels[ch];
+        });
+        if (!Object.keys(labels).length) delete spec._aov.panelLabels;
+        return spec;
+    },
+    // The facet fields of a spec: its facet operator's or facet encodings',
+    // and each per-column-Y child's.
+    _specFacetFields: function(spec) {
+        var out = [];
+        var push = function(d) { if (d && typeof d === 'object' && d.field !== undefined) out.push(String(d.field)); };
+        (function view(v) {
+            if (!v || typeof v !== 'object') return;
+            if (v.facet) { push(v.facet); push(v.facet.row); push(v.facet.column); }
+            else if (v.encoding) { push(v.encoding.facet); push(v.encoding.row); push(v.encoding.column); }
+            (v.hconcat || []).forEach(view);
+        })(spec);
+        return out;
+    },
+    // Call f(encoding) on every `ch` encoding of a spec's units.
+    _eachEncoding: function(node, ch, f) {
+        var self = this;
+        if (!node || typeof node !== 'object') return;
+        if (node.encoding && node.encoding[ch] && typeof node.encoding[ch] === 'object') f(node.encoding[ch]);
+        ['layer', 'hconcat', 'vconcat', 'concat'].forEach(function(k) {
+            if (Array.isArray(node[k])) node[k].forEach(function(n) { self._eachEncoding(n, ch, f); });
+        });
+        if (node.spec) self._eachEncoding(node.spec, ch, f);
+    },
     _cellView: function(col, colId, el, key, plan, tooltip) {
         var self = this;
         if (!el.isConnected) return;
@@ -30688,7 +31319,8 @@
         var faceted = !!(spec.facet || spec.spec || top.column || top.row || top.facet);
         var layered = Array.isArray(inner.layer), units = layered ? inner.layer : [inner];
         var prefix = (namePrefix || '') + (faceted ? 'child_' : ''), dodge = aov.dodgeX;
-        var plan = {units: {}, order: [], x: null, xType: null, xTitle: null, faceted: faceted, series: null};
+        var plan = {units: {}, order: [], x: null, xType: null, xTitle: null, faceted: faceted, series: null,
+            panel: this._panelLabelsOf(spec)};
         var paths = false;
         units.forEach(function(u, i) {
             if (!u || u.layer) return;
@@ -30896,16 +31528,19 @@
     // entry per panel and series, panel by panel from the top: a name shared
     // by two panels (a scenario in each) is two series of two quantities.
     _readoutEntries: function(view, plan, at) {
-        var series = {}, list = [], stacked = !!plan.stacked;
+        var self = this, series = {}, list = [], stacked = !!plan.stacked;
         at.forEach(function(c) {
             var u = c.unit, d = c.datum, field = stacked ? u.series : plan.series;
+            // A panel with its own axis title (`config(facet=(; ylabels))`)
+            // names its uncoloured series by it.
+            var title = self._panelTitle(plan.panel && plan.panel.y, d, u.title);
             var name = u.color ? d[u.color] : u.label !== null ? u.label :
-                (field && d[field] !== undefined ? d[field] : u.title);
+                (field && d[field] !== undefined ? d[field] : title);
             name = String(name);
             var key = stacked ? u.panel + '\u0000' + name : name;
             var s = series[key];
             if (!s) {
-                s = series[key] = {name: name, panel: stacked ? u.panel : null, coloured: name !== String(u.title),
+                s = series[key] = {name: name, panel: stacked ? u.panel : null, coloured: name !== String(title),
                     first: u.index, colour: null, units: {}};
                 list.push(s);
             }
@@ -30963,7 +31598,7 @@
     // date (Vega reads a Julia Date as UTC midnight), else a time as
     // `2026-03-15 17:00` in the local time Vega read it in; a number with
     // the x axis title.
-    _readoutHeading: function(view, plan, v, dateOnly) {
+    _readoutHeading: function(view, plan, v, dateOnly, datum) {
         var loc = view.locale ? view.locale() : null;
         if (loc && !loc.format) loc = null;
         if (plan.xType === 'temporal') {
@@ -30972,7 +31607,7 @@
             var spec = d.getSeconds() ? '%Y-%m-%d %H:%M:%S' : '%Y-%m-%d %H:%M';
             return loc ? loc.timeFormat(spec)(d) : d.toString();
         }
-        return plan.xTitle + ': ' + (loc ? loc.format('.4~r')(v) : String(v));
+        return this._panelTitle(plan.panel && plan.panel.x, datum, plan.xTitle) + ': ' + (loc ? loc.format('.4~r')(v) : String(v));
     },
     _readoutShow: function(id, view, f, scope, at, all, fromPointer) {
         var self = this, st = self._readouts[id], el = self._els[id];
@@ -31005,7 +31640,7 @@
         var link = self._link(id), DAY = 86400000;
         var dateOnly = link && link.key === st.plan.x && link.temporal ? link.temporal === 'date' :
             all.every(function(c) { return c.value % DAY === 0; });
-        head.textContent = self._readoutHeading(view, st.plan, at[0].value, dateOnly);
+        head.textContent = self._readoutHeading(view, st.plan, at[0].value, dateOnly, at[0].datum);
         box.appendChild(head);
         // A stack's panels, top to bottom: a panel's rows sit indented under
         // its y title, unless that title already names every row (one
@@ -32343,7 +32978,7 @@
             // Re-broadcast cross-source layers after row mutations
             this._broadcastCrossSource(spec);
 
-            return spec;
+            return this._fitPanelLabels(spec);
         }
 
         // Find layers in either simple or faceted structure
@@ -32760,7 +33395,7 @@
         // (color mutations need no broadcast — see _broadcastCrossSource).
         this._broadcastCrossSource(spec);
 
-        return spec;
+        return this._fitPanelLabels(spec);
     }
 };
 </script>
@@ -32798,6 +33433,9 @@
     _tipThemes: {},
     _tipStyle: null,
     _cellTips: {},
+    // vega-embed's tooltip handler per tooltip option, for a plot whose
+    // tooltips name each facet panel's own axis title (_panelTooltip).
+    _tipHandlers: {},
     // Keyed highlights (AoV.highlight): each plot's match test and the
     // revision its view's `aov_highlight` signal shows. Hovers: the mark
     // under the pointer, and the key it announced to its link group.
@@ -33908,7 +34546,17 @@
             // Host theme, read now: a theme change re-runs this embed.
             var embedOpts = self._withFrame(id, self._themedOpts(id, s, opts), plan);
             var fonts = self._fontsPending((s.config && s.config.font) || (embedOpts.config && embedOpts.config.font));
-            return fonts ? fonts.then(function() { return render(s, embedOpts); }) : render(s, embedOpts);
+            // Per-panel axis titles (src/panel_labels.jl): the tooltip names
+            // each panel's title, through a handler vega-embed installs
+            // before the view first draws (setting one later resets the
+            // renderer). Other plots embed as before, in the same tick.
+            var labels = self._panelLabelsOf(s);
+            var draw = !labels ? function() { return render(s, embedOpts); } : function() {
+                return self._tooltipHandler(embedOpts.tooltip).then(function(base) {
+                    return render(s, base ? Object.assign({}, embedOpts, {tooltip: self._panelTooltip(base, labels)}) : embedOpts);
+                });
+            };
+            return fonts ? fonts.then(draw) : draw();
         };
         var render = function(s, embedOpts) {
             // Superseded while its font loaded.
@@ -36119,6 +36767,116 @@
         }
         return this._cellTips[theme];
     },
+    // The handler vega-embed installs for tooltip option `t` (a theme's
+    // options, the default `undefined`, or an app's own handler), obtained as
+    // _cellTooltip does; null when `t` turns tooltips off.
+    _tooltipHandler: function(t) {
+        if (t === false) return Promise.resolve(null);
+        if (typeof t === 'function') return Promise.resolve(t);
+        var opts = t && typeof t === 'object' ? t : {}, key = JSON.stringify(opts);
+        if (!this._tipHandlers[key]) {
+            this._tipHandlers[key] = vegaEmbed(document.createElement('div'), {},
+                    {mode: 'vega', renderer: 'none', actions: false, tooltip: opts})
+                .then(function(r) { var handler = r.view.tooltip(); r.finalize(); return handler; })
+                .catch(function(err) { console.error('AoV: tooltips do not name each panel\'s axis title:', err); return null; });
+        }
+        return this._tipHandlers[key];
+    },
+    // Per-panel axis titles (`config(facet=(; ylabels, xlabels))`,
+    // src/panel_labels.jl): `_aov.panelLabels` maps a channel to the column
+    // whose value titles each panel's axis, the facet fields the panels were
+    // written for, the axis titles they replace and the fields they title.
+    _panelLabelsOf: function(spec) {
+        var labels = spec && spec._aov && spec._aov.panelLabels;
+        return labels && typeof labels === 'object' && Object.keys(labels).length ? labels : null;
+    },
+    // A row's panel title on channel record `L`, or `fallback` where the row
+    // has none.
+    _panelTitle: function(L, d, fallback) {
+        var t = L && d ? d[L.field] : undefined;
+        return t === null || t === undefined || t !== t || t === '' ? fallback : String(t);
+    },
+    // The tooltip of a hovered item, its rows named by the item's panel
+    // title in place of the axis title they were written with: the estimate
+    // row `Level (cm): median (95% interval)` reads `Cmax (ng/mL): median
+    // (95% interval)`, a value row `Level (cm)` reads `Cmax (ng/mL)`. A
+    // Vega-Lite tooltip's row titles are fixed text, and a Vega expression
+    // cannot build an object key, so the rows are renamed here.
+    _panelTooltip: function(base, labels) {
+        var self = this;
+        return function(handler, event, item, value) {
+            return base.call(this, handler, event, item, self._panelTooltipValue(labels, item, value));
+        };
+    },
+    _panelTooltipValue: function(labels, item, value) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+        var self = this, d = item && item.datum, renames = [];
+        Object.keys(labels).forEach(function(ch) {
+            var L = labels[ch], t = self._panelTitle(L, d, null);
+            if (t !== null) (L.titles || []).forEach(function(from) { if (from) renames.push([String(from), t]); });
+        });
+        if (!renames.length) return value;
+        var out = {};
+        Object.keys(value).forEach(function(k) {
+            var nk = k;
+            for (var i = 0; i < renames.length; i++) {
+                var from = renames[i][0], to = renames[i][1];
+                if (k === from) { nk = to; break; }
+                if (k.indexOf(from + ': ') === 0) { nk = to + k.slice(from.length); break; }
+            }
+            // A row whose new name another row already has keeps its own.
+            if (nk !== k && (nk in value || nk in out)) nk = k;
+            out[nk] = value[k];
+        });
+        return out;
+    },
+    // After a picker remap: per-panel titles hold while their panels are the
+    // ones they were written for (their facet fields are still facets) and the
+    // axis still shows a field they were written for. Otherwise the axes read
+    // their mapping's title again, and tooltips and the readout no longer
+    // rename: an unfaceted plot has no panel, and another field's axis is not
+    // the quantity the label column names.
+    _fitPanelLabels: function(spec) {
+        var labels = this._panelLabelsOf(spec);
+        if (!labels) return spec;
+        var self = this, facets = self._specFacetFields(spec);
+        Object.keys(labels).forEach(function(ch) {
+            var L = labels[ch], titled = [];
+            self._eachEncoding(spec, ch, function(e) {
+                if (e.axis && e.axis.title && typeof e.axis.title === 'object' && e.axis.title.expr !== undefined) titled.push(e);
+            });
+            var keep = (L.facet || []).every(function(f) { return facets.indexOf(f) !== -1; }) &&
+                titled.every(function(e) { return (L.fields || []).indexOf(e.field) !== -1; });
+            if (keep) return;
+            titled.forEach(function(e) { delete e.axis.title; });
+            delete labels[ch];
+        });
+        if (!Object.keys(labels).length) delete spec._aov.panelLabels;
+        return spec;
+    },
+    // The facet fields of a spec: its facet operator's or facet encodings',
+    // and each per-column-Y child's.
+    _specFacetFields: function(spec) {
+        var out = [];
+        var push = function(d) { if (d && typeof d === 'object' && d.field !== undefined) out.push(String(d.field)); };
+        (function view(v) {
+            if (!v || typeof v !== 'object') return;
+            if (v.facet) { push(v.facet); push(v.facet.row); push(v.facet.column); }
+            else if (v.encoding) { push(v.encoding.facet); push(v.encoding.row); push(v.encoding.column); }
+            (v.hconcat || []).forEach(view);
+        })(spec);
+        return out;
+    },
+    // Call f(encoding) on every `ch` encoding of a spec's units.
+    _eachEncoding: function(node, ch, f) {
+        var self = this;
+        if (!node || typeof node !== 'object') return;
+        if (node.encoding && node.encoding[ch] && typeof node.encoding[ch] === 'object') f(node.encoding[ch]);
+        ['layer', 'hconcat', 'vconcat', 'concat'].forEach(function(k) {
+            if (Array.isArray(node[k])) node[k].forEach(function(n) { self._eachEncoding(n, ch, f); });
+        });
+        if (node.spec) self._eachEncoding(node.spec, ch, f);
+    },
     _cellView: function(col, colId, el, key, plan, tooltip) {
         var self = this;
         if (!el.isConnected) return;
@@ -36976,7 +37734,8 @@
         var faceted = !!(spec.facet || spec.spec || top.column || top.row || top.facet);
         var layered = Array.isArray(inner.layer), units = layered ? inner.layer : [inner];
         var prefix = (namePrefix || '') + (faceted ? 'child_' : ''), dodge = aov.dodgeX;
-        var plan = {units: {}, order: [], x: null, xType: null, xTitle: null, faceted: faceted, series: null};
+        var plan = {units: {}, order: [], x: null, xType: null, xTitle: null, faceted: faceted, series: null,
+            panel: this._panelLabelsOf(spec)};
         var paths = false;
         units.forEach(function(u, i) {
             if (!u || u.layer) return;
@@ -37184,16 +37943,19 @@
     // entry per panel and series, panel by panel from the top: a name shared
     // by two panels (a scenario in each) is two series of two quantities.
     _readoutEntries: function(view, plan, at) {
-        var series = {}, list = [], stacked = !!plan.stacked;
+        var self = this, series = {}, list = [], stacked = !!plan.stacked;
         at.forEach(function(c) {
             var u = c.unit, d = c.datum, field = stacked ? u.series : plan.series;
+            // A panel with its own axis title (`config(facet=(; ylabels))`)
+            // names its uncoloured series by it.
+            var title = self._panelTitle(plan.panel && plan.panel.y, d, u.title);
             var name = u.color ? d[u.color] : u.label !== null ? u.label :
-                (field && d[field] !== undefined ? d[field] : u.title);
+                (field && d[field] !== undefined ? d[field] : title);
             name = String(name);
             var key = stacked ? u.panel + '\u0000' + name : name;
             var s = series[key];
             if (!s) {
-                s = series[key] = {name: name, panel: stacked ? u.panel : null, coloured: name !== String(u.title),
+                s = series[key] = {name: name, panel: stacked ? u.panel : null, coloured: name !== String(title),
                     first: u.index, colour: null, units: {}};
                 list.push(s);
             }
@@ -37251,7 +38013,7 @@
     // date (Vega reads a Julia Date as UTC midnight), else a time as
     // `2026-03-15 17:00` in the local time Vega read it in; a number with
     // the x axis title.
-    _readoutHeading: function(view, plan, v, dateOnly) {
+    _readoutHeading: function(view, plan, v, dateOnly, datum) {
         var loc = view.locale ? view.locale() : null;
         if (loc && !loc.format) loc = null;
         if (plan.xType === 'temporal') {
@@ -37260,7 +38022,7 @@
             var spec = d.getSeconds() ? '%Y-%m-%d %H:%M:%S' : '%Y-%m-%d %H:%M';
             return loc ? loc.timeFormat(spec)(d) : d.toString();
         }
-        return plan.xTitle + ': ' + (loc ? loc.format('.4~r')(v) : String(v));
+        return this._panelTitle(plan.panel && plan.panel.x, datum, plan.xTitle) + ': ' + (loc ? loc.format('.4~r')(v) : String(v));
     },
     _readoutShow: function(id, view, f, scope, at, all, fromPointer) {
         var self = this, st = self._readouts[id], el = self._els[id];
@@ -37293,7 +38055,7 @@
         var link = self._link(id), DAY = 86400000;
         var dateOnly = link && link.key === st.plan.x && link.temporal ? link.temporal === 'date' :
             all.every(function(c) { return c.value % DAY === 0; });
-        head.textContent = self._readoutHeading(view, st.plan, at[0].value, dateOnly);
+        head.textContent = self._readoutHeading(view, st.plan, at[0].value, dateOnly, at[0].datum);
         box.appendChild(head);
         // A stack's panels, top to bottom: a panel's rows sit indented under
         // its y title, unless that title already names every row (one
@@ -38631,7 +39393,7 @@
             // Re-broadcast cross-source layers after row mutations
             this._broadcastCrossSource(spec);
 
-            return spec;
+            return this._fitPanelLabels(spec);
         }
 
         // Find layers in either simple or faceted structure
@@ -39048,7 +39810,7 @@
         // (color mutations need no broadcast — see _broadcastCrossSource).
         this._broadcastCrossSource(spec);
 
-        return spec;
+        return this._fitPanelLabels(spec);
     }
 };
 </script>
@@ -39302,6 +40064,9 @@
     _tipThemes: {},
     _tipStyle: null,
     _cellTips: {},
+    // vega-embed's tooltip handler per tooltip option, for a plot whose
+    // tooltips name each facet panel's own axis title (_panelTooltip).
+    _tipHandlers: {},
     // Keyed highlights (AoV.highlight): each plot's match test and the
     // revision its view's `aov_highlight` signal shows. Hovers: the mark
     // under the pointer, and the key it announced to its link group.
@@ -40412,7 +41177,17 @@
             // Host theme, read now: a theme change re-runs this embed.
             var embedOpts = self._withFrame(id, self._themedOpts(id, s, opts), plan);
             var fonts = self._fontsPending((s.config && s.config.font) || (embedOpts.config && embedOpts.config.font));
-            return fonts ? fonts.then(function() { return render(s, embedOpts); }) : render(s, embedOpts);
+            // Per-panel axis titles (src/panel_labels.jl): the tooltip names
+            // each panel's title, through a handler vega-embed installs
+            // before the view first draws (setting one later resets the
+            // renderer). Other plots embed as before, in the same tick.
+            var labels = self._panelLabelsOf(s);
+            var draw = !labels ? function() { return render(s, embedOpts); } : function() {
+                return self._tooltipHandler(embedOpts.tooltip).then(function(base) {
+                    return render(s, base ? Object.assign({}, embedOpts, {tooltip: self._panelTooltip(base, labels)}) : embedOpts);
+                });
+            };
+            return fonts ? fonts.then(draw) : draw();
         };
         var render = function(s, embedOpts) {
             // Superseded while its font loaded.
@@ -42623,6 +43398,116 @@
         }
         return this._cellTips[theme];
     },
+    // The handler vega-embed installs for tooltip option `t` (a theme's
+    // options, the default `undefined`, or an app's own handler), obtained as
+    // _cellTooltip does; null when `t` turns tooltips off.
+    _tooltipHandler: function(t) {
+        if (t === false) return Promise.resolve(null);
+        if (typeof t === 'function') return Promise.resolve(t);
+        var opts = t && typeof t === 'object' ? t : {}, key = JSON.stringify(opts);
+        if (!this._tipHandlers[key]) {
+            this._tipHandlers[key] = vegaEmbed(document.createElement('div'), {},
+                    {mode: 'vega', renderer: 'none', actions: false, tooltip: opts})
+                .then(function(r) { var handler = r.view.tooltip(); r.finalize(); return handler; })
+                .catch(function(err) { console.error('AoV: tooltips do not name each panel\'s axis title:', err); return null; });
+        }
+        return this._tipHandlers[key];
+    },
+    // Per-panel axis titles (`config(facet=(; ylabels, xlabels))`,
+    // src/panel_labels.jl): `_aov.panelLabels` maps a channel to the column
+    // whose value titles each panel's axis, the facet fields the panels were
+    // written for, the axis titles they replace and the fields they title.
+    _panelLabelsOf: function(spec) {
+        var labels = spec && spec._aov && spec._aov.panelLabels;
+        return labels && typeof labels === 'object' && Object.keys(labels).length ? labels : null;
+    },
+    // A row's panel title on channel record `L`, or `fallback` where the row
+    // has none.
+    _panelTitle: function(L, d, fallback) {
+        var t = L && d ? d[L.field] : undefined;
+        return t === null || t === undefined || t !== t || t === '' ? fallback : String(t);
+    },
+    // The tooltip of a hovered item, its rows named by the item's panel
+    // title in place of the axis title they were written with: the estimate
+    // row `Level (cm): median (95% interval)` reads `Cmax (ng/mL): median
+    // (95% interval)`, a value row `Level (cm)` reads `Cmax (ng/mL)`. A
+    // Vega-Lite tooltip's row titles are fixed text, and a Vega expression
+    // cannot build an object key, so the rows are renamed here.
+    _panelTooltip: function(base, labels) {
+        var self = this;
+        return function(handler, event, item, value) {
+            return base.call(this, handler, event, item, self._panelTooltipValue(labels, item, value));
+        };
+    },
+    _panelTooltipValue: function(labels, item, value) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+        var self = this, d = item && item.datum, renames = [];
+        Object.keys(labels).forEach(function(ch) {
+            var L = labels[ch], t = self._panelTitle(L, d, null);
+            if (t !== null) (L.titles || []).forEach(function(from) { if (from) renames.push([String(from), t]); });
+        });
+        if (!renames.length) return value;
+        var out = {};
+        Object.keys(value).forEach(function(k) {
+            var nk = k;
+            for (var i = 0; i < renames.length; i++) {
+                var from = renames[i][0], to = renames[i][1];
+                if (k === from) { nk = to; break; }
+                if (k.indexOf(from + ': ') === 0) { nk = to + k.slice(from.length); break; }
+            }
+            // A row whose new name another row already has keeps its own.
+            if (nk !== k && (nk in value || nk in out)) nk = k;
+            out[nk] = value[k];
+        });
+        return out;
+    },
+    // After a picker remap: per-panel titles hold while their panels are the
+    // ones they were written for (their facet fields are still facets) and the
+    // axis still shows a field they were written for. Otherwise the axes read
+    // their mapping's title again, and tooltips and the readout no longer
+    // rename: an unfaceted plot has no panel, and another field's axis is not
+    // the quantity the label column names.
+    _fitPanelLabels: function(spec) {
+        var labels = this._panelLabelsOf(spec);
+        if (!labels) return spec;
+        var self = this, facets = self._specFacetFields(spec);
+        Object.keys(labels).forEach(function(ch) {
+            var L = labels[ch], titled = [];
+            self._eachEncoding(spec, ch, function(e) {
+                if (e.axis && e.axis.title && typeof e.axis.title === 'object' && e.axis.title.expr !== undefined) titled.push(e);
+            });
+            var keep = (L.facet || []).every(function(f) { return facets.indexOf(f) !== -1; }) &&
+                titled.every(function(e) { return (L.fields || []).indexOf(e.field) !== -1; });
+            if (keep) return;
+            titled.forEach(function(e) { delete e.axis.title; });
+            delete labels[ch];
+        });
+        if (!Object.keys(labels).length) delete spec._aov.panelLabels;
+        return spec;
+    },
+    // The facet fields of a spec: its facet operator's or facet encodings',
+    // and each per-column-Y child's.
+    _specFacetFields: function(spec) {
+        var out = [];
+        var push = function(d) { if (d && typeof d === 'object' && d.field !== undefined) out.push(String(d.field)); };
+        (function view(v) {
+            if (!v || typeof v !== 'object') return;
+            if (v.facet) { push(v.facet); push(v.facet.row); push(v.facet.column); }
+            else if (v.encoding) { push(v.encoding.facet); push(v.encoding.row); push(v.encoding.column); }
+            (v.hconcat || []).forEach(view);
+        })(spec);
+        return out;
+    },
+    // Call f(encoding) on every `ch` encoding of a spec's units.
+    _eachEncoding: function(node, ch, f) {
+        var self = this;
+        if (!node || typeof node !== 'object') return;
+        if (node.encoding && node.encoding[ch] && typeof node.encoding[ch] === 'object') f(node.encoding[ch]);
+        ['layer', 'hconcat', 'vconcat', 'concat'].forEach(function(k) {
+            if (Array.isArray(node[k])) node[k].forEach(function(n) { self._eachEncoding(n, ch, f); });
+        });
+        if (node.spec) self._eachEncoding(node.spec, ch, f);
+    },
     _cellView: function(col, colId, el, key, plan, tooltip) {
         var self = this;
         if (!el.isConnected) return;
@@ -43480,7 +44365,8 @@
         var faceted = !!(spec.facet || spec.spec || top.column || top.row || top.facet);
         var layered = Array.isArray(inner.layer), units = layered ? inner.layer : [inner];
         var prefix = (namePrefix || '') + (faceted ? 'child_' : ''), dodge = aov.dodgeX;
-        var plan = {units: {}, order: [], x: null, xType: null, xTitle: null, faceted: faceted, series: null};
+        var plan = {units: {}, order: [], x: null, xType: null, xTitle: null, faceted: faceted, series: null,
+            panel: this._panelLabelsOf(spec)};
         var paths = false;
         units.forEach(function(u, i) {
             if (!u || u.layer) return;
@@ -43688,16 +44574,19 @@
     // entry per panel and series, panel by panel from the top: a name shared
     // by two panels (a scenario in each) is two series of two quantities.
     _readoutEntries: function(view, plan, at) {
-        var series = {}, list = [], stacked = !!plan.stacked;
+        var self = this, series = {}, list = [], stacked = !!plan.stacked;
         at.forEach(function(c) {
             var u = c.unit, d = c.datum, field = stacked ? u.series : plan.series;
+            // A panel with its own axis title (`config(facet=(; ylabels))`)
+            // names its uncoloured series by it.
+            var title = self._panelTitle(plan.panel && plan.panel.y, d, u.title);
             var name = u.color ? d[u.color] : u.label !== null ? u.label :
-                (field && d[field] !== undefined ? d[field] : u.title);
+                (field && d[field] !== undefined ? d[field] : title);
             name = String(name);
             var key = stacked ? u.panel + '\u0000' + name : name;
             var s = series[key];
             if (!s) {
-                s = series[key] = {name: name, panel: stacked ? u.panel : null, coloured: name !== String(u.title),
+                s = series[key] = {name: name, panel: stacked ? u.panel : null, coloured: name !== String(title),
                     first: u.index, colour: null, units: {}};
                 list.push(s);
             }
@@ -43755,7 +44644,7 @@
     // date (Vega reads a Julia Date as UTC midnight), else a time as
     // `2026-03-15 17:00` in the local time Vega read it in; a number with
     // the x axis title.
-    _readoutHeading: function(view, plan, v, dateOnly) {
+    _readoutHeading: function(view, plan, v, dateOnly, datum) {
         var loc = view.locale ? view.locale() : null;
         if (loc && !loc.format) loc = null;
         if (plan.xType === 'temporal') {
@@ -43764,7 +44653,7 @@
             var spec = d.getSeconds() ? '%Y-%m-%d %H:%M:%S' : '%Y-%m-%d %H:%M';
             return loc ? loc.timeFormat(spec)(d) : d.toString();
         }
-        return plan.xTitle + ': ' + (loc ? loc.format('.4~r')(v) : String(v));
+        return this._panelTitle(plan.panel && plan.panel.x, datum, plan.xTitle) + ': ' + (loc ? loc.format('.4~r')(v) : String(v));
     },
     _readoutShow: function(id, view, f, scope, at, all, fromPointer) {
         var self = this, st = self._readouts[id], el = self._els[id];
@@ -43797,7 +44686,7 @@
         var link = self._link(id), DAY = 86400000;
         var dateOnly = link && link.key === st.plan.x && link.temporal ? link.temporal === 'date' :
             all.every(function(c) { return c.value % DAY === 0; });
-        head.textContent = self._readoutHeading(view, st.plan, at[0].value, dateOnly);
+        head.textContent = self._readoutHeading(view, st.plan, at[0].value, dateOnly, at[0].datum);
         box.appendChild(head);
         // A stack's panels, top to bottom: a panel's rows sit indented under
         // its y title, unless that title already names every row (one
@@ -45135,7 +46024,7 @@
             // Re-broadcast cross-source layers after row mutations
             this._broadcastCrossSource(spec);
 
-            return spec;
+            return this._fitPanelLabels(spec);
         }
 
         // Find layers in either simple or faceted structure
@@ -45552,7 +46441,7 @@
         // (color mutations need no broadcast — see _broadcastCrossSource).
         this._broadcastCrossSource(spec);
 
-        return spec;
+        return this._fitPanelLabels(spec);
     }
 };
 </script>
