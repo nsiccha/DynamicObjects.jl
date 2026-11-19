@@ -139,6 +139,19 @@ pieces, so a result can exceed the size of a single socket read on macOS.
 The requester reassembles the result in memory. For `@cached` and `@mmap`
 results, the worker publishes the file and the requester loads it.
 
+For a result larger than 64 MiB, look for `DynamicObjects: large worker result`
+in the forwarded worker stderr. It gives the worker PID, request ID, owning
+type, property, abbreviated arguments and serialized byte count before the
+first piece goes out. To inspect smaller results, run
+`DynamicObjects.configure_queue!(; worker_reply_warn_bytes=1024^2)`.
+The next submissions to that queue use the 1 MiB threshold, including on
+already-running workers. Restore the default with `worker_reply_warn_bytes=64 * 1024^2`.
+
+On disconnect, the requester logs a warning for each outstanding call assigned
+to that worker. Match the worker PID and request ID across the two logs. If a
+transfer was interrupted between pieces, the warning gives the event kind and
+its full serialized byte count. Before a header arrives, the size is unknown.
+
 The queue counts requests from assignment through completion, including time
 spent starting a process or loading packages. When workers have equal loads,
 the queue prefers one that recently used the root. The root type must belong to

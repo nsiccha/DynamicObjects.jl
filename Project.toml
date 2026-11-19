@@ -1,7 +1,7 @@
 name = "DynamicObjects"
 uuid = "23d02862-63fe-4c6e-8fdb-1d52cbbd39d5"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com> and contributors"]
-version = "0.5.33"
+version = "0.5.34"
 
 [deps]
 OrderedCollections = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"

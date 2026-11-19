@@ -41,8 +41,12 @@ end
 mutable struct _RemoteRequest
     const id::Int
     const events::Channel{Any}
+    const call::String
     worker::Any       # the worker it was sent to; only that worker's exit abandons it
+    receiving::Union{Nothing,Tuple{Symbol,Int}} # kind and total bytes of an incomplete event
+    settled::Bool     # terminal event or abandonment already delivered for this attempt
 end
+_RemoteRequest(id, call) = _RemoteRequest(id, Channel{Any}(Inf), call, nothing, nothing, false)
 
 """
 Connection to one worker process: its handle and output reader (`worker`), the actor task that makes
@@ -97,12 +101,13 @@ mutable struct JobQueue
     worker_exeflags::Union{Nothing,Vector{String}}
     worker_preload::Vector{Base.PkgId}
     worker_idle_timeout::Float64
+    worker_reply_warn_bytes::Int
     const conns::Vector{_WorkerConn}
 end
 function JobQueue(; max_running::Integer=0)
     _check_max_running(max_running)
     JobQueue(ReentrantLock(), QueuedItem[], Any[], Int(max_running), 0, 0, :lazy, nothing,
-             Base.PkgId[], 300.0, _WorkerConn[])
+             Base.PkgId[], 300.0, 64 * 1024^2, _WorkerConn[])
 end
 
 _check_max_running(n) =
@@ -131,7 +136,8 @@ job_queue() = _JOB_QUEUE
 """
     DynamicObjects.configure_queue!(q=job_queue(); max_running=nothing, workers=nothing,
                                     worker_start=nothing, worker_exeflags=nothing,
-                                    worker_preload=nothing, worker_idle_timeout=nothing) -> NamedTuple
+                                    worker_preload=nothing, worker_idle_timeout=nothing,
+                                    worker_reply_warn_bytes=nothing) -> NamedTuple
 
 Bound how many queued computations run at once. Off by default (`max_running=0`): a
 `@queued` computation starts on `:default` at once. With `max_running=n` at most `n` run at a
@@ -195,12 +201,17 @@ node ("Starting the worker process", "Loading packages: …", from
 See [`worker_status`](@ref DynamicObjects.worker_status) and
 [`restart_worker!`](@ref DynamicObjects.restart_worker!).
 
+`worker_reply_warn_bytes` defaults to 64 MiB. A worker emits one warning before sending
+a result whose serialized size exceeds this many bytes. It includes the owning type,
+property, abbreviated arguments, worker PID, request ID and exact byte count. Set a
+nonnegative integer to change the threshold for subsequent submissions on this queue.
+
 Returns [`queue_settings(q)`](@ref DynamicObjects.queue_settings); an omitted setting is
 unchanged.
 """
 function configure_queue!(q::JobQueue=job_queue(); max_running=nothing, workers=nothing,
                           worker_start=nothing, worker_exeflags=nothing, worker_preload=nothing,
-                          worker_idle_timeout=nothing)
+                          worker_idle_timeout=nothing, worker_reply_warn_bytes=nothing)
     if workers !== nothing
         workers isa Real && isinteger(workers) && 0 <= workers <= typemax(Int) || throw(ArgumentError(
             "workers must be a non-negative integer, got $(workers)"))
@@ -213,6 +224,9 @@ function configure_queue!(q::JobQueue=job_queue(); max_running=nothing, workers=
     worker_idle_timeout === nothing || (worker_idle_timeout isa Real && worker_idle_timeout >= 0) ||
         throw(ArgumentError("worker_idle_timeout must be non-negative, got $(worker_idle_timeout)"))
     max_running === nothing || _check_max_running(max_running)
+    worker_reply_warn_bytes === nothing ||
+        (worker_reply_warn_bytes isa Integer && 0 <= worker_reply_warn_bytes <= typemax(Int)) ||
+        throw(ArgumentError("worker_reply_warn_bytes must be a nonnegative byte count that fits in an Int"))
     removed, admitted = lock(q.lock) do
         was_eager = q.worker_start === :now
         preload_changed = worker_preload !== nothing && q.worker_preload != worker_preload
@@ -221,6 +235,7 @@ function configure_queue!(q::JobQueue=job_queue(); max_running=nothing, workers=
         worker_exeflags === nothing || (q.worker_exeflags = worker_exeflags)
         worker_preload === nothing || (q.worker_preload = worker_preload)
         worker_idle_timeout === nothing || (q.worker_idle_timeout = worker_idle_timeout)
+        worker_reply_warn_bytes === nothing || (q.worker_reply_warn_bytes = worker_reply_warn_bytes)
         previous = length(q.conns)
         n = something(workers, previous)
         removed = n < length(q.conns) ? q.conns[n+1:end] : _WorkerConn[]
