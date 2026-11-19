@@ -148,9 +148,13 @@ and outstanding request count. Pass the observed PID to
 processes continue their work. Surplus processes retire after five minutes idle
 by default. An open compute scope keeps the processes it used until it closes.
 
-The configuration reference contains the complete `worker_start` and
-`worker_preload` contract, including eager and lazy startup, restart behavior,
-and the distinction between omitting the preload list and clearing it. Use
+With `worker_start=:now`, the queue starts a replacement after an unexpected
+exit and loads its `worker_preload` packages even while idle. Work already
+running in the lost process receives `ComputeAbandoned`. Other workers keep
+their PIDs and their work. A surplus worker stopped by its idle timeout starts
+again on demand. With the default `:lazy` setting, a request assigned to the
+vacant slot starts its replacement.
+The configuration reference describes retry limits and preload settings. Use
 [`worker_status`](@ref DynamicObjects.worker_status) to inspect the process and
 [`restart_worker!`](@ref DynamicObjects.restart_worker!) to replace it.
 [`carry_to_worker!`](@ref DynamicObjects.carry_to_worker!) registers named

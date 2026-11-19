@@ -117,11 +117,11 @@ const DO = DynamicObjects
 q = DO.job_queue()
 missing = Base.PkgId(Base.UUID("afc73367-81fa-47d7-aee3-02262ce07276"), "MissingWorkerPreload")
 try
-    DO.configure_queue!(; workers=1, worker_start=:lazy, worker_preload=[missing])
-    @test_logs (:error, r"preloading the worker process failed") begin
-        task = DO._start_worker_soon!(q, only(q.conns))
-        settles(() -> istaskdone(task), 120.0) || error("failed preload did not settle")
-        fetch(task)
+    failure = (:error, r"preloading the worker process failed")
+    @test_logs failure failure failure failure (:warn, r"background worker retries exhausted") begin
+        DO.configure_queue!(; workers=1, worker_start=:now, worker_preload=[missing])
+        settles(() -> lock(() -> q.conns[1].eager === nothing, q.conns[1].lock), 120.0) ||
+            error("preload retries did not stop")
     end
     @test !(missing in lock(() -> copy(q.conns[1].loaded), q.conns[1].lock))
     t = Toy(2, mktempdir())
@@ -136,5 +136,170 @@ try
     @test t.square(3).value == 18
 finally
     DO.configure_queue!(; workers=0, worker_start=:lazy, worker_preload=[])
+end
+end
+
+@testitem "worker preloads: idle loss reloads once and a racing request joins the replacement" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects
+const DO = DynamicObjects
+q = DO.job_queue()
+id = Base.PkgId(Base.UUID("6ff30dc2-6786-49b3-8560-52d617bc86d8"), "WorkerPreloadGate")
+dir = mktempdir()
+gate = joinpath(dir, "go")
+receipts = joinpath(dir, "initializers")
+withenv("DO_WORKER_PRELOAD_GATE" => dir) do
+    touch(gate)
+    try
+        DO.configure_queue!(; workers=1, worker_start=:now, worker_preload=[id])
+        ready() = lock(() -> DO._worker_alive(q.conns[1].worker) && id in q.conns[1].loaded, q.conns[1].lock)
+        settles(ready, 120.0) || error("initial worker did not preload")
+        old = q.conns[1].worker
+        rm(gate)
+        kill(old.handle.proc, Base.SIGKILL)
+        settles(() -> length(readlines(receipts)) == 2, 120.0) || error("idle recovery did not preload")
+        newpid = DO.worker_status().pid
+        @test parse.(Int, readlines(receipts)) == [old.handle.proc_pid, newpid]
+        @test DO.worker_status().in_flight == 0
+        t = Toy(3, mktempdir())
+        p = t.square(2; fetch=identity)
+        @test settles(() -> DO.worker_status().in_flight == 1)
+        @test !isready(p)
+        touch(gate)
+        @test settles(() -> isready(p), 120.0) && fetch(p).pid == newpid
+
+        p = t.gated(7; dir, fetch=identity)
+        waitfor(joinpath(dir, "started_7_1")) || error("computation did not start")
+        kill(q.conns[1].worker.handle.proc, Base.SIGKILL)
+        settles(() -> DO._settled(p)) || error("lost computation did not settle")
+        @test_throws ComputeAbandoned fetch(p)
+        settles(() -> ready() && DO.worker_status().pid != newpid, 120.0) ||
+            error("queue did not warm up after losing an in-flight computation")
+        @test DO.worker_status().in_flight == 0
+        @test length(readlines(receipts)) == 3
+    finally
+        touch(gate)
+        DO.configure_queue!(; workers=0, worker_start=:lazy, worker_preload=[])
+    end
+end
+end
+
+@testitem "worker preloads: a lost pool member recovers beside a busy sibling and still retires when idle" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects, WorkerToy
+const DO = DynamicObjects
+q = DO.job_queue()
+dir = mktempdir()
+id = Base.PkgId(WorkerToy)
+ready(conn) = lock(() -> DO._worker_alive(conn.worker) && id in conn.loaded, conn.lock)
+try
+    DO.configure_queue!(; workers=2, worker_start=:now, worker_preload=[WorkerToy], worker_idle_timeout=Inf)
+    first, second = q.conns
+    settles(() -> ready(first) && ready(second), 120.0) || error("pool did not preload")
+    survivor = Toy(2, dir).gated(1; dir, fetch=identity)
+    waitfor(joinpath(dir, "started_1_1")) || error("sibling request did not start")
+    pids = [p.pid for p in DO.worker_status().processes]
+    @test [p.in_flight for p in DO.worker_status().processes] == [1, 0]
+    kill(second.worker.handle.proc, Base.SIGKILL)
+    settles(() -> ready(second) && second.pid != pids[2], 120.0) || error("surplus slot did not recover")
+    @test id in DO._remote_fetch(second, second.worker, DO._loaded_packages)
+    @test DO.worker_status().processes[1].pid == pids[1]
+    touch(joinpath(dir, "go_1"))
+    @test fetch(survivor).pid == pids[1]
+    monitor = second.eager
+    DO.configure_queue!(; worker_idle_timeout=0.1)
+    settles(() -> !DO.worker_status().processes[2].running && istaskdone(monitor)) ||
+        error("intentional idle retirement did not stop recovery")
+    cold = q.conns[2]
+    DO.configure_queue!(; workers=2, worker_preload=[WorkerToy])
+    @test cold !== second && cold.eager === nothing && cold.spawning === nothing
+finally
+    touch(joinpath(dir, "go_1"))
+    DO.configure_queue!(; workers=0, worker_start=:lazy, worker_preload=[], worker_idle_timeout=300)
+end
+end
+
+@testitem "worker preloads: disabling or switching to lazy cancels a queued eager launch" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects, WorkerToy
+const DO = DynamicObjects
+for settings in ((; workers=0), (; worker_start=:lazy))
+    q = DO.JobQueue()
+    DO.configure_queue!(q; workers=1)
+    conn = only(q.conns)
+    entered, release = Base.Event(), Base.Event()
+    blocker = Threads.@spawn DO._on_actor(conn) do
+        notify(entered)
+        wait(release)
+    end
+    try
+        wait(entered)
+        DO.configure_queue!(q; workers=1, worker_start=:now, worker_preload=[WorkerToy])
+        settles(() -> lock(() -> conn.spawning !== nothing, conn.lock)) || error("launch was never queued")
+        supervisor, launch = lock(() -> (conn.eager, conn.spawning), conn.lock)
+        DO.configure_queue!(q; settings...)
+        notify(release)
+        @test fetch(launch) === nothing
+        wait(supervisor)
+        @test conn.eager === nothing
+        @test !DO.worker_status(q).running
+    finally
+        notify(release)
+        wait(blocker)
+        DO.configure_queue!(q; workers=0)
+    end
+end
+end
+
+@testitem "worker preloads: repeated short-lived processes stop background retries" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects, WorkerToy
+const DO = DynamicObjects
+q = DO.job_queue()
+id = Base.PkgId(WorkerToy)
+try
+    DO.configure_queue!(; workers=1, worker_start=:now, worker_preload=[WorkerToy])
+    supervisor = q.conns[1].eager
+    pids = Set{Int}()
+    for _ in 1:4
+        ready() = lock(q.conns[1].lock) do
+            DO._worker_alive(q.conns[1].worker) && q.conns[1].pid ∉ pids && id in q.conns[1].loaded
+        end
+        settles(ready, 120.0) || error("expected another preloaded worker")
+        push!(pids, q.conns[1].pid)
+        kill(q.conns[1].worker.handle.proc, Base.SIGKILL)
+    end
+    settles(() -> istaskdone(supervisor)) || error("rapidly exiting workers kept restarting")
+    @test !istaskfailed(supervisor)
+    @test !DO.worker_status().running
+    # An ordinary request can recover after the automatic attempts are exhausted.
+    @test Toy(3, mktempdir()).square(2).pid ∉ pids
+    @test q.conns[1].eager isa Task && q.conns[1].eager !== supervisor
+finally
+    DO.configure_queue!(; workers=0, worker_start=:lazy, worker_preload=[])
+end
+end
+
+@testitem "worker preloads: disabling an initializing worker stops its process" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects
+const DO = DynamicObjects
+q = DO.JobQueue()
+dir = mktempdir()
+script, started, release = joinpath.(dir, ("boot.jl", "started", "release"))
+write(script, """
+    push!(Base.package_callbacks, function (id)
+        id.name == "DynamicObjects" || return
+        touch($(repr(started)))
+        timedwait(() -> isfile($(repr(release))), 120.0)
+    end)
+    """)
+try
+    DO.configure_queue!(q; workers=1, worker_start=:now, worker_exeflags=["--threads=1,1", "-L", script])
+    waitfor(started) || error("worker did not enter the startup gate")
+    w = lock(() -> q.conns[1].starting_worker, q.conns[1].lock)
+    @test w !== nothing && process_running(w.handle.proc)
+    @test !DO.worker_status(q).running
+    DO.configure_queue!(q; workers=0)
+    @test process_exited(w.handle.proc)
+    @test !DO.worker_status(q).running
+finally
+    touch(release)
+    DO.configure_queue!(q; workers=0)
 end
 end

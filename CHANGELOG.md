@@ -14,6 +14,13 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.30
+
+- With `worker_start=:now`, an unexpected worker exit starts a
+  replacement and loads the configured `worker_preload` packages even when the
+  queue is idle. Requests already running in the lost process receive
+  `ComputeAbandoned`. Repeated failures trigger up to three background retries.
+
 ## 0.5.29
 
 - Restore `memo_retention_stats(queue)` for zero or one configured worker.
