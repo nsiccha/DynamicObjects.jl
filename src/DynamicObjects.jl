@@ -107,9 +107,10 @@ load(::Val{:serial}, path::AbstractString, ::Any) = Serialization.deserialize(pa
 # mv(force=true) first unlinks the destination, which a reader in another worker can see.
 function _atomic_save(fmt::Val, path::AbstractString, x, guard=nothing)
     tmp = tempname(dirname(path); cleanup=false)
+    published = false
     try
         save(fmt, tmp, x)
-        if guard === nothing
+        published = if guard === nothing
             _replace_cache_file(tmp, path)
         else
             # Retraction and publication share the latch lock only for the rename.
@@ -120,7 +121,7 @@ function _atomic_save(fmt::Val, path::AbstractString, x, guard=nothing)
             end
         end
     finally
-        rm(tmp; force=true)
+        published || rm(tmp; force=true)
     end
 end
 
