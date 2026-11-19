@@ -20,10 +20,12 @@ next_read(seconds=10) = timedwait(() -> isready(READS), seconds) === :ok ? take!
 # How many tasks are parked on the in-flight latch of `key` in cache `c` (blocking
 # waiters, `fetch`es of a `Pending`), so a test invalidates only once they wait there.
 waiting(c, key) = lock(c.lock) do
-    cnd = get(c.computing, key, nothing)
+    latch = get(c.computing, key, nothing)
+    latch === nothing && return 0
+    cnd = latch.condition
     # Julia 1.14 wait entries can belong to multiple queues; the queue reference
     # carries the condition identity needed to traverse the right links.
-    cnd === nothing ? 0 : length(isdefined(Base, :waitqueue) ? Base.waitqueue(cnd) : cnd.waitq)
+    length(isdefined(Base, :waitqueue) ? Base.waitqueue(cnd) : cnd.waitq)
 end
 
 gated_read(path) = begin

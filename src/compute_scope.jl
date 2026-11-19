@@ -37,6 +37,8 @@ mutable struct _ScopeEntry
     owners::IdDict{_ComputeScope,Int}
     pending_result::Union{Nothing,Base.RefValue{Any}}
     worker_result::Union{Nothing,_WorkerResultPin}
+    memo::Union{Nothing,_RetainedMemo}
+    adopted::Bool
 end
 
 const _SCOPE_SLOTS = IdDict{Any,Dict{Any,_ScopeEntry}}()
@@ -66,6 +68,7 @@ function _forget_scope_entry!(entry; adopt=false, releasing=nothing)
         push!(owner.releases, (entry.worker_result, adopt))
         entry.worker_result = nothing
     end
+    adopt && entry.memo !== nothing && _register_memo!(entry.memo)
     slot = entry.slot
     entries = _SCOPE_SLOTS[slot.cache]
     delete!(entries, slot.key)
@@ -79,7 +82,12 @@ end
 
 function _claim_scope_entry!(entry, scope)
     if scope === nothing || scope.closed
-        _forget_scope_entry!(entry; adopt=true)
+        if _HEAP_HINT[] == 0
+            _forget_scope_entry!(entry; adopt=true)
+        else
+            # Other readers still own this generation until their last target.
+            entry.adopted = true
+        end
         return
     end
     # A managed job can outlive its enclosing scope. Its own claim lasts until
@@ -98,28 +106,41 @@ function _claim_scope_entry!(entry, scope)
     nothing
 end
 
-# Called under the cache lock on hits and joins. Ignore pre-existing entries.
+# Called under the cache lock on hits and joins. Pre-existing ordinary memos
+# are borrowed only when they participate in automatic retention.
 @inline function _on_hit!(c::AbstractThreadsafeDict, key)
     _OPEN_SCOPE_COUNT[] == 0 || _share_scope_entry!(c, key)
+    _HEAP_HINT[] == 0 || _touch_memo!(c, key)
     nothing
 end
 
 function _share_scope_entry!(c, key)
     lock(_SCOPE_LOCK) do
         entry = _scope_entry(c, key)
-        entry === nothing || _claim_scope_entry!(entry, _COMPUTE_SCOPE[])
+        scope = _COMPUTE_SCOPE[]
+        if entry === nothing && scope !== nothing && !scope.closed && _HEAP_HINT[] != 0
+            store = _scope_dict(c.cache, key)
+            m = store isa _MemoValues ? get(store.raw, key, nothing) : nothing
+            if m isa _RetainedMemo
+                # Borrow a pre-existing ordinary slot. Scope exit returns it to
+                # the warm cache, including when several scopes borrowed it.
+                _park_memo!(m)
+                entry = _new_scope_entry!(c, key, m.name, m, true)
+            end
+        end
+        entry === nothing || _claim_scope_entry!(entry, scope)
     end
 end
 
 # A wrapper or a constructor seed is never claimed. Only the ordinary property
 # producers carry _Settling; state and identity have their existing prune roles.
-_scope_eligible(scope, f, key) = false
-function _scope_eligible(scope, f::_Settling, key)
+_eligible_memo(protected_names, f, key) = false
+function _eligible_memo(protected_names, f::_Settling, key)
     name, o = f.name, f.o
     _is_dunder(name) && return false
     key isa Symbol && haskey(getfield(o, :cache).seed, name) && return false
     # One metadata walk per type in the report, including its deferred jobs.
-    protected = get!(scope.protected_names, typeof(o)) do
+    protected = get!(protected_names, typeof(o)) do
         union!(Set{Symbol}(_state_names(typeof(o))), _computed_version_names(typeof(o)))
     end
     name ∉ protected
@@ -137,13 +158,19 @@ function _record_scope_generation!(c, key, f)
         entries = get(_SCOPE_SLOTS, cache, nothing)
         old = entries === nothing ? nothing : get(entries, key, nothing)
         old === nothing || _forget_scope_entry!(old)
-        scope !== nothing && !scope.closed && _scope_eligible(scope, f, key) || return
-        entries = get!(() -> Dict{Any,_ScopeEntry}(), _SCOPE_SLOTS, cache)
-        slot = _MemSlot(c.lock, cache, _scope_dict(c.computing, key), _scope_dict(c.status, key), key)
-        entry = _ScopeEntry(slot, f.name, IdDict{_ComputeScope,Int}(), nothing, nothing)
-        entries[key] = entry
+        scope !== nothing && !scope.closed && _eligible_memo(scope.protected_names, f, key) || return
+        entry = _new_scope_entry!(c, key, f.name, nothing, false)
         _claim_scope_entry!(entry, scope)
     end
+end
+
+function _new_scope_entry!(c, key, name, memo, adopted)
+    store = _scope_dict(c.cache, key)
+    entries = get!(() -> Dict{Any,_ScopeEntry}(), _SCOPE_SLOTS, store)
+    slot = _MemSlot(c.lock, store, _scope_dict(c.computing, key), _scope_dict(c.status, key), key)
+    entry = _ScopeEntry(slot, name, IdDict{_ComputeScope,Int}(), nothing, nothing, memo, adopted)
+    entries[key] = entry
+    entry
 end
 
 # A pending handle may cross the scope boundary after its job already finished.
@@ -182,8 +209,9 @@ function _release_scope_entry!(scope, entry)
             isempty(entry.owners) || return
             # An escaped computation still owns its latch and must publish for its callers.
             computing = haskey(slot.computing, slot.key)
-            _forget_scope_entry!(entry; adopt=computing, releasing=scope)
-            computing && return
+            adopt = computing || entry.adopted
+            _forget_scope_entry!(entry; adopt, releasing=scope)
+            adopt && return
             haskey(slot.cache, slot.key) || return
             if entry.pending_result !== nothing
                 entry.pending_result[] = slot.cache[slot.key]

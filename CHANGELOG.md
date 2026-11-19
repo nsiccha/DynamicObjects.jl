@@ -14,6 +14,16 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.27
+
+- **Breaking:** With an explicit Julia heap-size hint, the requester and queue
+  worker can release cold memoized results under pressure. A later read of a
+  memory-only property can run the body again. Use `@cached` when the exact
+  result must survive eviction, including stochastic results. The default zero
+  hint retains ordinary memoization for the object's lifetime.
+- `memo_retention_stats()` reports local releases and heap use.
+  `memo_retention_stats(DynamicObjects.job_queue())` includes the live worker.
+
 ## 0.5.26
 
 - `with_compute_scope() do … end` releases derived cache entries a group of

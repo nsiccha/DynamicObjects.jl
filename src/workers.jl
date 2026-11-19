@@ -505,7 +505,7 @@ function _release_worker_results!(requests)
             if adopt && scope !== nothing
                 # A replacement may already have retired this generation.
                 for entry in collect(get(scope.entries, 0, ()))
-                    _forget_scope_entry!(entry; adopt=true)
+                    _claim_scope_entry!(entry, nothing)
                 end
             end
             scope
@@ -1392,7 +1392,9 @@ function _compute_in_worker(f::_WorkerCompute, o, name::Symbol, args::Tuple, kwa
                 value = try
                     wire = _deserialized(payload)
                     if wire isa _OnDisk
-                        _load_published(o, name, args, kwargs, status, wire.path)
+                        result = _load_published(o, name, args, kwargs, status, wire.path)
+                        _HEAP_HINT[] == 0 || _record_memo_disk!(_publish_guard(), o, name, args, kwargs, wire.path)
+                        result
                     elseif wire isa _Address
                         _resolve(wire, _requester_objects(o))
                     else
@@ -1632,6 +1634,13 @@ function _prune_worker_root!(keep, address)
 end
 
 # --- Status and control -------------------------------------------------------------------------
+
+function memo_retention_stats(q::JobQueue)
+    conn = q.conn
+    w = lock(() -> conn.worker, conn.lock)
+    worker = _worker_alive(w) ? _remote_fetch(conn, w, memo_retention_stats) : nothing
+    (; requester=memo_retention_stats(), worker)
+end
 
 """
     DynamicObjects.worker_status(q=job_queue()) -> NamedTuple

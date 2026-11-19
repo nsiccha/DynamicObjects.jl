@@ -37,6 +37,31 @@ indexed calls already memoize.
 Treat returned arrays and other mutable results as read-only. Make a copy
 before changing them. Mutation would also change what later cache hits return.
 
+## Automatic release under heap pressure
+
+Start Julia with an explicit `--heap-size-hint` to enable automatic trimming.
+The requester and each queue worker monitor their own Julia heap. At 90% of
+the hint, reads and publications can release a bounded batch of cold derived
+entries. The most recently used eligible result stays warm. With the default
+zero hint, ordinary reads retain their memoized results for the object's lifetime.
+
+DynamicObjects first releases cold results that can reload from their
+`@cached` or `@mmap` file. It then releases the least recently read eligible
+memory-only results. A later read runs that body again. For a randomized fit
+this can produce different draws. Use an explicit disk cache to reuse the
+published draws, or a compute scope to share a result during a report.
+
+Trimming preserves constructor inputs, state and its owning objects, versions,
+in-flight work, pending deliveries, and scope claims. The package checks
+eligibility from the result type or a bounded inspection of a small mixed
+container. Values that may own native resources stay in memory. Other owners
+can keep a released result alive, and the application can exceed its heap hint.
+
+`memo_retention_stats(DynamicObjects.job_queue())` reports separate requester
+and worker counts, estimated slot payloads, known mapping sizes, and current
+Julia heap estimates. Two slots that reference the same array each contribute
+its size when released.
+
 ## Computing a report
 
 Put the reads for one report in `with_compute_scope`. Its targets can share an
