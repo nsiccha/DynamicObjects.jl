@@ -82,7 +82,7 @@ end
 
 function _claim_scope_entry!(entry, scope)
     if scope === nothing || scope.closed
-        if _HEAP_HINT[] == 0
+        if !_memo_retention_enabled()
             _forget_scope_entry!(entry; adopt=true)
         else
             # Other readers still own this generation until their last target.
@@ -110,7 +110,7 @@ end
 # are borrowed only when they participate in automatic retention.
 @inline function _on_hit!(c::AbstractThreadsafeDict, key)
     _OPEN_SCOPE_COUNT[] == 0 || _share_scope_entry!(c, key)
-    _HEAP_HINT[] == 0 || _touch_memo!(c, key)
+    _memo_retention_enabled() && _touch_memo!(c, key)
     nothing
 end
 
@@ -118,7 +118,7 @@ function _share_scope_entry!(c, key)
     lock(_SCOPE_LOCK) do
         entry = _scope_entry(c, key)
         scope = _COMPUTE_SCOPE[]
-        if entry === nothing && scope !== nothing && !scope.closed && _HEAP_HINT[] != 0
+        if entry === nothing && scope !== nothing && !scope.closed && _memo_retention_enabled()
             store = _scope_dict(c.cache, key)
             m = store isa _MemoValues ? get(store.raw, key, nothing) : nothing
             if m isa _RetainedMemo

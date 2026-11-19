@@ -10,6 +10,7 @@ entries
 cached_entries
 mem_cache_entries
 memo_retention_stats
+DynamicObjects.memo_native_bytes
 DynamicObjects.MemCacheEntry
 ```
 

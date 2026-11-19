@@ -2,7 +2,7 @@
 # check does not catch their removal from the reference pages.
 const QUALIFIED_PUBLIC_DOCS = [
     "DynamicObjects.$name" for name in (
-        "MemCacheEntry", "clear_cache!", "canonical_hash", "RemountSharedContextError",
+        "MemCacheEntry", "memo_native_bytes", "clear_cache!", "canonical_hash", "RemountSharedContextError",
         "save", "load", "progress_notes", "run!", "abandon!", "property_executor",
         "await_deferred", "property_settled", "configure_queue!", "queue_settings",
         "job_queue", "JobQueue", "QueuedItem", "observe_queue!", "unobserve_queue!",

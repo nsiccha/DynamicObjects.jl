@@ -14,6 +14,17 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.30
+
+- The requester and each worker use their explicit Julia heap hint as a soft
+  budget for process memory on Linux and macOS. Set
+  `DYNAMICOBJECTS_PROCESS_BUDGET_BYTES` at launch to override this budget, or
+  set it to zero to use only Julia's heap signal.
+- Producers of rebuildable native models can specialize
+  `DynamicObjects.memo_native_bytes` for the property and result type.
+  `memo_retention_stats` reports the process footprint, estimated native
+  bytes released from slots, and the count of released slots of unknown size.
+
 ## 0.5.29
 
 - Restore `memo_retention_stats(queue)` for zero or one configured worker.
