@@ -65,7 +65,9 @@ end
     DO = DynamicObjects
     parent = AddressLookup(; __status__=nothing)
     first_child = parent.child(1)
+    other_child = AddressLookup(; __status__=nothing).child(1)
     @test DO._child_step(parent, first_child) == (:child, true, (1,), (;))
+    @test DO._child_step(parent, other_child) === nothing
     @test DO._held_entry(parent.child, ((1.0,), (;))) === first_child
     @test DO._held_entry(parent.child, ((2,), (;))) === nothing
     small = @allocated DO._child_step(parent, first_child)
@@ -75,6 +77,8 @@ end
     @test DO._child_step(parent, first_child) == (:child, true, (1,), (;))
     large = @allocated DO._child_step(parent, first_child)
     @test large < 4small + 1024
+    # A miss scans every entry regardless of the dictionary's iteration order.
+    @test (@allocated DO._child_step(parent, other_child)) < 4small + 1024
     clear_mem_caches!(parent)
     @test DO._child_step(parent, first_child) === nothing
 end
