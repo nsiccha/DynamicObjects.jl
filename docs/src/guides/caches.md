@@ -55,8 +55,19 @@ for the object's lifetime.
 When either measurement reaches 90% of its budget, reads and publications can
 release up to 16 cold derived entries toward an 80% target. The most recently
 used eligible result stays warm. After a batch driven by process pressure,
-DynamicObjects collects garbage and rechecks the footprint. It waits longer
-between process checks when the batch gives little relief.
+DynamicObjects collects garbage and rechecks the footprint. A batch should
+close at least 5% of the gap to the target, or take the footprint below the
+90% trigger. Successive batches must also show this progress between their
+post-collection readings, since temporary allocations can grow back between
+collections.
+
+When a batch gives less relief, the next process-driven release waits for
+five seconds. Repeated delays double up to five minutes. Ordinary cache
+access still samples the footprint during the wait. A reading below the
+trigger clears the delay. Newly eligible cache entries whose estimated bytes
+together cover 5% of the remaining gap allow an earlier retry. A successful
+batch restores the usual cadence. Julia heap pressure can release entries
+throughout the wait.
 
 DynamicObjects first releases cold results that can reload from their
 `@cached` or `@mmap` file. It then releases the least recently read eligible
