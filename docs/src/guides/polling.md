@@ -134,7 +134,10 @@ Use `DynamicObjects.configure_queue!(; workers=2, max_running=2)` to run two
 independently submitted `@queued` computations concurrently. For example,
 while a fit runs on one process, a figure from the same root can use the idle
 process. A nested read in the fit runs on the fit's process. Each process
-keeps its own memory cache. Disk-backed results are available to both.
+keeps its own memory cache. Workers send memory-only results in bounded
+pieces, so a result can exceed the size of a single socket read on macOS.
+The requester reassembles the result in memory. For `@cached` and `@mmap`
+results, the worker publishes the file and the requester loads it.
 
 The queue counts requests from assignment through completion, including time
 spent starting a process or loading packages. When workers have equal loads,
