@@ -471,6 +471,153 @@ function _with_worker_scopes(f, values)
     ScopedValues.with(f, scoped...)
 end
 
+# A remote scope belongs to a particular worker process. Its token is allocated by
+# that worker; a replacement starts with an empty registry and gets a fresh scope.
+const _WORKER_COMPUTE_SCOPES = Dict{UInt,_ComputeScope}()
+const _NEXT_WORKER_SCOPE = Threads.Atomic{UInt}(0)
+const _WORKER_RESULT_PINS = Dict{Int,_ComputeScope}()
+
+# Hold only the worker slot whose result the caller is about to cache.
+# Other intermediates keep the deadlines of the report(s) that used them.
+function _pin_worker_result!(id, scope, o, name, args, kwargs, result)
+    cache = getproperty(o, name).cache
+    key = _memo_key(args, kwargs)
+    if cache isa _OpaqueSubcache && _ns_tainted(cache.ns, _taint_key(cache, key))
+        cache = cache.local_dict
+    end
+    lock(cache.lock) do
+        get(cache.cache, key, _missing_sentinel) === result || return false
+        lock(_SCOPE_LOCK) do
+            entry = _scope_entry(cache, key)
+            (entry === nothing || !haskey(entry.owners, scope)) && return false
+            pin = _new_compute_scope()
+            _claim_scope_entry!(entry, pin)
+            _WORKER_RESULT_PINS[id] = pin
+            true
+        end
+    end
+end
+
+function _release_worker_results!(requests)
+    for (id, adopt) in requests
+        pin = lock(_SCOPE_LOCK) do
+            scope = pop!(_WORKER_RESULT_PINS, id, nothing)
+            if adopt && scope !== nothing
+                # A replacement may already have retired this generation.
+                for entry in collect(get(scope.entries, 0, ()))
+                    _forget_scope_entry!(entry; adopt=true)
+                end
+            end
+            scope
+        end
+        pin === nothing || _close_compute_scope!(pin)
+    end
+    nothing
+end
+
+# On result delivery, bind the worker pin to the very latch which requested
+# it. A caller that already adopted the latch also adopts the worker slot.
+# A retracted latch cannot acquire a claim on the replacement.
+function _attach_worker_result!(pin, guard)
+    disposition = lock(guard.cache.lock) do
+        get(guard.cache.computing, guard.key, nothing) === guard.latch || return :discard
+        lock(_SCOPE_LOCK) do
+            entry = _scope_entry(guard.cache, guard.key)
+            entry === nothing && return :adopt
+            entry.worker_result = pin
+            :attached
+        end
+    end
+    if disposition !== :attached
+        _on_live_worker!(pin.conn, pin.worker, _release_worker_results!, [(pin.request, disposition === :adopt)])
+    end
+    nothing
+end
+
+function _on_live_worker!(conn, w, operation, args...)
+    try
+        _worker_alive(w) && _remote_fetch(conn, w, operation, args...)
+    catch err
+        err isa Malt.TerminatedWorkerException || rethrow()
+    end
+end
+
+# A hit adds no transport round trip. At each boundary send one acknowledged
+# release per worker, including workers a caller-only reader never submitted to.
+function _flush_worker_results!(scope)
+    groups = lock(_SCOPE_LOCK) do
+        isempty(scope.releases) && return nothing
+        batches = IdDict{Any,Tuple{_WorkerConn,Vector{Tuple{Int,Bool}}}}()
+        for (pin, adopt) in scope.releases
+            _, batch = get!(() -> (pin.conn, Tuple{Int,Bool}[]), batches, pin.worker)
+            push!(batch, (pin.request, adopt))
+        end
+        empty!(scope.releases)
+        batches
+    end
+    groups === nothing && return
+    @sync for (w, (conn, batch)) in groups
+        @async _on_live_worker!(conn, w, _release_worker_results!, batch)
+    end
+    nothing
+end
+
+function _open_worker_scope!(lifetimes, target)
+    token = Threads.atomic_add!(_NEXT_WORKER_SCOPE, UInt(1)) + UInt(1)
+    scope = _new_compute_scope(lifetimes, target)
+    lock(() -> _WORKER_COMPUTE_SCOPES[token] = scope, _SCOPE_LOCK)
+    token
+end
+
+function _close_worker_scope!(token)
+    scope = lock(() -> pop!(_WORKER_COMPUTE_SCOPES, token), _SCOPE_LOCK)
+    _close_compute_scope!(scope)
+end
+
+function _worker_scope_token(conn, w)
+    scope = _COMPUTE_SCOPE[]
+    scope === nothing && return nothing
+    # The outermost live report owns the remote lifetime. A queued job that
+    # starts after its report closed owns a fresh, job-local remote lifetime.
+    scope = lock(_SCOPE_LOCK) do
+        owner = scope
+        while owner.parent !== nothing && !owner.parent.closed
+            owner = owner.parent
+        end
+        owner
+    end
+    lock(scope.remote_lock) do
+        lock(() -> scope.closed, _SCOPE_LOCK) && return UInt(0)
+        _, token = get!(scope.workers, w) do
+            (conn, _remote_fetch(conn, w, _open_worker_scope!, scope.lifetimes, scope.target))
+        end
+        token
+    end
+end
+
+function _worker_target_delivered!(token)
+    scope = lock(() -> _WORKER_COMPUTE_SCOPES[token], _SCOPE_LOCK)
+    _target_delivered!(scope)
+end
+
+function _release_scope_workers!(scope)
+    try
+        _flush_worker_results!(scope)
+    finally
+        _on_scope_workers!(scope, _close_worker_scope!)
+    end
+end
+function _on_scope_workers!(scope, operation)
+    lock(scope.remote_lock) do
+        isempty(scope.workers) && return
+        @sync for (w, (conn, token)) in scope.workers
+            @async _on_live_worker!(conn, w, operation, token)
+        end
+        operation === _close_worker_scope! && empty!(scope.workers)
+    end
+    nothing
+end
+
 # --- Requester messages ----------------------------------------------------------------------
 
 const _WORKER_REQUEST = ScopedValues.ScopedValue{Union{Nothing,Int}}(nothing)
@@ -567,6 +714,7 @@ function _push_event!(id::Int, kind::Symbol, payload)
         _serialized(payload)
     catch err
         kind === :log && return nothing
+        kind === :pinned_result && _release_worker_results!(((id, false),))
         kind = :failed
         _serialized("the worker could not send the result back: " * sprint(showerror, err))
     end
@@ -588,14 +736,20 @@ function _worker_control_loop()
 end
 
 function _worker_control(::Val{:submit}, id::Int, address, name::Symbol, args, kwargs, is_fresh::Bool,
-                         min_level::Int32, mirrored::Bool, scopes)
+                         min_level::Int32, mirrored::Bool, scopes, scope_token=nothing)
+    # Keep this request's values until its result is ready even if its report
+    # closed while the control message was waiting in the worker mailbox.
+    scope = if scope_token !== nothing
+        parent = lock(() -> get(_WORKER_COMPUTE_SCOPES, scope_token, nothing), _SCOPE_LOCK)
+        _new_compute_scope(; parent)
+    end
     logger = _ForwardLogger(id, Base.CoreLogging.LogLevel(min_level))
     pinned = _kept_keys(address)
     _pin!(_W_OBJECTS, pinned, 1)
     started = try
         _with_worker_scopes(scopes) do
             ScopedValues.with_logger(logger) do
-                ScopedValues.with(_WORKER_REQUEST => id) do
+                ScopedValues.with(_WORKER_REQUEST => id, _COMPUTE_SCOPE => scope) do
                     o = _resolve(address, _W_OBJECTS)
                     sync!(_retained_object(_root_of(o)))
                     args = _unwire(args, _W_OBJECTS)
@@ -617,13 +771,16 @@ function _worker_control(::Val{:submit}, id::Int, address, name::Symbol, args, k
         end
     catch err
         _pin!(_W_OBJECTS, pinned, -1)
+        scope === nothing || _close_compute_scope!(scope)
         _push_event!(id, :failed, _remote_failure(err, catch_backtrace()))
         return
     end
     o, handle, node, mirror = started
     node === nothing || lock(() -> _W_NODES[id] = (node, mirror), _W_NODES_LOCK)
-    errormonitor(Threads.@spawn Base.invokelatest(_worker_finish, id, o, name, args, kwargs, is_fresh,
-                                                  handle, mirror, pinned))
+    ScopedValues.with(_COMPUTE_SCOPE => scope) do
+        errormonitor(Threads.@spawn Base.invokelatest(_worker_finish, id, o, name, args, kwargs,
+                                                      is_fresh, handle, mirror, pinned))
+    end
     nothing
 end
 
@@ -653,21 +810,28 @@ function _mirror(id::Int, node::Treebars.ProgressNode)
 end
 
 function _worker_finish(id, o, name, args, kwargs, is_fresh, handle, mirror, pinned)
+    result_pinned = false
     try
         succeeded = false
-        value = try
+        scope = _COMPUTE_SCOPE[]
+        payload = try
             result = handle isa Union{Pending,Task} ? fetch(handle) : handle
+            value = is_fresh ? _wire_result(result) : _result_payload(o, name, args, kwargs, result)
+            result_pinned = scope !== nothing && !is_fresh &&
+                _pin_worker_result!(id, scope, o, name, args, kwargs, result)
             succeeded = true
-            result
+            value
         finally
             # The closing frame (the whole final tree) goes out before the outcome.
             if mirror !== nothing
                 close(mirror)
                 _push_event!(id, :progress_closed, succeeded ? :done : :failed)
             end
+            scope === nothing || _close_compute_scope!(scope)
         end
-        _push_event!(id, :done, is_fresh ? _wire_result(value) : _result_payload(o, name, args, kwargs, value))
+        _push_event!(id, result_pinned ? :pinned_result : :done, payload)
     catch err
+        result_pinned && _release_worker_results!(((id, false),))
         _push_event!(id, :failed, _remote_failure(err, catch_backtrace()))
     finally
         lock(() -> delete!(_W_NODES, id), _W_NODES_LOCK)
@@ -1033,13 +1197,21 @@ function _event_pump(conn::_WorkerConn, w)
                 ComputeAbandoned("the connection to the worker process failed: " * sprint(showerror, err), true)
             break
         end
-        lock(conn.lock) do
+        orphaned = lock(conn.lock) do
+            orphaned = nothing
             conn.last_message_at = time()
             for (id, kind, bytes) in batch
                 req = get(conn.inflight, id, nothing)
-                req === nothing || put!(req.events, (kind, bytes))
+                if req !== nothing
+                    put!(req.events, (kind, bytes))
+                elseif kind === :pinned_result
+                    orphaned === nothing && (orphaned = Tuple{Int,Bool}[])
+                    push!(orphaned, (id, false))
+                end
             end
+            orphaned
         end
+        orphaned === nothing || _on_live_worker!(conn, w, _release_worker_results!, orphaned)
     end
     _abandon_inflight!(conn, w, failure)
 end
@@ -1175,6 +1347,7 @@ end
 function _compute_in_worker(f::_WorkerCompute, o, name::Symbol, args::Tuple, kwargs::NamedTuple, status)
     q, is_fresh = f.queue, f.is_fresh
     conn = q.conn
+    guard = _COMPUTE_SCOPE[] === nothing || is_fresh ? nothing : _publish_guard()
     address, wired_args, wired_kwargs = try
         _address(o), _wire(args), _wire(kwargs)
     catch err
@@ -1215,10 +1388,24 @@ function _compute_in_worker(f::_WorkerCompute, o, name::Symbol, args::Tuple, kwa
                 _emit_log(_deserialized(payload), pid)
             elseif kind === :message
                 _deliver_requester_message(_deserialized(payload)...)
-            elseif kind === :done
-                value = _deserialized(payload)
-                value isa _OnDisk && return _load_published(o, name, args, kwargs, status, value.path)
-                return value isa _Address ? _resolve(value, _requester_objects(o)) : value
+            elseif kind === :done || kind === :pinned_result
+                value = try
+                    wire = _deserialized(payload)
+                    if wire isa _OnDisk
+                        _load_published(o, name, args, kwargs, status, wire.path)
+                    elseif wire isa _Address
+                        _resolve(wire, _requester_objects(o))
+                    else
+                        wire
+                    end
+                catch
+                    kind === :pinned_result && _on_live_worker!(conn, w, _release_worker_results!, [(req.id, false)])
+                    rethrow()
+                end
+                if kind === :pinned_result
+                    _attach_worker_result!(_WorkerResultPin(conn, w, req.id), guard)
+                end
+                return value
             elseif kind === :failed
                 _throw_remote(o, name, args, kwargs, pid, _deserialized(payload))
             elseif kind === :abandoned
@@ -1232,8 +1419,21 @@ function _compute_in_worker(f::_WorkerCompute, o, name::Symbol, args::Tuple, kwa
             end
         end
     finally
-        interrupter === nothing || close(interrupter)
-        lock(() -> delete!(conn.inflight, req.id), conn.lock)
+        try
+            interrupter === nothing || close(interrupter)
+        finally
+            # A renderer or message handler can fail before it reads the final
+            # event. Dispose of a pin already delivered to its request here.
+            # A later event finds no request and is handled by the event pump.
+            unread_pin = lock(conn.lock) do
+                delete!(conn.inflight, req.id)
+                while isready(req.events)
+                    first(take!(req.events)) === :pinned_result && return true
+                end
+                false
+            end
+            unread_pin && _on_live_worker!(conn, req.worker, _release_worker_results!, [(req.id, false)])
+        end
     end
 end
 
@@ -1254,7 +1454,7 @@ function _submit!(q, req::_RemoteRequest, o, name, args, kwargs, packages, messa
         lock(() -> req.worker = w, conn.lock)
         try
             _ensure_packages!(conn, w, union(_worker_preload(q), packages), status)
-            _remote_fetch(conn, w, _worker_submit, message...)
+            _remote_fetch(conn, w, _worker_submit, message..., _worker_scope_token(conn, w))
             return w, w.handle.proc_pid
         catch err
             if err isa Malt.TerminatedWorkerException
@@ -1401,6 +1601,34 @@ function _invalidation_address(o)
         err isa _NotAddressable || @debug "DynamicObjects: no worker address for an invalidation" exception = err
         nothing
     end
+end
+
+"""
+    prune_worker_mem_caches!(keep, root; queue=DynamicObjects.job_queue())
+
+Run the ordinary memory-cache prune on the existing queue worker's copy of
+`root` and wait for its counts `(; objects, kept, evicted)`. A stopped worker
+or absent root returns zero counts. This never starts a worker or builds the
+object. The predicate travels to the worker and executes there; use a callable
+available in its environment, such as `Returns(false)` or an application
+package function. Predicate and transport failures are reported to the caller.
+To prune the calling process as well, call [`prune_mem_caches!`](@ref) there.
+"""
+function prune_worker_mem_caches!(keep, root; queue=job_queue())
+    _is_dynamic_object(root) || throw(ArgumentError("expected a @dynamicstruct root"))
+    conn = queue.conn
+    w = lock(() -> conn.worker, conn.lock)
+    _worker_alive(w) || return (objects=0, kept=0, evicted=0)
+    address = _address(root; strict=true)
+    packages = _packages!(_packages!(Set{Base.PkgId}(), address), keep)
+    _ensure_packages!(conn, w, packages)
+    _remote_fetch(conn, w, _prune_worker_root!, keep, address)
+end
+
+function _prune_worker_root!(keep, address)
+    root = _resolve_existing(address, _W_OBJECTS)
+    root === nothing && return (objects=0, kept=0, evicted=0)
+    prune_mem_caches!(keep, root)
 end
 
 # --- Status and control -------------------------------------------------------------------------

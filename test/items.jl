@@ -1281,7 +1281,8 @@ end
 _slot_fail_calls = Threads.Atomic{Int}(0)
 @dynamicstruct struct SlotFailing
     x::Int
-    boom = (Threads.atomic_add!(_slot_fail_calls, 1); sleep(0.02); error("slot boom $x"))
+    @state gate = Base.Event()
+    boom = (Threads.atomic_add!(_slot_fail_calls, 1); wait(gate); error("slot boom $x"))
 end
 
 end # @testmodule DOSlotFixtures
@@ -1327,10 +1328,18 @@ end
 Pins failure fan-out, retry, and polling behavior for readers sharing one
 in-flight slot computation.
 """
-@testitem "slot failure → c.errors → all waiters rethrow" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures] begin
+@testitem "slot failure → c.errors → all waiters rethrow" tags=[:core] setup=[DOImports, DOFixtures, DOSlotFixtures, DOStatusFixtures, DOIncludeFixtures, DOMmapFixtures, DOFreshFixtures, InflightInvalidationFixtures] begin
     _slot_fail_calls[] = 0
     o = SlotFailing(7)
-    errs = fetch.([Threads.@spawn(try o.boom; nothing catch e; e end) for _ in 1:8])
+    readers = [Threads.@spawn(try o.boom; nothing catch e; e end) for _ in 1:8]
+    try
+        # A reader arriving after failure correctly starts a retry. Release
+        # the failing body only once the other seven readers have joined it.
+        @test timedwait(() -> waiting(getfield(o, :cache).cache, :boom) == 7, 30) === :ok
+    finally
+        notify(o.gate)
+    end
+    errs = fetch.(readers)
     @test all(e -> e isa PropertyComputationError, errs)  # every waiter rethrew the recorded error
     @test all(e -> e.property === :boom, errs)
     @test _slot_fail_calls[] == 1                         # RHS ran once; waiters did NOT recompute
@@ -1341,6 +1350,7 @@ in-flight slot computation.
     o2 = SlotFailing(9)
     perr = Ref{Any}(nothing)
     fetchproperty(o2, :boom) do rv, status
+        notify(o2.gate)
         rv isa Pending || return rv
         try fetch(rv) catch e; perr[] = e end
     end

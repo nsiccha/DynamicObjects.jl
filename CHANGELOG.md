@@ -14,6 +14,17 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.26
+
+- `with_compute_scope() do … end` releases derived cache entries a group of
+  computations created in the caller and queue worker, including on failure.
+  Other active scopes keep the entries they use. An ordinary reader keeps its
+  usual warm cache. `compute_targets(root, targets)` can release entries at
+  an earlier target when the remaining declarations have known dependencies.
+- `prune_worker_mem_caches!(keep, root)` runs a predicate on the worker's
+  existing copy of a root and returns its eviction counts. Disk files and
+  object versions survive pruning.
+
 ## 0.5.25
 
 - When a queue worker dies, each affected request's `ComputeAbandoned` prints
