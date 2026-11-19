@@ -14,6 +14,14 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.36
+
+- A cold worker configured with `worker_start=:now` and a nonempty
+  `worker_preload` receives the package list at process launch. Configuration
+  returns once the child has been launched. The worker can load the application
+  concurrently with the parent's import. Repeating the configuration with the
+  same packages keeps the worker and its progress.
+
 ## 0.5.35
 
 - The requester and each worker use their explicit Julia heap hint as a soft

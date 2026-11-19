@@ -1,6 +1,8 @@
 module WorkerPreloadGate
 function __init__()
     dir = ENV["DO_WORKER_PRELOAD_GATE"]
+    println(stdout, "WorkerPreloadGate initializing on ", getpid())
+    flush(stdout)
     open(joinpath(dir, "initializers"), "a") do io
         println(io, getpid())
     end
