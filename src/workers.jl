@@ -686,7 +686,7 @@ end
 
 const _IS_WORKER = Threads.Atomic{Bool}(false)
 const _W_CONTROL = Channel{Any}(Inf)
-const _W_EVENTS = Channel{Any}(Inf)
+const _W_EVENTS = Channel{Tuple{Int,Symbol,IOBuffer}}(Inf)
 const _W_OBJECTS = (; lock=ReentrantLock(), dict=Dict{Any,Any}(), recent=_Recency())
 const _W_NODES = Dict{Int,Any}()          # request id => (progress node, mirror or nothing)
 const _W_NODES_LOCK = ReentrantLock()
@@ -720,11 +720,23 @@ function _worker_invalidate_wait(msg...)
 end
 _worker_interrupt(id::Int, node_id::Int=1) = (put!(_W_CONTROL, (:interrupt, id, node_id)); nothing)
 
-# The events queued since the last call, oldest first; waits for at least one.
-function _worker_take_events()
-    batch = Any[take!(_W_EVENTS)]
-    while isready(_W_EVENTS)
-        push!(batch, take!(_W_EVENTS))
+# Julia's native socket read on macOS can reject lengths above typemax(Cint).
+# Bound both byte vectors and the number of fixed-shape headers in a Malt reply.
+const _WORKER_REPLY_BYTES = 8 * 1024^2
+const _WORKER_REPLY_PARTS = 256
+
+function _worker_take_events(events=_W_EVENTS, budget=_WORKER_REPLY_BYTES)
+    batch = Tuple{Int,Symbol,Int,Int,Vector{UInt8}}[]
+    while isempty(batch) || (budget > 0 && length(batch) < _WORKER_REPLY_PARTS && isready(events))
+        # This pump is the channel's only reader. Leave a partly sent event at
+        # its head so subsequent polls finish it before any later event.
+        id, kind, io = fetch(events)
+        offset, available = position(io), bytesavailable(io)
+        total = offset + available
+        bytes = offset == 0 && available <= budget ? take!(io) : read(io, min(available, budget))
+        length(bytes) == available && take!(events)
+        push!(batch, (id, kind, offset, total, bytes))
+        budget -= length(bytes)
     end
     batch
 end
@@ -732,18 +744,23 @@ end
 # Events are serialized where they are queued, one by one: one that cannot be serialized
 # fails its own request instead of the whole batch.
 function _push_event!(id::Int, kind::Symbol, payload)
-    bytes = try
-        _serialized(payload)
+    io = try
+        _serialized_buffer(payload)
     catch err
         kind === :log && return nothing
         kind === :pinned_result && _release_worker_results!(((id, false),))
         kind = :failed
-        _serialized("the worker could not send the result back: " * sprint(showerror, err))
+        _serialized_buffer("the worker could not send the result back: " * sprint(showerror, err))
     end
-    put!(_W_EVENTS, (id, kind, bytes))
+    put!(_W_EVENTS, (id, kind, io))
     nothing
 end
-_serialized(x) = (io = IOBuffer(); Serialization.serialize(io, x); take!(io))
+function _serialized_buffer(x)
+    io = IOBuffer()
+    Serialization.serialize(io, x)
+    seekstart(io)
+end
+
 _deserialized(bytes::Vector{UInt8}) = Serialization.deserialize(IOBuffer(bytes))
 
 function _worker_control_loop()
@@ -1297,6 +1314,38 @@ function _detach_worker!(conn, w)
     end
 end
 
+# Only the last piece delivers an event (and transfers ownership of a result pin).
+function _deliver_worker_events!(conn, w, batch)
+    orphaned = nothing
+    conn.last_message_at = time()
+    for (id, kind, offset, total, bytes) in batch
+        req = get(conn.inflight, id, nothing)
+        complete = offset + length(bytes) == total
+        if req !== nothing && req.worker === w
+            put!(req.events, (complete ? kind : :fragment, (offset, total, bytes)))
+        elseif complete && kind === :pinned_result
+            orphaned === nothing && (orphaned = Tuple{Int,Bool}[])
+            push!(orphaned, (id, false))
+        end
+    end
+    orphaned
+end
+
+# Assemble on the requesting task. Allocating a large value can fail there
+# without stopping the shared pump or disturbing another request.
+function _take_worker_event(events)
+    partial = nothing
+    while true
+        kind, payload = take!(events)
+        kind === :abandoned && return kind, payload
+        offset, total, bytes = payload
+        length(bytes) == total && return kind, bytes
+        offset == 0 && (partial = Vector{UInt8}(undef, total))
+        copyto!(partial, offset + 1, bytes, 1, length(bytes))
+        kind === :fragment || return kind, partial
+    end
+end
+
 # Deliver the worker's events to their requests until the worker exits; then fail every
 # request still in flight with `ComputeAbandoned`.
 function _event_pump(conn::_WorkerConn, w)
@@ -1312,18 +1361,7 @@ function _event_pump(conn::_WorkerConn, w)
             break
         end
         orphaned = lock(conn.lock) do
-            orphaned = nothing
-            conn.last_message_at = time()
-            for (id, kind, bytes) in batch
-                req = get(conn.inflight, id, nothing)
-                if req !== nothing
-                    put!(req.events, (kind, bytes))
-                elseif kind === :pinned_result
-                    orphaned === nothing && (orphaned = Tuple{Int,Bool}[])
-                    push!(orphaned, (id, false))
-                end
-            end
-            orphaned
+            _deliver_worker_events!(conn, w, batch)
         end
         orphaned === nothing || _on_live_worker!(conn, w, _release_worker_results!, orphaned)
     end
@@ -1525,7 +1563,7 @@ function _compute_in_worker(f::_WorkerCompute, o, name::Symbol, args::Tuple, kwa
         replica = _replica(status, conn, w, req.id)
         interrupter = replica === nothing ? _forward_interrupts(conn, w, req.id, status) : replica
         while true
-            kind, payload = take!(req.events)
+            kind, payload = _take_worker_event(req.events)
             if kind === :progress
                 replica === nothing || Treebars.apply_frame!(replica, _deserialized(payload))
             elseif kind === :progress_closed

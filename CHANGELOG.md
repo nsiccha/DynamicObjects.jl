@@ -14,6 +14,12 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.32
+
+- Queue workers deliver large in-memory results across multiple socket replies
+  so each read fits within the macOS size limit. Replies that combine smaller
+  events also have a size limit.
+
 ## 0.5.31
 
 - With `worker_start=:now`, an unexpected worker exit starts a

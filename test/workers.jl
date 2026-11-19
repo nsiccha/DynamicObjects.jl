@@ -39,6 +39,80 @@ function with_worker(f)
 end
 end
 
+@testitem "workers: bounded event replies preserve order and isolate an abandoned transfer" tags=[:core, :workers] begin
+using DynamicObjects, Serialization
+const DO = DynamicObjects
+
+# Record the actual bulk reads Julia's deserializer requests from a reply.
+struct ReadProbe <: IO
+    io::IOBuffer
+    reads::Vector{Int}
+end
+Base.read(p::ReadProbe, ::Type{UInt8}) = read(p.io, UInt8)
+function Base.unsafe_read(p::ReadProbe, ptr::Ptr{UInt8}, n::UInt)
+    push!(p.reads, n)
+    unsafe_read(p.io, ptr, n)
+end
+
+conn = DO._WorkerConn(1)
+worker = :original
+requests = [DO._RemoteRequest(i, Channel{Any}(Inf), worker) for i in 1:2]
+for req in requests
+    conn.inflight[req.id] = req
+end
+events = Channel{Tuple{Int,Symbol,IOBuffer}}(Inf)
+queue(id, kind, value) = put!(events, (id, kind, DO._serialized_buffer(value)))
+budget = 1024
+large = UInt8[mod(i, 251) for i in 1:(3budget + 17)]
+queue(1, :progress, :running)
+queue(1, :pinned_result, large)
+queue(2, :message, reverse(large))
+queue(2, :progress_closed, :done)
+queue(2, :done, large)
+
+reads = Int[]
+orphans = Tuple{Int,Bool}[]
+let polls = 0
+    while isready(events)
+        batch = DO._worker_take_events(events, budget)
+        @test sum(part -> length(last(part)), batch) <= budget
+        reply = deserialize(ReadProbe(DO._serialized_buffer(batch), reads))
+        released = DO._deliver_worker_events!(conn, worker, reply)
+        released === nothing || append!(orphans, released)
+        polls += 1
+        if polls == 1
+            @test first.(batch) == [1, 1]
+            kind, data = DO._take_worker_event(requests[1].events)
+            @test kind === :progress && DO._deserialized(data) === :running
+            delete!(conn.inflight, 1)  # requester leaves during its pinned result
+        end
+    end
+    @test polls > 3
+end
+@test maximum(reads) == budget
+@test orphans == [(1, false)]
+reason = (worker, ComputeAbandoned("worker stopped", true))
+put!(requests[1].events, (:abandoned, reason))
+close(requests[1].events)
+@test DO._take_worker_event(requests[1].events) === (:abandoned, reason)
+@test !isready(requests[1].events)
+close(requests[2].events)
+for expected in [(:message, reverse(large)), (:progress_closed, :done), (:done, large)]
+    kind, data = DO._take_worker_event(requests[2].events)
+    @test (kind, DO._deserialized(data)) == expected
+end
+@test !isready(requests[2].events)
+
+# Tiny events have a header cost even when their payloads fit the byte budget.
+for i in 1:(DO._WORKER_REPLY_PARTS + 1)
+    queue(i, :log, nothing)
+end
+first_batch = DO._worker_take_events(events)
+@test first.(first_batch) == 1:DO._WORKER_REPLY_PARTS
+@test bytesavailable(DO._serialized_buffer(first_batch)) < 64 * 1024
+@test only(DO._worker_take_events(events))[1] == DO._WORKER_REPLY_PARTS + 1
+end
+
 @testitem "workers: @queued values come back from the worker, memory and disk tier" setup=[WorkerFixtures] tags=[:core, :workers] begin
 using DynamicObjects
 with_worker() do
@@ -56,6 +130,24 @@ with_worker() do
     sleep(0.2)
     @test settled_count(:square) == 1
     @test DynamicObjects.worker_status().in_flight == 0
+
+    # Cross a Malt reply boundary while another request is live on the same worker.
+    slots = DynamicObjects.queue_settings().max_running
+    dir = mktempdir()
+    DynamicObjects.configure_queue!(; max_running=2)
+    peer = try
+        pending = t.gated(1; dir, fetch=identity)
+        waitfor(joinpath(dir, "started_1_1")) || error("peer did not reach the worker")
+        n = DynamicObjects._WORKER_REPLY_BYTES + 17
+        large = t.byte_pattern(n)
+        @test large.pid == r.pid
+        @test large.bytes == UInt8[mod(i, 251) for i in 1:n]
+        pending
+    finally
+        touch(joinpath(dir, "go_1"))
+        DynamicObjects.configure_queue!(; max_running=slots)
+    end
+    @test fetch(peer) == (pid=r.pid, n=1, value=3)
 
     # Disk tier: the worker publishes the entry; this process loads it from disk.
     c = t.cube(2)

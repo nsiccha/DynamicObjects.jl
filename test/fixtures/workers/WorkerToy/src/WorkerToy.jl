@@ -95,6 +95,7 @@ end
     __prefix__ = ""
     "Memory-tier item"
     @queued square(x::Int) = (pid=getpid(), n=computed!(:square), value=base * x^2)
+    @queued byte_pattern(n::Int) = (pid=getpid(), bytes=UInt8[mod(i, 251) for i in 1:n])
     "Disk-tier item"
     @queued @cached cube(x::Int) = (pid=getpid(), n=computed!(:cube), value=base * x^3)
     "Gated item"
