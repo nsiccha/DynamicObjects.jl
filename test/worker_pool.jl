@@ -162,20 +162,26 @@ q = DO.job_queue()
 dir = mktempdir()
 t = Toy(1, dir)
 resume = Base.Event()
-entered = Base.Event()
+entered = Channel{Nothing}(1)
+function pause_actor()
+    put!(entered, nothing)
+    wait(resume)
+end
+function await_task(task, operation)
+    settles(() -> istaskdone(task)) || error("timed out waiting for $operation")
+    fetch(task)
+end
 try
     DO.configure_queue!(; workers=2)
     hold = t.gated(1; dir, fetch=identity)
     waitfor(joinpath(dir, "started_1_1")) || error("fit did not start")
-    prior = t.square(5)
+    prior = await_task(Threads.@spawn(t.square(5)), "the initial square")
     @test prior.pid == DO.worker_status().processes[2].pid
     # Delay only the first connection's control stream. The second worker can still
     # answer, but its square(5) is stale until the invalidation reaches it.
-    blocked = Threads.@spawn DO._on_actor(q.conns[1]) do
-        notify(entered)
-        wait(resume)
-    end
-    wait(entered)
+    blocked = Threads.@spawn DO._on_actor(pause_actor, q.conns[1])
+    settles(() -> isready(entered) || istaskdone(blocked)) || error("first actor did not pause")
+    istaskdone(blocked) && fetch(blocked)
     ip = t.square
     key = DO._memo_key((5,), (;))
     clear = Threads.@spawn invalidate!(ip, 5)
@@ -186,8 +192,9 @@ try
     @test settles(() -> isready(replacement) || blocked_submit())
     @test !isready(replacement)
     notify(resume)
-    fetch(blocked)
-    fetch(clear)
+    await_task(blocked, "the paused actor")
+    await_task(clear, "replica invalidation")
+    settles(() -> isready(replacement)) || error("replacement did not settle")
     value = fetch(replacement)
     @test value.pid == prior.pid && value.n == prior.n + 1
     @test ip(5) === value
