@@ -315,8 +315,10 @@ cumulative automatic memo releases in the disk and memory tiers.
 `estimated_payload_bytes` counts shallow payloads dropped from slots and
 `mapped_payload_bytes` counts known explicit mappings separately. Aliases can
 contribute to several slots and other owners may still hold the value.
-Passing a job queue returns `(; requester, worker)` with a separate snapshot
-for each process. An idle queue without a live worker returns `worker=nothing`.
+For a queue configured with zero or one worker, the result is `(; requester, worker)`.
+`worker` is `nothing` when the process is absent. For a pool, the result is
+`(; requester, workers)` with a snapshot per configured slot, in slot order.
+A slot without a live process contains `nothing`. Reading statistics leaves idle workers idle.
 """
 function memo_retention_stats()
     counts = lock(() -> _MEMO_EVICTED[], _MEMO_LOCK)

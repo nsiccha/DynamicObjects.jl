@@ -14,6 +14,12 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.29
+
+- Restore `memo_retention_stats(queue)` for zero or one configured worker.
+  With multiple workers, `stats.workers` reports one snapshot per slot and
+  `nothing` for a stopped process.
+
 ## 0.5.28
 
 - `configure_queue!(; workers=2)` lets independent queued work run in different

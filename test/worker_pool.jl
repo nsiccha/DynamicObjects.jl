@@ -13,17 +13,23 @@ release(x) = touch(joinpath(dir, "go_$x"))
 started(x) = settles(() -> any(startswith("started_$(x)_"), readdir(dir)), 120.0)
 try
     DO.configure_queue!(; workers=2, max_running=2)
+    @test memo_retention_stats(DO.job_queue()).workers == [nothing, nothing]
     @test !any(p -> p.running, slots())
     @test_throws ArgumentError DO.restart_worker!()
     @test_throws ArgumentError DO.restart_worker!(; pid=-1)
 
     fit = gate(t, 1)
     started(1) || error("first request did not reach its worker")
+    stats = memo_retention_stats(DO.job_queue())
+    @test stats.requester.pid == getpid()
+    @test stats.workers[1].pid == slots()[1].pid
+    @test isnothing(stats.workers[2])
     joined = gate(t, 1)
     figure = gate(t, 2)
     started(2) || error("same-root figure could not start beside the fit")
     pids = [s.pid for s in slots()]
     @test all(p -> p != getpid(), pids) && allunique(pids)
+    @test [s.pid for s in memo_retention_stats(DO.job_queue()).workers] == pids
     @test [s.in_flight for s in slots()] == [1, 1]
     waiting = gate(other, 3)
     @test settles(() -> DO.queue_settings().queued == 1)
@@ -100,7 +106,7 @@ function DO.save(::Val{:pool_gate}, path::AbstractString, x)
 end
 cache = DO.ThreadsafeDict()
 key = :entry
-latch = Threads.Condition(cache.lock)
+latch = DO._MemoLatch(cache.lock)
 cache.computing[key] = latch
 guard = DO._PublishGuard(cache, key, latch)
 mktempdir() do dir
