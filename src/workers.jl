@@ -535,10 +535,15 @@ function _attach_worker_result!(pin, guard)
 end
 
 function _on_live_worker!(conn, w, operation, args...)
+    _worker_alive(w) || return nothing
     try
-        _worker_alive(w) && _remote_fetch(conn, w, operation, args...)
+        _remote_fetch(conn, w, operation, args...)
     catch err
-        err isa Malt.TerminatedWorkerException || rethrow()
+        # A restart, resize or idle timer can retire this connection during the call.
+        if err isa Malt.TerminatedWorkerException || (err isa InvalidStateException && !isopen(conn.ops))
+            return nothing
+        end
+        rethrow()
     end
 end
 
@@ -1780,10 +1785,14 @@ end
 # --- Status and control -------------------------------------------------------------------------
 
 function memo_retention_stats(q::JobQueue)
-    conn = q.conn
-    w = lock(() -> conn.worker, conn.lock)
-    worker = _worker_alive(w) ? _remote_fetch(conn, w, memo_retention_stats) : nothing
-    (; requester=memo_retention_stats(), worker)
+    conns = lock(() -> copy(q.conns), q.lock)
+    workers = map(conns) do conn
+        w = lock(() -> conn.worker, conn.lock)
+        _on_live_worker!(conn, w, memo_retention_stats)
+    end
+    requester = memo_retention_stats()
+    length(workers) > 1 && return (; requester, workers)
+    (; requester, worker=isempty(workers) ? nothing : only(workers))
 end
 
 """

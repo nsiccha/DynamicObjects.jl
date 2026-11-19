@@ -62,6 +62,10 @@ and worker counts, estimated slot payloads, known mapping sizes, and current
 Julia heap estimates. Two slots that reference the same array each contribute
 its size when released.
 
+With zero or one configured worker, read `stats.worker`. With two or more,
+read `stats.workers` in queue slot order. Each live snapshot includes its PID.
+An absent process gives `nothing`, and reading the statistics never starts one.
+
 ## Computing a report
 
 Put the reads for one report in `with_compute_scope`. Its targets can share an
