@@ -844,11 +844,13 @@ w = Malt.Worker()
 try
     hooks = added(before)
     @test length(hooks) == 1 && DO._stops_worker(only(hooks), w)
-    DO._exit_without_waiting!(w)
+    exiting = Threads.Atomic{Bool}(false)
+    DO._exit_without_waiting!(w, exiting)
     hooks = added(before)
     @test length(hooks) == 1 && parentmodule(typeof(only(hooks))) === DO
     # Run at exit, DO's hook kills the worker and returns without waiting for it to go.
     @test (@elapsed only(hooks)()) < 1
+    @test exiting[]
     @test settles(() -> !Malt.isrunning(w), 10.0)
 finally
     Malt.isrunning(w) && Malt.stop(w)
@@ -897,6 +899,23 @@ else
         process_running(proc) && kill(proc, Base.SIGKILL)
         wpid !== nothing && alive(wpid) && run(ignorestatus(`kill -KILL $wpid`))
         ok || println(read(out, String), read(err, String))
+    end
+end
+end
+
+@testitem "workers: normal parent exit lets eager supervision finish without replacing the worker" tags=[:core, :workers] begin
+using DynamicObjects
+script = joinpath(dirname(pathof(DynamicObjects)), "..", "test", "fixtures", "worker_exit_process.jl")
+mktempdir() do dir
+    check = joinpath(dir, "exit-check")
+    project = dirname(Base.active_project())
+    proc = run(`$(Base.julia_cmd()) --startup-file=no --threads=2 --project=$project $script $check`; wait=false)
+    try
+        @test timedwait(() -> process_exited(proc), 180.0) === :ok && success(proc)
+        @test isfile(check) && read(check, String) == "ok false"
+    finally
+        process_running(proc) && kill(proc, Base.SIGKILL)
+        wait(proc)
     end
 end
 end

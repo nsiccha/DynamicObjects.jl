@@ -327,4 +327,6 @@ end
 
 function __init__()
     _HEAP_HINT[] = Base.JLOptions().heap_size_hint
+    # A queue between retries can be exiting even before its first worker exists.
+    atexit(() -> (_WORKERS_EXITING[] = true))
 end
