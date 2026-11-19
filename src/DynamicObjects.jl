@@ -1258,7 +1258,7 @@ struct ThreadsafeDict{K,V} <: AbstractThreadsafeDict{K,V}
     errors::Dict{K,Any}
     ThreadsafeDict{K,V}(lk, cache, status, computing, errors) where {K,V} =
         new{K,V}(lk, cache, status, computing, errors)
-    ThreadsafeDict{K,V}(c) where {K,V} = new{K,V}(ReentrantLock(), _MemoValues(Dict{K,V}(c)), Dict{K,Any}(), Dict{K,_MemoLatch}(), Dict{K,Any}())
+    ThreadsafeDict{K,V}(@nospecialize(c)) where {K,V} = new{K,V}(ReentrantLock(), _MemoValues(Dict{K,V}(c)), Dict{K,Any}(), Dict{K,_MemoLatch}(), Dict{K,Any}())
     ThreadsafeDict() = new{Any,Any}(ReentrantLock(), _MemoValues(Dict{Any,Any}()), Dict{Any,Any}(), Dict{Any,_MemoLatch}(), Dict{Any,Any}())
 end
 
@@ -1689,6 +1689,17 @@ end
 # `@progress`) keeps the node there and shows hits too (`_link_hit!`).
 Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substatus=nothing, retry_failed=true,
           trace_t0=_trace_clock(), link=nothing) = begin
+    # A consumer's workload knows its actual cache keys and progress factory.
+    # Request the same callable signature used by runtime dispatch, even when
+    # the compiler inlined or inferred a more specific caller in the workload.
+    if ccall(:jl_generating_output, Cint, ()) != 0
+        precompile(_get_or_start!, (Function, typeof(c), typeof(key), typeof(fetch),
+                                    typeof(substatus), typeof(retry_failed), typeof(trace_t0), typeof(link)))
+    end
+    _get_or_start!(f, c, key, fetch, substatus, retry_failed, trace_t0, link)
+end
+
+function _get_or_start!(@nospecialize(f::Function), c, key, fetch, substatus, retry_failed, trace_t0, link)
     # Fast path: a ready value returns immediately, no substatus cost. (`_missing_sentinel`
     # distinguishes "absent" from a legitimately-cached `nothing`.)
     t0 = trace_t0
@@ -7125,7 +7136,8 @@ end
 # context (`nt`), masked names (`forced_local`), its own construction state
 # (`local_seed`) and request-scoped state (`_CHILD_CONTEXT_SEEDS`, progress).
 # `nothing` when the view keeps none, which is what most views do.
-function _kept_inputs(inputs::NamedTuple, invalidated, aliases, wrappers, nt::NamedTuple, forced_local)
+function _kept_inputs(@nospecialize(inputs::NamedTuple), invalidated, aliases, wrappers,
+                      @nospecialize(nt::NamedTuple), forced_local)
     names = nothing
     for name in keys(inputs)
         (name in invalidated || haskey(aliases, name) || name in wrappers) || continue

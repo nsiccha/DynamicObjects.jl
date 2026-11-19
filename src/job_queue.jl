@@ -546,8 +546,19 @@ _queued_status(_) = nothing
 # executor starts memoized computations only, so a fresh one runs inline. `status` is the
 # call's pending progress node; it starts when the computation runs.
 _fresh_through(executor, compute, status=nothing) = (_start_substatus!(status); compute())
-_fresh_through(e::QueueExecutor, compute, status=nothing) =
-    fetch(enqueue!(e.queue, QueuedCall(compute; status); e.property, e.tag).work)
+function _fresh_through(e::QueueExecutor, compute, status=nothing)
+    value = fetch(enqueue!(e.queue, QueuedCall(compute; status); e.property, e.tag).work)
+    if ccall(:jl_generating_output, Cint, ()) != 0
+        # The local workload sees the app's concrete return type. Compile
+        # its worker reply path without serializing the value or running a child.
+        T = typeof(value)
+        precompile(_wire_result, (T,))
+        if !hasfield(T, :cache) || !(fieldtype(T, :cache) <: PropertyCache)
+            precompile(_serialized_buffer, (T,))
+        end
+    end
+    value
+end
 
 # Literal pool symbol: `@spawn` accepts a computed pool only on newer Julia.
 _start_admitted((item, slot, q)::_Admitted) =

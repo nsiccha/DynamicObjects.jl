@@ -1,3 +1,11 @@
+# Reflection reads the same fields for every declaration. Keep the syntax as
+# authored, but avoid compiling a new Pair and NamedTuple reader for each
+# combination of literal, expression, annotation and docstring.
+const _DeclarationInfo = @NamedTuple{
+    lhs, macros::Set{Symbol}, rhs, lnn::Union{Nothing,LineNumberNode},
+    dependson::Union{Nothing,Set{Symbol}}, locals::Union{Nothing,Set{Symbol}},
+    indices::Union{Tuple,Vector{Any}}, indexed::Bool, cache_version, result_type, doc}
+
 dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, lint=true) = begin
     # Short-form sugar: `T(arg1::T1, arg2::T2) = begin … end` is shorthand
     # for `struct T; arg1::T1; arg2::T2; … end`. Positional args become
@@ -480,7 +488,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     # `doc` ref is reset to `nothing` once that property consumes it.
     metadata = (lnn = Ref{Any}(nothing), doc = Ref{Any}(nothing))
     docs = []
-    oproperties = Pair[]
+    oproperties = Pair{Symbol,_DeclarationInfo}[]
     inline_methods = Any[]
     # `@options <parameter> = <domain expression>` declarations, in body order.
     # Held as `(; parameter, expression, lnn)` until the property list is
@@ -727,7 +735,7 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
     # names — e.g. a future `@get foo()` + `@include foo(x::String)` pair). It's
     # what `meta(T)` returns; macro-internal lookups that just need "is `x` a
     # property name?" use the `prop_names` set built from it.
-    properties = collect(oproperties)
+    properties = Vector{Pair}(oproperties)
     prop_names = Set{Symbol}(first.(oproperties))
     # Bare-ref resolution set: user property names PLUS the injected magic
     # dunders, so a body may reference `__hash__`/`__cache_path__`/… bare and
