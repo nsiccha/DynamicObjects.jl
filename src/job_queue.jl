@@ -63,6 +63,8 @@ mutable struct _WorkerConn
     actor::Union{Nothing,Task}
     worker::Any                 # a `_QueueWorker`, `nothing` while none runs
     spawning::Union{Nothing,Task}
+    launch::Union{Nothing,Base.Event} # cold eager configuration waits only for OS launch
+    connecting::Union{Nothing,Base.Process} # can be stopped before the port arrives
     starting_worker::Any        # its process handle while DynamicObjects initializes
     eager::Union{Nothing,Task}  # maintains the current :now configuration
     const changed::Threads.Condition
@@ -76,7 +78,7 @@ end
 function _WorkerConn(index)
     lock = ReentrantLock()
     _WorkerConn(index, false, 0, nothing, Any[], lock, Channel{Any}(Inf),
-                nothing, nothing, nothing, nothing, nothing, Threads.Condition(lock),
+                nothing, nothing, nothing, nothing, nothing, nothing, nothing, Threads.Condition(lock),
                 0, NaN, NaN, 0, Dict{Int,_RemoteRequest}(), Set{Base.PkgId}())
 end
 
@@ -186,7 +188,11 @@ Reapply `worker_start=:now` to resume background recovery. In a single-worker qu
 Set `worker_preload=[AppModule]` to also load
 the application's packages at startup, before any computation is submitted. The list accepts
 package modules (a nested module selects its root package) or `Base.PkgId`s, and is reapplied
-after a restart. Additional workers exit after `worker_idle_timeout` seconds idle (default
+after a restart. With `:now` and a nonempty list, cold configuration returns after launching
+the child with its preload list. Its connection and package initialization continue in the
+background, including while the parent imports the same package. Repeating the configuration
+with the corresponding module reuses the worker and any preload in progress.
+Additional workers exit after `worker_idle_timeout` seconds idle (default
 300, `Inf` keeps them warm) and start again on demand. Open compute scopes keep the workers
 they use. With `:lazy`, packages load with the first worker-bound computation.
 Changing the list under `:now` also loads its packages into an already-running worker;
@@ -227,6 +233,7 @@ function configure_queue!(q::JobQueue=job_queue(); max_running=nothing, workers=
     worker_reply_warn_bytes === nothing ||
         (worker_reply_warn_bytes isa Integer && 0 <= worker_reply_warn_bytes <= typemax(Int)) ||
         throw(ArgumentError("worker_reply_warn_bytes must be a nonnegative byte count that fits in an Int"))
+    launches = Base.Event[]
     removed, admitted = lock(q.lock) do
         was_eager = q.worker_start === :now
         preload_changed = worker_preload !== nothing && q.worker_preload != worker_preload
@@ -251,6 +258,7 @@ function configure_queue!(q::JobQueue=job_queue(); max_running=nothing, workers=
                 lock(conn.lock) do
                     if was_eager && q.worker_start === :lazy
                         conn.eager = nothing
+                        _finish_launch!(conn)
                         notify(conn.changed)
                         # An admitted request still needs its launch. Discard a purely
                         # eager launch by retiring its slot, including a stuck initializer.
@@ -268,6 +276,11 @@ function configure_queue!(q::JobQueue=job_queue(); max_running=nothing, workers=
                             notify(conn.changed)
                         end
                         if warm || conn.index == 1 || conn.index > previous || worker_start === :now
+                            if conn.worker === nothing && conn.spawning === nothing && conn.eager === nothing &&
+                                    !isempty(q.worker_preload) && !_WORKERS_EXITING[]
+                                conn.launch === nothing && (conn.launch = Base.Event())
+                            end
+                            conn.launch === nothing || push!(launches, conn.launch)
                             _start_worker_soon!(q, conn)
                         end
                     end
@@ -282,6 +295,7 @@ function configure_queue!(q::JobQueue=job_queue(); max_running=nothing, workers=
     end
     foreach(_start_admitted, admitted)
     foreach(_stop_worker!, removed)
+    foreach(wait, launches)
     queue_settings(q)
 end
 

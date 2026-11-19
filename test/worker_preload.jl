@@ -111,6 +111,73 @@ withenv("DO_WORKER_PRELOAD_GATE" => dir) do
 end
 end
 
+@testitem "worker preloads: the worker initializes the app while the parent holds the package loader" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects
+const DO = DynamicObjects
+id = Base.PkgId(Base.UUID("6ff30dc2-6786-49b3-8560-52d617bc86d8"), "WorkerPreloadGate")
+dir, parent_dir = mktempdir(), mktempdir()
+q = DO.job_queue()
+original_flags = q.worker_exeflags
+gate = joinpath(dir, "allow_port")
+script = joinpath(dir, "before_port.jl")
+write(script, "timedwait(() -> isfile($(repr(gate))), 90) === :ok || error(\"port gate timed out\")")
+touch(joinpath(parent_dir, "go"))
+withenv("DO_WORKER_PRELOAD_GATE" => dir) do
+    try
+        lock(Base.require_lock) do
+            caller = Threads.@spawn DO.configure_queue!(; workers=1, worker_start=:now,
+                worker_preload=[id], worker_exeflags=["--threads=1,1", "-L", script])
+            settles(() -> istaskdone(caller), 60) || error("launch waited for the parent loader or port")
+            fetch(caller)
+            app = withenv(() -> Base.require(id), "DO_WORKER_PRELOAD_GATE" => parent_dir)
+            DO.configure_queue!(; workers=1, worker_start=:now, worker_preload=[app])
+            # Only this caller can release the child to advertise its port.
+            touch(gate)
+            waitfor(joinpath(dir, "started")) || error("preload waited for the parent loader")
+            DO.configure_queue!(; workers=1, worker_start=:now, worker_preload=[app])
+            touch(joinpath(dir, "go"))
+            waitfor(joinpath(dir, "finished")) || error("preload did not finish under the parent lock")
+        end
+        value = Toy(2, mktempdir()).square(3)
+        @test value.value == 18
+        @test value.pid == DO.worker_status().pid != getpid()
+        @test readlines(joinpath(dir, "initializers")) == [string(value.pid)]
+    finally
+        touch(gate)
+        touch(joinpath(dir, "go"))
+        DO.configure_queue!(; workers=0, worker_start=:lazy, worker_preload=[])
+        lock(() -> q.worker_exeflags = original_flags, q.lock)
+    end
+end
+end
+
+@testitem "worker preloads: a busy single-threaded parent services an already-advertised port" tags=[:core, :workers] begin
+script = joinpath(@__DIR__, "fixtures", "worker_preload_busy_parent.jl")
+cmd = `$(first(Base.julia_cmd().exec)) --startup-file=no --project=$(Base.active_project()) --threads=1 $script`
+@test success(cmd)
+end
+
+@testitem "worker preloads: disabling the queue stops a child waiting to advertise its port" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects, WorkerToy
+const DO = DynamicObjects
+q = DO.JobQueue()
+dir = mktempdir()
+script, release = joinpath.(dir, ("pause.jl", "release"))
+write(script, "timedwait(() -> isfile($(repr(release))), 120)")
+try
+    DO.configure_queue!(q; workers=1, worker_start=:now, worker_preload=[WorkerToy],
+                        worker_exeflags=["-L", script])
+    conn = only(q.conns)
+    proc = lock(() -> conn.connecting, conn.lock)
+    @test proc isa Base.Process && process_running(proc)
+    DO.configure_queue!(q; workers=0)
+    @test settles(() -> process_exited(proc), 10)
+finally
+    touch(release)
+    DO.configure_queue!(q; workers=0)
+end
+end
+
 @testitem "worker preloads: failures are logged and fail the computation until corrected" setup=[WorkerFixtures] tags=[:core, :workers] begin
 using DynamicObjects, Logging
 const DO = DynamicObjects
@@ -157,8 +224,9 @@ withenv("DO_WORKER_PRELOAD_GATE" => dir) do
         rm(gate)
         kill(old.handle.proc, Base.SIGKILL)
         settles(() -> length(readlines(receipts)) == 2, 120.0) || error("idle recovery did not preload")
-        newpid = DO.worker_status().pid
-        @test parse.(Int, readlines(receipts)) == [old.handle.proc_pid, newpid]
+        previouspid, newpid = parse.(Int, readlines(receipts))
+        @test previouspid == old.handle.proc_pid != newpid
+        @test settles(() -> DO.worker_status().pid == newpid)
         @test DO.worker_status().in_flight == 0
         t = Toy(3, mktempdir())
         p = t.square(2; fetch=identity)
@@ -231,10 +299,11 @@ for settings in ((; workers=0), (; worker_start=:lazy))
     end
     try
         wait(entered)
-        DO.configure_queue!(q; workers=1, worker_start=:now, worker_preload=[WorkerToy])
+        caller = Threads.@spawn DO.configure_queue!(q; workers=1, worker_start=:now, worker_preload=[WorkerToy])
         settles(() -> lock(() -> conn.spawning !== nothing, conn.lock)) || error("launch was never queued")
         supervisor, launch = lock(() -> (conn.eager, conn.spawning), conn.lock)
         DO.configure_queue!(q; settings...)
+        wait(caller)
         notify(release)
         @test fetch(launch) === nothing
         wait(supervisor)

@@ -704,7 +704,45 @@ end
 # for any of them again.
 _loaded_packages() = Base.PkgId[Base.PkgId(m) for m in Base.loaded_modules_array()]
 
+struct _WorkerBoot
+    info::@NamedTuple{pid::Int32, threads::Int, loaded::Vector{Base.PkgId}}
+    loading::Task
+end
+const _WORKER_BOOT = Ref{Union{Nothing,_WorkerBoot}}(nothing)
+
+function _init_preloaded_worker!(packages)
+    info = _worker_init!()  # install control and prohibit nested workers before app __init__
+    loading = Threads.@spawn begin
+        for id in packages
+            try
+                Base.require(id)
+            catch err
+                return (id, err)
+            end
+        end
+        nothing
+    end
+    _WORKER_BOOT[] = _WorkerBoot(info, loading)
+    nothing
+end
+
+function _worker_boot_info()
+    boot = _WORKER_BOOT[]::_WorkerBoot
+    # A module can already be registered while its initializer is still running.
+    if istaskdone(boot.loading) && fetch(boot.loading) === nothing
+        _WORKER_BOOT[] = nothing
+        return merge(boot.info, (; loaded=_loaded_packages()))
+    end
+    boot.info
+end
+
 function _worker_require(ids::Vector{Base.PkgId})
+    boot = _WORKER_BOOT[]
+    if boot !== nothing
+        failure = fetch(boot.loading)
+        _WORKER_BOOT[] = nothing
+        failure !== nothing && first(failure) in ids && throw(last(failure))
+    end
     foreach(Base.require, ids)
     _loaded_packages()
 end
@@ -1079,7 +1117,10 @@ function _ensure_worker!(q, conn::_WorkerConn, status=nothing; eager=nothing)
             eager !== nothing && conn.eager !== eager && return nothing
             _WORKERS_EXITING[] && throw(ComputeAbandoned("worker startup was cancelled", true))
             _worker_alive(conn.worker) && return conn.worker
-            conn.spawning === nothing && (conn.spawning = Threads.@spawn _spawn_worker!(q, conn))
+            if conn.spawning === nothing
+                receipt = conn.launch
+                conn.spawning = Threads.@spawn _spawn_worker!(q, conn, receipt)
+            end
             conn.spawning
         end
         spawning isa Task || return spawning
@@ -1149,9 +1190,13 @@ end
 # worker and returns at once. It kills rather than asks: a stuck worker would never act on a
 # request, and once this process is gone nothing is left to follow one up. A worker whose host
 # ends without exit hooks (a crash, `SIGKILL`) still exits by itself when the connection closes.
-function _exit_without_waiting!(w::Malt.Worker, exiting=_WORKERS_EXITING)
+function _exit_without_waiting!(w::Malt.Worker, exiting=_WORKERS_EXITING; protected=false)
     Base.@lock Base._atexit_hooks_lock filter!(f -> !_stops_worker(f, w), Base.atexit_hooks)
-    proc, pid = w.proc, w.proc_pid
+    protected || _kill_at_exit!(w.proc, w.proc_pid, exiting)
+    w
+end
+
+function _kill_at_exit!(proc, pid, exiting)
     # `uv_kill` is a plain `kill` (`TerminateProcess` on Windows) and takes no lock. A child
     # libuv has not reaped keeps its pid, so `process_running` guards against a reused one.
     hook = function ()
@@ -1165,7 +1210,7 @@ function _exit_without_waiting!(w::Malt.Worker, exiting=_WORKERS_EXITING)
         wait(proc)
         Base.@lock Base._atexit_hooks_lock filter!(f -> f !== hook, Base.atexit_hooks)
     end)
-    w
+    nothing
 end
 
 # Whether the exit hook `f` is Malt's for `w`: a closure of Malt's that holds `w`.
@@ -1258,14 +1303,97 @@ function _inflight_worker_death(w)
     _worker_death(w, "the worker process (pid $(w.handle.proc_pid)) $cause")
 end
 
-function _spawn_worker!(q, conn)
+# Malt 1.5 starts its port wait after run(wait=false). At that point the
+# process exists and owns the preload arguments, even on a single Julia thread.
+# A port already advertised by the child can be waiting in the pipe when a
+# busy parent finally services its timers. Give the reader a turn in that case.
+struct _WorkerPortTimeout <: Real
+    seconds::Float64
+    advertised::String
+    conn::_WorkerConn
+    submitted::Union{Nothing,Base.Event}
+end
+function Base.timedwait(connected, timeout::_WorkerPortTimeout; pollint=0.1)
+    # Malt registers the new process before it waits for the port. Match the
+    # unique launch argument, including when several queues start at once.
+    proc = lock(Malt.procs_lock) do
+        for process in Malt.__iNtErNaL_running_procs
+            timeout.advertised in process.cmd.exec && return process
+        end
+        nothing  # another concurrent launch can prune an already-exited process
+    end
+    proc === nothing && return :timed_out
+    lock(timeout.conn.lock) do
+        if process_running(proc)
+            _kill_at_exit!(proc, getpid(proc), _WORKERS_EXITING)
+            timeout.conn.connecting = proc
+            timeout.conn.retired && kill(proc, Base.SIGKILL)
+        end
+    end
+    timeout.submitted === nothing || notify(timeout.submitted)
+    done() = connected() || process_exited(proc)
+    result = timedwait(done, timeout.seconds; pollint)
+    if result === :timed_out && isfile(timeout.advertised)
+        timedwait(done, max(timeout.seconds, pollint); pollint)
+    end
+    connected() ? :ok : :timed_out
+end
+
+# Resolve the source while the package is loaded. Looking up pkgdir from the
+# launch task would wait on a caller that already holds Julia's loader lock.
+const _WORKER_STARTUP_SOURCE = let path = joinpath(@__DIR__, "worker_startup.jl")
+    include_dependency(path)
+    read(path, String)
+end
+
+function _open_queue_worker(conn, exeflags, preload, submitted)
+    env = _worker_env()
+    options = (; env, monitor_stdout=false, monitor_stderr=false)
+    isempty(preload) && return Malt.Worker(; exeflags, options...)
+    mktempdir() do dir
+        advertised = joinpath(dir, "listening")
+        program = joinpath(dir, "worker_startup.jl")
+        write(program, _WORKER_STARTUP_SOURCE)
+        push!(exeflags, program, advertised)
+        for id in (_DYNAMICOBJECTS_PKGID, preload...)
+            push!(exeflags, string(id.uuid), id.name)
+        end
+        timeout = _WorkerPortTimeout(Malt._default_connect_timeout(), advertised, conn, submitted)
+        Malt.Worker(; exeflags, connect_timeout=timeout, options...)
+    end
+end
+
+function _finish_launch!(conn, receipt=conn.launch)
+    receipt === nothing || notify(receipt)
+    conn.launch === receipt && (conn.launch = nothing)
+end
+
+function _spawn_worker!(q, conn, receipt)
+    try
+        _start_queue_process!(q, conn, receipt)
+    finally
+        lock(() -> _finish_launch!(conn, receipt), conn.lock)
+    end
+end
+
+function _start_queue_process!(q, conn, receipt)
     exeflags = _worker_exeflags(q, conn.index)
+    preload = lock(() -> q.worker_start === :now ? q.worker_preload : Base.PkgId[], q.lock)
     spawning = current_task()
     current() = conn.spawning === spawning && !conn.retired && !_WORKERS_EXITING[]
     w = _on_actor(conn) do
         lock(current, conn.lock) || return nothing
-        worker = Malt.Worker(; exeflags, env=_worker_env(), monitor_stdout=false, monitor_stderr=false)
-        _forward_output!(_exit_without_waiting!(worker))
+        try
+            worker = _open_queue_worker(conn, exeflags, preload, receipt)
+            _forward_output!(_exit_without_waiting!(worker; protected=!isempty(preload)))
+        catch
+            lock(conn.lock) do
+                conn.connecting === nothing || kill(conn.connecting, Base.SIGKILL)
+            end
+            rethrow()
+        finally
+            lock(() -> conn.connecting = nothing, conn.lock)
+        end
     end
     w === nothing && return nothing
     try
@@ -1278,10 +1406,14 @@ function _spawn_worker!(q, conn)
             _stop_process(conn, w)
             return nothing
         end
-        id = _DYNAMICOBJECTS_PKGID
-        load = :(Base.require(Base.PkgId(Base.UUID($(string(id.uuid))), $(id.name))); nothing)
-        fetch(_on_actor(() -> Malt.remote_eval(w.handle, load), conn))
-        info = _remote_fetch(conn, w, _worker_init!)
+        info = if isempty(preload)
+            id = _DYNAMICOBJECTS_PKGID
+            load = :(Base.require(Base.PkgId(Base.UUID($(string(id.uuid))), $(id.name))); nothing)
+            fetch(_on_actor(() -> Malt.remote_eval(w.handle, load), conn))
+            _remote_fetch(conn, w, _worker_init!)
+        else
+            _remote_fetch(conn, w, _worker_boot_info)
+        end
         published = lock(conn.lock) do
             current() || return false
             empty!(conn.recent_roots)
@@ -2023,6 +2155,7 @@ function _retire_connection!(conn)
     lock(conn.lock) do
         conn.retired = true
         conn.eager = nothing
+        _finish_launch!(conn)
         notify(conn.changed)
     end
 end
@@ -2045,7 +2178,10 @@ function _schedule_idle!(q, conn)
 end
 
 function _stop_worker!(conn)
-    w, starting, spawning = lock(() -> (conn.worker, conn.starting_worker, conn.spawning), conn.lock)
+    w, starting, spawning = lock(conn.lock) do
+        conn.connecting === nothing || kill(conn.connecting, Base.SIGKILL)
+        conn.worker, conn.starting_worker, conn.spawning
+    end
     try
         starting === nothing || _stop_process(conn, starting)
         if w !== nothing

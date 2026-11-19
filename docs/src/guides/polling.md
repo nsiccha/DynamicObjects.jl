@@ -164,6 +164,26 @@ and outstanding request count. Pass the observed PID to
 processes continue their work. Surplus processes retire after five minutes idle
 by default. An open compute scope keeps the processes it used until it closes.
 
+To overlap package loading in the parent and worker, configure the queue before
+importing the package. This example uses the `TOML` standard library. In an app
+entry script, use the name of the package that defines your queued computations.
+
+```@example eager_worker
+import DynamicObjects
+app_id = Base.identify_package("TOML")::Base.PkgId
+DynamicObjects.configure_queue!(; workers=1, worker_start=:now, worker_preload=[app_id])
+using TOML
+settings = DynamicObjects.configure_queue!(; worker_preload=[TOML])
+@assert settings.workers == 1 # hide
+DynamicObjects.configure_queue!(; workers=0, worker_start=:lazy, worker_preload=[]) # hide
+settings.workers
+```
+
+Configuration returns after launching the child with its package list.
+The child can initialize the package during the parent's import. A later call
+that names the same package by module keeps the worker. If the first request
+arrives during preload, it waits for initialization.
+
 With `worker_start=:now`, the queue starts a replacement after an unexpected
 exit and loads its `worker_preload` packages even while idle. Work already
 running in the lost process receives `ComputeAbandoned`. Other workers keep
