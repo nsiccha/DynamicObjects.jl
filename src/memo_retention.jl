@@ -185,6 +185,7 @@ Return an estimated native byte count (a nonnegative `Int`), or `missing` when
 the size is unknown. The default `nothing` preserves native-handle pinning.
 The method runs at publication and should only inspect the result. The producer
 is responsible for replaying the correct inputs, including any seed or file.
+A disk-cached producer must also support restoring a valid live resource.
 DynamicObjects drops its reference and leaves resource finalization to the owner.
 """
 memo_native_bytes(owner_type, property, value) = nothing

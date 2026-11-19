@@ -80,6 +80,23 @@ if Sys.islinux() || Sys.isapple()
     check_native_lifetime()
     GC.gc(true)
     @test freed[] == 64 * MiB
+
+    # Cross a budget with real native growth, leaving the polling deadlines
+    # alone. Calibrate against this process's baseline (including its JIT).
+    o = NativeCache(16 * MiB)
+    before = memo_retention_stats()
+    DO._PROCESS_BUDGET[] = cld(10 * (before.process_memory_bytes + 32 * MiB), 9)
+    for i in 1:6
+        o.sized(i)
+    end
+    @test timedwait(12; pollint=0.05) do
+        o.marker(1)
+        memo_retention_stats().estimated_native_bytes > before.estimated_native_bytes
+    end == :ok
+    after = memo_retention_stats()
+    @test after.live_heap_bytes < after.process_budget_bytes * 0.9
+    @test freed[] > 64 * MiB
+    @info "Native growth triggered release" baseline=before.process_memory_bytes budget=after.process_budget_bytes live_heap=after.live_heap_bytes declared_bytes_released=(after.estimated_native_bytes - before.estimated_native_bytes)
 end
 
 # An invalid declaration fails the computation and allows a retry.
