@@ -972,8 +972,8 @@ else
     alive(pid) = (s = strip(readchomp(ignorestatus(`ps -o stat= -p $pid`))); !isempty(s) && !startswith(s, "Z"))
     proc = run(pipeline(`$(Base.julia_cmd()) --startup-file=no --threads=2 --project=$project $script`;
                         stdout=out, stderr=err); wait=false)
-    wpid = nothing
-    ok = false
+    local wpid = nothing
+    local ok = false
     try
         ready = timedwait(() -> process_exited(proc) || occursin(r"^ready$"m, read(out, String)), 300.0; pollint=0.2)
         m = match(r"^worker pid (\d+)$"m, read(out, String))
