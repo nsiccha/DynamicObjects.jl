@@ -14,6 +14,12 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.33
+
+- `remount` views share work that depends on a retained construction keyword,
+  even when the keyword's declared default reads request context. Rebinding
+  that keyword in a view gives its dependents a separate cache.
+
 ## 0.5.32
 
 - Queue workers deliver large in-memory results across multiple socket replies

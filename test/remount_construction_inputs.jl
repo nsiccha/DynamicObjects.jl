@@ -16,7 +16,9 @@ rin_reset!() = (empty!(RIN_CALLS); nothing)
 @dynamicstruct struct InRoot
     ctx = nothing
     a = (_rin_bump!(:a); ctx === nothing ? 0.2 : 0.2 + ctx)
-    b = 10a
+    b = (_rin_bump!(:b); 10a)
+    mixed = b + something(ctx, 0)
+    by_index(i) = (_rin_bump!(:by_index); b * i)
     f(i) = (ctx, i)
 end
 
@@ -26,7 +28,7 @@ end
     __parent__ = nothing
     __req__ = nothing
     a = __req__ === nothing ? 0.2 : 0.2 + __req__
-    b = 10a
+    b = (_rin_bump!(:kid_b); 10a)
 end
 @dynamicstruct struct InParent
     __req__ = nothing
@@ -46,10 +48,12 @@ end
 
 @dynamicstruct struct InInline
     ctx = nothing
-    data = 1
+    data = something(ctx, 1)
     @struct single = begin
         mine = data + 1
     end
+    read_child = (_rin_bump!(:read_child); single.mine)
+    hold_child = (_rin_bump!(:hold_child); single)
 end
 
 # `data` of the child is an alias of its parent's `data`.
@@ -90,11 +94,15 @@ using DynamicObjects
 rin_reset!()
 source = InRoot(; a = 0.4)
 views = [remount(source; ctx = i) for i in 1:3]
-for v in views
+for (i, v) in enumerate(views)
     @test v.a == 0.4
     @test v.b == 4.0
+    @test v.mixed == 4.0 + i
+    @test v.by_index(3) == 12.0
 end
 @test source.a == 0.4 && source.b == 4.0
+@test source.by_index(3) == 12.0
+@test RIN_CALLS[:b] == RIN_CALLS[:by_index] == 1
 # The default the keyword replaces never ran, on the source or on a view.
 @test get(RIN_CALLS, :a, 0) == 0
 
@@ -107,15 +115,33 @@ plain = InRoot()
 # A name the call rebinds takes the rebound value.
 rebound = remount(source; ctx = 1, a = 0.7)
 @test rebound.a == 0.7 && rebound.b == 7.0
+@test rebound.by_index(3) == 21.0
+@test remount(source; ctx = 2, a = 0.8).b == 8.0
+@test source.b == 4.0
 @test source.a == 0.4
 
 # A view of a view is a view of the retained object.
 @test remount(views[1]; ctx = 9).a == 0.4
 end
 
+@testitem "remount routing reuses a construction keyword shape across objects" setup=[RemountInputFixtures] begin
+using DynamicObjects
+
+keyword_view(a, reverse) = remount(reverse ? InRoot(; f = :given, a) : InRoot(; a, f = :given); ctx = 1)
+@test keyword_view(1, false).b == 10
+plans = DynamicObjects._REMOUNT_CONTEXTS[DynamicObjects.meta(InRoot)]
+settled = length(plans)
+for i in 2:30
+    v = keyword_view(i, isodd(i))
+    @test v.b == 10i && v.f === :given
+end
+@test length(plans) == settled
+end
+
 @testitem "an external child a view adopts keeps its construction keywords" setup=[RemountInputFixtures] begin
 using DynamicObjects
 
+rin_reset!()
 source = InParent()
 @test source.kid.a == 0.4
 for req in 1:3
@@ -128,6 +154,8 @@ for req in 1:3
     @test kid.a == 0.4
     @test kid.b == 4.0
 end
+@test source.kid.b == 4.0
+@test RIN_CALLS[:kid_b] == 1
 # A child the source never realized is the view's own and was constructed with the keyword.
 unrealized = remount(InParent(); __req__ = 1)
 @test unrealized.kid.a == 0.4 && unrealized.kid.b == 4.0
@@ -143,7 +171,9 @@ for v in views
     @test v.a == 0.4
     @test v.scaled == 40.0
 end
+@test RIN_CALLS[:scaled] == 1
 @test source.scaled == 40.0
+@test remount(source; ctx = 9, a = 0.7).scaled == 70.0
 # Without the keyword the opaque default follows each view's context.
 plain = InOpaque()
 @test remount(plain; ctx = 1).a == 1.2
@@ -179,12 +209,29 @@ view = remount(source; ctx = 1)
 @test remount(InPlainParent(); ctx = 1).kid.a == 0.4
 
 # An inline child of another parent keeps that parent.
+rin_reset!()
 other = InInline(; data = 100)
 borrowed = InInline(; single = other.single)
 @test borrowed.single.mine == 101
 bview = remount(borrowed; ctx = 1)
 @test bview.single === other.single
 @test bview.single.mine == 101
+for v in (bview, remount(borrowed; ctx = 2), borrowed)
+    @test v.read_child == 101
+    @test v.hold_child === other.single
+end
+@test RIN_CALLS[:read_child] == RIN_CALLS[:hold_child] == 1
+rebound = remount(borrowed; single = InInline(; data = 20).single)
+@test rebound.read_child == 21
+@test rebound.hold_child === rebound.single
+
+# The inline child's forwarded `data` follows the routing of its own parent.
+rin_reset!()
+for ctx in (1, 2)
+    @test remount(other; ctx).read_child == 101
+end
+@test RIN_CALLS[:read_child] == 1
+@test remount(other; ctx = 2, data = 10).read_child == 11
 end
 
 @testitem "an indexed property constructed as a value reads that value through a view" setup=[RemountInputFixtures] begin
