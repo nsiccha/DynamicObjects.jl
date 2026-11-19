@@ -22,6 +22,15 @@ end
 end
 end
 
+@testitem "property declarations share one reflection signature" tags=[:core] setup=[PerformanceFixtures] begin
+    declarations = DynamicObjects.meta(AccessInference)
+    @test all(p -> typeof(p) === typeof(first(declarations)), declarations)
+    fixed, annotated, indexed = last.(declarations)
+    @test fixed.rhs === nothing && fixed.lhs == :(input::Int)
+    @test annotated.rhs isa Expr && annotated.result_type === :Int
+    @test indexed.indexed && only(indexed.indices) == :(i::Int)
+end
+
 @testitem "constant fixed-field reads infer without constraining overrides" tags=[:core] setup=[PerformanceFixtures] begin
     read_input(o) = o.input
     o = AccessInference(1000; __status__=nothing)

@@ -442,7 +442,8 @@ function carry_to_worker!(owner::Module, name::Symbol; wire=identity, unwire=ide
     variable = getfield(owner, name)
     variable isa ScopedValues.ScopedValue || throw(ArgumentError(
         "carry_to_worker!: $(owner).$(name) is not a ScopedValue"))
-    lock(() -> _WORKER_SCOPES[key] = _WorkerScopeBinding(variable, wire, unwire), _WORKER_SCOPES_LOCK)
+    binding = _WorkerScopeBinding(variable, wire, unwire)
+    lock(() -> _WORKER_SCOPES[key] = binding, _WORKER_SCOPES_LOCK)
     variable
 end
 
@@ -781,7 +782,7 @@ end
 
 # Events are serialized where they are queued, one by one: one that cannot be serialized
 # fails its own request instead of the whole batch.
-function _push_event!(id::Int, kind::Symbol, payload, call=nothing, warn_bytes=typemax(Int))
+function _push_event!(id::Int, kind::Symbol, @nospecialize(payload), call=nothing, warn_bytes=typemax(Int))
     io = try
         _serialized_buffer(payload)
     catch err
@@ -1091,19 +1092,31 @@ function _actor_loop(conn::_WorkerConn)
     end
 end
 
+# Keep one wire type for boot, submit, event and control calls. Otherwise
+# Malt and the socket serializer specialize on every operation and on the
+# application's argument tuple before they can send the first request.
+struct _WorkerCall
+    operation::Any
+    args::Tuple
+end
+(call::_WorkerCall)() = call.operation(call.args...)
+
 # A Malt call made on the actor (so sends keep their order), waited for here. Malt's worker
 # calls `f` from a task that runs in the world it started in, before DynamicObjects and the
 # application were loaded there: every call goes through `invokelatest`.
 function _remote_fetch(conn::_WorkerConn, w, f, args...)
-    task = _on_actor(() -> Malt.remote_call(Base.invokelatest, w.handle, f, args...), conn)
+    call = _WorkerCall(f, args)
+    task = _on_actor(() -> Malt.remote_call(Base.invokelatest, w.handle, call), conn)
     try
         fetch(task)
     catch err
         throw(err isa TaskFailedException ? err.task.exception : err)
     end
 end
-_remote_do(conn::_WorkerConn, w, f, args...) =
-    _on_actor(() -> Malt.remote_do(Base.invokelatest, w.handle, f, args...), conn)
+function _remote_do(conn::_WorkerConn, w, f, args...)
+    call = _WorkerCall(f, args)
+    _on_actor(() -> Malt.remote_do(Base.invokelatest, w.handle, call), conn)
+end
 
 _worker_alive(w) = w !== nothing && Malt.isrunning(w.handle)
 
@@ -1494,7 +1507,7 @@ function _event_pump(conn::_WorkerConn, w)
     failure = nothing
     while true
         batch = try
-            fetch(Malt.remote_call(Base.invokelatest, w.handle, _worker_take_events))
+            fetch(Malt.remote_call(Base.invokelatest, w.handle, _WorkerCall(_worker_take_events, ())))
         catch err
             err = err isa TaskFailedException ? err.task.exception : err
             failure = err isa Malt.TerminatedWorkerException ?
@@ -1644,6 +1657,18 @@ end
 
 # Run an admitted item: in the worker when it is bound there, else here.
 function _run_item(q, item)
+    if ccall(:jl_generating_output, Cint, ()) != 0 && q.workers == 0
+        local_call = _worker_compute(item.work)
+        if local_call !== nothing
+            remote = _WorkerCompute(q, local_call, item.work isa QueuedCall, :pending)
+            status_type = typeof(_queued_status(item.work))
+            precompile(run!, (typeof(remote), typeof(item.work)))
+            precompile(remote, (status_type,))
+            if remote.is_fresh
+                precompile(_fresh_in_worker, (map(typeof, local_call)..., status_type))
+            end
+        end
+    end
     compute = q.workers > 0 ? _worker_compute(item.work) : nothing
     (compute === nothing || _reads_request(compute[1], compute[2])) && return run!(item.work)
     run!(_WorkerCompute(q, compute, item.work isa QueuedCall, :pending), item.work)
