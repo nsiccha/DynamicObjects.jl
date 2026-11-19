@@ -1623,7 +1623,7 @@ function _compute_in_worker(f::_WorkerCompute, o, name::Symbol, args::Tuple, kwa
                     wire = _deserialized(payload)
                     if wire isa _OnDisk
                         result = _load_published(o, name, args, kwargs, status, wire.path)
-                        _HEAP_HINT[] == 0 || _record_memo_disk!(_publish_guard(), o, name, args, kwargs, wire.path)
+                        _memo_retention_enabled() && _record_memo_disk!(_publish_guard(), o, name, args, kwargs, wire.path)
                         result
                     elseif wire isa _Address
                         _resolve(wire, _requester_objects(o))

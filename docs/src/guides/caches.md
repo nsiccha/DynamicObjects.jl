@@ -37,13 +37,26 @@ indexed calls already memoize.
 Treat returned arrays and other mutable results as read-only. Make a copy
 before changing them. Mutation would also change what later cache hits return.
 
-## Automatic release under heap pressure
+## Automatic release under memory pressure
 
 Start Julia with an explicit `--heap-size-hint` to enable automatic trimming.
-The requester and each queue worker monitor their own Julia heap. At 90% of
-the hint, reads and publications can release a bounded batch of cold derived
-entries. The most recently used eligible result stays warm. With the default
-zero hint, ordinary reads retain their memoized results for the object's lifetime.
+The requester and each queue worker use their own hint as a soft budget for
+both the Julia heap and process memory. On macOS the process signal is physical
+footprint, including compressed pages. On Linux it is resident memory plus
+private anonymous swap (`VmRSS + VmSwap`). On other platforms the heap signal
+still applies.
+
+To set a separate per-process budget, set `DYNAMICOBJECTS_PROCESS_BUDGET_BYTES`
+to a byte count in the environment before starting Julia. This also works
+without a heap hint. An explicit zero disables process-pressure sampling on
+cache access. With both budgets zero, ordinary reads retain memoized results
+for the object's lifetime.
+
+When either measurement reaches 90% of its budget, reads and publications can
+release up to 16 cold derived entries toward an 80% target. The most recently
+used eligible result stays warm. After a batch driven by process pressure,
+DynamicObjects collects garbage and rechecks the footprint. It waits longer
+between process checks when the batch gives little relief.
 
 DynamicObjects first releases cold results that can reload from their
 `@cached` or `@mmap` file. It then releases the least recently read eligible
@@ -54,13 +67,34 @@ published draws, or a compute scope to share a result during a report.
 Trimming preserves constructor inputs, state and its owning objects, versions,
 in-flight work, pending deliveries, and scope claims. The package checks
 eligibility from the result type or a bounded inspection of a small mixed
-container. Values that may own native resources stay in memory. Other owners
-can keep a released result alive, and the application can exceed its heap hint.
+container. Values that may own native resources stay in memory by default.
+For a property that can reliably recreate its native result, declare the
+result eligible. This property can recompile its regular expression from the
+same pattern.
+
+```@example caches
+@dynamicstruct struct Patterns
+    pattern::String
+    compiled = Regex(pattern)
+end
+DynamicObjects.memo_native_bytes(::Type{Patterns}, ::Val{:compiled}, ::Regex) = missing
+occursin(Patterns("^fit").compiled, "fit-1")
+```
+
+Return a nonnegative `Int` when the producer knows the native byte count.
+`missing` declares the size unknown. A producer of a BridgeStan model can
+use the same declaration when it can replay the library, data and seed.
+Other properties returning the same
+type keep their default lifetime. Releasing a slot drops one reference.
+Callers can continue using their own references, and the model's finalizer
+can run after its last owner releases it.
 
 `memo_retention_stats(DynamicObjects.job_queue())` reports separate requester
 and worker counts, estimated slot payloads, known mapping sizes, and current
-Julia heap estimates. Two slots that reference the same array each contribute
-its size when released.
+heap and process measurements. `process_memory_bytes` is `nothing` when
+unavailable. `estimated_native_bytes` sums declared estimates and
+`unknown_native_slots` counts releases without a size estimate. Two slots
+that reference the same value each contribute when released.
 
 With zero or one configured worker, read `stats.worker`. With two or more,
 read `stats.workers` in queue slot order. Each live snapshot includes its PID.

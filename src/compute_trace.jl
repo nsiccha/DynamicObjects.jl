@@ -462,10 +462,11 @@ end
 # the latch gone and re-resolve against the current state. Such a compute may have read what
 # was invalidated, so it publishes nothing: its value (or failure) goes to its own caller only.
 function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::_MemoLatch, f, s)
-    local v
+    local v, native_bytes
     _start_substatus!(s)
     try
         v = _with_publish_guard(() -> f(s), f, c, key, cnd)
+        native_bytes = _publication_native_bytes(c, key, f, v)
     catch e
         # Fail the node before waking waiters: a waiter that shows it under its own
         # node (`_linked`) keeps it there exactly when it reads as failed.
@@ -492,7 +493,7 @@ function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::_MemoLatch, f,
         published = existing === _missing_sentinel
         if published
             c.cache[key] = v
-            _HEAP_HINT[] == 0 || _register_publication!(c, key, cnd, f, v)
+            _memo_retention_enabled() && _register_publication!(c, key, cnd, f, v, native_bytes)
             existing = v
         else
             _on_hit!(c, key)          # defensive: someone published first
@@ -502,7 +503,8 @@ function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::_MemoLatch, f,
         (existing, published)
     end
     published && _settled!(f, stored)
-    published && _HEAP_HINT[] != 0 && _check_memo_pressure!(_memo_bytes(stored) >= 256 * 1024)
+    published && _memo_retention_enabled() &&
+        _check_memo_pressure!(native_bytes !== nothing || _memo_bytes(stored) >= 256 * 1024)
     stored
 end
 

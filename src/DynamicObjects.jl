@@ -1222,6 +1222,7 @@ no store).
 fresh(ip::IndexableProperty{name}, args...; kwargs...) where {name} =
     _fresh_through(property_executor(ip.o, Val(name)),
                    _FreshCompute(ip.o, name, args, (; kwargs...), nothing))
+include("process_memory.jl")
 include("memo_retention.jl")
 
 """
@@ -1696,7 +1697,7 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
         _missing_sentinel
     end
     if hit !== _missing_sentinel
-        _HEAP_HINT[] == 0 || _check_memo_pressure!()
+        _memo_retention_enabled() && _check_memo_pressure!()
         t0 == 0 || _trace_read!(f, Val(:hit), t0)
         _link_hit!(link, c, key, hit)
         return hit
@@ -1732,7 +1733,7 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     end
     kind = action[1]
     if kind === :value
-        _HEAP_HINT[] == 0 || _check_memo_pressure!()
+        _memo_retention_enabled() && _check_memo_pressure!()
         !isnothing(s) && _finalize_substatus!(s)
         t0 == 0 || _trace_read!(f, Val(:hit), t0)
         _link_hit!(link, c, key, action[2])
@@ -3423,7 +3424,7 @@ $_cache_context""")
                 end
                 rv
             end
-            _HEAP_HINT[] == 0 || _record_memo_disk!(guard, o, name, indices, kwargs, cache_path)
+            _memo_retention_enabled() && _record_memo_disk!(guard, o, name, indices, kwargs, cache_path)
             # Record accessed key for indexed @cached properties
             if !isempty(indices)
                 _record_accessed_key(o, name, indices, kwargs)
@@ -3458,7 +3459,7 @@ function _peek_hit(c::AbstractThreadsafeDict, key)
     finally
         unlock(c.lock)
     end
-    _HEAP_HINT[] == 0 || _check_memo_pressure!()
+    _memo_retention_enabled() && _check_memo_pressure!()
     value
 end
 _peek_hit(c::AbstractDict, key) = get(c, key, _missing_sentinel)

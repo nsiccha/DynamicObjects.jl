@@ -23,6 +23,7 @@ mutable struct _RetainedMemo
     const status::Any
     const lock::ReentrantLock
     const latch::_MemoLatch
+    const native_bytes::Union{Nothing,Missing,Int}
     ticket::UInt
     disk::Bool
 end
@@ -64,11 +65,15 @@ const _MEMO_SWEEP = _MemoOrder()
 const _MEMO_LOCK = ReentrantLock()
 const _MEMO_TICKET = Ref(UInt(0))
 const _MOST_RECENT_MEMO = Threads.Atomic{UInt}(0)
-const _MEMO_EVICTED = Ref((disk=0, memory=0, estimated_payload_bytes=0, mapped_payload_bytes=0))
+const _MEMO_EVICTED = Ref((disk=0, memory=0, estimated_payload_bytes=0, mapped_payload_bytes=0,
+                           estimated_native_bytes=0, unknown_native_slots=0))
 const _NEXT_MEMO_CHECK = Threads.Atomic{UInt64}(0)
 const _MEMO_PROTECTED_NAMES = IdDict{Type,Set{Symbol}}()
 const _TRIMMING_MEMOS = Threads.Atomic{Bool}(false)
 const _HEAP_HINT = Ref(UInt64(0))
+const _PROCESS_BUDGET = Ref(0)
+const _NEXT_PROCESS_CHECK = Ref(UInt64(0)) # only the sampler writes this
+_memo_retention_enabled() = _HEAP_HINT[] != 0 || _PROCESS_BUDGET[] != 0
 
 # Recency across all slots also supplies the fallback order for a disk file
 # that disappeared or was replaced. Its original read age still applies.
@@ -172,14 +177,43 @@ _memo_bytes(v) = isbitstype(typeof(v)) ? sizeof(v) : 0
 _memo_bytes(v::String) = ncodeunits(v)
 _memo_bytes(v::Array) = sizeof(v)
 
-function _register_publication!(c, key, latch, f, v)
-    f isa _Settling && _plain_memo_payload(v) || return
+"""
+    DynamicObjects.memo_native_bytes(owner_type, ::Val{property}, value)
+
+Declare that this property's body can safely rebuild a native result after its
+cache slot is released. Specialize on the owner type, property and result type.
+Return an estimated native byte count (a nonnegative `Int`), or `missing` when
+the size is unknown. The default `nothing` preserves native-handle pinning.
+The method runs at publication and should only inspect the result. The producer
+is responsible for replaying the correct inputs, including any seed or file.
+A disk-cached producer must also support restoring a valid live resource.
+DynamicObjects drops its reference and leaves resource finalization to the owner.
+"""
+memo_native_bytes(owner_type, property, value) = nothing
+
+function _publication_native_bytes(c, key, f, v)
+    _memo_retention_enabled() && f isa _Settling || return nothing
+    (_plain_memo(v) || _is_dynamic_object(v) || v isa IndexableProperty) && return nothing
+    # Constructor seeds, @state and versioned properties never opt in. Run
+    # user code outside cache locks and inside the normal compute error path.
+    eligible = lock(c.lock) do
+        lock(() -> _eligible_memo(_MEMO_PROTECTED_NAMES, f, key), _MEMO_LOCK)
+    end
+    eligible || return nothing
+    bytes = memo_native_bytes(typeof(f.o), Val(f.name), v)
+    (bytes === nothing || bytes === missing || (bytes isa Int && bytes >= 0)) ||
+        throw(ArgumentError("memo_native_bytes must return nothing, missing or a nonnegative Int"))
+    bytes
+end
+
+function _register_publication!(c, key, latch, f, v, native_bytes)
+    f isa _Settling && (native_bytes !== nothing || _plain_memo_payload(v)) || return
     eligible = lock(() -> _eligible_memo(_MEMO_PROTECTED_NAMES, f, key), _MEMO_LOCK)
     eligible || return
     store = _scope_dict(c.cache, key)
     store isa _MemoValues{<:Any,Any} || return
     m = _RetainedMemo(v, store, key, f.name, _scope_dict(c.computing, key),
-                      _scope_dict(c.status, key), c.lock, latch, 0, latch.stamp !== nothing)
+                      _scope_dict(c.status, key), c.lock, latch, native_bytes, 0, latch.stamp !== nothing)
     store.raw[key] = m
     if _OPEN_SCOPE_COUNT[] != 0
         claimed = lock(_SCOPE_LOCK) do
@@ -240,7 +274,7 @@ function _release_coldest_memo!()
     try
         current = get(m.store.raw, m.key, nothing) === m
         # A small mixed container can acquire state or a handle after publication.
-        eligible = current && _plain_memo_payload(m.value)
+        eligible = current && (m.native_bytes !== nothing || _plain_memo_payload(m.value))
         recoverable = current && m.disk && _memo_file_stamp(m.latch.disk_path) == m.latch.stamp
         lock(_MEMO_LOCK) do
             m.ticket == ticket && _coldest_ticket() == ticket || return 0
@@ -266,29 +300,41 @@ function _release_coldest_memo!()
             bytes = _memo_bytes(m.value)
             counts = _MEMO_EVICTED[]
             mapped = m.latch.mapped ? bytes : 0
+            native = m.native_bytes isa Int ? m.native_bytes : 0
             _MEMO_EVICTED[] = (disk=counts.disk + m.disk, memory=counts.memory + !m.disk,
                 estimated_payload_bytes=counts.estimated_payload_bytes + bytes - mapped,
-                mapped_payload_bytes=counts.mapped_payload_bytes + mapped)
-            bytes - mapped
+                mapped_payload_bytes=counts.mapped_payload_bytes + mapped,
+                estimated_native_bytes=counts.estimated_native_bytes + native,
+                unknown_native_slots=counts.unknown_native_slots + ismissing(m.native_bytes))
+            (; heap=bytes - mapped, native)
         end
     finally
         unlock(m.lock)
     end
 end
 
-function _trim_memos!(excess; batch=16)
+function _trim_memos!(heap_excess, process_excess=0; batch=16)
+    released = 0
     for _ in 1:batch
-        excess > 0 || break
+        (heap_excess > 0 || process_excess > 0) || break
         bytes = _release_coldest_memo!()
         bytes === nothing && break
-        excess -= bytes
+        bytes === 0 && continue # stale, ineligible or demoted ticket
+        released += 1
+        heap_excess -= min(heap_excess, bytes.heap)
+        process_excess -= min(process_excess, bytes.heap)
+        process_excess -= min(process_excess, bytes.native)
     end
-    nothing
+    released
+end
+
+function _memo_excess(used, limit)
+    limit == 0 && return 0
+    used === nothing && return 0
+    used < limit - limit ÷ 10 ? 0 : Int(used - (limit - limit ÷ 5))
 end
 
 function _check_memo_pressure!(large_store=false)
-    hint = _HEAP_HINT[]
-    hint == 0 && return
     now = time_ns()
     deadline = _NEXT_MEMO_CHECK[]
     now < deadline && !large_store && return
@@ -297,11 +343,27 @@ function _check_memo_pressure!(large_store=false)
     if !large_store
         Threads.atomic_cas!(_NEXT_MEMO_CHECK, deadline, now + 50_000_000) == deadline || return
     end
-    live = Base.gc_live_bytes()
-    live >= hint - hint ÷ 10 || return
     Threads.atomic_cas!(_TRIMMING_MEMOS, false, true) && return
     try
-        _trim_memos!(Int(live) - Int(hint - hint ÷ 5))
+        heap_excess = _memo_excess(Base.gc_live_bytes(), _HEAP_HINT[])
+        budget = _PROCESS_BUDGET[]
+        footprint = if budget > 0 && now >= _NEXT_PROCESS_CHECK[]
+            _NEXT_PROCESS_CHECK[] = now + 250_000_000
+            _process_memory_bytes()
+        end
+        process_excess = _memo_excess(footprint, budget)
+        max(heap_excess, process_excess) > 0 || return
+        released = _trim_memos!(heap_excess, process_excess)
+        if process_excess > 0 && released > 0
+            # Native finalizers may run only once the last alias disappears.
+            # Collect only after a real release and back off if the batch
+            # barely moved the observed footprint (e.g. an unrelated heap).
+            GC.gc(true)
+            after = _process_memory_bytes()
+            if after === nothing || footprint - after < min(process_excess, 1024^2)
+                _NEXT_PROCESS_CHECK[] = time_ns() + 5_000_000_000
+            end
+        end
     finally
         _TRIMMING_MEMOS[] = false
     end
@@ -311,11 +373,14 @@ end
     memo_retention_stats()
     memo_retention_stats(queue)
 
-Report this process's heap hint, Julia's current live-heap estimate and
+Report this process's heap hint, Julia's current live-heap estimate, the
+process-memory budget and current footprint (`nothing` when unavailable), and
 cumulative automatic memo releases in the disk and memory tiers.
 `estimated_payload_bytes` counts shallow payloads dropped from slots and
 `mapped_payload_bytes` counts known explicit mappings separately. Aliases can
 contribute to several slots and other owners may still hold the value.
+`estimated_native_bytes` sums producer estimates, and `unknown_native_slots`
+counts released native results for which the producer supplied no estimate.
 For a queue configured with zero or one worker, the result is `(; requester, worker)`.
 `worker` is `nothing` when the process is absent. For a pool, the result is
 `(; requester, workers)` with a snapshot per configured slot, in slot order.
@@ -323,11 +388,21 @@ A slot without a live process contains `nothing`. Reading statistics leaves idle
 """
 function memo_retention_stats()
     counts = lock(() -> _MEMO_EVICTED[], _MEMO_LOCK)
-    (; pid=getpid(), heap_hint_bytes=_HEAP_HINT[], live_heap_bytes=Base.gc_live_bytes(), counts...)
+    (; pid=getpid(), heap_hint_bytes=_HEAP_HINT[], live_heap_bytes=Base.gc_live_bytes(),
+       process_budget_bytes=_PROCESS_BUDGET[], process_memory_bytes=_process_memory_bytes(), counts...)
 end
 
 function __init__()
     _HEAP_HINT[] = Base.JLOptions().heap_size_hint
+    budget = get(ENV, "DYNAMICOBJECTS_PROCESS_BUDGET_BYTES", nothing)
+    if budget === nothing
+        _PROCESS_BUDGET[] = _HEAP_HINT[]
+    else
+        value = tryparse(Int, budget)
+        (value !== nothing && value >= 0) ||
+            throw(ArgumentError("DYNAMICOBJECTS_PROCESS_BUDGET_BYTES must be a nonnegative integer byte count, got $(repr(budget))"))
+        _PROCESS_BUDGET[] = value
+    end
     # A queue between retries can be exiting even before its first worker exists.
     atexit(() -> (_WORKERS_EXITING[] = true))
 end
