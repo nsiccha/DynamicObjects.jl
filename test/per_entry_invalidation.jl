@@ -11,7 +11,16 @@ _bump!(k) = (INV_CALLS[k] = get(INV_CALLS, k, 0) + 1)
     __cache_path__::String
     plain(x; scale=1) = (_bump!((:plain, x, scale)); x * scale * 10)
     @cached saved(x) = (_bump!((:saved, x)); x + 100)
-    slow(x) = (sleep(3.0); n = _bump!((:slow, x)); (x, n))
+    @state first_task = Channel{Task}(1)
+    @state release_first = Base.Event()
+    slow(x) = begin
+        n = _bump!((:slow, x))
+        if n == 1
+            put!(first_task, current_task())
+            wait(release_first)
+        end
+        (x, n)
+    end
 end
 end
 
@@ -96,47 +105,32 @@ end
 using DynamicObjects
 
 empty!(INV_CALLS)
-o = InvApp(mktempdir())
-started(key) = begin
-    for _ in 1:200
-        DynamicObjects.n_running(o.slow.cache) >= 1 && return true
-        sleep(0.05)
+for (key, force) in ((1, false), (2, true))
+    o = InvApp(mktempdir())
+    pending = fetchindex((value, _) -> value, o.slow, key)
+    @test pending isa Pending
+    first = take!(o.first_task)
+    # Finish the replacement first, then let the superseded computation
+    # finish and check that its older value cannot overwrite the newer one.
+    replacement = Threads.@spawn begin
+        if force
+            fetchindex(o.slow, key; force=true) do value, status
+                value isa Pending ? fetch(value) : value
+            end
+        else
+            invalidate!(o.slow, key)
+            fetch(pending)
+        end
     end
-    false
+    try
+        @test timedwait(() -> istaskdone(replacement), 30) === :ok
+    finally
+        notify(o.release_first)
+    end
+    wait(first)
+    @test fetch(replacement) == (key, 2)
+    @test fetch(pending) == (key, 2)
+    @test o.slow(key) == (key, 2)
+    @test INV_CALLS[(:slow, key)] == 2
 end
-
-# Mid-flight invalidation: the compute is not stopped, but it may have read what was
-# invalidated, so its value is not stored. A handle taken before the invalidation
-# re-resolves: with nothing in flight any more, its fetch starts a new compute.
-t = Threads.@spawn fetchindex(o.slow, 1) do rv, status
-    rv
-end
-@test started(1)
-pend = Base.fetch(t)
-@test pend isa Pending
-invalidate!(o.slow, 1)
-gap = fetch(pend)
-@test gap isa Tuple
-sleep(3.5)
-@test INV_CALLS[(:slow, 1)] == 2      # the invalidated compute ran to completion too
-@test o.slow(1) == gap                 # but only the re-resolved one is stored
-@test INV_CALLS[(:slow, 1)] == 2
-
-# force=true mid-flight starts a second compute; the superseded one is not stored,
-# so the forced value is the one served.
-t2 = Threads.@spawn fetchindex(o.slow, 2) do rv, status
-    rv
-end
-@test started(2)
-pend2 = Base.fetch(t2)
-@test pend2 isa Pending
-forced2 = fetchindex(o.slow, 2; force=true) do rv, status
-    rv isa Pending ? fetch(rv) : rv
-end
-@test forced2 isa Tuple
-@test fetch(pend2) == forced2          # the old handle resolves to the forced compute
-sleep(3.5)
-@test INV_CALLS[(:slow, 2)] == 2
-@test o.slow(2) == forced2
-@test INV_CALLS[(:slow, 2)] == 2
 end
