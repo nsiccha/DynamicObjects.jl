@@ -8,6 +8,20 @@ using DynamicObjects
 import DynamicObjects.Treebars
 export Toy, settled_count, reset_settled!
 
+# Byte arrays whose first byte identifies the execution that produced them.
+const RETENTION_BUILDS = Dict{Symbol,Int}()
+function retention_bytes(property, bytes)
+    build = RETENTION_BUILDS[property] = get(RETENTION_BUILDS, property, 0) + 1
+    fill(UInt8(build), bytes)
+end
+@dynamicstruct struct RetentionRoot
+    folder::String
+    __cache_base__ = folder
+    @queued blob(key) = retention_bytes(:blob, 8 * 1024^2)
+    @queued @cached saved(key) = retention_bytes(:saved, 1024^2)
+    @queued @fresh snapshot() = (length(cached_entries(blob)), copy(RETENTION_BUILDS))
+end
+
 # Nested modules and custom value conversion must resolve to the worker's own bindings.
 module RequestContext
 using DynamicObjects

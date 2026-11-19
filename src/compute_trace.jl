@@ -418,7 +418,7 @@ end
 struct _PublishGuard{C<:AbstractThreadsafeDict,K}
     cache::C
     key::K
-    latch::Threads.Condition
+    latch::_MemoLatch
 end
 const _PUBLISH_GUARD = :__dynamicobjects_publish_guard__
 
@@ -461,7 +461,7 @@ end
 # retracts the latch of a compute in flight and wakes its waiters (`_retract!`), which find
 # the latch gone and re-resolve against the current state. Such a compute may have read what
 # was invalidated, so it publishes nothing: its value (or failure) goes to its own caller only.
-function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condition, f, s)
+function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::_MemoLatch, f, s)
     local v
     _start_substatus!(s)
     try
@@ -492,6 +492,7 @@ function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condit
         published = existing === _missing_sentinel
         if published
             c.cache[key] = v
+            _HEAP_HINT[] == 0 || _register_publication!(c, key, cnd, f, v)
             existing = v
         else
             _on_hit!(c, key)          # defensive: someone published first
@@ -501,6 +502,7 @@ function _run_cache_compute!(c::AbstractThreadsafeDict, key, cnd::Threads.Condit
         (existing, published)
     end
     published && _settled!(f, stored)
+    published && _HEAP_HINT[] != 0 && _check_memo_pressure!(_memo_bytes(stored) >= 256 * 1024)
     stored
 end
 
@@ -508,7 +510,7 @@ end
 # (rethrow the recorded exception). If the computer vanished with neither (evicted mid
 # flight), recompute from scratch OUTSIDE the lock. With an executor the blocking part
 # runs inside `await_deferred`.
-function _await_cache_value!(c::AbstractThreadsafeDict, key, cnd::Threads.Condition, f; fetch=Base.fetch, substatus=nothing, retry_failed=true, link=nothing)
+function _await_cache_value!(c::AbstractThreadsafeDict, key, cnd::_MemoLatch, f; fetch=Base.fetch, substatus=nothing, retry_failed=true, link=nothing)
     t0 = _trace_clock()
     outcome = _latch_outcome(c, key, cnd, false)
     if outcome[1] === :pending
@@ -556,9 +558,10 @@ _link_hit!(a::_Attached, c::AbstractThreadsafeDict, key, v) =
 
 # The state of `key` behind latch `cnd`: `:value`, `:error`, `:gone` (the latch was
 # retracted with neither), or — without `block` — `:pending` while it is still in flight.
-_latch_outcome(c::AbstractThreadsafeDict, key, cnd::Threads.Condition, block::Bool) =
+_latch_outcome(c::AbstractThreadsafeDict, key, cnd::_MemoLatch, block::Bool) =
     lock(c.lock) do
         while true
+            cnd.saved === _missing_sentinel || return (:value, cnd.saved)
             v = get(c.cache, key, _missing_sentinel)
             v !== _missing_sentinel && (_on_hit!(c, key); return (:value, v))
             haskey(c.errors, key) && return (:error, c.errors[key])
@@ -597,7 +600,10 @@ struct Pending{C<:AbstractThreadsafeDict, K, S, E, R}
     slot::S       # a `Slot{T}` for slotted bare props; `nothing` for `cache`-backed keys
     executor::E   # the executor a blocking `fetch` waits through; `nothing` for none
     resolve::R    # re-runs the access once its computation was retracted; `nothing` for none
+    delivery::Union{Nothing,_MemoLatch}
 end
+Pending(cache, key, slot, executor, resolve) = Pending(cache, key, slot, executor, resolve, nothing)
+_delivered(p) = p.delivery === nothing ? _missing_sentinel : p.delivery.saved
 Pending(cache, key, slot) = Pending(cache, key, slot, nothing, nothing)
 Pending(cache, key, slot, executor) = Pending(cache, key, slot, executor, nothing)
 # The selector that blocks for `p`'s computation through its executor.
@@ -607,7 +613,7 @@ _blocking_selector(p::Pending) = p.executor === nothing ? Base.fetch : _Blocking
 function Base.isready(p::Pending)
     p.slot === nothing || return (@atomic :acquire p.slot.set)
     lock(p.cache.lock) do
-        _pending_saved(p.resolve) !== _missing_sentinel || haskey(p.cache.cache, p.key)
+        _delivered(p) !== _missing_sentinel || _pending_saved(p.resolve) !== _missing_sentinel || haskey(p.cache.cache, p.key)
     end
 end
 
@@ -631,7 +637,7 @@ function _fetch_pending(p::Pending)
                 haskey(c.errors, p.key) && throw(c.errors[p.key])
                 cnd = get(c.computing, p.key, nothing)
                 cnd === nothing && return false
-                wait(cnd::Threads.Condition)
+                wait(cnd::_MemoLatch)
                 true
             end
             again || break
@@ -641,6 +647,8 @@ function _fetch_pending(p::Pending)
     end
     while true
         step = lock(c.lock) do
+            delivered = _delivered(p)
+            delivered === _missing_sentinel || return (:value, delivered)
             saved = _pending_saved(p.resolve)
             saved !== _missing_sentinel && return (:value, saved)
             v = get(c.cache, p.key, _missing_sentinel)
@@ -649,7 +657,7 @@ function _fetch_pending(p::Pending)
             cnd = get(c.computing, p.key, nothing)
             cnd === nothing && return (:gone, nothing)
             _on_hit!(c, p.key)
-            wait(cnd::Threads.Condition)
+            wait(cnd::_MemoLatch)
             (:retry, nothing)
         end
         step[1] === :value && return step[2]

@@ -9,6 +9,7 @@
 entries
 cached_entries
 mem_cache_entries
+memo_retention_stats
 DynamicObjects.MemCacheEntry
 ```
 

@@ -8,6 +8,10 @@ optional disk storage.
 module DynamicObjects
 export @dynamicstruct, @cache_status, @is_cached, @cache_path, @clear_cache!, invalidate!, @persist, @memo!, @fresh, fresh, @fetch!, @dynamic_progress, memoize!, maybememoize!, maybefresh, maybefetchindex!, maybefetchproperty!, maybeprogress!, noprogress, remake, remount, file_version, fetchindex, fetchindex!, fetchproperty, fetchproperty!, getstatus, PropertyComputationError, unwrap_error, entries, cached_entries, clear_all_caches!, clear_mem_caches!, clear_disk_caches!, mem_cache_entries, prune_mem_caches!, PersistentSet, LazyPersistentDict, KeyTracker, SharedFileTracker, NoKeyTracker, key_tracker, record!, load_keys, Pending, Deferred, DeferredCompute, ComputeAbandoned, BackgroundCache
 
+using OrderedCollections: OrderedDict
+
+export memo_retention_stats
+
 import SHA, Serialization, Mmap, Treebars, ScopedValues, Malt
 
 # Treebars 0.1.1 is the floor for the three Treebars features checked below:
@@ -1211,6 +1215,8 @@ no store).
 fresh(ip::IndexableProperty{name}, args...; kwargs...) where {name} =
     _fresh_through(property_executor(ip.o, Val(name)),
                    _FreshCompute(ip.o, name, args, (; kwargs...), nothing))
+include("memo_retention.jl")
+
 """
     AbstractThreadsafeDict{K,V}
 
@@ -1225,9 +1231,9 @@ abstract type AbstractThreadsafeDict{K,V} <: AbstractDict{K,V} end
 
 struct ThreadsafeDict{K,V} <: AbstractThreadsafeDict{K,V}
     lock::ReentrantLock
-    cache::Dict{K,V}
+    cache::_MemoValues{K,V}
     status::Dict{K,Any}
-    # In-flight computes. Maps an in-flight key to a `Threads.Condition` bound to `lock`.
+    # In-flight computes. Maps an in-flight key to a `_MemoLatch` bound to `lock`.
     # The first accessor — a blocking caller computing INLINE, or a poller that spawned a
     # fire-and-forget compute — registers here; concurrent accessors see the marker and
     # either `wait` on it (blocking) or return a `Pending` handle (polling) instead of
@@ -1235,14 +1241,31 @@ struct ThreadsafeDict{K,V} <: AbstractThreadsafeDict{K,V}
     # the computer removes its entry + `notify`s under `lock`. We deliberately do NOT
     # retain the compute Task: the value lands in `cache`, and a failure lands in
     # `errors` (below), so the Task carries nothing we need (no value, no cancel).
-    computing::Dict{K,Threads.Condition}
+    computing::Dict{K,_MemoLatch}
     # Captured exception for a compute that threw. The value never lands in `cache`, so a
     # waiter / `fetch(::Pending)` reads the failure here and rethrows it, a poll surfaces
     # `:failed`, and `retry_failed` clears it to allow a fresh compute. Replaces the former
     # "leave the failed Task in `tasks` until retry_failed clears it".
     errors::Dict{K,Any}
-    ThreadsafeDict{K,V}(c) where {K,V} = new{K,V}(ReentrantLock(), Dict{K,V}(c), Dict{K,Any}(), Dict{K,Threads.Condition}(), Dict{K,Any}())
-    ThreadsafeDict() = new{Any,Any}(ReentrantLock(), Dict{Any,Any}(), Dict{Any,Any}(), Dict{Any,Threads.Condition}(), Dict{Any,Any}())
+    ThreadsafeDict{K,V}(lk, cache, status, computing, errors) where {K,V} =
+        new{K,V}(lk, cache, status, computing, errors)
+    ThreadsafeDict{K,V}(c) where {K,V} = new{K,V}(ReentrantLock(), _MemoValues(Dict{K,V}(c)), Dict{K,Any}(), Dict{K,_MemoLatch}(), Dict{K,Any}())
+    ThreadsafeDict() = new{Any,Any}(ReentrantLock(), _MemoValues(Dict{Any,Any}()), Dict{Any,Any}(), Dict{Any,_MemoLatch}(), Dict{Any,Any}())
+end
+
+# Julia serialization writes the five physical fields of this immutable type.
+# A persisted object from 0.5.26 has a plain value Dict and condition latches.
+# Wrap the same backing Dict so other restored views still share its entries.
+_restore_values(d::Dict) = _MemoValues(d)
+_restore_values(d::_MemoValues) = d
+_restore_latches(d::Dict{K,_MemoLatch}) where K = d
+function _restore_latches(d::Dict{K,Threads.Condition}) where K
+    isempty(d) || throw(ArgumentError("cannot restore an in-flight cache computation from another process"))
+    Dict{K,_MemoLatch}()
+end
+function Serialization.deserialize(s::Serialization.AbstractSerializer, ::Type{ThreadsafeDict{K,V}}) where {K,V}
+    lk, values, status, computing, errors = ntuple(_ -> Serialization.deserialize(s), 5)
+    ThreadsafeDict{K,V}(lk, _restore_values(values), status, _restore_latches(computing), errors)
 end
 
 # An invalidation retracts the in-flight latch of `key` from a `computing` dict, under
@@ -1428,7 +1451,7 @@ struct MountedThreadsafeDict{S<:ThreadsafeDict{Symbol,Any},O} <: AbstractThreads
     lock::ReentrantLock
     cache::MountedDict{Symbol,Any}
     status::MountedDict{Symbol,Any}
-    computing::MountedDict{Symbol,Threads.Condition}
+    computing::MountedDict{Symbol,_MemoLatch}
     errors::MountedDict{Symbol,Any}
     shared::S
     source::O
@@ -1444,6 +1467,16 @@ struct MountedThreadsafeDict{S<:ThreadsafeDict{Symbol,Any},O} <: AbstractThreads
     inputs::Tuple{Vararg{Symbol}}
 end
 
+function Serialization.deserialize(s::Serialization.AbstractSerializer, T::Type{<:MountedThreadsafeDict})
+    fields = ntuple(_ -> Serialization.deserialize(s), fieldcount(T))
+    lk, values, status, computing, errors, shared = fields
+    if values.overlay isa Dict
+        values = MountedDict(shared.cache, _restore_values(values.overlay), values.local_names)
+        computing = MountedDict(shared.computing, _restore_latches(computing.overlay), computing.local_names)
+    end
+    T(lk, values, status, computing, errors, fields[6:end]...)
+end
+
 # Private inner-constructor discriminator emitted by `@dynamicstruct`. A public
 # call can never collide with it, and ordinary constructors keep their existing
 # signature and overrideable-default behavior.
@@ -1456,9 +1489,9 @@ function MountedThreadsafeDict(shared::ThreadsafeDict{Symbol,Any}, source,
                                inputs=())
     names = Set{Symbol}(local_names)
     union!(names, keys(seed))
-    local_cache = Dict{Symbol,Any}(pairs(seed))
+    local_cache = _MemoValues(Dict{Symbol,Any}(pairs(seed)))
     local_status = Dict{Symbol,Any}()
-    local_computing = Dict{Symbol,Threads.Condition}()
+    local_computing = Dict{Symbol,_MemoLatch}()
     local_errors = Dict{Symbol,Any}()
     MountedThreadsafeDict(
         shared.lock,
@@ -1656,6 +1689,7 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
         _missing_sentinel
     end
     if hit !== _missing_sentinel
+        _HEAP_HINT[] == 0 || _check_memo_pressure!()
         t0 == 0 || _trace_read!(f, Val(:hit), t0)
         _link_hit!(link, c, key, hit)
         return hit
@@ -1679,11 +1713,11 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
         if cnd !== nothing
             _on_hit!(c, key)
             # A compute is already in flight (inline, or a prior poller's fire-and-forget).
-            return sync ? (:wait, cnd) : (:pending, nothing)
+            return sync ? (:wait, cnd) : (:pending, cnd)
         end
         # Nobody computing — WE become the sole computer. Register the latch + (optional)
         # status so concurrent accessors dedup onto us and getstatus/pollers see progress.
-        cnd = Threads.Condition(c.lock)
+        cnd = _MemoLatch(c.lock)
         _scope_new_generation!(c, key, f)
         c.computing[key] = cnd
         !isnothing(s) && (c.status[key] = s)
@@ -1691,6 +1725,7 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     end
     kind = action[1]
     if kind === :value
+        _HEAP_HINT[] == 0 || _check_memo_pressure!()
         !isnothing(s) && _finalize_substatus!(s)
         t0 == 0 || _trace_read!(f, Val(:hit), t0)
         _link_hit!(link, c, key, action[2])
@@ -1706,19 +1741,19 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
         # We built `s` but aren't the computer; finalize it (the winner owns the status).
         !isnothing(s) && _finalize_substatus!(s)
         return _linked(link, link === nothing ? nothing : _status_of(c, key)) do
-            _await_cache_value!(c, key, action[2]::Threads.Condition, f; fetch, substatus, retry_failed, link)
+            _await_cache_value!(c, key, action[2]::_MemoLatch, f; fetch, substatus, retry_failed, link)
         end
     end
     if kind === :pending
         # Poller, compute already in flight elsewhere — hand back a cheap Pending, no spawn.
         !isnothing(s) && _finalize_substatus!(s)
         t0 == 0 || _trace_read!(f, Val(:pending), t0)
-        return fetch(Pending(c, key, nothing, executor, _resolver(f, c, key, fetch, substatus, retry_failed)))
+        return fetch(Pending(c, key, nothing, executor, _resolver(f, c, key, fetch, substatus, retry_failed), action[2]))
     end
     if kind === :inline
         # Blocking first-arriver: compute on THIS thread (no spawn), publish, return value.
         return _linked(link, s) do
-            _run_cache_compute!(c, key, action[2]::Threads.Condition, f, s)
+            _run_cache_compute!(c, key, action[2]::_MemoLatch, f, s)
         end
     end
     # :start — first-arriver of a poller, or of any caller with an executor: kick the
@@ -1727,13 +1762,13 @@ Base.get!(f::Function, c::AbstractThreadsafeDict, key; fetch=Base.fetch, substat
     # latch. Without an executor it spawns on the `:default` pool; the selector's
     # executor (a caller's `Deferred`, or a declared `property_executor`) receives it
     # instead.
-    cnd = action[2]::Threads.Condition
+    cnd = action[2]::_MemoLatch
     _start_compute(executor, DeferredCompute(c, key, cnd, f, s))
     # A blocking caller waits for the compute it started, as for one already in flight.
     sync && return _linked(link, s) do
         _await_cache_value!(c, key, cnd, f; fetch, substatus, retry_failed, link)
     end
-    p = Pending(c, key, nothing, executor, _resolver(f, c, key, fetch, substatus, retry_failed))
+    p = Pending(c, key, nothing, executor, _resolver(f, c, key, fetch, substatus, retry_failed), cnd)
     # An executor may have run the compute synchronously: hand back the value.
     executor !== nothing && isready(p) && return Base.fetch(p)
     t0 == 0 || _trace_read!(f, Val(:pending), t0)
@@ -1844,7 +1879,7 @@ running task's own.
 mutable struct DeferredCompute
     const cache::AbstractThreadsafeDict
     const key::Any
-    const latch::Threads.Condition
+    const latch::_MemoLatch
     const f::Any
     const status::Any
     @atomic claimed::Bool
@@ -2916,7 +2951,7 @@ function _raw_entries(ip::IndexableProperty{N,<:Any,<:AbstractThreadsafeDict}) w
         end
         for (k, _cnd) in c.computing
             haskey(c.cache, k) && continue
-            push!(result, (; key=k, state=:running, status=get(c.status, k, nothing), value=Pending(c, k, nothing, executor)))
+            push!(result, (; key=k, state=:running, status=get(c.status, k, nothing), value=Pending(c, k, nothing, executor, nothing, _cnd)))
         end
         for (k, e) in c.errors
             haskey(c.cache, k) && continue
@@ -3385,6 +3420,7 @@ $_cache_context""")
                 end
                 rv
             end
+            _HEAP_HINT[] == 0 || _record_memo_disk!(guard, o, name, indices, kwargs, cache_path)
             # Record accessed key for indexed @cached properties
             if !isempty(indices)
                 _record_accessed_key(o, name, indices, kwargs)
@@ -3412,13 +3448,15 @@ end
 _peek_hit(pc::PropertyCache, name::Symbol) = _peek_hit(getfield(pc, :cache), name)
 function _peek_hit(c::AbstractThreadsafeDict, key)
     lock(c.lock)
-    try
+    value = try
         value = get(c.cache, key, _missing_sentinel)
         value === _missing_sentinel || _on_hit!(c, key)
-        return value
+        value
     finally
         unlock(c.lock)
     end
+    _HEAP_HINT[] == 0 || _check_memo_pressure!()
+    value
 end
 _peek_hit(c::AbstractDict, key) = get(c, key, _missing_sentinel)
 _peek_hit(c::MountedThreadsafeDict, name::Symbol) =
@@ -6613,7 +6651,7 @@ surfacing another view's context dependence.
 """
 struct _OpaqueSubcache{L<:AbstractThreadsafeDict} <: AbstractThreadsafeDict{Any,Any}
     lock::ReentrantLock
-    cache::Dict
+    cache::_MemoValues
     status::Dict
     computing::Dict
     errors::Dict
@@ -6627,6 +6665,12 @@ _OpaqueSubcache(ns::_OpaqueNamespace, name::Symbol, requester, shared::Threadsaf
                 local_dict::AbstractThreadsafeDict) =
     _OpaqueSubcache(shared.lock, shared.cache, shared.status, shared.computing, shared.errors,
                     shared, local_dict, ns, name, requester)
+
+function Serialization.deserialize(s::Serialization.AbstractSerializer, T::Type{<:_OpaqueSubcache})
+    fields = ntuple(_ -> Serialization.deserialize(s), fieldcount(T))
+    shared, local_dict, ns, name, requester = fields[6:end]
+    _OpaqueSubcache(ns, name, requester, shared, local_dict)
+end
 
 # A bare property is keyed by its name, an indexed one by `(indices, kwargs)`.
 const _OpaqueBare = _OpaqueSubcache{<:MountedThreadsafeDict}
