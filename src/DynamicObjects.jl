@@ -2180,14 +2180,16 @@ This holds wherever the invalidation is issued from, including the body of a
 computation of the same object.
 """
 function invalidate!(ip::IndexableProperty, indices...; kwargs...)
-    key = _memo_key(indices, (;kwargs...))
-    traced = _trace_scope() !== nothing
-    held = traced && haskey(ip.cache, key)
-    maybepop!(ip.cache, key)
-    on_disk = _remove_disk_entry!(ip.o, name(ip), indices...; kwargs...)
-    traced && _trace_invalidation!(:invalidate!, ip.o, held || on_disk ? (name(ip),) : (), _plain_key(key))
-    _forward_entry_invalidation(ip.o, name(ip), indices, (; kwargs...))
-    nothing
+    _with_worker_invalidation(ip.o) do address
+        key = _memo_key(indices, (;kwargs...))
+        traced = _trace_scope() !== nothing
+        held = traced && haskey(ip.cache, key)
+        maybepop!(ip.cache, key)
+        on_disk = _remove_disk_entry!(ip.o, name(ip), indices...; kwargs...)
+        traced && _trace_invalidation!(:invalidate!, ip.o, held || on_disk ? (name(ip),) : (), _plain_key(key))
+        _forward_entry_invalidation(address, name(ip), indices, (; kwargs...))
+        nothing
+    end
 end
 
 # Remove one entry's disk payload (explicit `@cached`/`@mmap` or automatic) and
@@ -2971,7 +2973,13 @@ entry. The progress root is also dropped unless supplied as a constructor input.
 Inside a computation, prefer a narrower property clear or `sync!`.
 """
 function clear_mem_caches!(obj)
-    forward = _invalidation_address(obj)   # while `obj`'s parent still holds it
+    _with_worker_invalidation(obj) do address
+        _clear_mem_caches_local!(obj)
+        _forward_invalidation(address, :clear_mem_caches!)
+    end
+end
+
+function _clear_mem_caches_local!(obj)
     pc = getfield(obj, :cache)
     c = pc.cache
     state = _state_names(typeof(obj))
@@ -3020,7 +3028,6 @@ function clear_mem_caches!(obj)
     _restore_seeds!(pc)
     isempty(dropped) || _object_cleared!(obj, unique!(dropped))
     held === nothing || _trace_invalidation!(:clear_mem_caches!, obj, _trace_cleared(held, c, state))
-    _forward_invalidation(forward, :clear_mem_caches!)
     nothing
 end
 
@@ -4506,10 +4513,11 @@ With indices or kwargs it drops exactly that one entry, as
 clear_cache!(o, name::Symbol; kwargs...) =
     isempty(kwargs) ? _clear_property!(o, name) : _clear_cache_entry!(o, name; kwargs...)
 function _clear_property!(o, name::Symbol)
-    forward = _invalidation_address(o)
-    names = _invalidate_property!(o, name)
-    _forward_invalidation(forward, :clear_cache!, name)
-    names
+    _with_worker_invalidation(o) do address
+        names = _invalidate_property!(o, name)
+        _forward_invalidation(address, :clear_cache!, name)
+        names
+    end
 end
 clear_cache!(o, name::Symbol, index, indices...; kwargs...) =
     _clear_cache_entry!(o, name, index, indices...; kwargs...)
@@ -4521,9 +4529,11 @@ function _clear_cache_entry!(o, name::Symbol, indices...; kwargs...)
     if v isa IndexableProperty
         invalidate!(v, indices...; kwargs...)
     else
-        on_disk = _remove_disk_entry!(o, name, indices...; kwargs...)
-        _trace_invalidation!(:invalidate!, o, on_disk ? (name,) : (), (indices, (;kwargs...)))
-        _forward_entry_invalidation(o, name, indices, (; kwargs...))
+        _with_worker_invalidation(o) do address
+            on_disk = _remove_disk_entry!(o, name, indices...; kwargs...)
+            _trace_invalidation!(:invalidate!, o, on_disk ? (name,) : (), (indices, (;kwargs...)))
+            _forward_entry_invalidation(address, name, indices, (; kwargs...))
+        end
     end
     nothing
 end

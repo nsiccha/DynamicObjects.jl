@@ -1445,7 +1445,7 @@ function _compute_in_worker(f::_WorkerCompute, o, name::Symbol, args::Tuple, kwa
     conn, req = _reserve_worker!(q, root)
     interrupter = nothing
     try
-        w, pid = _submit!(q, conn, req, o, name, args, kwargs, packages,
+        w, pid = _submit!(q, conn, req, root, o, name, args, kwargs, packages,
                           (req.id, address, name, wired_args, wired_kwargs, is_fresh, min_level,
                            _mirrorable(status), scopes), status)
         lock(conn.lock) do
@@ -1524,7 +1524,7 @@ end
 # nothing it ran survives it. Its exit still reaches `req` from the event pump as
 # `:abandoned`, naming it, which `_compute_in_worker` then ignores. Starting a worker and
 # loading packages show as phases on the computation's progress node `status`.
-function _submit!(q, conn, req::_RemoteRequest, o, name, args, kwargs, packages, message, status=nothing)
+function _submit!(q, conn, req::_RemoteRequest, root, o, name, args, kwargs, packages, message, status=nothing)
     for attempt in 1:2
         w = try
             _ensure_worker!(q, conn, status)
@@ -1535,6 +1535,7 @@ function _submit!(q, conn, req::_RemoteRequest, o, name, args, kwargs, packages,
         lock(() -> req.worker = w, conn.lock)
         try
             _ensure_packages!(conn, w, union(_worker_preload(q), packages), status)
+            _wait_for_invalidation(root)
             _remote_fetch(conn, w, _worker_submit, message..., _worker_scope_token(q, conn, w))
             return w, w.handle.proc_pid
         catch err
@@ -1640,6 +1641,42 @@ end
 
 # --- Invalidation forwarding ------------------------------------------------------------------
 
+# An invalidation retracts requester latches before it reaches the workers. A waiter
+# can immediately acquire a replacement latch. Hold its submission until all copies
+# of that root have seen the invalidation, without holding a queue or cache lock.
+const _INVALIDATIONS = Dict{Any,Int}()
+const _INVALIDATION_CHANGED = Threads.Condition()
+const _INSIDE_INVALIDATION = ScopedValues.ScopedValue(false)
+
+function _with_worker_invalidation(f, o)
+    address = _invalidation_address(o)
+    isnothing(address) && return f(nothing)
+    root = first(_kept_keys(address))
+    lock(_INVALIDATION_CHANGED) do
+        _INVALIDATIONS[root] = get(_INVALIDATIONS, root, 0) + 1
+    end
+    try
+        ScopedValues.with(() -> f(address), _INSIDE_INVALIDATION => true)
+    finally
+        lock(_INVALIDATION_CHANGED) do
+            if (_INVALIDATIONS[root] -= 1) == 0
+                delete!(_INVALIDATIONS, root)
+                notify(_INVALIDATION_CHANGED; all=true)
+            end
+        end
+    end
+end
+
+function _wait_for_invalidation(root)
+    # Resolving a cache path inside an invalidation may itself request a property.
+    _INSIDE_INVALIDATION[] && return
+    lock(_INVALIDATION_CHANGED) do
+        while haskey(_INVALIDATIONS, root)
+            wait(_INVALIDATION_CHANGED)
+        end
+    end
+end
+
 # Forward an invalidation of `o` to the worker, which applies it to the object it holds at the
 # same address (and ignores it when it holds none). `address` is computed by the caller
 # before it invalidates, while `o` is still held by its parent.
@@ -1661,8 +1698,7 @@ function _forward_invalidation(address, verb::Symbol, args...)
 end
 
 # Forward the invalidation of one indexed entry.
-function _forward_entry_invalidation(o, name::Symbol, indices::Tuple, kwargs::NamedTuple)
-    address = _invalidation_address(o)
+function _forward_entry_invalidation(address, name::Symbol, indices::Tuple, kwargs::NamedTuple)
     address === nothing && return nothing
     wired = try
         (_wire(indices), _wire(kwargs))
@@ -1769,24 +1805,38 @@ function worker_status(q=job_queue())
 end
 
 """
-    DynamicObjects.restart_worker!(q=job_queue(); worker=nothing) -> NamedTuple
+    DynamicObjects.restart_worker!(q=job_queue(); pid=nothing) -> NamedTuple
 
-Stop the process in slot `worker` (1-based), failing its requests with [`ComputeAbandoned`](@ref).
+Stop the process with the observed `pid`, failing its requests with [`ComputeAbandoned`](@ref).
 A replacement starts on demand, or immediately under `worker_start=:now`. A pool requires
-an explicit slot. With zero or one worker the argument can be omitted. Returns
+an explicit PID from `worker_status().processes`. A PID that has already exited leaves its
+replacement alone. With zero or one worker the argument can be omitted. Returns
 [`worker_status`](@ref DynamicObjects.worker_status).
 """
-function restart_worker!(q=job_queue(); worker=nothing)
+function restart_worker!(q=job_queue(); pid=nothing)
     old, eager = lock(q.lock) do
-        n = length(q.conns)
-        isnothing(worker) && n == 0 && return (nothing, nothing)
-        isnothing(worker) && n > 1 && throw(ArgumentError("select a worker slot from 1:$n"))
-        i = something(worker, 1)
-        i isa Integer && 1 <= i <= n || throw(ArgumentError("worker must be a slot from 1:$n"))
-        conn = q.conns[i]
-        _retire_connection!(conn)
-        q.conns[i] = _WorkerConn(i)
-        conn, q.worker_start === :now ? q.conns[i] : nothing
+        if isnothing(pid)
+            isempty(q.conns) && return (nothing, nothing)
+            length(q.conns) == 1 || throw(ArgumentError("select a worker by pid"))
+        elseif !(pid isa Integer && pid > 0)
+            throw(ArgumentError("pid must be a positive process ID"))
+        end
+        for conn in q.conns
+            matched = lock(conn.lock) do
+                if pid === nothing || (_worker_alive(conn.worker) && conn.pid == pid)
+                    _retire_connection!(conn)
+                    true
+                else
+                    false
+                end
+            end
+            if matched
+                replacement = _WorkerConn(conn.index)
+                q.conns[conn.index] = replacement
+                return conn, q.worker_start === :now ? replacement : nothing
+            end
+        end
+        nothing, nothing
     end
     old === nothing || _stop_worker!(old)
     eager === nothing || _start_worker_soon!(q, eager)

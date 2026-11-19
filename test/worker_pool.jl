@@ -15,7 +15,7 @@ try
     DO.configure_queue!(; workers=2, max_running=2)
     @test !any(p -> p.running, slots())
     @test_throws ArgumentError DO.restart_worker!()
-    @test_throws ArgumentError DO.restart_worker!(; worker=3)
+    @test_throws ArgumentError DO.restart_worker!(; pid=-1)
 
     fit = gate(t, 1)
     started(1) || error("first request did not reach its worker")
@@ -73,7 +73,10 @@ try
     @test newpid != pids[1]
     retry = gate(t, 7)
     started(7) || error("surplus worker did not recover")
-    DO.restart_worker!(; worker=2)
+    replacement_pid = slots()[2].pid
+    DO.restart_worker!(; pid=pids[2])
+    @test slots()[2].pid == replacement_pid
+    DO.restart_worker!(; pid=replacement_pid)
     @test_throws ComputeAbandoned fetch(retry)
     release(6)
     @test fetch(fresh).pid == newpid
@@ -113,5 +116,86 @@ mktempdir() do dir
     @test !fetch(stale)
     @test deserialize(path) == "new"
     @test readdir(dir) == ["value"]
+end
+end
+
+@testitem "worker pool: scope ownership and pruning cover both copies" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects, WorkerToy
+const DO = DynamicObjects
+q = DO.job_queue()
+report = WorkerToy.ScopedReport(9)
+dir = mktempdir()
+toy = Toy(1, dir)
+slots() = DO.worker_status().processes
+function fill_both(round)
+    @test report.render(10round) == 10round * 1024^2
+    hold = toy.gated(round; dir, fetch=identity)
+    settles(() -> any(startswith("started_$(round)_"), readdir(dir)), 120.0) || error("gate did not open")
+    try
+        @test report.render(10round+1) == (10round+1) * 1024^2
+    finally
+        touch(joinpath(dir, "go_$round"))
+    end
+    fetch(hold)
+end
+try
+    DO.configure_queue!(; workers=2, worker_idle_timeout=Inf)
+    with_compute_scope() do
+        fill_both(1)
+        DO.configure_queue!(; worker_idle_timeout=0.1)
+        sleep(0.3)
+        @test all(p -> p.running, slots())
+        DO.configure_queue!(; worker_idle_timeout=Inf)
+    end
+    @test prune_worker_mem_caches!(Returns(false), report).evicted == 0
+    fill_both(2)
+    @test prune_worker_mem_caches!(Returns(false), report).evicted == 2
+finally
+    DO.configure_queue!(; workers=0, worker_idle_timeout=300)
+end
+end
+
+@testitem "worker pool: a replacement waits for invalidation on the other replica" setup=[WorkerFixtures] tags=[:core, :workers] begin
+using DynamicObjects
+const DO = DynamicObjects
+q = DO.job_queue()
+dir = mktempdir()
+t = Toy(1, dir)
+resume = Base.Event()
+entered = Base.Event()
+try
+    DO.configure_queue!(; workers=2)
+    hold = t.gated(1; dir, fetch=identity)
+    waitfor(joinpath(dir, "started_1_1")) || error("fit did not start")
+    prior = t.square(5)
+    @test prior.pid == DO.worker_status().processes[2].pid
+    # Delay only the first connection's control stream. The second worker can still
+    # answer, but its square(5) is stale until the invalidation reaches it.
+    blocked = Threads.@spawn DO._on_actor(q.conns[1]) do
+        notify(entered)
+        wait(resume)
+    end
+    wait(entered)
+    ip = t.square
+    key = DO._memo_key((5,), (;))
+    clear = Threads.@spawn invalidate!(ip, 5)
+    settles(() -> !haskey(ip.cache, key)) || error("requester entry was not retracted")
+    replacement = ip(5; fetch=identity)
+    @test replacement isa Pending
+    blocked_submit() = lock(() -> !isempty(DO._INVALIDATION_CHANGED.waitq), DO._INVALIDATION_CHANGED)
+    @test settles(() -> isready(replacement) || blocked_submit())
+    @test !isready(replacement)
+    notify(resume)
+    fetch(blocked)
+    fetch(clear)
+    value = fetch(replacement)
+    @test value.pid == prior.pid && value.n == prior.n + 1
+    @test ip(5) === value
+    touch(joinpath(dir, "go_1"))
+    fetch(hold)
+finally
+    notify(resume)
+    touch(joinpath(dir, "go_1"))
+    DO.configure_queue!(; workers=0)
 end
 end

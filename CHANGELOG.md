@@ -14,6 +14,20 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.27
+
+- `configure_queue!(; workers=2)` lets independent queued work run in different
+  Julia processes even when it shares one root. The queue assigns work to the
+  least-busy process and prefers recent roots on ties. All processes share
+  the admission limit, and each has its own progress, failures and memory cache.
+- `worker_status().processes` reports the processes in a pool.
+  `restart_worker!(; pid)` targets the observed process. Additional processes
+  release their memory after `worker_idle_timeout` seconds idle (default 300).
+  Default compute threads and the inherited heap hint are split at startup.
+- Invalidation and explicit worker cache pruning reach every live replica.
+  An invalidated disk writer can discard its temporary file safely while
+  another process publishes a replacement.
+
 ## 0.5.26
 
 - `with_compute_scope() do … end` releases derived cache entries a group of
