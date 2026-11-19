@@ -66,12 +66,12 @@ function check_native_lifetime()
     DO._PROCESS_BUDGET[] = 1
     DO._NEXT_PROCESS_CHECK[] = DO._NEXT_MEMO_CHECK[] = 0
     o.marker(3)
-    deadline = DO._NEXT_PROCESS_CHECK[]
+    deadline = DO._PROCESS_RETRY.retry_at
     @test deadline > time_ns() + 1_000_000_000
     before = memo_retention_stats().memory
     o.marker(4)
     DO._check_memo_pressure!(true)
-    @test DO._NEXT_PROCESS_CHECK[] == deadline
+    @test DO._PROCESS_RETRY.retry_at == deadline
     @test memo_retention_stats().memory == before
     @test o.pinned === pinned
     @info "Footprint after native finalizers" before=old.process_memory_bytes after=stats.process_memory_bytes freed_bytes=freed[]

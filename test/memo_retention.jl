@@ -26,6 +26,12 @@ end
     end
 end
 
+@testitem "low-yield process releases back off and recover" tags=[:core] begin
+    script = joinpath(@__DIR__, "fixtures", "process_retry.jl")
+    cmd = `$(first(Base.julia_cmd().exec)) --startup-file=no --project=$(Base.active_project()) --threads=2 $script`
+    @test success(pipeline(cmd; stdout, stderr))
+end
+
 @testitem "retention order, delivery, ownership and byte accounting" tags=[:core] begin
 script = joinpath(@__DIR__, "fixtures", "memo_retention_order.jl")
 @test success(`$(first(Base.julia_cmd().exec)) --startup-file=no --project=$(Base.active_project()) --threads=2 --heap-size-hint=8G $script`)

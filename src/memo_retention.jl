@@ -73,6 +73,16 @@ const _TRIMMING_MEMOS = Threads.Atomic{Bool}(false)
 const _HEAP_HINT = Ref(UInt64(0))
 const _PROCESS_BUDGET = Ref(0)
 const _NEXT_PROCESS_CHECK = Ref(UInt64(0)) # only the sampler writes this
+
+# Only the task holding _TRIMMING_MEMOS updates the retry schedule. New
+# eligible publications can earn an earlier attempt under _MEMO_LOCK.
+mutable struct _ProcessTrimRetry
+    last_excess::Int
+    delay_ns::UInt64
+    retry_at::UInt64
+    bytes_until_retry::Int
+end
+const _PROCESS_RETRY = _ProcessTrimRetry(0, 0, 0, 0)
 _memo_retention_enabled() = _HEAP_HINT[] != 0 || _PROCESS_BUDGET[] != 0
 
 # Recency across all slots also supplies the fallback order for a disk file
@@ -97,6 +107,12 @@ function _register_memo!(m)
         ref = WeakRef(m)
         _MEMO_RECENT[m.ticket] = _MEMO_SWEEP[m.ticket] = ref
         m.disk && (_MEMO_DISK[m.ticket] = ref)
+        remaining = _PROCESS_RETRY.bytes_until_retry
+        if remaining > 0
+            m.latch.mapped || (remaining -= min(remaining, _memo_bytes(m.value)))
+            native = m.native_bytes isa Int ? m.native_bytes : 0
+            _PROCESS_RETRY.bytes_until_retry = remaining - min(remaining, native)
+        end
     end
 end
 
@@ -334,6 +350,49 @@ function _memo_excess(used, limit)
     used < limit - limit ÷ 10 ? 0 : Int(used - (limit - limit ÷ 5))
 end
 
+function _reset_process_retry!()
+    retry = _PROCESS_RETRY
+    retry.last_excess = retry.delay_ns = retry.retry_at = 0
+    lock(_MEMO_LOCK) do
+        retry.bytes_until_retry = 0
+    end
+end
+
+function _sample_process_excess!(budget, now)
+    (budget == 0 || now < _NEXT_PROCESS_CHECK[]) && return 0
+    _NEXT_PROCESS_CHECK[] = now + 250_000_000
+    footprint = _process_memory_bytes()
+    footprint === nothing && return 0
+    excess = _memo_excess(footprint, budget)
+    retry = _PROCESS_RETRY
+    if excess == 0
+        retry.last_excess == 0 || _reset_process_retry!()
+    elseif now < retry.retry_at && lock(() -> retry.bytes_until_retry > 0, _MEMO_LOCK)
+        return 0
+    end
+    excess
+end
+
+function _record_process_relief!(excess, after, budget, now)
+    retry = _PROCESS_RETRY
+    # A collection can repeatedly remove temporary allocations while leaving
+    # exactly the same footprint behind. Compare consecutive post-GC samples
+    # as well as the drop within this batch.
+    reference = retry.last_excess == 0 ? excess : min(retry.last_excess, excess)
+    remaining = after === nothing ? reference : _memo_excess(after, budget)
+    if remaining == 0 || reference - remaining >= cld(reference, 20)
+        _reset_process_retry!()
+    else
+        retry.delay_ns = clamp(2 * retry.delay_ns, UInt64(5_000_000_000), UInt64(300_000_000_000))
+        retry.retry_at = now + retry.delay_ns
+        lock(_MEMO_LOCK) do
+            retry.bytes_until_retry = cld(remaining, 20)
+        end
+    end
+    retry.last_excess = remaining
+    nothing
+end
+
 function _check_memo_pressure!(large_store=false)
     now = time_ns()
     deadline = _NEXT_MEMO_CHECK[]
@@ -347,22 +406,14 @@ function _check_memo_pressure!(large_store=false)
     try
         heap_excess = _memo_excess(Base.gc_live_bytes(), _HEAP_HINT[])
         budget = _PROCESS_BUDGET[]
-        footprint = if budget > 0 && now >= _NEXT_PROCESS_CHECK[]
-            _NEXT_PROCESS_CHECK[] = now + 250_000_000
-            _process_memory_bytes()
-        end
-        process_excess = _memo_excess(footprint, budget)
+        process_excess = _sample_process_excess!(budget, now)
         max(heap_excess, process_excess) > 0 || return
         released = _trim_memos!(heap_excess, process_excess)
         if process_excess > 0 && released > 0
             # Native finalizers may run only once the last alias disappears.
-            # Collect only after a real release and back off if the batch
-            # barely moved the observed footprint (e.g. an unrelated heap).
             GC.gc(true)
             after = _process_memory_bytes()
-            if after === nothing || footprint - after < min(process_excess, 1024^2)
-                _NEXT_PROCESS_CHECK[] = time_ns() + 5_000_000_000
-            end
+            _record_process_relief!(process_excess, after, budget, time_ns())
         end
     finally
         _TRIMMING_MEMOS[] = false

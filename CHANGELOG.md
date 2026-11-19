@@ -14,6 +14,13 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.37
+
+- When releasing cold cache entries barely reduces the process footprint,
+  retries start five seconds apart and back off to once every five minutes.
+  A fresh pressure episode or enough newly eligible cache data can trigger
+  an earlier attempt. Julia heap pressure continues to trigger its own releases.
+
 ## 0.5.36
 
 - A cold worker configured with `worker_start=:now` and a nonempty
