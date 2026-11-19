@@ -6489,7 +6489,7 @@ function _shared_parent_aliases(::Type{T}, parent_context::Set{Symbol}) where {T
     aliases
 end
 
-# Return (invalidated values, local wrapper keys, opaque). `invalidated` is the
+# Partition value routing and identify the inputs to seed in the view. `invalidated` is the
 # sound transitive closure rooted at explicit context overrides, fresh progress
 # state, opaque self-reaches, and nested children (which retain their parent
 # object). `opaque` is the part of it reached only through opaque self-reaches:
@@ -6500,21 +6500,30 @@ end
 # when that property is absent from `invalidated` (see the mounted `subcache`
 # method above). Shared parent aliases (`_shared_parent_aliases`) are likewise
 # local keys — re-read through the current parent — that join neither closure.
-function _remount_partition(source, shared::ThreadsafeDict{Symbol,Any}, changed,
+function _remount_partition(source, shared::ThreadsafeDict{Symbol,Any}, nt::NamedTuple,
                             forced_local=(), parent_view=nothing)
     T = typeof(source)
+    changed = keys(nt)
     parent_context = parent_view === nothing ? nothing : _remount_context_names(parent_view)
-    invalidated, opaque, aliases = _remount_context(T, changed, forced_local, parent_context)
-    local_names = union(invalidated, keys(aliases))
+    invalidated, opaque, aliases = _remount_context(T, changed, forced_local, parent_context, ())
+    local_names = Set{Symbol}()
     for (name, info) in meta(T)
         get(info, :indexed, false) || continue
         value = get(shared, name, _missing_sentinel)
         (value === _missing_sentinel || value isa IndexableProperty) && push!(local_names, name)
     end
-    invalidated, local_names, opaque, aliases
+    # Only an input that the declaration would route locally can change routing.
+    # Other construction keywords need neither a view seed nor another memo entry.
+    kept = _kept_inputs(getfield(source, :cache).seed, invalidated, aliases, local_names,
+                        nt, forced_local)
+    if kept !== nothing
+        invalidated, opaque, aliases = _remount_context(T, changed, forced_local, parent_context, keys(kept))
+    end
+    union!(local_names, invalidated, keys(aliases))
+    invalidated, local_names, opaque, aliases, kept
 end
 
-# The static part of the partition, which a type and its rebound names decide.
+# The static part of the partition, specialized to its rebound and kept names.
 # A nested child instance is always per view, because it holds its parent. What
 # depends on the child is not, when it is an inline child whose memoized cache
 # every view shares: a sibling reading `pins.ap3` is per view exactly when that
@@ -6522,30 +6531,31 @@ end
 # parent already routes per view, through a forwarded name, and adding a sibling
 # can make another read context, so the two closures alternate until settled.
 #
-# The answer depends only on the type and on which names are rebound, a small fixed
-# set for an app, so it is computed once per process: `remount` runs per request
+# The answer depends on the declaration and the rebound and kept names, never
+# their values, so it is computed once per shape: `remount` runs per request
 # and per child read. The result is shared, so no caller may mutate it. It is held
 # per `meta(T)` object, which a re-expanded struct replaces.
 const _REMOUNT_CONTEXTS = IdDict{Any,Dict{Any,Any}}()
 const _REMOUNT_CONTEXTS_LOCK = ReentrantLock()
-function _remount_context(::Type{T}, changed, forced_local, parent_context) where {T}
+function _remount_context(::Type{T}, changed, forced_local, parent_context, kept) where {T}
     declaration = meta(T)
-    key = (sort!(collect(Symbol, changed)), sort!(collect(Symbol, forced_local)), parent_context)
+    kept_key = isempty(kept) ? () : sort!(collect(Symbol, kept))
+    key = (sort!(collect(Symbol, changed)), sort!(collect(Symbol, forced_local)), kept_key, parent_context)
     known = lock(_REMOUNT_CONTEXTS_LOCK) do
         contexts = get(_REMOUNT_CONTEXTS, declaration, nothing)
         contexts === nothing ? nothing : get(contexts, key, nothing)
     end
     known === nothing || return known
     # Outside the lock: computing recurses into child types. A race computes twice.
-    context = _compute_remount_context(T, changed, forced_local, parent_context)
-    stored = (first(key), key[2], parent_context === nothing ? nothing : copy(parent_context))
+    context = _compute_remount_context(T, changed, forced_local, parent_context, kept)
+    stored = (key[1], key[2], kept_key, parent_context === nothing ? nothing : copy(parent_context))
     lock(_REMOUNT_CONTEXTS_LOCK) do
         get!(() -> Dict{Any,Any}(), _REMOUNT_CONTEXTS, declaration)[stored] = context
     end
     context
 end
 
-function _compute_remount_context(::Type{T}, changed, forced_local, parent_context) where {T}
+function _compute_remount_context(::Type{T}, changed, forced_local, parent_context, kept) where {T}
     dependencies = Dict{Symbol,Set{Symbol}}()
     computed = Set{Symbol}()
     names = Set{Symbol}()
@@ -6571,30 +6581,40 @@ function _compute_remount_context(::Type{T}, changed, forced_local, parent_conte
     declared_opaque = _remount_opaque_properties(T)
     # An older expansion carries no opacity data: every computed property is context.
     declared_opaque === nothing && union!(invalidated, computed)
-    aliases = filter!(p -> !(first(p) in invalidated), _shared_parent_aliases(T, parent_context))
-    shared_aliases = keys(aliases)
+    # A kept keyword supplies its value even if its default is a child, an
+    # alias, or opaque. No dependency of that unevaluated default reaches it.
+    kept_names = Set{Symbol}(kept)
+    setdiff!(invalidated, kept_names)
+    aliases = filter!(p -> !(first(p) in invalidated || first(p) in kept_names),
+                      _shared_parent_aliases(T, parent_context))
+    shared_inputs = union(kept_names, keys(aliases))
     # A property whose reads of a child are recorded is decided by those reads, so
     # the child's name is no dependency of it here. `sync!` keeps the full graph.
     child_reads = _remount_child_reads(T)
     for (name, paths) in child_reads
         deps = get(dependencies, name, nothing)
-        deps === nothing || foreach(path -> delete!(deps, first(path)), paths)
+        deps === nothing && continue
+        for path in paths
+            child = first(path)
+            # Replacing the child itself can change every member.
+            child in changed || child in forced_local || delete!(deps, child)
+        end
     end
     graph = _DependencyGraph(dependencies)
     while true
-        _close_dependents!(invalidated, graph, shared_aliases)
+        _close_dependents!(invalidated, graph, shared_inputs)
         grew = false
         for (name, paths) in child_reads
-            (name in invalidated || name in shared_aliases) && continue
-            any(path -> _child_read_is_context(T, path, invalidated), paths) || continue
+            (name in invalidated || name in shared_inputs) && continue
+            any(path -> _child_read_is_context(T, path, invalidated, kept_names), paths) || continue
             push!(invalidated, name)
             grew = true
         end
         grew || break
     end
     opaque = declared_opaque === nothing ? Set{Symbol}() :
-        setdiff!(Set{Symbol}(declared_opaque), invalidated)
-    _close_dependents!(opaque, graph, union(invalidated, shared_aliases))
+        setdiff!(Set{Symbol}(declared_opaque), invalidated, shared_inputs)
+    _close_dependents!(opaque, graph, union(invalidated, shared_inputs))
     union!(invalidated, opaque)
     invalidated, opaque, aliases
 end
@@ -6604,7 +6624,8 @@ end
 # view gets (`_remount_child`), so the answer and the routing cannot disagree.
 # Holding the instance itself, a name the child does not declare, and anything
 # opaque count as context.
-function _child_read_is_context(::Type{T}, path, parent_names) where {T}
+function _child_read_is_context(::Type{T}, path, parent_names, kept) where {T}
+    first(path) in kept && return false
     length(path) == 1 && return true
     _source_shared_child(T, Val(first(path))) || return true
     C = _nested_struct_type(T, Val(first(path)))
@@ -6616,9 +6637,11 @@ function _child_read_is_context(::Type{T}, path, parent_names) where {T}
     :__parent__ in child_names && push!(changed, :__parent__)
     :__req__ in child_names && any(p -> first(p) === :__req__, meta(T)) && push!(changed, :__req__)
     forced = (:__status__, (:__prefix__ in child_names ? (:__prefix__,) : ())...)
-    context, = _remount_context(C, changed, forced, parent_names)
+    # The child need not exist yet. Its declared defaults are conservative;
+    # its forwarded names see what this particular parent view shares.
+    context, = _remount_context(C, changed, forced, parent_names, ())
     if _source_shared_child(C, Val(member)) && length(path) > 2
-        return _child_read_is_context(C, path[2:end], context)
+        return _child_read_is_context(C, path[2:end], context, ())
     end
     member in context
 end
@@ -7021,9 +7044,9 @@ view keeps it: `remount(T(; a=0.4); ctx=1).a` is `0.4`, also when the declared
 default of `a` reads `ctx`, hands `__self__` to other code, copies a parent
 property or builds a nested child. A name the call rebinds takes the rebound
 value, and the request-scoped `__status__`, `__req__` and `__prefix__` are
-always the view's own. What reads a kept keyword is routed as its declared
-dependencies say: a property that depends on `a` is computed per view when the
-default of `a` reads rebound context.
+always the view's own. A kept keyword cuts the dependency on its declared
+default: if `b = 10a` and the retained object was constructed with `a=0.4`,
+the object and its views share `b`. A view that rebinds `a` computes its own `b`.
 
 What reads a nested child is decided by the read. Reading a member of a memoized
 inline `@struct` child, `pins.ap3`, makes a property per view only when that member
@@ -7070,17 +7093,8 @@ function _remount_impl(obj, nt::NamedTuple, forced_local=(), parent_view=nothing
     # `local_seed` is internal view-local construction state (`_remount_child`'s
     # progress node). It is not a declared property, so it skips validation, but
     # like forced keys it is view-specific: local and invalidated.
-    invalidated, local_names, opaque, aliases = _remount_partition(source, shared, changed,
-        (forced_local..., keys(local_seed)...), parent_view)
-    # A keyword the retained object was constructed with is an input, not a
-    # computed value: its declared body never runs, so here it is neither opaque
-    # nor an alias, and the view holds the retained object's value.
-    kept = _kept_inputs(getfield(source, :cache).seed, local_names, nt, forced_local, local_seed)
-    if kept !== nothing
-        any(in(opaque), keys(kept)) && (opaque = setdiff(opaque, keys(kept)))
-        any(name -> haskey(aliases, name), keys(kept)) &&
-            (aliases = filter(p -> !haskey(kept, first(p)), aliases))
-    end
+    invalidated, local_names, opaque, aliases, kept = _remount_partition(source, shared,
+        nt, (forced_local..., keys(local_seed)...), parent_view)
     # Views rebinding the same context share one namespace for their opaque work.
     namespace = isempty(opaque) ? nothing :
         _opaque_namespace(shared, setdiff(invalidated, opaque))
@@ -7102,19 +7116,18 @@ end
 
 # The construction inputs of the retained object (`inputs`, its `PropertyCache.seed`)
 # that a view keeps. A name the view shares needs nothing: the view reads the
-# retained object's seeded value. A name it routes locally (`local_names`) would
+# retained object's seeded value. A name the declaration routes locally would
 # be recomputed from its declared default, read again through the view's parent,
 # or rebuilt as a nested child, so the view is seeded with the retained object's
 # value instead. What the view binds itself stays the view's own: the rebound
 # context (`nt`), masked names (`forced_local`), its own construction state
 # (`local_seed`) and request-scoped state (`_CHILD_CONTEXT_SEEDS`, progress).
 # `nothing` when the view keeps none, which is what most views do.
-function _kept_inputs(inputs::NamedTuple, local_names, nt::NamedTuple, forced_local,
-                      local_seed::NamedTuple)
+function _kept_inputs(inputs::NamedTuple, invalidated, aliases, wrappers, nt::NamedTuple, forced_local)
     names = nothing
     for name in keys(inputs)
-        name in local_names || continue
-        (haskey(nt, name) || haskey(local_seed, name) || name in forced_local ||
+        (name in invalidated || haskey(aliases, name) || name in wrappers) || continue
+        (haskey(nt, name) || name in forced_local ||
          name in _CHILD_CONTEXT_SEEDS || name in _REMOUNT_STATUS_NAMES) && continue
         names === nothing ? (names = Symbol[name]) : push!(names, name)
     end
