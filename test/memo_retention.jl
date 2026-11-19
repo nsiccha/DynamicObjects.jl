@@ -12,10 +12,17 @@ end
 end
 
 @testitem "process footprint and native cache ownership" tags=[:core] begin
-    for fixture in ("process_memory.jl", "native_retention.jl")
+    cases = [("process_memory.jl", String[]), ("native_retention.jl", String[])]
+    # A fresh allocator makes the growth case independent of pages kept
+    # after the lifetime case freed its own buffers.
+    if Sys.islinux() || Sys.isapple()
+        push!(cases, ("native_retention.jl", ["growth"]))
+    end
+    for (fixture, args) in cases
         script = joinpath(@__DIR__, "fixtures", fixture)
-        cmd = `$(first(Base.julia_cmd().exec)) --startup-file=no --project=$(Base.active_project()) $script`
-        @test success(addenv(cmd, "DYNAMICOBJECTS_PROCESS_BUDGET_BYTES" => string(8 * 1024^3)))
+        cmd = `$(first(Base.julia_cmd().exec)) --startup-file=no --project=$(Base.active_project()) $script $args`
+        cmd = addenv(cmd, "DYNAMICOBJECTS_PROCESS_BUDGET_BYTES" => string(8 * 1024^3))
+        @test success(pipeline(cmd; stdout, stderr))
     end
 end
 

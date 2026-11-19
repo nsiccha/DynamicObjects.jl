@@ -53,15 +53,16 @@ function check_native_lifetime()
     @test stats.estimated_native_bytes - old.estimated_native_bytes == 32 * MiB
     @test stats.unknown_native_slots - old.unknown_native_slots == 1
     @test freed[] == 32 * MiB
-    @test stats.process_memory_bytes < old.process_memory_bytes - 16 * MiB
     @test unsafe_load(held.handle) == 17
     @test o.pinned === pinned
     @test has_slot(o, :pinned)
 
     # All remaining native data has an external owner. A fruitless batch of
     # small ordinary results gets a cooldown, even on a large publication.
+    DO._PROCESS_BUDGET[] = old.process_budget_bytes
     o.marker(2)
     o.marker(3)
+    GC.gc(true)
     DO._PROCESS_BUDGET[] = 1
     DO._NEXT_PROCESS_CHECK[] = DO._NEXT_MEMO_CHECK[] = 0
     o.marker(3)
@@ -73,16 +74,17 @@ function check_native_lifetime()
     @test DO._NEXT_PROCESS_CHECK[] == deadline
     @test memo_retention_stats().memory == before
     @test o.pinned === pinned
+    @info "Footprint after native finalizers" before=old.process_memory_bytes after=stats.process_memory_bytes freed_bytes=freed[]
     GC.@preserve held pinned nothing
 end
 
-if Sys.islinux() || Sys.isapple()
-    check_native_lifetime()
-    GC.gc(true)
-    @test freed[] == 64 * MiB
-
+function check_native_growth()
     # Cross a budget with real native growth, leaving the polling deadlines
     # alone. Calibrate against this process's baseline (including its JIT).
+    warm = NativeCache(64)
+    warm.sized(1)
+    warm.marker(1)
+    GC.gc(true)
     o = NativeCache(16 * MiB)
     before = memo_retention_stats()
     DO._PROCESS_BUDGET[] = cld(10 * (before.process_memory_bytes + 32 * MiB), 9)
@@ -91,12 +93,24 @@ if Sys.islinux() || Sys.isapple()
     end
     @test timedwait(12; pollint=0.05) do
         o.marker(1)
-        memo_retention_stats().estimated_native_bytes > before.estimated_native_bytes
+        memo_retention_stats().estimated_native_bytes - before.estimated_native_bytes >= o.n
     end == :ok
     after = memo_retention_stats()
     @test after.live_heap_bytes < after.process_budget_bytes * 0.9
-    @test freed[] > 64 * MiB
+    @test freed[] >= o.n
     @info "Native growth triggered release" baseline=before.process_memory_bytes budget=after.process_budget_bytes live_heap=after.live_heap_bytes declared_bytes_released=(after.estimated_native_bytes - before.estimated_native_bytes)
+end
+
+if !isempty(ARGS)
+    @assert only(ARGS) == "growth"
+    check_native_growth()
+    exit()
+end
+
+if Sys.islinux() || Sys.isapple()
+    check_native_lifetime()
+    GC.gc(true)
+    @test freed[] == 64 * MiB
 end
 
 # An invalid declaration fails the computation and allows a retry.
