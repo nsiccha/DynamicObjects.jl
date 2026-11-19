@@ -1174,10 +1174,12 @@ _stderr_excerpt(tail::_WorkerStderr) = lock(tail.lock) do
     (tail.omitted ? _STDERR_OMITTED : "") * join(tail.lines, '\n')
 end
 
-struct _QueueWorker
-    handle::Malt.Worker
-    stderr::_WorkerStderr
-    stderr_task::Task
+mutable struct _QueueWorker
+    const handle::Malt.Worker
+    const stderr::_WorkerStderr
+    const stderr_task::Task
+    const stop_lock::ReentrantLock
+    stopped::Bool   # Malt.stop asked this live process to exit; guarded by stop_lock
 end
 
 # Print the worker's stdout and stderr on this process's, each line prefixed with
@@ -1193,7 +1195,7 @@ function _forward_output!(w::Malt.Worker)
     tail = _WorkerStderr()
     errormonitor(@async _forward_lines(w.stdout, :stdout, w.proc_pid))
     reader = errormonitor(@async _forward_lines(w.stderr, :stderr, w.proc_pid, tail))
-    _QueueWorker(w, tail, reader)
+    _QueueWorker(w, tail, reader, ReentrantLock(), false)
 end
 function _forward_lines(pipe, which::Symbol, pid, tail=nothing)
     for line in eachline(pipe)
@@ -1213,6 +1215,12 @@ function _worker_death(w::_QueueWorker, reason)
     summary = reason * ", " * _exit_status(w.handle.proc)
     istaskdone(w.stderr_task) || timedwait(() -> istaskdone(w.stderr_task), 2.0; pollint=0.01)
     ComputeAbandoned(summary, true, _stderr_excerpt(w.stderr))
+end
+
+function _inflight_worker_death(w)
+    stopped = lock(() -> w.stopped, w.stop_lock)
+    cause = stopped ? "was stopped" : "exited while computing it"
+    _worker_death(w, "the worker process (pid $(w.handle.proc_pid)) $cause")
 end
 
 function _spawn_worker!(q, conn)
@@ -1255,7 +1263,7 @@ function _event_pump(conn::_WorkerConn, w)
         catch err
             err = err isa TaskFailedException ? err.task.exception : err
             failure = err isa Malt.TerminatedWorkerException ?
-                _worker_death(w, "the worker process (pid $(w.handle.proc_pid)) exited while computing it") :
+                _inflight_worker_death(w) :
                 ComputeAbandoned("the connection to the worker process failed: " * sprint(showerror, err), true)
             break
         end
@@ -1292,7 +1300,17 @@ end
 
 # Stop `w` through its own process handle: asked to exit, then `SIGTERM`, then `SIGKILL`. A
 # stuck worker never runs the exit it is asked for, so the signals follow within seconds.
-_stop_process(conn, w) = _on_actor(() -> Malt.stop(w.handle; exit_timeout=3.0, term_timeout=3.0), conn)
+function _stop_process(conn, w)
+    _on_actor(conn) do
+        # The event pump can observe death before Malt.stop returns. Let it see the
+        # outcome of this stop, including false if the process had already exited.
+        lock(w.stop_lock) do
+            stopped = Malt.stop(w.handle; exit_timeout=3.0, term_timeout=3.0)
+            w.stopped |= stopped
+            stopped
+        end
+    end
+end
 
 # How a worker process ended, for the reasons its computations fail with: the signal that
 # killed it, or its exit code. A memory killer's or `kill -9`'s `SIGKILL`, a crash's `SIGSEGV`
@@ -1826,6 +1844,7 @@ end
     DynamicObjects.restart_worker!(q=job_queue(); pid=nothing) -> NamedTuple
 
 Stop the process with the observed `pid`, failing its requests with [`ComputeAbandoned`](@ref).
+For work running on that process, the reason says `was stopped` followed by its exit code or signal.
 A replacement starts on demand, or immediately under `worker_start=:now`. A pool requires
 an explicit PID from `worker_status().processes`. A PID that has already exited leaves its
 replacement alone. With zero or one worker the argument can be omitted. Returns
@@ -1903,7 +1922,7 @@ function _stop_worker!(conn)
     try
         if w !== nothing
             _stop_process(conn, w)
-            _abandon_inflight!(conn, w, _worker_death(w, "the worker process (pid $(w.handle.proc_pid)) was stopped"))
+            _abandon_inflight!(conn, w, _inflight_worker_death(w))
         end
     finally
         close(conn.ops)

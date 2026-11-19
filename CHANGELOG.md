@@ -14,6 +14,13 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.30
+
+- When `restart_worker!` stops a worker, every computation interrupted on it
+  reports `was stopped` followed by the exit code or signal. A worker that
+  exits independently still reports `exited while computing it`, even with
+  exit code 0.
+
 ## 0.5.29
 
 - Restore `memo_retention_stats(queue)` for zero or one configured worker.
