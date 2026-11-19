@@ -982,6 +982,7 @@ _log_value(v) = sprint(show, v; context=:limit => true)
 
 # Whether any queue has a worker configured: one atomic load gates every forwarding hook.
 const _WORKERS_ACTIVE = Threads.Atomic{Bool}(false)
+const _WORKERS_EXITING = Threads.Atomic{Bool}(false)
 
 const _WORKER_QUEUES = WeakKeyDict{JobQueue,Nothing}()
 const _WORKER_QUEUES_LOCK = ReentrantLock()
@@ -1046,17 +1047,21 @@ _worker_alive(w) = w !== nothing && Malt.isrunning(w.handle)
 # The running worker of `q`, spawned first if there is none. A computation's progress node
 # `status` shows the wait for the worker to start as a phase, also when another computation or
 # `worker_start=:now` started it.
-function _ensure_worker!(q, conn::_WorkerConn, status=nothing)
+function _ensure_worker!(q, conn::_WorkerConn, status=nothing; eager=nothing)
     while true
         spawning = lock(conn.lock) do
             conn.retired && throw(ComputeAbandoned("the worker was stopped", true))
+            eager !== nothing && conn.eager !== eager && return nothing
+            _WORKERS_EXITING[] && throw(ComputeAbandoned("worker startup was cancelled", true))
             _worker_alive(conn.worker) && return conn.worker
             conn.spawning === nothing && (conn.spawning = Threads.@spawn _spawn_worker!(q, conn))
             conn.spawning
         end
         spawning isa Task || return spawning
         try
-            _waiting_phase(() -> fetch(spawning), status, :starting_worker)
+            w = _waiting_phase(() -> fetch(spawning), status, :starting_worker)
+            # Recheck retirement and shutdown after a pending launch was cancelled.
+            w === nothing || return w
         catch err
             lock(conn.lock) do
                 conn.spawning === spawning && (conn.spawning = nothing)
@@ -1119,13 +1124,18 @@ end
 # worker and returns at once. It kills rather than asks: a stuck worker would never act on a
 # request, and once this process is gone nothing is left to follow one up. A worker whose host
 # ends without exit hooks (a crash, `SIGKILL`) still exits by itself when the connection closes.
-function _exit_without_waiting!(w::Malt.Worker)
+function _exit_without_waiting!(w::Malt.Worker, exiting=_WORKERS_EXITING)
     Base.@lock Base._atexit_hooks_lock filter!(f -> !_stops_worker(f, w), Base.atexit_hooks)
     proc, pid = w.proc, w.proc_pid
     # `uv_kill` is a plain `kill` (`TerminateProcess` on Windows) and takes no lock. A child
     # libuv has not reaped keeps its pid, so `process_running` guards against a reused one.
-    hook = () -> (Base.process_running(proc) && ccall(:uv_kill, Cint, (Cint, Cint), pid, Base.SIGKILL); nothing)
+    hook = function ()
+        exiting[] = true
+        Base.process_running(proc) && ccall(:uv_kill, Cint, (Cint, Cint), pid, Base.SIGKILL)
+        nothing
+    end
     atexit(hook)
+    # An eager queue may replace processes throughout the lifetime of the application.
     errormonitor(@async begin
         wait(proc)
         Base.@lock Base._atexit_hooks_lock filter!(f -> f !== hook, Base.atexit_hooks)
@@ -1174,10 +1184,12 @@ _stderr_excerpt(tail::_WorkerStderr) = lock(tail.lock) do
     (tail.omitted ? _STDERR_OMITTED : "") * join(tail.lines, '\n')
 end
 
-struct _QueueWorker
-    handle::Malt.Worker
-    stderr::_WorkerStderr
-    stderr_task::Task
+mutable struct _QueueWorker
+    const handle::Malt.Worker
+    const stderr::_WorkerStderr
+    const stderr_task::Task
+    const stop_lock::ReentrantLock
+    stopped::Bool   # Malt.stop asked this live process to exit; guarded by stop_lock
 end
 
 # Print the worker's stdout and stderr on this process's, each line prefixed with
@@ -1193,7 +1205,7 @@ function _forward_output!(w::Malt.Worker)
     tail = _WorkerStderr()
     errormonitor(@async _forward_lines(w.stdout, :stdout, w.proc_pid))
     reader = errormonitor(@async _forward_lines(w.stderr, :stderr, w.proc_pid, tail))
-    _QueueWorker(w, tail, reader)
+    _QueueWorker(w, tail, reader, ReentrantLock(), false)
 end
 function _forward_lines(pipe, which::Symbol, pid, tail=nothing)
     for line in eachline(pipe)
@@ -1215,34 +1227,74 @@ function _worker_death(w::_QueueWorker, reason)
     ComputeAbandoned(summary, true, _stderr_excerpt(w.stderr))
 end
 
+function _inflight_worker_death(w)
+    stopped = lock(() -> w.stopped, w.stop_lock)
+    cause = stopped ? "was stopped" : "exited while computing it"
+    _worker_death(w, "the worker process (pid $(w.handle.proc_pid)) $cause")
+end
+
 function _spawn_worker!(q, conn)
     exeflags = _worker_exeflags(q, conn.index)
+    spawning = current_task()
+    current() = conn.spawning === spawning && !conn.retired && !_WORKERS_EXITING[]
     w = _on_actor(conn) do
+        lock(current, conn.lock) || return nothing
         worker = Malt.Worker(; exeflags, env=_worker_env(), monitor_stdout=false, monitor_stderr=false)
         _forward_output!(_exit_without_waiting!(worker))
     end
+    w === nothing && return nothing
     try
+        initializing = lock(conn.lock) do
+            current() || return false
+            conn.starting_worker = w
+            true
+        end
+        if !initializing
+            _stop_process(conn, w)
+            return nothing
+        end
         id = _DYNAMICOBJECTS_PKGID
         load = :(Base.require(Base.PkgId(Base.UUID($(string(id.uuid))), $(id.name))); nothing)
         fetch(_on_actor(() -> Malt.remote_eval(w.handle, load), conn))
         info = _remote_fetch(conn, w, _worker_init!)
-        lock(conn.lock) do
+        published = lock(conn.lock) do
+            current() || return false
             empty!(conn.recent_roots)
             conn.worker = w
+            conn.starting_worker = nothing
             conn.spawning = nothing
             conn.pid = info.pid
             conn.started_at = time()
             conn.last_message_at = NaN
             union!(empty!(conn.loaded), info.loaded)
+            notify(conn.changed)
+            true
+        end
+        if !published
+            _stop_process(conn, w)
+            return nothing
         end
         _on_actor(() -> errormonitor(@async _event_pump(conn, w)), conn)
     catch err
         _stop_process(conn, w)
+        cancelled = lock(conn.lock) do
+            conn.starting_worker === w && (conn.starting_worker = nothing)
+            !current() && conn.worker !== w
+        end
+        cancelled && return nothing
         (err isa TaskFailedException ? err.task.exception : err) isa Malt.TerminatedWorkerException ||
             rethrow()
         throw(_worker_death(w, "the worker process could not be started: the worker process (pid $(w.handle.proc_pid)) exited during its start-up"))
     end
     w
+end
+
+# A late exit from an old process must only abandon its own requests.
+function _detach_worker!(conn, w)
+    if conn.worker === w
+        conn.worker = nothing
+        notify(conn.changed)
+    end
 end
 
 # Deliver the worker's events to their requests until the worker exits; then fail every
@@ -1255,7 +1307,7 @@ function _event_pump(conn::_WorkerConn, w)
         catch err
             err = err isa TaskFailedException ? err.task.exception : err
             failure = err isa Malt.TerminatedWorkerException ?
-                _worker_death(w, "the worker process (pid $(w.handle.proc_pid)) exited while computing it") :
+                _inflight_worker_death(w) :
                 ComputeAbandoned("the connection to the worker process failed: " * sprint(showerror, err), true)
             break
         end
@@ -1280,7 +1332,7 @@ end
 
 function _abandon_inflight!(conn::_WorkerConn, w, failure::ComputeAbandoned)
     lock(conn.lock) do
-        conn.worker === w && (conn.worker = nothing)
+        _detach_worker!(conn, w)
         for req in values(conn.inflight)
             # Names the worker: `_submit!` may send `req` on to a fresh one before it is read.
             req.worker === w && put!(req.events, (:abandoned, (w, failure)))
@@ -1292,7 +1344,17 @@ end
 
 # Stop `w` through its own process handle: asked to exit, then `SIGTERM`, then `SIGKILL`. A
 # stuck worker never runs the exit it is asked for, so the signals follow within seconds.
-_stop_process(conn, w) = _on_actor(() -> Malt.stop(w.handle; exit_timeout=3.0, term_timeout=3.0), conn)
+function _stop_process(conn, w)
+    _on_actor(conn) do
+        # The event pump can observe death before Malt.stop returns. Let it see the
+        # outcome of this stop, including false if the process had already exited.
+        lock(w.stop_lock) do
+            stopped = Malt.stop(w.handle; exit_timeout=3.0, term_timeout=3.0)
+            w.stopped |= stopped
+            stopped
+        end
+    end
+end
 
 # How a worker process ended, for the reasons its computations fail with: the signal that
 # killed it, or its exit code. A memory killer's or `kill -9`'s `SIGKILL`, a crash's `SIGSEGV`
@@ -1544,10 +1606,11 @@ function _submit!(q, conn, req::_RemoteRequest, root, o, name, args, kwargs, pac
             _ensure_packages!(conn, w, union(_worker_preload(q), packages), status)
             _wait_for_invalidation(root)
             _remote_fetch(conn, w, _worker_submit, message..., _worker_scope_token(q, conn, w))
+            _start_worker_soon!(q, conn)
             return w, w.handle.proc_pid
         catch err
             if err isa Malt.TerminatedWorkerException
-                lock(() -> conn.worker === w && (conn.worker = nothing), conn.lock)
+                lock(() -> _detach_worker!(conn, w), conn.lock)
                 attempt == 1 && continue
                 throw(_worker_death(w, "the worker process (pid $(w.handle.proc_pid)) exited before it started"))
             end
@@ -1826,6 +1889,7 @@ end
     DynamicObjects.restart_worker!(q=job_queue(); pid=nothing) -> NamedTuple
 
 Stop the process with the observed `pid`, failing its requests with [`ComputeAbandoned`](@ref).
+For work running on that process, the reason says `was stopped` followed by its exit code or signal.
 A replacement starts on demand, or immediately under `worker_start=:now`. A pool requires
 an explicit PID from `worker_status().processes`. A PID that has already exited leaves its
 replacement alone. With zero or one worker the argument can be omitted. Returns
@@ -1870,17 +1934,22 @@ end
 
 function _retire_connection!(conn)
     _cancel_idle!(conn)
-    lock(() -> conn.retired = true, conn.lock)
+    lock(conn.lock) do
+        conn.retired = true
+        conn.eager = nothing
+        notify(conn.changed)
+    end
 end
 
 function _schedule_idle!(q, conn)
     _cancel_idle!(conn)
     (conn.index == 1 || conn.holds > 0) && return
-    idle = lock(() -> !conn.retired && isempty(conn.inflight) && _worker_alive(conn.worker), conn.lock)
-    idle && isfinite(q.worker_idle_timeout) || return
+    worker = lock(() -> !conn.retired && isempty(conn.inflight) ? conn.worker : nothing, conn.lock)
+    _worker_alive(worker) && isfinite(q.worker_idle_timeout) || return
     conn.idle_timer = Timer(q.worker_idle_timeout) do timer
         retired = lock(q.lock) do
             conn.idle_timer === timer || return false
+            lock(() -> conn.worker === worker && _worker_alive(worker), conn.lock) || return false
             _retire_connection!(conn)
             q.conns[conn.index] = _WorkerConn(conn.index)
             true
@@ -1890,23 +1959,29 @@ function _schedule_idle!(q, conn)
 end
 
 function _stop_worker!(conn)
-    spawning = lock(() -> conn.spawning, conn.lock)
-    if spawning !== nothing
-        # The starter reports its own failure. A successful late start must be stopped too.
-        try
-            wait(spawning)
-        catch err
-            err isa TaskFailedException || rethrow()
-        end
-    end
-    w = lock(() -> conn.worker, conn.lock)
+    w, starting, spawning = lock(() -> (conn.worker, conn.starting_worker, conn.spawning), conn.lock)
     try
+        starting === nothing || _stop_process(conn, starting)
         if w !== nothing
             _stop_process(conn, w)
-            _abandon_inflight!(conn, w, _worker_death(w, "the worker process (pid $(w.handle.proc_pid)) was stopped"))
+            _abandon_inflight!(conn, w, _inflight_worker_death(w))
         end
     finally
-        close(conn.ops)
+        if spawning === nothing
+            close(conn.ops)
+        else
+            # A launch queued on the actor or still constructing a Malt worker must
+            # finish discarding its process before its actor channel closes.
+            errormonitor(Threads.@spawn begin
+                try
+                    wait(spawning)
+                catch err
+                    err isa TaskFailedException || rethrow()
+                finally
+                    close(conn.ops)
+                end
+            end)
+        end
     end
     nothing
 end
@@ -1925,17 +2000,60 @@ function _release_worker!(q, conn)
     end
 end
 
+const _WORKER_RETRY_DELAYS = (1, 2, 4)
+const _WORKER_STABLE_NS = 30_000_000_000
+
 function _start_worker_soon!(q, conn)
-    _hold_worker!(q, conn)
-    errormonitor(Threads.@spawn try
-        w = _ensure_worker!(q, conn)
-        _ensure_packages!(conn, w, _worker_preload(q))
-    catch err
-        lock(() -> conn.retired, conn.lock) ||
+    lock(q.lock) do
+        q.worker_start === :now || return
+        lock(conn.lock) do
+            if !conn.retired && conn.eager === nothing && !_WORKERS_EXITING[]
+                conn.eager = errormonitor(Threads.@spawn _keep_worker_ready!(q, conn))
+            end
+        end
+    end
+end
+
+function _keep_worker_ready!(q, conn)
+    supervisor = current_task()
+    current() = conn.eager === supervisor && !_WORKERS_EXITING[]
+    failures = 0
+    while true
+        try
+            # Keep a surplus slot through preload, then let its normal idle timer run.
+            _hold_worker!(q, conn)
+            w = try
+                worker = _ensure_worker!(q, conn; eager=supervisor)
+                worker === nothing && return
+                _ensure_packages!(conn, worker, _worker_preload(q))
+                worker
+            finally
+                _release_worker!(q, conn)
+            end
+            ready = time_ns()
+            lock(conn.lock) do
+                while current() && conn.worker === w
+                    wait(conn.changed)
+                end
+            end
+            time_ns() - ready >= _WORKER_STABLE_NS && (failures = 0)
+        catch err
+            lock(current, conn.lock) || return
             @error "DynamicObjects: starting or preloading the worker process failed" exception = (err, catch_backtrace())
-    finally
-        _release_worker!(q, conn)
-    end)
+        end
+        failures += 1
+        again = lock(conn.lock) do
+            current() || return false
+            if failures > length(_WORKER_RETRY_DELAYS)
+                conn.eager = nothing
+                @warn "DynamicObjects: background worker retries exhausted; reapply worker settings or call restart_worker! to retry"
+                return false
+            end
+            true
+        end
+        again || return
+        sleep(_WORKER_RETRY_DELAYS[failures])
+    end
 end
 
 """

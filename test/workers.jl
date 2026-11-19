@@ -372,21 +372,35 @@ with_worker() do
     @test r.value == 12
     @test r.pid == worker_pid() != pid
 
-    # `restart_worker!` stops the worker through its process handle, with the same outcome.
+    # Both requests are running when the queue asks this worker to exit.
     p = t.gated(8; dir, fetch=identity)
     @test waitfor(joinpath(dir, "started_8_1"))
+    other = t.gated(9; dir, fetch=identity)
+    @test waitfor(joinpath(dir, "started_9_2"))
     old = worker_pid()
     stopped = @elapsed status = DynamicObjects.restart_worker!()
     @test status.running == false
     @test stopped < 15
-    err = try fetch(p); nothing catch e; e end
-    @test err isa ComputeAbandoned
-    # The stop's own reason or the event pump's, whichever reached the computation first.
-    @test occursin(r"the worker process \(pid \d+\) (was stopped|exited while computing it), (with exit code \d+|killed by signal \d+)",
-                   sprint(showerror, err))
+    for work in (p, other)
+        err = try fetch(work); nothing catch e; e end
+        @test err isa ComputeAbandoned && err.started
+        @test err.reason == "the worker process (pid $old) was stopped, with exit code 0"
+    end
     @test settles(() -> DynamicObjects.worker_status().in_flight == 0)
     touch(joinpath(dir, "go_8"))
     @test t.gated(8; dir).pid != old
+
+    # Stop the process without restart_worker!'s fallback notification. Only the
+    # event pump can wake this requester, regardless of scheduler timing.
+    p = t.gated(10; dir, fetch=identity)
+    @test waitfor(joinpath(dir, "started_10_2"))
+    conn = DynamicObjects.job_queue().conns[1]
+    old = worker_pid()
+    @test DynamicObjects._stop_process(conn, conn.worker)
+    settles(() -> DynamicObjects._settled(p)) || error("event pump did not abandon the request")
+    err = try fetch(p); nothing catch e; e end
+    @test err isa ComputeAbandoned && err.started
+    @test err.reason == "the worker process (pid $old) was stopped, with exit code 0"
 end
 end
 
@@ -419,7 +433,12 @@ with_worker() do
     @test err isa ComputeAbandoned && err.started
     @test occursin("the worker process (pid $pid) exited while computing it, with exit code 3", sprint(showerror, err))
     @test !occursin("WorkerToy.jl", err.worker_stderr)
-    @test t.square(3).value == 36
+    replacement = t.square(3)
+    @test replacement.value == 36
+    # A worker can also exit successfully without the queue asking it to stop.
+    err = abandoned(() -> t.exits(0))
+    @test err isa ComputeAbandoned && err.started
+    @test err.reason == "the worker process (pid $(replacement.pid)) exited while computing it, with exit code 0"
 end
 end
 
@@ -825,11 +844,13 @@ w = Malt.Worker()
 try
     hooks = added(before)
     @test length(hooks) == 1 && DO._stops_worker(only(hooks), w)
-    DO._exit_without_waiting!(w)
+    exiting = Threads.Atomic{Bool}(false)
+    DO._exit_without_waiting!(w, exiting)
     hooks = added(before)
     @test length(hooks) == 1 && parentmodule(typeof(only(hooks))) === DO
     # Run at exit, DO's hook kills the worker and returns without waiting for it to go.
     @test (@elapsed only(hooks)()) < 1
+    @test exiting[]
     @test settles(() -> !Malt.isrunning(w), 10.0)
 finally
     Malt.isrunning(w) && Malt.stop(w)
@@ -878,6 +899,23 @@ else
         process_running(proc) && kill(proc, Base.SIGKILL)
         wpid !== nothing && alive(wpid) && run(ignorestatus(`kill -KILL $wpid`))
         ok || println(read(out, String), read(err, String))
+    end
+end
+end
+
+@testitem "workers: normal parent exit lets eager supervision finish without replacing the worker" tags=[:core, :workers] begin
+using DynamicObjects
+script = joinpath(dirname(pathof(DynamicObjects)), "..", "test", "fixtures", "worker_exit_process.jl")
+mktempdir() do dir
+    check = joinpath(dir, "exit-check")
+    project = dirname(Base.active_project())
+    proc = run(`$(Base.julia_cmd()) --startup-file=no --threads=2 --project=$project $script $check`; wait=false)
+    try
+        @test timedwait(() -> process_exited(proc), 180.0) === :ok && success(proc)
+        @test isfile(check) && read(check, String) == "ok false"
+    finally
+        process_running(proc) && kill(proc, Base.SIGKILL)
+        wait(proc)
     end
 end
 end

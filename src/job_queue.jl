@@ -59,6 +59,9 @@ mutable struct _WorkerConn
     actor::Union{Nothing,Task}
     worker::Any                 # a `_QueueWorker`, `nothing` while none runs
     spawning::Union{Nothing,Task}
+    starting_worker::Any        # its process handle while DynamicObjects initializes
+    eager::Union{Nothing,Task}  # maintains the current :now configuration
+    const changed::Threads.Condition
     pid::Int
     started_at::Float64
     last_message_at::Float64
@@ -66,9 +69,12 @@ mutable struct _WorkerConn
     const inflight::Dict{Int,_RemoteRequest}
     const loaded::Set{Base.PkgId}
 end
-_WorkerConn(index) = _WorkerConn(index, false, 0, nothing, Any[], ReentrantLock(), Channel{Any}(Inf),
-                                 nothing, nothing, nothing, 0, NaN, NaN, 0,
-                                 Dict{Int,_RemoteRequest}(), Set{Base.PkgId}())
+function _WorkerConn(index)
+    lock = ReentrantLock()
+    _WorkerConn(index, false, 0, nothing, Any[], lock, Channel{Any}(Inf),
+                nothing, nothing, nothing, nothing, nothing, Threads.Condition(lock),
+                0, NaN, NaN, 0, Dict{Int,_RemoteRequest}(), Set{Base.PkgId}())
+end
 
 """
     DynamicObjects.JobQueue(; max_running=0)
@@ -149,8 +155,8 @@ the same process as their caller. Workers have independent memory caches. A comp
 as a [`PropertyComputationError`](@ref) caused by a
 [`RemoteComputationError`](@ref DynamicObjects.RemoteComputationError) that holds the worker's
 printout, and [`unwrap_error`](@ref) returns the exception itself wherever it can cross; a worker
-that exits fails every computation it ran with [`ComputeAbandoned`](@ref), and the next one starts
-a fresh worker. `workers=0` (the default) runs everything here; switching to it stops the worker.
+that exits fails every computation it ran with [`ComputeAbandoned`](@ref).
+`workers=0` (the default) runs everything here; switching to it stops the worker.
 When this process exits, its exit hooks kill the worker at once instead of waiting for it, so a
 stuck worker never holds the exit up.
 
@@ -164,8 +170,14 @@ The worker also inherits an equal share of this process's `--heap-size-hint`, wh
 not a shared memory cap: the parent, worker and other processes still need their own headroom.
 Flags apply at process startup. After resizing a live pool, restart existing processes
 to apply the new per-process budgets.
-`worker_start=:lazy` (the default) starts it with the first computation sent to it,
-`worker_start=:now` at once, in the background. Set `worker_preload=[AppModule]` to also load
+`worker_start=:lazy` (the default) starts the worker on demand, including after an exit.
+`worker_start=:now` starts it in the background and replaces it after an unexpected exit,
+even while idle. Repeated startup failures or short-lived workers trigger up to three
+background retries with increasing delays. A worker ready for 30 seconds resets this limit.
+After retries are exhausted, a computation assigned to that slot can still start a worker.
+Reapply `worker_start=:now` to resume background recovery. In a single-worker queue,
+`restart_worker!()` also starts a new attempt.
+Set `worker_preload=[AppModule]` to also load
 the application's packages at startup, before any computation is submitted. The list accepts
 package modules (a nested module selects its root package) or `Base.PkgId`s, and is reapplied
 after a restart. Additional workers exit after `worker_idle_timeout` seconds idle (default
@@ -201,7 +213,10 @@ function configure_queue!(q::JobQueue=job_queue(); max_running=nothing, workers=
     worker_idle_timeout === nothing || (worker_idle_timeout isa Real && worker_idle_timeout >= 0) ||
         throw(ArgumentError("worker_idle_timeout must be non-negative, got $(worker_idle_timeout)"))
     max_running === nothing || _check_max_running(max_running)
-    removed, eager, admitted = lock(q.lock) do
+    removed, admitted = lock(q.lock) do
+        was_eager = q.worker_start === :now
+        preload_changed = worker_preload !== nothing && q.worker_preload != worker_preload
+        flags_changed = worker_exeflags !== nothing && q.worker_exeflags != worker_exeflags
         worker_start === nothing || (q.worker_start = worker_start)
         worker_exeflags === nothing || (q.worker_exeflags = worker_exeflags)
         worker_preload === nothing || (q.worker_preload = worker_preload)
@@ -216,14 +231,31 @@ function configure_queue!(q::JobQueue=job_queue(); max_running=nothing, workers=
         end
         @atomic q.workers = Int(n)
         _register_worker_queue!(q)
-        eager = _WorkerConn[]
-        if q.worker_start === :now
+        if any(!isnothing, (workers, worker_start, worker_preload, worker_exeflags))
             for conn in q.conns
-                live = lock(() -> _worker_alive(conn.worker), conn.lock)
-                # Adjusting admission alone should not resurrect an idle surplus process.
-                if conn.index > previous || worker_start === :now ||
-                        (live && worker_preload !== nothing) || (conn.index == 1 && !live)
-                    push!(eager, conn)
+                lock(conn.lock) do
+                    if was_eager && q.worker_start === :lazy
+                        conn.eager = nothing
+                        notify(conn.changed)
+                        # An admitted request still needs its launch. Discard a purely
+                        # eager launch by retiring its slot, including a stuck initializer.
+                        if conn.spawning !== nothing && isempty(conn.inflight)
+                            _retire_connection!(conn)
+                            q.conns[conn.index] = _WorkerConn(conn.index)
+                            push!(removed, conn)
+                        end
+                    elseif q.worker_start === :now
+                        # An idle timeout installs a fresh, unused connection. Changing
+                        # settings alone must not warm that surplus slot again.
+                        warm = conn.eager !== nothing || conn.actor !== nothing
+                        if preload_changed || flags_changed
+                            conn.eager = nothing
+                            notify(conn.changed)
+                        end
+                        if warm || conn.index == 1 || conn.index > previous || worker_start === :now
+                            _start_worker_soon!(q, conn)
+                        end
+                    end
                 end
             end
         end
@@ -231,11 +263,10 @@ function configure_queue!(q::JobQueue=job_queue(); max_running=nothing, workers=
             foreach(c -> _schedule_idle!(q, c), q.conns)
         end
         max_running === nothing || (q.max_running = Int(max_running))
-        removed, eager, max_running === nothing ? _Admitted[] : _admit!(q)
+        removed, max_running === nothing ? _Admitted[] : _admit!(q)
     end
     foreach(_start_admitted, admitted)
     foreach(_stop_worker!, removed)
-    foreach(c -> _start_worker_soon!(q, c), eager)
     queue_settings(q)
 end
 

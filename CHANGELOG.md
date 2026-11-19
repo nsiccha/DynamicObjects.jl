@@ -14,7 +14,7 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
-## 0.5.30
+## 0.5.32
 
 - The requester and each worker use their explicit Julia heap hint as a soft
   budget for process memory on Linux and macOS. Set
@@ -24,6 +24,20 @@ failing or silently behaving differently at run time.
   `DynamicObjects.memo_native_bytes` for the property and result type.
   `memo_retention_stats` reports the process footprint, estimated native
   bytes released from slots, and the count of released slots of unknown size.
+
+## 0.5.31
+
+- With `worker_start=:now`, an unexpected worker exit starts a
+  replacement and loads the configured `worker_preload` packages even when the
+  queue is idle. Requests already running in the lost process receive
+  `ComputeAbandoned`. Repeated failures trigger up to three background retries.
+
+## 0.5.30
+
+- When `restart_worker!` stops a worker, every computation interrupted on it
+  reports `was stopped` followed by the exit code or signal. A worker that
+  exits independently still reports `exited while computing it`, even with
+  exit code 0.
 
 ## 0.5.29
 

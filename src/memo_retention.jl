@@ -401,4 +401,6 @@ function __init__()
             throw(ArgumentError("DYNAMICOBJECTS_PROCESS_BUDGET_BYTES must be a nonnegative integer byte count, got $(repr(budget))"))
         _PROCESS_BUDGET[] = value
     end
+    # A queue between retries can be exiting even before its first worker exists.
+    atexit(() -> (_WORKERS_EXITING[] = true))
 end
