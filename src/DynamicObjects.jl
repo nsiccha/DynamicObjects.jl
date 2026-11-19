@@ -99,24 +99,31 @@ load(fmt::Val, path::AbstractString, ::Any) = error("no `load` method for format
 save(::Val{:serial}, path::AbstractString, x) = Serialization.serialize(path, x)
 load(::Val{:serial}, path::AbstractString, ::Any) = Serialization.deserialize(path)
 
-# Every disk-cache write goes through `_atomic_save`: the format payload is
-# written to a unique sibling temp file, then `mv(...; force=true)` renames it
-# over `path`. `tempname(dirname(path))` is guaranteed same-filesystem, so the
-# `mv` is a `rename(2)` — atomic. Consequences: a reader (`get_cache_status` /
-# `load`) never observes a half-written file (it sees either the prior complete
-# file or the new one), a crash mid-`save` leaves the old cache intact instead
-# of a truncated one, and an in-flight READONLY `@mmap` mapping keeps the old
-# inode alive until unmapped (a plain in-place overwrite would corrupt it).
-function _atomic_save(fmt::Val, path::AbstractString, x)
+# Serialize to a sibling file, then atomically replace the destination. Julia's
+# mv(force=true) first unlinks the destination, which a reader in another worker can see.
+function _atomic_save(fmt::Val, path::AbstractString, x, guard=nothing)
     tmp = tempname(dirname(path); cleanup=false)
     try
-        r = save(fmt, tmp, x)
-        mv(tmp, path; force=true)
-        r
-    catch
+        save(fmt, tmp, x)
+        if guard === nothing
+            _replace_cache_file(tmp, path)
+        else
+            # Retraction and publication share the latch lock only for the rename.
+            # An invalidated writer discards its own temp, never a sibling's new value.
+            lock(guard.cache.lock) do
+                _publishable(guard) || return false
+                _replace_cache_file(tmp, path)
+            end
+        end
+    finally
         rm(tmp; force=true)
-        rethrow()
     end
+end
+
+function _replace_cache_file(tmp, path)
+    err = ccall(:jl_fs_rename, Int32, (Cstring, Cstring), tmp, path)
+    err < 0 && Base.uv_error("renaming cache file to $path", err)
+    true
 end
 
 # --- `Val{:mmap}` format (D2-v2, D3, layout) ---
@@ -2188,9 +2195,9 @@ end
 function _remove_disk_entry!(o, name::Symbol, indices...; kwargs...)
     path = get_cache_path(o, name, indices...; kwargs...)
     removed = isfile(path)
-    removed && rm(path)
+    removed && rm(path; force=true)
     metadata_path = _automatic_materialization_path(path)
-    isfile(metadata_path) && rm(metadata_path)
+    rm(metadata_path; force=true)
     removed
 end
 
@@ -3238,21 +3245,10 @@ function _record_accessed_key(o, name::Symbol, indices, kwargs)
     nothing
 end
 
-# Publish a computed disk entry unless an invalidation retracted the computation (`guard`):
-# not before the save, and if one lands during it, the entry is removed again — invalidations
-# retract the latch before removing disk entries, so either side sees the other. Returns
-# whether the entry stands; if not, the caller keeps the computed value itself.
-function _save_if_publishable!(guard, fmt::Val, path::AbstractString, value)
-    if !_publishable(guard)
-        # The non-strict flow's empty placeholder would read as an interrupted write.
-        get_cache_status(path) === :started && rm(path; force=true)
-        return false
-    end
-    _atomic_save(fmt, path, value)
-    _publishable(guard) && return true
-    rm(path; force=true)
-    false
-end
+# Skip serialization if the computation has already been retracted. The final check
+# inside _atomic_save also covers invalidation during serialization.
+_save_if_publishable!(guard, fmt::Val, path::AbstractString, value) =
+    _publishable(guard) && _atomic_save(fmt, path, value, guard)
 
 # Every computation of a property goes through here: memoized, fresh, or loaded from disk.
 # Under an active compute trace it runs as a traced computation (`_traced_compute`); a

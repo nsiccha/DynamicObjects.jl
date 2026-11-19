@@ -250,7 +250,7 @@ with_worker() do
     root, dir = mktempdir(), mktempdir()
     plain = Toy(2, root)
     warm = plain.square(3)
-    conn = DO.job_queue().conn
+    conn = DO.job_queue().conns[1]
     kept() = DO._remote_fetch(conn, conn.worker, DO._worker_kept_objects)
 
     # A computation in flight keeps its context-bearing root, however many others pass.
@@ -337,7 +337,7 @@ with_worker() do
     # The old remote request may re-resolve its Pending and join the replacement,
     # so both requests can stay in flight. Wait for the old computing task itself:
     # its publication fence has run, while the replacement remains gated.
-    conn = DynamicObjects.job_queue().conn
+    conn = DynamicObjects.job_queue().conns[1]
     @test settles(() -> DynamicObjects._remote_fetch(conn, conn.worker,
         WorkerToy.disk_task_finished, 1))
     @test !isfile(path)
@@ -596,7 +596,7 @@ using DynamicObjects
 @dynamicstruct struct NotInAPackage
     @queued twice(x::Int) = 2x
 end
-@test_throws ArgumentError DynamicObjects.configure_queue!(; workers=2)
+@test_throws ArgumentError DynamicObjects.configure_queue!(; workers=-1)
 @test_throws ArgumentError DynamicObjects.configure_queue!(; worker_start=:later)
 with_worker() do
     t = Toy(1, mktempdir())
@@ -728,7 +728,7 @@ with_worker() do
         text = Treebars.render_text(node)
         @test occursin("✓ Counted item", text)
         @test occursin("✓ Steps ($n/$n)", text)
-        conn = DynamicObjects.job_queue().conn
+        conn = DynamicObjects.job_queue().conns[1]
         source_duration = DynamicObjects._remote_fetch(conn, conn.worker,
             WorkerToy.counted_duration, n)
         @test Treebars.duration(node) == source_duration
@@ -745,7 +745,7 @@ with_worker() do
     touch(joinpath(dir, "go_16"))
     settles(() -> istaskdone(task), 30.0) || error("fresh worker result did not settle")
     @test fetch(task) == 16
-    conn = DynamicObjects.job_queue().conn
+    conn = DynamicObjects.job_queue().conns[1]
     source_duration = DynamicObjects._remote_fetch(conn, conn.worker, WorkerToy.counted_duration, 16)
     @test Treebars.duration(node) == source_duration
     DynamicObjects.on_requester_message!(identity, :counted_end)
@@ -793,7 +793,7 @@ with_worker() do
     @test isempty(waits(getstatus(t.counted, 12; dir), :en))
     # What the worker loaded as a dependency (Treebars, under DynamicObjects) is known to be
     # loaded: naming it neither asks the worker nor shows a phase.
-    conn = DynamicObjects.job_queue().conn
+    conn = DynamicObjects.job_queue().conns[1]
     probe = Treebars.initialize_progress!(:state; description="probe")
     DynamicObjects._ensure_packages!(conn, conn.worker,
         [Base.PkgId(Treebars), Base.PkgId(DynamicObjects), Base.PkgId(WorkerToy)], probe)

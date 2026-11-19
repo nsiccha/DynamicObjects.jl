@@ -429,7 +429,7 @@ running its computation. Default values travel too. Each computation has its own
 bindings do not persist into later requests, including after an error or worker restart.
 Conversions must not mutate their inputs. Register before starting computations.
 
-This applies to memoized and fresh `@queued` property computations with `workers=1`.
+This applies to memoized and fresh `@queued` property computations with a positive worker count.
 In-process computations already inherit every requester scoped value and do not call these
 converters. A shared memoized computation still uses the scope of its first caller; this
 does not add context to cache keys. Unregistered scoped values are not transported.
@@ -574,7 +574,7 @@ function _close_worker_scope!(token)
     _close_compute_scope!(scope)
 end
 
-function _worker_scope_token(conn, w)
+function _worker_scope_token(q, conn, w)
     scope = _COMPUTE_SCOPE[]
     scope === nothing && return nothing
     # The outermost live report owns the remote lifetime. A queued job that
@@ -588,8 +588,10 @@ function _worker_scope_token(conn, w)
     end
     lock(scope.remote_lock) do
         lock(() -> scope.closed, _SCOPE_LOCK) && return UInt(0)
-        _, token = get!(scope.workers, w) do
-            (conn, _remote_fetch(conn, w, _open_worker_scope!, scope.lifetimes, scope.target))
+        _, _, token = get!(scope.workers, w) do
+            token = _remote_fetch(conn, w, _open_worker_scope!, scope.lifetimes, scope.target)
+            _hold_worker!(q, conn)
+            (q, conn, token)
         end
         token
     end
@@ -610,10 +612,18 @@ end
 function _on_scope_workers!(scope, operation)
     lock(scope.remote_lock) do
         isempty(scope.workers) && return
-        @sync for (w, (conn, token)) in scope.workers
-            @async _on_live_worker!(conn, w, operation, token)
+        try
+            @sync for (w, (_, conn, token)) in scope.workers
+                @async _on_live_worker!(conn, w, operation, token)
+            end
+        finally
+            if operation === _close_worker_scope!
+                for (q, conn, _) in values(scope.workers)
+                    _release_worker!(q, conn)
+                end
+                empty!(scope.workers)
+            end
         end
-        operation === _close_worker_scope! && empty!(scope.workers)
     end
     nothing
 end
@@ -696,6 +706,13 @@ end
 
 _worker_submit(msg...) = (put!(_W_CONTROL, (:submit, msg...)); nothing)
 _worker_invalidate(msg...) = (put!(_W_CONTROL, (:invalidate, msg...)); nothing)
+function _worker_invalidate_wait(msg...)
+    reply = Channel{Any}(1)
+    put!(_W_CONTROL, (:invalidate, reply, msg...))
+    err = take!(reply)
+    isnothing(err) || throw(err)
+    nothing
+end
 _worker_interrupt(id::Int, node_id::Int=1) = (put!(_W_CONTROL, (:interrupt, id, node_id)); nothing)
 
 # The events queued since the last call, oldest first; waits for at least one.
@@ -904,6 +921,15 @@ Base.unsafe_write(io::_CappedIO, p::Ptr{UInt8}, n::UInt) = (_room!(io, n); unsaf
 Serialization.serialize(::Serialization.Serializer{_CappedIO}, ::PropertyCache) =
     throw(_NotCarried("it holds a DynamicObjects object"))
 
+function _worker_control(verb::Val{:invalidate}, reply::Channel, address, op::Symbol, args...)
+    result = try
+        _worker_control(verb, address, op, args...)
+        nothing
+    catch err
+        err
+    end
+    put!(reply, result)
+end
 function _worker_control(::Val{:invalidate}, address, verb::Symbol, args...)
     o = _resolve_existing(address, _W_OBJECTS)
     o === nothing && return
@@ -951,6 +977,20 @@ _log_value(v) = sprint(show, v; context=:limit => true)
 
 # Whether any queue has a worker configured: one atomic load gates every forwarding hook.
 const _WORKERS_ACTIVE = Threads.Atomic{Bool}(false)
+
+const _WORKER_QUEUES = WeakKeyDict{JobQueue,Nothing}()
+const _WORKER_QUEUES_LOCK = ReentrantLock()
+
+function _register_worker_queue!(q)
+    lock(_WORKER_QUEUES_LOCK) do
+        if isempty(q.conns)
+            delete!(_WORKER_QUEUES, q)
+        else
+            _WORKER_QUEUES[q] = nothing
+        end
+        _WORKERS_ACTIVE[] = !isempty(_WORKER_QUEUES)
+    end
+end
 
 # Run `f()` on the actor task and return its value (rethrowing its failure).
 function _on_actor(f, conn::_WorkerConn)
@@ -1001,12 +1041,12 @@ _worker_alive(w) = w !== nothing && Malt.isrunning(w.handle)
 # The running worker of `q`, spawned first if there is none. A computation's progress node
 # `status` shows the wait for the worker to start as a phase, also when another computation or
 # `worker_start=:now` started it.
-function _ensure_worker!(q, status=nothing)
-    conn = q.conn
+function _ensure_worker!(q, conn::_WorkerConn, status=nothing)
     while true
         spawning = lock(conn.lock) do
+            conn.retired && throw(ComputeAbandoned("the worker was stopped", true))
             _worker_alive(conn.worker) && return conn.worker
-            conn.spawning === nothing && (conn.spawning = Threads.@spawn _spawn_worker!(q))
+            conn.spawning === nothing && (conn.spawning = Threads.@spawn _spawn_worker!(q, conn))
             conn.spawning
         end
         spawning isa Task || return spawning
@@ -1031,17 +1071,29 @@ end
 _preload_pkgid(x) = throw(ArgumentError("worker_preload entries must be package modules or Base.PkgIds, got $(repr(x))"))
 _worker_preload(q) = lock(() -> q.worker_preload, q.lock)
 
-function _worker_exeflags(q)
+function _worker_exeflags(q, index)
+    count, custom = lock(() -> (max(q.workers, 1), q.worker_exeflags), q.lock)
+    threads, extra = divrem(Threads.nthreads(:default), count)
     flags = String[c for c in Base.julia_cmd().exec[2:end]]
     project = Base.active_project()
     project === nothing || push!(flags, "--project=" * project)
-    append!(flags, something(q.worker_exeflags,
-        ["--threads=$(Threads.nthreads(:default)),1"]))
+    # Some Julia versions include the parent hint in julia_cmd(). Normalize it before
+    # appending explicit child flags so exactly one effective hint reaches the child.
+    if count > 1
+        i = findfirst(==("--heap-size-hint"), flags)
+        isnothing(i) || deleteat!(flags, i:i+1)
+        filter!(f -> !startswith(f, "--heap-size-hint="), flags)
+    end
+    if custom === nothing || (count > 1 && !any(f -> f == "--threads" ||
+            startswith(f, "--threads=") || startswith(f, "-t"), custom))
+        push!(flags, "--threads=$(max(1, threads + (index <= extra))),1")
+    end
+    custom === nothing || append!(flags, custom)
     # julia_cmd() does not carry the heap hint on every supported Julia version.
     # A flag already supplied by Julia or the caller takes precedence.
     hint = Base.JLOptions().heap_size_hint
     if hint != 0 && !any(f -> f == "--heap-size-hint" || startswith(f, "--heap-size-hint="), flags)
-        push!(flags, "--heap-size-hint=$hint")
+        push!(flags, "--heap-size-hint=$(max(1, hint ÷ count))")
     end
     flags
 end
@@ -1067,7 +1119,12 @@ function _exit_without_waiting!(w::Malt.Worker)
     proc, pid = w.proc, w.proc_pid
     # `uv_kill` is a plain `kill` (`TerminateProcess` on Windows) and takes no lock. A child
     # libuv has not reaped keeps its pid, so `process_running` guards against a reused one.
-    atexit(() -> (Base.process_running(proc) && ccall(:uv_kill, Cint, (Cint, Cint), pid, Base.SIGKILL); nothing))
+    hook = () -> (Base.process_running(proc) && ccall(:uv_kill, Cint, (Cint, Cint), pid, Base.SIGKILL); nothing)
+    atexit(hook)
+    errormonitor(@async begin
+        wait(proc)
+        Base.@lock Base._atexit_hooks_lock filter!(f -> f !== hook, Base.atexit_hooks)
+    end)
     w
 end
 
@@ -1153,9 +1210,8 @@ function _worker_death(w::_QueueWorker, reason)
     ComputeAbandoned(summary, true, _stderr_excerpt(w.stderr))
 end
 
-function _spawn_worker!(q)
-    conn = q.conn
-    exeflags = _worker_exeflags(q)
+function _spawn_worker!(q, conn)
+    exeflags = _worker_exeflags(q, conn.index)
     w = _on_actor(conn) do
         worker = Malt.Worker(; exeflags, env=_worker_env(), monitor_stdout=false, monitor_stderr=false)
         _forward_output!(_exit_without_waiting!(worker))
@@ -1166,6 +1222,7 @@ function _spawn_worker!(q)
         fetch(_on_actor(() -> Malt.remote_eval(w.handle, load), conn))
         info = _remote_fetch(conn, w, _worker_init!)
         lock(conn.lock) do
+            empty!(conn.recent_roots)
             conn.worker = w
             conn.spawning = nothing
             conn.pid = info.pid
@@ -1344,9 +1401,30 @@ mutable struct _WorkerCompute{Q,C}
 end
 (f::_WorkerCompute)(status) = _compute_in_worker(f, f.compute..., status)
 
+# Serialize selection and reservation so two simultaneous cold calls see each other's
+# assignments before either has a PID. Transport and package loading stay off q.lock.
+function _reserve_worker!(q, root)
+    lock(q.lock) do
+        isempty(q.conns) && throw(ComputeAbandoned("queue workers were disabled", true))
+        conn = argmin(q.conns) do c
+            lock(c.lock) do
+                live = _worker_alive(c.worker)
+                (length(c.inflight), !(live && root in c.recent_roots), !live)
+            end
+        end
+        _cancel_idle!(conn)
+        req = lock(conn.lock) do
+            conn.next_id += 1
+            r = _RemoteRequest(conn.next_id, Channel{Any}(Inf), nothing)
+            conn.inflight[r.id] = r
+            r
+        end
+        conn, req
+    end
+end
+
 function _compute_in_worker(f::_WorkerCompute, o, name::Symbol, args::Tuple, kwargs::NamedTuple, status)
     q, is_fresh = f.queue, f.is_fresh
-    conn = q.conn
     guard = _COMPUTE_SCOPE[] === nothing || is_fresh ? nothing : _publish_guard()
     address, wired_args, wired_kwargs = try
         _address(o), _wire(args), _wire(kwargs)
@@ -1363,17 +1441,20 @@ function _compute_in_worker(f::_WorkerCompute, o, name::Symbol, args::Tuple, kwa
             (err, catch_backtrace())))
     end
     min_level = Int32(Base.CoreLogging.min_enabled_level(ScopedValues.current_logger()).level)
-    req = lock(conn.lock) do
-        conn.next_id += 1
-        r = _RemoteRequest(conn.next_id, Channel{Any}(Inf), nothing)
-        conn.inflight[r.id] = r
-        r
-    end
+    root = first(_kept_keys(address))
+    conn, req = _reserve_worker!(q, root)
     interrupter = nothing
     try
-        w, pid = _submit!(q, req, o, name, args, kwargs, packages,
+        w, pid = _submit!(q, conn, req, o, name, args, kwargs, packages,
                           (req.id, address, name, wired_args, wired_kwargs, is_fresh, min_level,
                            _mirrorable(status), scopes), status)
+        lock(conn.lock) do
+            if conn.worker === w
+                filter!(!isequal(root), conn.recent_roots)
+                push!(conn.recent_roots, root)
+                length(conn.recent_roots) > _WORKER_KEEP && popfirst!(conn.recent_roots)
+            end
+        end
         replica = _replica(status, conn, w, req.id)
         interrupter = replica === nothing ? _forward_interrupts(conn, w, req.id, status) : replica
         while true
@@ -1433,6 +1514,7 @@ function _compute_in_worker(f::_WorkerCompute, o, name::Symbol, args::Tuple, kwa
                 false
             end
             unread_pin && _on_live_worker!(conn, req.worker, _release_worker_results!, [(req.id, false)])
+            lock(() -> _schedule_idle!(q, conn), q.lock)
         end
     end
 end
@@ -1442,11 +1524,10 @@ end
 # nothing it ran survives it. Its exit still reaches `req` from the event pump as
 # `:abandoned`, naming it, which `_compute_in_worker` then ignores. Starting a worker and
 # loading packages show as phases on the computation's progress node `status`.
-function _submit!(q, req::_RemoteRequest, o, name, args, kwargs, packages, message, status=nothing)
-    conn = q.conn
+function _submit!(q, conn, req::_RemoteRequest, o, name, args, kwargs, packages, message, status=nothing)
     for attempt in 1:2
         w = try
-            _ensure_worker!(q, status)
+            _ensure_worker!(q, conn, status)
         catch err
             err isa ComputeAbandoned && rethrow()
             throw(ComputeAbandoned("the worker process could not be started: " * sprint(showerror, err), true))
@@ -1454,7 +1535,7 @@ function _submit!(q, req::_RemoteRequest, o, name, args, kwargs, packages, messa
         lock(() -> req.worker = w, conn.lock)
         try
             _ensure_packages!(conn, w, union(_worker_preload(q), packages), status)
-            _remote_fetch(conn, w, _worker_submit, message..., _worker_scope_token(conn, w))
+            _remote_fetch(conn, w, _worker_submit, message..., _worker_scope_token(q, conn, w))
             return w, w.handle.proc_pid
         catch err
             if err isa Malt.TerminatedWorkerException
@@ -1564,14 +1645,17 @@ end
 # before it invalidates, while `o` is still held by its parent.
 function _forward_invalidation(address, verb::Symbol, args...)
     address === nothing && return nothing
-    q = job_queue()
-    conn = q.conn
-    w = lock(() -> conn.worker, conn.lock)
-    _worker_alive(w) || return nothing
-    try
-        _remote_do(conn, w, _worker_invalidate, address, verb, args...)
-    catch err
-        @debug "DynamicObjects: forwarding an invalidation to the worker failed" exception = err
+    conns = _live_connections()
+    for (conn, w) in conns
+        try
+            if length(conns) == 1
+                _remote_do(conn, w, _worker_invalidate, address, verb, args...)
+            else
+                _remote_fetch(conn, w, _worker_invalidate_wait, address, verb, args...)
+            end
+        catch err
+            _worker_alive(w) && rethrow()
+        end
     end
     nothing
 end
@@ -1588,13 +1672,26 @@ function _forward_entry_invalidation(o, name::Symbol, indices::Tuple, kwargs::Na
     _forward_invalidation(address, :invalidate!, name, wired...)
 end
 
+_live_connections() = _live_connections(lock(() -> collect(keys(_WORKER_QUEUES)), _WORKER_QUEUES_LOCK))
+function _live_connections(queues)
+    live = Tuple{_WorkerConn,_QueueWorker}[]
+    for q in queues
+        lock(q.lock) do
+            for conn in q.conns
+                w = lock(() -> conn.worker, conn.lock)
+                _worker_alive(w) && push!(live, (conn, w))
+            end
+        end
+    end
+    live
+end
+
 # The address an invalidation of `o` forwards to, or `nothing` (no worker, or the worker
 # cannot hold `o`).
 function _invalidation_address(o)
     _WORKERS_ACTIVE[] || return nothing
     _is_dynamic_object(o) || return nothing
-    q = job_queue()
-    _worker_alive(lock(() -> q.conn.worker, q.conn.lock)) || return nothing
+    isempty(_live_connections()) && return nothing
     try
         _address(o; strict=true)
     catch err
@@ -1606,8 +1703,7 @@ end
 """
     prune_worker_mem_caches!(keep, root; queue=DynamicObjects.job_queue())
 
-Run the ordinary memory-cache prune on the existing queue worker's copy of
-`root` and wait for its counts `(; objects, kept, evicted)`. A stopped worker
+Prune each live worker's copy of `root` and return the summed counts `(; objects, kept, evicted)`. A stopped worker
 or absent root returns zero counts. This never starts a worker or builds the
 object. The predicate travels to the worker and executes there; use a callable
 available in its environment, such as `Returns(false)` or an application
@@ -1616,13 +1712,25 @@ To prune the calling process as well, call [`prune_mem_caches!`](@ref) there.
 """
 function prune_worker_mem_caches!(keep, root; queue=job_queue())
     _is_dynamic_object(root) || throw(ArgumentError("expected a @dynamicstruct root"))
-    conn = queue.conn
-    w = lock(() -> conn.worker, conn.lock)
-    _worker_alive(w) || return (objects=0, kept=0, evicted=0)
-    address = _address(root; strict=true)
-    packages = _packages!(_packages!(Set{Base.PkgId}(), address), keep)
-    _ensure_packages!(conn, w, packages)
-    _remote_fetch(conn, w, _prune_worker_root!, keep, address)
+    live = lock(queue.lock) do
+        pairs = _live_connections((queue,))
+        foreach(pair -> _hold_worker!(queue, first(pair)), pairs)
+        pairs
+    end
+    counts = (objects=0, kept=0, evicted=0)
+    isempty(live) && return counts
+    try
+        address = _address(root; strict=true)
+        packages = _packages!(_packages!(Set{Base.PkgId}(), address), keep)
+        for (conn, w) in live
+            _ensure_packages!(conn, w, packages)
+            part = _remote_fetch(conn, w, _prune_worker_root!, keep, address)
+            counts = map(+, counts, part)
+        end
+        counts
+    finally
+        foreach(pair -> _release_worker!(queue, first(pair)), live)
+    end
 end
 
 function _prune_worker_root!(keep, address)
@@ -1636,53 +1744,131 @@ end
 """
     DynamicObjects.worker_status(q=job_queue()) -> NamedTuple
 
-The worker process of `q`: `(; workers, running, pid, started_at, in_flight, last_message_at)`.
-`workers` is the configured count; `running` whether a worker process is up; `pid` its process
-id (`nothing` without one); `started_at` and `last_message_at` are `time()` stamps of its start
-and of the last batch of events it sent (`nothing` before the first); `in_flight` counts the
-computations this process waits for it to finish. A watchdog that finds a worker stuck (no
-message and no CPU for a while) calls [`restart_worker!`](@ref DynamicObjects.restart_worker!).
+For zero or one worker, returns `(; workers, running, pid, started_at, in_flight,
+last_message_at)`. For a pool, `running` reports whether any process is up and `in_flight`
+counts all assigned requests, including startup. The process-specific fields are `nothing`.
+The additional `processes` vector gives each slot's `pid`, `running`, `started_at`,
+`last_message_at` and `in_flight`, in slot order. Timestamps are seconds since the epoch.
 """
 function worker_status(q=job_queue())
-    conn = q.conn
-    lock(conn.lock) do
-        running = _worker_alive(conn.worker)
-        (; workers=q.workers, running, pid=running ? conn.pid : nothing,
-           started_at=running ? conn.started_at : nothing, in_flight=length(conn.inflight),
-           last_message_at=running && !isnan(conn.last_message_at) ? conn.last_message_at : nothing)
+    lock(q.lock) do
+        processes = map(q.conns) do conn
+            lock(conn.lock) do
+                running = _worker_alive(conn.worker)
+                (; running, pid=running ? conn.pid : nothing, started_at=running ? conn.started_at : nothing,
+                   in_flight=length(conn.inflight), last_message_at=running && !isnan(conn.last_message_at) ?
+                       conn.last_message_at : nothing)
+            end
+        end
+        n = length(processes)
+        n == 1 && return (; workers=n, only(processes)...)
+        summary = (; workers=n, running=any(p -> p.running, processes), pid=nothing, started_at=nothing,
+                   in_flight=sum(p -> p.in_flight, processes; init=0), last_message_at=nothing)
+        n == 0 ? summary : (; summary..., processes)
     end
 end
 
 """
-    DynamicObjects.restart_worker!(q=job_queue()) -> NamedTuple
+    DynamicObjects.restart_worker!(q=job_queue(); worker=nothing) -> NamedTuple
 
-Stop `q`'s worker process through its own process handle (asked to exit, then `SIGTERM`, then
-`SIGKILL`), which fails every computation in flight there with [`ComputeAbandoned`](@ref); the
-next worker-bound computation starts a fresh worker, or one starts at once under
-`worker_start=:now`. Returns [`worker_status`](@ref DynamicObjects.worker_status).
+Stop the process in slot `worker` (1-based), failing its requests with [`ComputeAbandoned`](@ref).
+A replacement starts on demand, or immediately under `worker_start=:now`. A pool requires
+an explicit slot. With zero or one worker the argument can be omitted. Returns
+[`worker_status`](@ref DynamicObjects.worker_status).
 """
-function restart_worker!(q=job_queue())
-    _stop_worker!(q)
-    q.workers > 0 && q.worker_start === :now && _start_worker_soon!(q)
+function restart_worker!(q=job_queue(); worker=nothing)
+    old, eager = lock(q.lock) do
+        n = length(q.conns)
+        isnothing(worker) && n == 0 && return (nothing, nothing)
+        isnothing(worker) && n > 1 && throw(ArgumentError("select a worker slot from 1:$n"))
+        i = something(worker, 1)
+        i isa Integer && 1 <= i <= n || throw(ArgumentError("worker must be a slot from 1:$n"))
+        conn = q.conns[i]
+        _retire_connection!(conn)
+        q.conns[i] = _WorkerConn(i)
+        conn, q.worker_start === :now ? q.conns[i] : nothing
+    end
+    old === nothing || _stop_worker!(old)
+    eager === nothing || _start_worker_soon!(q, eager)
     worker_status(q)
 end
 
-function _stop_worker!(q)
-    conn = q.conn
+# Timer identity and slot membership are protected by the queue lock. Swap out an idle
+# connection before stopping it, so a new request can never be sent to the retiring one.
+function _cancel_idle!(conn)
+    conn.idle_timer === nothing || close(conn.idle_timer)
+    conn.idle_timer = nothing
+end
+
+function _retire_connection!(conn)
+    _cancel_idle!(conn)
+    lock(() -> conn.retired = true, conn.lock)
+end
+
+function _schedule_idle!(q, conn)
+    _cancel_idle!(conn)
+    (conn.index == 1 || conn.holds > 0) && return
+    idle = lock(() -> !conn.retired && isempty(conn.inflight) && _worker_alive(conn.worker), conn.lock)
+    idle && isfinite(q.worker_idle_timeout) || return
+    conn.idle_timer = Timer(q.worker_idle_timeout) do timer
+        retired = lock(q.lock) do
+            conn.idle_timer === timer || return false
+            _retire_connection!(conn)
+            q.conns[conn.index] = _WorkerConn(conn.index)
+            true
+        end
+        retired && _stop_worker!(conn)
+    end
+end
+
+function _stop_worker!(conn)
+    spawning = lock(() -> conn.spawning, conn.lock)
+    if spawning !== nothing
+        # The starter reports its own failure. A successful late start must be stopped too.
+        try
+            wait(spawning)
+        catch err
+            err isa TaskFailedException || rethrow()
+        end
+    end
     w = lock(() -> conn.worker, conn.lock)
-    w === nothing && return nothing
-    _stop_process(conn, w)
-    _abandon_inflight!(conn, w, _worker_death(w, "the worker process (pid $(w.handle.proc_pid)) was stopped"))
+    try
+        if w !== nothing
+            _stop_process(conn, w)
+            _abandon_inflight!(conn, w, _worker_death(w, "the worker process (pid $(w.handle.proc_pid)) was stopped"))
+        end
+    finally
+        close(conn.ops)
+    end
     nothing
 end
 
-_start_worker_soon!(q) = errormonitor(Threads.@spawn try
-    q.workers > 0 || return
-    w = _ensure_worker!(q)
-    _ensure_packages!(q.conn, w, _worker_preload(q))
-catch err
-    @error "DynamicObjects: starting or preloading the worker process failed" exception = (err, catch_backtrace())
-end)
+function _hold_worker!(q, conn)
+    lock(q.lock) do
+        _cancel_idle!(conn)
+        conn.holds += 1
+    end
+end
+
+function _release_worker!(q, conn)
+    lock(q.lock) do
+        conn.holds -= 1
+        _schedule_idle!(q, conn)
+    end
+end
+
+function _start_worker_soon!(q, conn)
+    _hold_worker!(q, conn)
+    errormonitor(Threads.@spawn try
+        w = _ensure_worker!(q, conn)
+        _ensure_packages!(conn, w, _worker_preload(q))
+    catch err
+        lock(() -> conn.retired, conn.lock) ||
+            @error "DynamicObjects: starting or preloading the worker process failed" exception = (err, catch_backtrace())
+    finally
+        _release_worker!(q, conn)
+    end)
+end
 
 """
     DynamicObjects.run!(produce, d::DeferredCompute) -> Bool
