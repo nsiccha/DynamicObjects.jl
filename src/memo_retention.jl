@@ -46,11 +46,12 @@ Base.delete!(d::_MemoValues, k) = (delete!(d.raw, k); d)
 Base.empty!(d::_MemoValues) = (empty!(d.raw); d)
 Base.pop!(d::_MemoValues, k) = _unwrap_memo(pop!(d.raw, k))
 Base.pop!(d::_MemoValues, k, default) = _unwrap_memo(pop!(d.raw, k, default))
-function Base.iterate(d::_MemoValues, state...)
+function Base.iterate(d::_MemoValues{K,V}, state...) where {K,V}
     entry = iterate(d.raw, state...)
     entry === nothing && return nothing
     (k, v), next = entry
-    (k => _unwrap_memo(v), next)
+    # Keep the dictionary's pair type across entries in heterogeneous stores.
+    (Pair{K,V}(k, _unwrap_memo(v)), next)
 end
 
 # These ordered indexes hold neither a key, a cache nor its value. The third
