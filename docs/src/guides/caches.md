@@ -100,6 +100,26 @@ type keep their default lifetime. Releasing a slot drops one reference.
 Callers can continue using their own references, and the model's finalizer
 can run after its last owner releases it.
 
+A package can declare a type it owns once, for every property that returns
+it. That covers inline `@struct` children and objects that store a copy.
+
+```@example caches
+struct CompiledPattern
+    regex::Regex
+end
+DynamicObjects.memo_native_bytes(::CompiledPattern) = missing
+nothing # hide
+```
+
+A property declaration takes precedence over the declaration of its result
+type. Returning `nothing` there keeps that one property in memory. For a
+property declaration on an inline child, `tree_children_map(Parent)` returns
+the child's type.
+
+A property with no declaration that returns the same mutable object as a
+declared slot is released with it. A kept copy would hold the resource while
+the next read of its producer builds a second one.
+
 `memo_retention_stats(DynamicObjects.job_queue())` reports separate requester
 and worker counts, estimated slot payloads, known mapping sizes, and current
 heap and process measurements. `process_memory_bytes` is `nothing` when

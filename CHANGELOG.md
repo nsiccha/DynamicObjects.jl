@@ -14,6 +14,20 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.38
+
+- A package can declare a type it owns as a rebuildable native result once,
+  with the one-argument method `DynamicObjects.memo_native_bytes(::T)`. The
+  declaration covers every property that returns the type, in any owner,
+  including inline `@struct` children and objects that store a copy.
+- A three-argument declaration for one property takes precedence over the
+  declaration of its result type. Returning `nothing` there keeps that
+  property in memory.
+- A property without a declaration that returns the same mutable object as a
+  declared slot is released with it. Before, the copy kept the resource alive
+  after its producer's slot was released, and the next read of the producer
+  built a second instance.
+
 ## 0.5.37
 
 - When releasing cold cache entries barely reduces the process footprint,

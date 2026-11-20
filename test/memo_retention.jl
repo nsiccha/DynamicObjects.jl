@@ -12,7 +12,8 @@ end
 end
 
 @testitem "process footprint and native cache ownership" tags=[:core] begin
-    cases = [("process_memory.jl", String[]), ("native_retention.jl", String[])]
+    cases = [("process_memory.jl", String[]), ("native_retention.jl", String[]),
+             ("native_declarations.jl", String[])]
     # A fresh allocator makes the growth case independent of pages kept
     # after the lifetime case freed its own buffers.
     if Sys.islinux() || Sys.isapple()
