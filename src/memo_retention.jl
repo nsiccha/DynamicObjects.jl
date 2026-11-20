@@ -194,18 +194,57 @@ _memo_bytes(v::String) = ncodeunits(v)
 _memo_bytes(v::Array) = sizeof(v)
 
 """
-    DynamicObjects.memo_native_bytes(owner_type, ::Val{property}, value)
+    DynamicObjects.memo_native_bytes(owner_type, ::Val{property}, value::T)
+    DynamicObjects.memo_native_bytes(value::T)
 
-Declare that this property's body can safely rebuild a native result after its
-cache slot is released. Specialize on the owner type, property and result type.
+Declare that a native result can be rebuilt after its cache slot is released.
 Return an estimated native byte count (a nonnegative `Int`), or `missing` when
 the size is unknown. The default `nothing` preserves native-handle pinning.
+
+The three-argument method declares one property: specialize on the owner type,
+the property and the result type `T`. The one-argument method declares a type
+that your package owns, for every property that returns it in any owner,
+inline `@struct` children included. A property declaration takes precedence
+over the declaration of its result type, also when it returns `nothing`.
+
+A property without either declaration that returns the same mutable object as
+a declared slot is released with that object's estimate. A kept copy would
+retain the resource while a later read of its producer builds a second one.
+
 The method runs at publication and should only inspect the result. The producer
 is responsible for replaying the correct inputs, including any seed or file.
 A disk-cached producer must also support restoring a valid live resource.
 DynamicObjects drops its reference and leaves resource finalization to the owner.
 """
-memo_native_bytes(owner_type, property, value) = nothing
+memo_native_bytes(owner_type, property, value) = _undeclared_native_bytes(value)
+memo_native_bytes(value) = nothing
+
+# Objects that a declaration made releasable, by identity and held weakly.
+# Only mutable objects have an identity that costs nothing to compare. Each
+# addition also visits two old entries, as _MEMO_SWEEP does for its tickets.
+const _DECLARED_NATIVE = OrderedDict{UInt,Tuple{WeakRef,Union{Missing,Int}}}()
+
+function _remember_native!(v, bytes)
+    ismutable(v) || return
+    lock(_MEMO_LOCK) do
+        for _ in 1:min(2, length(_DECLARED_NATIVE))
+            id, entry = popfirst!(_DECLARED_NATIVE)
+            entry[1].value === nothing || (_DECLARED_NATIVE[id] = entry)
+        end
+        _DECLARED_NATIVE[objectid(v)] = (WeakRef(v), bytes)
+    end
+    nothing
+end
+
+# A property declaration never reaches this fallback, so its `nothing` holds.
+function _undeclared_native_bytes(v)
+    bytes = memo_native_bytes(v)
+    (bytes === nothing && ismutable(v)) || return bytes
+    lock(_MEMO_LOCK) do
+        entry = get(_DECLARED_NATIVE, objectid(v), nothing)
+        entry !== nothing && entry[1].value === v ? entry[2] : nothing
+    end
+end
 
 function _publication_native_bytes(c, key, f, v)
     _memo_retention_enabled() && f isa _Settling || return nothing
@@ -228,6 +267,7 @@ function _register_publication!(c, key, latch, f, v, native_bytes)
     eligible || return
     store = _scope_dict(c.cache, key)
     store isa _MemoValues{<:Any,Any} || return
+    native_bytes === nothing || _remember_native!(v, native_bytes)
     m = _RetainedMemo(v, store, key, f.name, _scope_dict(c.computing, key),
                       _scope_dict(c.status, key), c.lock, latch, native_bytes, 0, latch.stamp !== nothing)
     store.raw[key] = m
