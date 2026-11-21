@@ -14,6 +14,23 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.40
+
+- Release under an explicit heap hint is decided on live data. Each process
+  compares the hint with the live heap a full collection measured. Before, it
+  compared it with `Base.gc_live_bytes()`, which also counts everything
+  allocated since the last collection and, between full collections, old
+  objects that have since died, so it released results every 50 ms on a
+  reading that the next collection would have taken under the trigger. When
+  Julia's own estimate (what its last collection kept) passes 90% of the hint
+  and no full collection has measured it since, the process runs one with
+  `GC.gc(true)`. Julia's own full collections count as measurements. One
+  measurement decides at most one batch. After a measurement that found no
+  pressure or released nothing, the next waits until Julia's estimate exceeds
+  it by a tenth of the hint.
+- `memo_retention_stats()` reports `full_collections`, the full collections the
+  process ran to decide releases.
+
 ## 0.5.39
 
 - `materialization_observation(view, :property, arguments...)` on a `remount`

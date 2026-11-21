@@ -33,6 +33,12 @@ end
     @test success(pipeline(cmd; stdout, stderr))
 end
 
+@testitem "heap releases follow measured live data" tags=[:core] begin
+    script = joinpath(@__DIR__, "fixtures", "heap_measurement.jl")
+    cmd = `$(first(Base.julia_cmd().exec)) --startup-file=no --project=$(Base.active_project()) --threads=2 $script`
+    @test success(pipeline(cmd; stdout, stderr))
+end
+
 @testitem "retention order, delivery, ownership and byte accounting" tags=[:core] begin
 script = joinpath(@__DIR__, "fixtures", "memo_retention_order.jl")
 @test success(`$(first(Base.julia_cmd().exec)) --startup-file=no --project=$(Base.active_project()) --threads=2 --heap-size-hint=8G $script`)

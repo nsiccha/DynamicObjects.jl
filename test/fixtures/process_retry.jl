@@ -75,7 +75,8 @@ end
     @test retry.delay_ns == 20_000_000_000
 
     # Real heap pressure can release a batch during the process cooldown,
-    # without forcing a full collection or altering the retry schedule.
+    # decided on its own measuring collection, without a footprint sample
+    # or a change to the retry schedule.
     DO._HEAP_HINT[] = 1
     check!(hit, 250MiB)
     @test releases() > before + 16

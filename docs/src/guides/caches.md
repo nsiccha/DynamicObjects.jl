@@ -54,8 +54,19 @@ for the object's lifetime.
 
 When either measurement reaches 90% of its budget, reads and publications can
 release up to 16 cold derived entries toward an 80% target. The most recently
-used eligible result stays warm. After a batch driven by process pressure,
-DynamicObjects collects garbage and rechecks the footprint. A batch should
+used eligible result stays warm.
+
+The heap measurement is the live heap a full collection leaves. Julia's own
+estimate counts what its last collection kept, and between full collections
+that includes objects that have since died. When that estimate passes the
+trigger and no full collection has measured the heap since, DynamicObjects
+runs one first. A full collection that Julia runs on its own counts as a
+measurement. One measurement decides at most one batch. After a measurement
+that found no pressure or released nothing, the next waits until Julia's
+estimate exceeds it by a tenth of the hint.
+
+After a batch driven by process pressure, DynamicObjects collects garbage and
+rechecks the footprint. A batch should
 close at least 5% of the gap to the target, or take the footprint below the
 90% trigger. Successive batches must also show this progress between their
 post-collection readings, since temporary allocations can grow back between
@@ -126,6 +137,8 @@ heap and process measurements. `process_memory_bytes` is `nothing` when
 unavailable. `estimated_native_bytes` sums declared estimates and
 `unknown_native_slots` counts releases without a size estimate. Two slots
 that reference the same value each contribute when released.
+`full_collections` counts the full collections the process ran to decide
+releases.
 
 With zero or one configured worker, read `stats.worker`. With two or more,
 read `stats.workers` in queue slot order. Each live snapshot includes its PID.
