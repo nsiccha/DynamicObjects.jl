@@ -760,6 +760,7 @@ recomputed rather than served.
     @test DynamicObjects._automatic_materialization_metadata(
         path).value_type === Vector{Float64}
     clear_mem_caches!(object)
+    @test materialization_state(object, :plain, 1) === :stored
     @test execute_materialization(context, object, :plain, 1) isa Vector{Float64}
     @test GOVERNED_POLICY_CALLS[] == 2
 end

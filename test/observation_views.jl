@@ -6,7 +6,7 @@ using TestItemRunner
 # (snag `do-use-is-cached-240dfced`).
 @testmodule ObservationViewFixtures begin
 using DynamicObjects
-export ObservedViewApp, OBSERVED_GATE
+export ObservedViewApp, OBSERVED_GATE, SizeProbe, StateProbeApp
 
 const OBSERVED_GATE = Ref{Any}(nothing)
 _observed_opaque(app, n) = n * 100
@@ -22,7 +22,23 @@ _observed_opaque_context(app, n) = (app.ctx, n)
     @cached stored(n) = base * n
     slow(n) = (take!(OBSERVED_GATE[]); n)
     gate_is_cached(doses) = [@is_cached(__self__.stage(d, -50.0)) for d in doses]
-    gate_observed(doses) = [materialization_observation(__self__, :stage, d, -50.0).state for d in doses]
+    gate_observed(doses) = [materialization_state(__self__, :stage, d, -50.0) for d in doses]
+end
+
+struct SizeProbe
+    calls::Base.RefValue{Int}
+end
+function Base.summarysize(probe::SizeProbe)
+    probe.calls[] += 1
+    123
+end
+
+@dynamicstruct struct StateProbeApp
+    payload::SizeProbe
+    scalar = payload
+    item(n; bytes) = bytes ? payload : nothing
+    broken(n) = error("failed to compute")
+    @fresh preview() = 1
 end
 end
 
@@ -50,19 +66,28 @@ end
     # A disk-backed entry answers both, and stays stored after a memory clear.
     @test o.stored(3) == 6.0
     @test @is_cached(o.stored(3))
-    @test materialization_observation(o, :stored, 3).state === :ready
+    @test materialization_state(o, :stored, 3) === materialization_observation(o, :stored, 3).state === :ready
     clear_mem_caches!(o)
     @test @is_cached(o.stored(3))
     cleared = materialization_observation(o, :stored, 3)
     @test cleared.state === :stored
+    @test materialization_state(o, :stored, 3) === cleared.state
     @test !cleared.ready
     @test cleared.stored
     @test materialization_observation(o, :stage, 1.0, -50.0).state === :unmaterialized
+
+    # An interrupted write leaves an empty disk entry.
+    write(cleared.path, "")
+    @test materialization_state(o, :stored, 3) === materialization_observation(o, :stored, 3).state === :stored_partial
 end
 
 @testitem "materialization_observation on a remount view reads where the view would" tags=[:semantic] setup=[ObservationViewFixtures] begin
     using DynamicObjects
-    observed(o, name, args...) = materialization_observation(o, name, args...).state
+    function observed(o, name, args...)
+        state = materialization_state(o, name, args...)
+        @test state === materialization_observation(o, name, args...).state
+        state
+    end
     wrapper(view, name) = DynamicObjects._cache_snapshot(getfield(view, :cache).cache, name).state
 
     o = ObservedViewApp(2.0)
@@ -109,4 +134,31 @@ end
     put!(gate, nothing)
     @test fetch(pending) == 1
     @test observed(remount(o; ctx = 6), :slow, 1) === :ready
+end
+
+@testitem "materialization_state skips sizing and forwards property keywords" tags=[:semantic] setup=[ObservationViewFixtures] begin
+    using DynamicObjects
+    probe = SizeProbe(Ref(0))
+    o = StateProbeApp(probe; __cache_base__=mktempdir())
+    @test materialization_state(o, :payload) === :ready
+    @test materialization_state(o, :scalar) === :unmaterialized
+    @test materialization_state(o, :item, 1; bytes=true) === :unmaterialized
+    @test o.scalar === o.item(1; bytes=true) === probe
+    @test materialization_state(o, :scalar) === :ready
+    @test materialization_state(o, :item, 1; bytes=false) === :unmaterialized
+    @test o.item(1; bytes=false) === nothing
+    @test materialization_state(o, :item, 1; bytes=false) === :ready
+    @test all(_ -> materialization_state(o, :item, 1; bytes=true) === :ready, 1:54)
+    @test probe.calls[] == 0
+    observation = materialization_observation(o, :item, 1; bytes=true)
+    @test observation.state === :ready
+    @test observation.estimated_bytes == 123
+    @test probe.calls[] == 1
+
+    @test materialization_state(o, :preview) === materialization_observation(o, :preview).state === :fresh
+    @test_throws DynamicObjects.PropertyComputationError o.broken(2)
+    @test materialization_state(o, :broken, 2) === materialization_observation(o, :broken, 2).state === :failed
+    @test_throws ErrorException materialization_state(o, :unknown)
+    @test_throws ErrorException materialization_state(o, :payload, 1)
+    @test_throws ErrorException materialization_state(o, :scalar; bytes=true)
 end

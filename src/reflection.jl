@@ -482,16 +482,22 @@ _progress_mode(macros) =
 property_descriptor(T::Type, prop::Symbol, info::NamedTuple) =
     property_descriptor(_DeclarationAnalysis(T), prop, info)
 
+# The state query needs only these declaration flags, even when a property's
+# full descriptor describes many transitive inputs.
+function _materialization_flags(info)
+    macros = get(info, :macros, ())
+    (;fixed=isnothing(get(info, :rhs, nothing)),
+        indexed=get(info, :indexed, !isempty(get(info, :indices, ()))),
+        fresh=Symbol("@fresh") in macros, cached=Symbol("@cached") in macros,
+        mmap=Symbol("@mmap") in macros)
+end
+
 function property_descriptor(analysis::_DeclarationAnalysis, prop::Symbol, info::NamedTuple)
     T = analysis.type
     mod = parentmodule(T)
-    fixed = isnothing(get(info, :rhs, nothing))
-    indexed = get(info, :indexed, !isempty(get(info, :indices, ())))
+    (;fixed, indexed, fresh, cached, mmap) = _materialization_flags(info)
     macros = get(info, :macros, Set{Symbol}())
-    fresh = Symbol("@fresh") in macros
     state = Symbol("@state") in macros
-    cached = Symbol("@cached") in macros
-    mmap = Symbol("@mmap") in macros
     declared_versioned = Symbol("@versioned") in macros
     version_dependencies = copy(analysis.versions)
     versioned = has_versioned_fields(T) || !isempty(version_dependencies)
@@ -1539,8 +1545,7 @@ function _automatic_materialization_metadata(cache_path::AbstractString)
     metadata
 end
 
-function _disk_observation(o, descriptor::NamedTuple, name::Symbol, args, kwargs::NamedTuple)
-    semantics = descriptor.semantics
+function _disk_observation(o, semantics::NamedTuple, name::Symbol, args, kwargs::NamedTuple)
     path = get_cache_path(o, name, args...; kwargs...)
     automatic = _automatic_materialization_metadata(path)
     (semantics.cached || semantics.mmap || automatic !== nothing) ||
@@ -1550,11 +1555,37 @@ function _disk_observation(o, descriptor::NamedTuple, name::Symbol, args, kwargs
     (;state=get_cache_status(path), path, format)
 end
 
-_observation_state(memory, disk, fresh) =
-    memory.state !== :unmaterialized ? memory.state :
+function _observation_state(read_disk, memory, fresh)
+    memory.state === :unmaterialized || return memory.state
+    disk = read_disk()
     disk.state === :ready ? :stored :
     disk.state === :started ? :stored_partial :
     fresh ? :fresh : :unmaterialized
+end
+
+"""
+    materialization_state(object, property::Symbol, args...; kwargs...) -> Symbol
+
+Return the same state as [`materialization_observation`](@ref) for this call
+without computing the property, waiting for pending work, or sizing its value.
+Use this to decide whether a request needs to start work.
+
+A memory entry determines `:ready`, `:pending`, or `:failed` immediately.
+Otherwise the disk entry and declaration determine `:stored`, `:stored_partial`,
+`:fresh`, or `:unmaterialized`. Indexed calls on a [`remount`](@ref) view
+look in the same cache as the view's next read.
+"""
+function materialization_state(o, name::Symbol, args...; kwargs...)
+    T = typeof(o)
+    info = applicable(meta, T) ? metafirst(T, name) : nothing
+    info === nothing && error("$T has no DynamicObjects property `$name`")
+    flags = _materialization_flags(info)
+    property_kwargs = (;kwargs...)
+    memory = _memory_observation(o, flags, name, args, property_kwargs)
+    _observation_state(memory, flags.fresh) do
+        _disk_observation(o, flags, name, args, property_kwargs)
+    end
+end
 
 """
     materialization_observation(object, property::Symbol, args...; kwargs...)
@@ -1565,14 +1596,17 @@ DO cache path and inspects the file; it never creates or loads the target file.
 On a [`remount`](@ref) view, an indexed entry is observed where the view's next
 read would find it, so an entry the retained object or another view computed
 reads `:ready` before this view has read the property.
+For a ready value the observation includes its estimated byte size, which can
+require traversing the value. Use [`materialization_state`](@ref) when only
+the state is needed.
 """
 function materialization_observation(o, name::Symbol, args...; kwargs...)
     descriptor = property_descriptor(typeof(o), name)
     descriptor === nothing && error("$(typeof(o)) has no DynamicObjects property `$name`")
     property_kwargs = (;kwargs...)
     memory = _memory_observation(o, descriptor, name, args, property_kwargs)
-    disk = _disk_observation(o, descriptor, name, args, property_kwargs)
-    state = _observation_state(memory, disk, descriptor.semantics.fresh)
+    disk = _disk_observation(o, descriptor.semantics, name, args, property_kwargs)
+    state = _observation_state(() -> disk, memory, descriptor.semantics.fresh)
     value_type = memory.has_value ? typeof(memory.value) : descriptor.output.type
     (;
         name,

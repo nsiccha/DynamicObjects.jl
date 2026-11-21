@@ -3780,8 +3780,7 @@ Return whether the selected disk entry is ready, equivalent to comparing
 [`@cache_status`](@ref) with `:ready`. This is not a test for an in-memory hit:
 it stays `false` for a property that is not stored on disk, however often it
 was computed. To ask whether an entry is in memory, computing or on disk, read
-`materialization_observation(object, :property, arguments...).state` (see
-[`materialization_observation`](@ref)), which computes nothing either.
+[`materialization_state`](@ref) with the object, property name, and arguments.
 Inside a `@dynamicstruct` body the object prefix may be omitted.
 """
 macro is_cached(x)
@@ -8569,7 +8568,7 @@ export static_domain, property_descriptor, property_descriptors, type_descriptor
     option_domain, option_records
 export declaration_metadata, declaration_graph, declaration_selection, declaration_node_id,
     declaration_observations
-export materialization_observation
+export materialization_observation, materialization_state
 export with_compute_trace, ComputeTrace, compute_trace_rows
 export execute_materialization, release_materialization!, materialization_ownership, materialization_gc!
 export TrackedFile, TrackedDirectory, tracked_version, tracked_path, tracked_paths,
