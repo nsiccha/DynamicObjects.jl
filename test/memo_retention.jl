@@ -39,6 +39,16 @@ end
     @test success(pipeline(cmd; stdout, stderr))
 end
 
+@testitem "footprint batches cover the excess and return the pages they free" tags=[:core] begin
+    for fixture in ("process_batch.jl", "process_pages.jl")
+        script = joinpath(@__DIR__, "fixtures", fixture)
+        cmd = `$(first(Base.julia_cmd().exec)) --startup-file=no --project=$(Base.active_project()) $script`
+        # A budget at publication makes results releasable; each script sets its own.
+        cmd = addenv(cmd, "DYNAMICOBJECTS_PROCESS_BUDGET_BYTES" => string(8 * 1024^3))
+        @test success(pipeline(cmd; stdout, stderr))
+    end
+end
+
 @testitem "retention order, delivery, ownership and byte accounting" tags=[:core] begin
 script = joinpath(@__DIR__, "fixtures", "memo_retention_order.jl")
 @test success(`$(first(Base.julia_cmd().exec)) --startup-file=no --project=$(Base.active_project()) --threads=2 --heap-size-hint=8G $script`)

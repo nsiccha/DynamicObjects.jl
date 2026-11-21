@@ -46,3 +46,24 @@ elseif Sys.islinux()
 else
     _process_memory_bytes() = nothing
 end
+
+# glibc keeps memory that `free` returned in its arenas. Julia's collector
+# trims them only when the peak resident set grew by a quarter since its last
+# trim, so once a process has peaked, released results stay resident and the
+# footprint check measures memory the process no longer uses. The symbol is
+# looked up at load: other C libraries (musl) have no such call.
+const _MALLOC_TRIM = Ref(C_NULL)
+function _init_malloc_trim!()
+    Sys.islinux() || return
+    libc = Base.Libc.Libdl.dlopen_e("libc.so.6")
+    libc == C_NULL || (_MALLOC_TRIM[] = Base.Libc.Libdl.dlsym_e(libc, :malloc_trim))
+    nothing
+end
+function _return_free_memory!()
+    f = _MALLOC_TRIM[]
+    f == C_NULL || ccall(f, Cint, (Csize_t,), 0)
+    nothing
+end
+# Where freed pages are returned, the footprint read after a collection shows
+# what a release freed. Elsewhere (macOS) that is not measured yet.
+_footprint_follows_releases() = _MALLOC_TRIM[] != C_NULL
