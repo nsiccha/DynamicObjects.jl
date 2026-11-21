@@ -85,6 +85,23 @@ end
 const _PROCESS_RETRY = _ProcessTrimRetry(0, 0, 0, 0)
 _memo_retention_enabled() = _HEAP_HINT[] != 0 || _PROCESS_BUDGET[] != 0
 
+# Julia's heap estimate is what its last collection kept; between full
+# collections that still counts old objects that have died since. Releases
+# under heap pressure are decided on a full collection's measurement, Julia's
+# own or one DynamicObjects runs, and one measurement decides at most one
+# batch. Only the task holding _TRIMMING_MEMOS reads or writes this.
+mutable struct _HeapMeasurement
+    seen::Tuple{Int,Int} # (collections, full collections) at the last look
+    pauses::Int     # collections counted right after the last measurement
+    live::Int       # the live heap it found
+    pending::Bool   # no batch has been decided on it yet
+    relieved::Bool  # its batch released results: measure again after the next collection
+end
+const _HEAP_MEASURE = _HeapMeasurement((0, 0), -1, 0, false, false)
+const _FULL_COLLECTIONS = Threads.Atomic{Int}(0)
+_collected_heap_bytes() = Int(ccall(:jl_gc_live_bytes, Int64, ()))
+_gc_counts() = (n = Base.gc_num(); (Int(n.pause), Int(n.full_sweep)))
+
 # Recency across all slots also supplies the fallback order for a disk file
 # that disappeared or was replaced. Its original read age still applies.
 function _forget_ticket!(ticket)
@@ -433,6 +450,47 @@ function _record_process_relief!(excess, after, budget, now)
     nothing
 end
 
+function _record_heap_measurement!(counts, live)
+    m = _HEAP_MEASURE
+    m.seen = counts
+    m.pauses = first(counts)
+    m.live = live
+    m.pending = true
+    m.relieved = false
+    nothing
+end
+
+function _measure_heap!()
+    GC.gc(true)
+    Threads.atomic_add!(_FULL_COLLECTIONS, 1)
+    _record_heap_measurement!(_gc_counts(), _collected_heap_bytes())
+end
+
+function _sample_heap_excess!(hint)
+    hint == 0 && return 0
+    m = _HEAP_MEASURE
+    counts = _gc_counts()
+    # Allocations since the last collection count once a collection keeps them.
+    collected = _collected_heap_bytes()
+    collections, full = counts .- m.seen
+    m.seen = counts
+    # Every collection since the last look was full: the estimate is live data.
+    collections > 0 && full == collections && _record_heap_measurement!(counts, collected)
+    if first(counts) != m.pauses
+        _memo_excess(collected, hint) == 0 && return 0
+        # When the last measurement released nothing, measure again only once
+        # the estimate has grown by a tenth of the hint over it: objects that
+        # die in the old generation then cost one full collection per step,
+        # not one per collection Julia runs.
+        m.relieved || m.pending || collected >= m.live + Int(hint ÷ 10) || return 0
+        _measure_heap!()
+    elseif !m.pending
+        return 0 # nothing has collected the batch this measurement decided
+    end
+    m.pending = false
+    _memo_excess(m.live, hint)
+end
+
 function _check_memo_pressure!(large_store=false)
     now = time_ns()
     deadline = _NEXT_MEMO_CHECK[]
@@ -444,14 +502,16 @@ function _check_memo_pressure!(large_store=false)
     end
     Threads.atomic_cas!(_TRIMMING_MEMOS, false, true) && return
     try
-        heap_excess = _memo_excess(Base.gc_live_bytes(), _HEAP_HINT[])
+        heap_excess = _sample_heap_excess!(_HEAP_HINT[])
         budget = _PROCESS_BUDGET[]
         process_excess = _sample_process_excess!(budget, now)
         max(heap_excess, process_excess) > 0 || return
         released = _trim_memos!(heap_excess, process_excess)
+        heap_excess > 0 && (_HEAP_MEASURE.relieved = released > 0)
         if process_excess > 0 && released > 0
             # Native finalizers may run only once the last alias disappears.
-            GC.gc(true)
+            # The collection also measures the heap for the next decision.
+            _measure_heap!()
             after = _process_memory_bytes()
             _record_process_relief!(process_excess, after, budget, time_ns())
         end
@@ -472,6 +532,9 @@ cumulative automatic memo releases in the disk and memory tiers.
 contribute to several slots and other owners may still hold the value.
 `estimated_native_bytes` sums producer estimates, and `unknown_native_slots`
 counts released native results for which the producer supplied no estimate.
+`full_collections` counts the full collections this process ran to decide
+releases: one measures the live heap before a heap-pressure batch, and one
+follows each footprint-driven batch.
 For a queue configured with zero or one worker, the result is `(; requester, worker)`.
 `worker` is `nothing` when the process is absent. For a pool, the result is
 `(; requester, workers)` with a snapshot per configured slot, in slot order.
@@ -480,7 +543,8 @@ A slot without a live process contains `nothing`. Reading statistics leaves idle
 function memo_retention_stats()
     counts = lock(() -> _MEMO_EVICTED[], _MEMO_LOCK)
     (; pid=getpid(), heap_hint_bytes=_HEAP_HINT[], live_heap_bytes=Base.gc_live_bytes(),
-       process_budget_bytes=_PROCESS_BUDGET[], process_memory_bytes=_process_memory_bytes(), counts...)
+       process_budget_bytes=_PROCESS_BUDGET[], process_memory_bytes=_process_memory_bytes(), counts...,
+       full_collections=_FULL_COLLECTIONS[])
 end
 
 function __init__()
