@@ -72,13 +72,13 @@ close at least 5% of the gap to the target, or take the footprint below the
 post-collection readings, since temporary allocations can grow back between
 collections.
 
-When a batch gives less relief, the next process-driven release waits for
-five seconds. Repeated delays double up to five minutes. Ordinary cache
-access still samples the footprint during the wait. A reading below the
-trigger clears the delay. Newly eligible cache entries whose estimated bytes
-together cover 5% of the remaining gap allow an earlier retry. A successful
-batch restores the usual cadence. Julia heap pressure can release entries
-throughout the wait.
+After a batch gives less relief, the next process-driven release waits five
+seconds, doubling up to five minutes. A reading below the trigger, a
+successful batch, or new entries estimated at 5% of the remaining gap end the
+wait. Heap pressure can still release entries. On Linux with glibc,
+`malloc_trim(0)` follows that collection so the reading shows what was freed,
+and when the cold results' estimates cover the excess, a batch releases up to
+1,024 of them instead of 16.
 
 DynamicObjects first releases cold results that can reload from their
 `@cached` or `@mmap` file. It then releases the least recently read eligible

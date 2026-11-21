@@ -14,6 +14,23 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.41
+
+- On Linux with glibc, the footprint trigger calls `malloc_trim(0)` after the
+  collection that follows a released batch, before it reads the footprint
+  again. Julia's collector returns freed memory to the system only when the
+  peak resident set has grown by a quarter since its last trim, so once a
+  process had peaked, released results stayed resident, every batch read as
+  ineffective, and the 0.5.37 backoff stopped releasing while the process
+  stayed over `DYNAMICOBJECTS_PROCESS_BUDGET_BYTES`.
+- Where that trim is available and the estimated sizes of the cold cached
+  results cover the excess over the 80% target, a footprint-driven batch
+  releases enough results to cover it, up to 1,024, instead of 16. A batch
+  still releases at most 16 results without a size estimate. When the cold
+  results cannot cover the excess, batches stay at 16 with the 0.5.37 backoff,
+  which keeps the cache of a process whose footprint is mostly memory the
+  cache does not own. macOS keeps 16-result batches.
+
 ## 0.5.40
 
 - Release under an explicit heap hint is decided on live data. Each process

@@ -386,17 +386,49 @@ function _release_coldest_memo!()
     end
 end
 
-function _trim_memos!(heap_excess, process_excess=0; batch=16)
-    released = 0
-    for _ in 1:batch
-        (heap_excess > 0 || process_excess > 0) || break
+# A batch releases at most _HEAP_BATCH results. A footprint batch is followed
+# by a full collection and judged against the whole gap, so where that can work
+# it keeps releasing while the estimates of what it released fall short of the
+# process excess, up to _PROCESS_BATCH[] results: the cold results' estimates
+# must cover the excess, and the reading after the collection must show what
+# they freed. Otherwise the backoff protects a cache that cannot reach the
+# budget, as for memory the cache does not own. Results without an estimate
+# stay limited to _HEAP_BATCH: only the collection can show what they held.
+const _HEAP_BATCH = 16
+const _PROCESS_BATCH = Ref(1024)
+
+_memo_estimate(m) = (m.latch.mapped ? 0 : _memo_bytes(m.value)) +
+                    (m.native_bytes isa Int ? m.native_bytes : 0)
+
+# One pass over the recency order, stopping once the estimates cover `excess`.
+function _cold_estimates_cover(excess)
+    lock(_MEMO_LOCK) do
+        covered = 0
+        for (ticket, ref) in _MEMO_RECENT
+            m = ref.value
+            (m === nothing || ticket == _MOST_RECENT_MEMO[]) && continue
+            covered += _memo_estimate(m)
+            covered >= excess && return true
+        end
+        false
+    end
+end
+
+_process_batch(excess) = excess > 0 && _footprint_follows_releases() &&
+    _cold_estimates_cover(excess) ? _PROCESS_BATCH[] : _HEAP_BATCH
+
+function _trim_memos!(heap_excess, process_excess=0; batch=_HEAP_BATCH, process_batch=batch)
+    released = unsized = 0
+    for i in 1:max(batch, process_batch)
+        (i <= batch && heap_excess > 0 || process_excess > 0) || break
         bytes = _release_coldest_memo!()
         bytes === nothing && break
         bytes === 0 && continue # stale, ineligible or demoted ticket
         released += 1
         heap_excess -= min(heap_excess, bytes.heap)
-        process_excess -= min(process_excess, bytes.heap)
-        process_excess -= min(process_excess, bytes.native)
+        estimate = bytes.heap + bytes.native
+        process_excess -= min(process_excess, estimate)
+        estimate == 0 && (unsized += 1) >= batch && break
     end
     released
 end
@@ -506,12 +538,13 @@ function _check_memo_pressure!(large_store=false)
         budget = _PROCESS_BUDGET[]
         process_excess = _sample_process_excess!(budget, now)
         max(heap_excess, process_excess) > 0 || return
-        released = _trim_memos!(heap_excess, process_excess)
+        released = _trim_memos!(heap_excess, process_excess; process_batch=_process_batch(process_excess))
         heap_excess > 0 && (_HEAP_MEASURE.relieved = released > 0)
         if process_excess > 0 && released > 0
             # Native finalizers may run only once the last alias disappears.
             # The collection also measures the heap for the next decision.
             _measure_heap!()
+            _return_free_memory!()
             after = _process_memory_bytes()
             _record_process_relief!(process_excess, after, budget, time_ns())
         end
@@ -548,6 +581,7 @@ function memo_retention_stats()
 end
 
 function __init__()
+    _init_malloc_trim!()
     _HEAP_HINT[] = Base.JLOptions().heap_size_hint
     budget = get(ENV, "DYNAMICOBJECTS_PROCESS_BUDGET_BYTES", nothing)
     if budget === nothing
