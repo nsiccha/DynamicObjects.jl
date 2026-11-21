@@ -14,6 +14,18 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.39
+
+- `materialization_observation(view, :property, arguments...)` on a `remount`
+  view reports an indexed entry where the view's next read would find it. An
+  entry the retained object or another view computed now reads `:ready`
+  (`:pending` while it computes) before this view has read the property. Before,
+  a fresh request view reported `:unmaterialized` until it had read the
+  property, so a route that branched on the observation showed its "compute"
+  path for a value the retained root already held.
+- The `@is_cached` docstring says it reads the disk entry only and names
+  `materialization_observation(...).state` for an entry in memory.
+
 ## 0.5.38
 
 - A package can declare a type it owns as a rebuildable native result once,
