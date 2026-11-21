@@ -1457,12 +1457,43 @@ function _memory_observation(o, descriptor::NamedTuple, name::Symbol, args, kwar
     property_cache isa PropertyCache || return _empty_cache_snapshot()
     if descriptor.indexed
         outer = _cache_snapshot(property_cache.cache, name)
+        outer.state === :unmaterialized &&
+            return _unread_view_snapshot(property_cache.cache, descriptor, name, args, kwargs)
         outer.state === :ready || return outer
         outer.value isa IndexableProperty || return outer
-        return _cache_snapshot(outer.value.cache, _memo_key(Tuple(args), kwargs))
+        return _entry_snapshot(outer.value.cache, _memo_key(Tuple(args), kwargs))
     end
     (isempty(args) && isempty(kwargs)) || error("scalar property `$name` does not accept arguments")
     _cache_snapshot(property_cache.cache, name)
+end
+
+# An opaque key that read request context lives in the view's own dict from then
+# on, which is where its next read goes (`_opaque_get!`); the shared latch only
+# records that it failed there.
+_entry_snapshot(cache, key) = _cache_snapshot(cache, key)
+_entry_snapshot(oc::_OpaqueSubcache, key) =
+    _cache_snapshot(_ns_tainted(oc.ns, _taint_key(oc, key)) ? oc.local_dict : oc, key)
+
+# A remount view builds an indexed property's wrapper on its first read of the
+# property (`subcache` on a `MountedThreadsafeDict`), so until then the view's own
+# cache holds nothing for it, even when the retained object or another view has
+# computed the entry. Observe the entry where that first read would find it,
+# without building the wrapper: shared work in the retained object's subcache,
+# opaque work in the views' shared namespace unless that key read request context
+# (`_taint_key`), and nothing for a property this view computes on its own.
+_unread_view_snapshot(cache, descriptor, name, args, kwargs) = _empty_cache_snapshot()
+function _unread_view_snapshot(mounted::MountedThreadsafeDict, descriptor::NamedTuple,
+        name::Symbol, args, kwargs::NamedTuple)
+    if name in mounted.opaque
+        ns = mounted.namespace
+        ns === nothing && return _empty_cache_snapshot()
+        key = _memo_key(Tuple(args), kwargs)
+        shared = lock(() -> get(ns.subcaches, name, nothing), ns.lock)
+        (shared === nothing || _ns_tainted(ns, (name, key))) && return _empty_cache_snapshot()
+        return _cache_snapshot(shared, key)
+    end
+    name in mounted.invalidated && return _empty_cache_snapshot()
+    _memory_observation(mounted.source, descriptor, name, args, kwargs)
 end
 
 _observed_bytes(value::AbstractString) = ncodeunits(value)
@@ -1531,6 +1562,9 @@ _observation_state(memory, disk, fresh) =
 Observe a property's current memory/disk/pending/progress state without
 computing that property. For disk-backed properties this resolves the ordinary
 DO cache path and inspects the file; it never creates or loads the target file.
+On a [`remount`](@ref) view, an indexed entry is observed where the view's next
+read would find it, so an entry the retained object or another view computed
+reads `:ready` before this view has read the property.
 """
 function materialization_observation(o, name::Symbol, args...; kwargs...)
     descriptor = property_descriptor(typeof(o), name)

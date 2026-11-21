@@ -3777,7 +3777,11 @@ end
     @is_cached object.property(arguments...)
 
 Return whether the selected disk entry is ready, equivalent to comparing
-[`@cache_status`](@ref) with `:ready`. This is not a test for an in-memory hit.
+[`@cache_status`](@ref) with `:ready`. This is not a test for an in-memory hit:
+it stays `false` for a property that is not stored on disk, however often it
+was computed. To ask whether an entry is in memory, computing or on disk, read
+`materialization_observation(object, :property, arguments...).state` (see
+[`materialization_observation`](@ref)), which computes nothing either.
 Inside a `@dynamicstruct` body the object prefix may be omitted.
 """
 macro is_cached(x)
