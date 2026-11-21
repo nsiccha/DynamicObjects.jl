@@ -14,6 +14,16 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.43
+
+- Under an explicit heap hint, a process starts by releasing up to 16 cold
+  results and measures the change in live Julia heap. Later batches use the
+  observed bytes freed per slot to approach the 80% target, up to 1,024 slots
+  per batch. Ordinary cache access can continue trimming between Julia's own
+  full collections and while footprint-driven releases wait. When other
+  owners keep results alive and releases give little relief, heap-driven
+  retries back off.
+
 ## 0.5.42
 
 - `materialization_state(object, :property, args...; kwargs...)` returns the

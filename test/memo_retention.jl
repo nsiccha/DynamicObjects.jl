@@ -34,9 +34,11 @@ end
 end
 
 @testitem "heap releases follow measured live data" tags=[:core] begin
-    script = joinpath(@__DIR__, "fixtures", "heap_measurement.jl")
-    cmd = `$(first(Base.julia_cmd().exec)) --startup-file=no --project=$(Base.active_project()) --threads=2 $script`
-    @test success(pipeline(cmd; stdout, stderr))
+    for fixture in ("heap_measurement.jl", "heap_feedback.jl")
+        script = joinpath(@__DIR__, "fixtures", fixture)
+        cmd = `$(first(Base.julia_cmd().exec)) --startup-file=no --project=$(Base.active_project()) --threads=2 $script`
+        @test success(pipeline(cmd; stdout, stderr))
+    end
 end
 
 @testitem "footprint batches cover the excess and return the pages they free" tags=[:core] begin

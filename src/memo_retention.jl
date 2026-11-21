@@ -85,22 +85,28 @@ end
 const _PROCESS_RETRY = _ProcessTrimRetry(0, 0, 0, 0)
 _memo_retention_enabled() = _HEAP_HINT[] != 0 || _PROCESS_BUDGET[] != 0
 
-# Julia's heap estimate is what its last collection kept; between full
-# collections that still counts old objects that have died since. Releases
+# Julia's heap estimate includes allocations since its last collection. A
+# quick collection also counts old objects that have since died. Releases
 # under heap pressure are decided on a full collection's measurement, Julia's
 # own or one DynamicObjects runs, and one measurement decides at most one
 # batch. Only the task holding _TRIMMING_MEMOS reads or writes this.
 mutable struct _HeapMeasurement
     seen::Tuple{Int,Int} # (collections, full collections) at the last look
-    pauses::Int     # collections counted right after the last measurement
-    live::Int       # the live heap it found
-    pending::Bool   # no batch has been decided on it yet
-    relieved::Bool  # its batch released results: measure again after the next collection
+    pending::Union{Nothing,Int} # full measurement not yet used for a decision
+    live::Int                   # live heap at the last decision
+    batch::Int                  # slot limit for the next release
+    check_after::UInt64
+    delay_ns::UInt64            # backoff after little measured relief
+    retry_ticket::UInt          # eligible publications at the start of that wait
 end
-const _HEAP_MEASURE = _HeapMeasurement((0, 0), -1, 0, false, false)
+const _HEAP_BATCH = 16
+const _HEAP_MEASURE = _HeapMeasurement((0, 0), nothing, 0, _HEAP_BATCH, 0, 0, 0)
 const _FULL_COLLECTIONS = Threads.Atomic{Int}(0)
 _collected_heap_bytes() = Int(ccall(:jl_gc_live_bytes, Int64, ()))
-_gc_counts() = (n = Base.gc_num(); (Int(n.pause), Int(n.full_sweep)))
+function _gc_activity()
+    n = Base.gc_num()
+    (Int(n.pause), Int(n.full_sweep)), Int(n.allocd + n.deferred_alloc)
+end
 
 # Recency across all slots also supplies the fallback order for a disk file
 # that disappeared or was replaced. Its original read age still applies.
@@ -386,16 +392,11 @@ function _release_coldest_memo!()
     end
 end
 
-# A batch releases at most _HEAP_BATCH results. A footprint batch is followed
-# by a full collection and judged against the whole gap, so where that can work
-# it keeps releasing while the estimates of what it released fall short of the
-# process excess, up to _PROCESS_BATCH[] results: the cold results' estimates
-# must cover the excess, and the reading after the collection must show what
-# they freed. Otherwise the backoff protects a cache that cannot reach the
-# budget, as for memory the cache does not own. Results without an estimate
-# stay limited to _HEAP_BATCH: only the collection can show what they held.
-const _HEAP_BATCH = 16
-const _PROCESS_BATCH = Ref(1024)
+# Heap batches start small and grow on measured relief. The footprint path
+# uses producer estimates only where the cold cache can cover its excess.
+const _MAX_MEMO_BATCH = 1024
+const _PROCESS_BATCH = Ref(_MAX_MEMO_BATCH)
+const _MEMO_CHECK_NS = UInt64(50_000_000)
 
 _memo_estimate(m) = (m.latch.mapped ? 0 : _memo_bytes(m.value)) +
                     (m.native_bytes isa Int ? m.native_bytes : 0)
@@ -420,7 +421,7 @@ _process_batch(excess) = excess > 0 && _footprint_follows_releases() &&
 function _trim_memos!(heap_excess, process_excess=0; batch=_HEAP_BATCH, process_batch=batch)
     released = unsized = 0
     for i in 1:max(batch, process_batch)
-        (i <= batch && heap_excess > 0 || process_excess > 0) || break
+        (i <= batch && heap_excess > 0 || i <= process_batch && process_excess > 0) || break
         bytes = _release_coldest_memo!()
         bytes === nothing && break
         bytes === 0 && continue # stale, ineligible or demoted ticket
@@ -428,7 +429,9 @@ function _trim_memos!(heap_excess, process_excess=0; batch=_HEAP_BATCH, process_
         heap_excess -= min(heap_excess, bytes.heap)
         estimate = bytes.heap + bytes.native
         process_excess -= min(process_excess, estimate)
-        estimate == 0 && (unsized += 1) >= batch && break
+        if estimate == 0 && (unsized += 1) >= _HEAP_BATCH
+            process_excess = 0
+        end
     end
     released
 end
@@ -482,45 +485,83 @@ function _record_process_relief!(excess, after, budget, now)
     nothing
 end
 
-function _record_heap_measurement!(counts, live)
-    m = _HEAP_MEASURE
-    m.seen = counts
-    m.pauses = first(counts)
-    m.live = live
-    m.pending = true
-    m.relieved = false
-    nothing
-end
-
 function _measure_heap!()
+    before = Base.gc_num().pause
     GC.gc(true)
-    Threads.atomic_add!(_FULL_COLLECTIONS, 1)
-    _record_heap_measurement!(_gc_counts(), _collected_heap_bytes())
+    m = _HEAP_MEASURE
+    m.seen = first(_gc_activity())
+    # Julia can skip an explicit collection, e.g. while GC is disabled.
+    if Base.gc_num().pause == before
+        m.pending = nothing
+    else
+        Threads.atomic_add!(_FULL_COLLECTIONS, 1)
+        m.pending = _collected_heap_bytes()
+    end
 end
 
-function _sample_heap_excess!(hint)
+# Compare full measurements on either side of the release, before returning
+# to the caller: publications between checks can otherwise hide all its relief.
+function _record_heap_relief!(m, hint, after, released)
+    excess = _memo_excess(after, hint)
+    relief = m.live - after
+    m.live = after
+    m.batch = _HEAP_BATCH
+    if excess == 0
+        m.delay_ns = m.check_after = 0
+    elseif released > 0 && relief >= cld(excess, 256)
+        # Evicting the slot metadata alone can produce a small positive delta.
+        # Require measurable progress (1/256 of the remaining gap) to expand.
+        bytes_per_slot = max(1, relief ÷ released)
+        m.batch = min(cld(excess, bytes_per_slot), 4 * released, _MAX_MEMO_BATCH)
+        m.delay_ns = 0
+        m.check_after = time_ns() + _MEMO_CHECK_NS
+    else
+        m.delay_ns = clamp(2 * m.delay_ns, UInt64(5_000_000_000), UInt64(300_000_000_000))
+        m.check_after = time_ns() + m.delay_ns
+        m.retry_ticket = lock(() -> _MEMO_TICKET[], _MEMO_LOCK)
+    end
+end
+
+function _sample_heap_excess!(hint, now)
     hint == 0 && return 0
     m = _HEAP_MEASURE
-    counts = _gc_counts()
-    # Allocations since the last collection count once a collection keeps them.
+    counts, allocated = _gc_activity()
     collected = _collected_heap_bytes()
     collections, full = counts .- m.seen
     m.seen = counts
-    # Every collection since the last look was full: the estimate is live data.
-    collections > 0 && full == collections && _record_heap_measurement!(counts, collected)
-    if first(counts) != m.pauses
-        _memo_excess(collected, hint) == 0 && return 0
-        # When the last measurement released nothing, measure again only once
-        # the estimate has grown by a tenth of the hint over it: objects that
-        # die in the old generation then cost one full collection per step,
-        # not one per collection Julia runs.
-        m.relieved || m.pending || collected >= m.live + Int(hint ÷ 10) || return 0
-        _measure_heap!()
-    elseif !m.pending
-        return 0 # nothing has collected the batch this measurement decided
+    if collections > 0
+        m.pending = full == collections ? collected : nothing
     end
-    m.pending = false
-    _memo_excess(m.live, hint)
+    if m.pending !== nothing && _memo_excess(m.pending, hint) == 0
+        m.live = m.pending
+        m.batch = _HEAP_BATCH
+        m.delay_ns = m.check_after = 0
+        m.pending = nothing
+    end
+    step = max(1, Int(hint ÷ 10))
+    if now < m.check_after
+        # After a low-yield probe, transient allocations alone cannot earn
+        # another one. Require both growth kept by a GC and new eligible slots.
+        m.delay_ns > 0 && collected - m.live >= step || return 0
+        lock(() -> _MEMO_TICKET[] != m.retry_ticket, _MEMO_LOCK) || return 0
+    end
+    # A measurement may already be waiting, e.g. from a footprint batch.
+    # If substantial allocations followed it, establish a fresh baseline so
+    # they cannot hide the effect of dropping the next batch.
+    if m.pending === nothing || allocated >= cld(max(1, _memo_excess(m.pending, hint)), 256)
+        estimate = collected + allocated
+        _memo_excess(estimate, hint) > 0 || return 0
+        estimate - m.live >= step || m.check_after != 0 || m.pending !== nothing || return 0
+        _measure_heap!() === nothing && return 0
+    end
+    m.live = m.pending::Int
+    m.pending = nothing
+    excess = _memo_excess(m.live, hint)
+    if excess == 0
+        m.delay_ns = m.check_after = 0
+        m.batch = _HEAP_BATCH
+    end
+    excess
 end
 
 function _check_memo_pressure!(large_store=false)
@@ -530,20 +571,24 @@ function _check_memo_pressure!(large_store=false)
     # An eligible large publication checks immediately. Hits poll at most
     # once per interval, including when unrelated allocations cause pressure.
     if !large_store
-        Threads.atomic_cas!(_NEXT_MEMO_CHECK, deadline, now + 50_000_000) == deadline || return
+        Threads.atomic_cas!(_NEXT_MEMO_CHECK, deadline, now + _MEMO_CHECK_NS) == deadline || return
     end
     Threads.atomic_cas!(_TRIMMING_MEMOS, false, true) && return
     try
-        heap_excess = _sample_heap_excess!(_HEAP_HINT[])
+        hint = _HEAP_HINT[]
+        heap_excess = _sample_heap_excess!(hint, now)
         budget = _PROCESS_BUDGET[]
         process_excess = _sample_process_excess!(budget, now)
         max(heap_excess, process_excess) > 0 || return
-        released = _trim_memos!(heap_excess, process_excess; process_batch=_process_batch(process_excess))
-        heap_excess > 0 && (_HEAP_MEASURE.relieved = released > 0)
+        m = _HEAP_MEASURE
+        released = _trim_memos!(heap_excess, process_excess; batch=m.batch, process_batch=_process_batch(process_excess))
+        # One collection supplies both signals when the two triggers coincide.
+        released > 0 && _measure_heap!()
+        if heap_excess > 0
+            after = something(m.pending, m.live)
+            _record_heap_relief!(m, hint, after, released)
+        end
         if process_excess > 0 && released > 0
-            # Native finalizers may run only once the last alias disappears.
-            # The collection also measures the heap for the next decision.
-            _measure_heap!()
             _return_free_memory!()
             after = _process_memory_bytes()
             _record_process_relief!(process_excess, after, budget, time_ns())
@@ -565,9 +610,9 @@ cumulative automatic memo releases in the disk and memory tiers.
 contribute to several slots and other owners may still hold the value.
 `estimated_native_bytes` sums producer estimates, and `unknown_native_slots`
 counts released native results for which the producer supplied no estimate.
-`full_collections` counts the full collections this process ran to decide
-releases: one measures the live heap before a heap-pressure batch, and one
-follows each footprint-driven batch.
+`full_collections` counts full collections DynamicObjects ran to
+confirm pressure or measure relief. A collection after a batch can serve both
+the heap and footprint checks.
 For a queue configured with zero or one worker, the result is `(; requester, worker)`.
 `worker` is `nothing` when the process is absent. For a pool, the result is
 `(; requester, workers)` with a snapshot per configured slot, in slot order.
