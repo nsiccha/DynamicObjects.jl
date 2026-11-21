@@ -45,6 +45,7 @@ declaration_node_id
 declaration_selection
 declaration_observations
 materialization_observation
+materialization_state
 ```
 
 ## Host lifecycle

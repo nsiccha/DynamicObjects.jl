@@ -14,6 +14,12 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.42
+
+- `materialization_state(object, :property, args...; kwargs...)` returns the
+  cache state without sizing the cached value. Request handlers can check for
+  work already available or in flight even when a result holds a large graph.
+
 ## 0.5.41
 
 - On Linux with glibc, the footprint trigger calls `malloc_trim(0)` after the

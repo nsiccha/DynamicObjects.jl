@@ -54,22 +54,26 @@ to run the code that computes those choices.
 
 ## Observations
 
-`materialization_observation` reports the current cache state without
-requesting a missing value. The declaration describes what may be computed;
-an observation describes what is available on this particular instance.
+Use [`materialization_state`](@ref) to decide whether a request needs to start
+work. It checks the entry for this call without requesting a missing value,
+waiting for pending work, or walking a cached result to measure its size.
 
 ```@example reflection
 analysis = Analysis([1.0, 2.0, 3.0])
-before = materialization_observation(analysis, :total)
+before = materialization_state(analysis, :total)
 analysis.total
-after = materialization_observation(analysis, :total)
-@assert before.state == :unmaterialized && after.state == :ready # hide
+after = materialization_state(analysis, :total)
+@assert before == :unmaterialized && after == :ready # hide
 __docs_output__ = begin # hide
-(before = before.state, after = after.state)
+(; before, after)
 end # hide
 show(stdout, MIME"text/plain"(), __docs_output__) # hide
 println() # hide
 ```
+
+For diagnostics, [`materialization_observation`](@ref) also reports progress,
+the disk path, the value type, and an estimate of the ready value's size.
+Measuring a result can traverse every object it references.
 
 [`declaration_graph`](@ref) assembles type and property declarations with
 stable identifiers. [`declaration_observations`](@ref) adds a separate state
