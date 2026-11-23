@@ -282,6 +282,39 @@ entries = collect(mem_cache_entries(view))
 @test view.opaque(3)[] == 3 && mw_calls((:opaque, 3)) == 2
 end
 
+@testitem "a shared indexed entry a view read is listed once, under the retained object" setup=[MemWalkFixtures] begin
+using DynamicObjects
+# The queue worker keeps up to 64 request views of one retained root. A view that reads a
+# context-independent indexed property reads its root's subcache through a wrapper of its
+# own: one slot per key. Listed under each such view, a census that walked every kept view
+# counted that slot once per view (snag `worker-remount-v-0f760831`).
+mw_reset!()
+source = MWView()
+views = [remount(source; tag="req$k") for k in 1:3]
+for v in views
+    v.read_value(1)          # shared: the views' wrappers read the source's subcache
+    v.tagged(2)              # reads the rebound `tag`: each view's own
+end
+@test mw_calls((:read_value, 1)) == 1
+@test all(v -> getfield(v.read_value, :cache) === getfield(source.read_value, :cache), views)
+
+entries = collect(mem_cache_entries(views[1]))
+shared = filter(e -> e.property === :read_value, entries)
+@test length(shared) == 1 && only(shared).object === source && only(shared).path == ()
+@test entry_at(entries, views[1], :tagged, ((2,), (;))).value == "req12"
+
+# A census with one walk per object, counting an entry once per object that lists it.
+census = unique(e -> (objectid(e.object), e.property, e.key),
+                collect(Iterators.flatten(mem_cache_entries(o) for o in (source, views...))))
+@test count(e -> e.property === :read_value, census) == 1
+@test count(e -> e.property === :tagged, census) == 3
+
+# Pruning through a view evicts the one shared slot, for the source and every view.
+@test prune_mem_caches!(e -> e.property !== :read_value, views[2]).evicted == 1
+@test views[3].read_value(1) == [1.0] && mw_calls((:read_value, 1)) == 2
+@test source.read_value(1) === views[1].read_value(1)
+end
+
 @testitem "an evicted value's recompute settles again" setup=[MemWalkFixtures] begin
 using DynamicObjects
 object = MWSettled(4)

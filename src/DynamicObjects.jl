@@ -8395,14 +8395,29 @@ function _visit_store!(walk::_MemWalk, o, path::Tuple, (lk, cache, computing, st
     end
     for (name, value) in settled
         if _own_wrapper(o, name, value)
-            # The wrapper stays: holders share its subcache. Its entries are listed instead.
-            _visit_subcache!(walk, o, path, name, value.cache, _indexed_role(roles, name))
+            # The wrapper stays: holders share its subcache. Its entries are listed instead,
+            # under the object that holds them.
+            holder = _subcache_holder(o, name, value.cache)
+            _visit_subcache!(walk, holder, path, name, value.cache, _indexed_role(roles, name))
         else
             entry = MemCacheEntry((o, name, nothing, value, path, _bare_role(roles, name)))
             _push_entry!(walk, entry, _MemSlot(lk, cache, computing, status, name))
         end
     end
     nothing
+end
+
+# Who holds the entries of `sub`, the subcache `o`'s own wrapper of `name` reads. A remount
+# view's wrapper of a context-independent property reads its retained object's subcache
+# (`subcache`), so the retained object holds those entries: one slot per key, which the
+# object and every view read, and which the view's walk lists under the retained object as
+# for its other shared work. Listed under each view instead, a census that walks each kept
+# view counted one slot once per view (snag `worker-remount-v-0f760831`).
+function _subcache_holder(o, name::Symbol, sub)
+    c = getfield(o, :cache).cache
+    c isa MountedThreadsafeDict || return o
+    held = get(getfield(c.source, :cache).cache, name, nothing)
+    held isa IndexableProperty && held.cache === sub ? c.source : o
 end
 
 function _visit_subcache!(walk::_MemWalk, o, path::Tuple, name::Symbol, sub, role::Symbol)
@@ -8505,8 +8520,11 @@ is never walked). Constructor inputs and fixed fields are not followed, so neith
 is listed once, so aliases and cycles terminate. `root`'s own entries come first, then
 breadth-first.
 
-A [`remount`](@ref) view lists its own entries and walks its retained object, which also
-lists the opaque work its views share.
+A [`remount`](@ref) view lists the entries it holds itself (its request context and what
+reads it) and walks its retained object, which lists the work its views share: the shared
+properties, the entries of every shared indexed property, also one a view has read, and the
+opaque work. Each shared entry is one slot, listed under the retained object however many
+views read it.
 
 The walk is lazy: each object's entries are read under that object's cache lock when the walk
 reaches it, so `first`, `Iterators.take` or a `break` stop it early. A computation in flight
