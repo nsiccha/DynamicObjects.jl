@@ -5624,14 +5624,24 @@ function meta end
 
 include("declaration_analysis.jl")
 
+# Older expansions and hand-written meta methods have no declaration index.
+_first_declaration_positions(::Type, entries) = nothing
+
 """
     metafirst(T, name::Symbol) -> Union{Nothing, NamedTuple}
 
 Return the first info for `name` in `meta(T)`, or `nothing` if absent. Use when you
 expect at most one entry and don't care about duplicates.
 """
-metafirst(T::Type, name::Symbol) = let m = meta(T)
-    for (n, info) in m
+function metafirst(T::Type, name::Symbol)
+    entries = meta(T)
+    # A more specific or redefined meta method may return different declarations.
+    positions = _first_declaration_positions(T, entries)
+    if positions !== nothing
+        i = get(positions, name, 0)
+        return iszero(i) ? nothing : last(entries[i])
+    end
+    for (n, info) in entries
         n === name && return info
     end
     nothing
