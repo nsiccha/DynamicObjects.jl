@@ -14,6 +14,18 @@ DynamicObjects commit is then refused when it resolves, with
 `Unsatisfiable requirements detected for package DynamicObjects`, instead of
 failing or silently behaving differently at run time.
 
+## 0.5.44
+
+- `mem_cache_entries` lists the entries of an indexed property that a
+  `remount` view shares with its retained object under the retained object
+  (`entry.object`), also once the view has read the property, as it already
+  listed the view's other shared work; `prune_mem_caches!` hands its predicate
+  the same entries. Each shared entry is one slot, which the retained object
+  and every view read, so a release or prune of it frees the value for all of
+  them. Before, a view that had read such a property listed its entries under
+  itself, so a census that walked each request view a queue worker keeps (up
+  to 64) counted one slot once per view.
+
 ## 0.5.43
 
 - Under an explicit heap hint, a process starts by releasing up to 16 cold

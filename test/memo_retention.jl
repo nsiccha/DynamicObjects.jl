@@ -51,6 +51,13 @@ end
     end
 end
 
+@testitem "a release frees a shared value the kept request views have read" tags=[:core] begin
+    script = joinpath(@__DIR__, "fixtures", "remount_view_release.jl")
+    cmd = `$(first(Base.julia_cmd().exec)) --startup-file=no --project=$(Base.active_project()) $script`
+    cmd = addenv(cmd, "DYNAMICOBJECTS_PROCESS_BUDGET_BYTES" => string(64 * 1024^3))
+    @test success(pipeline(cmd; stdout, stderr))
+end
+
 @testitem "retention order, delivery, ownership and byte accounting" tags=[:core] begin
 script = joinpath(@__DIR__, "fixtures", "memo_retention_order.jl")
 @test success(`$(first(Base.julia_cmd().exec)) --startup-file=no --project=$(Base.active_project()) --threads=2 --heap-size-hint=8G $script`)
