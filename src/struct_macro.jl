@@ -732,11 +732,14 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
         push!(oproperties, name=>(;lhs=arg, macros, rhs, lnn, dependson, locals, indices, indexed, cache_version, result_type=ext_type, doc))
     end
     # `properties` holds the per-declaration list (preserves order AND duplicate
-    # names — e.g. a future `@get foo()` + `@include foo(x::String)` pair). It's
-    # what `meta(T)` returns; macro-internal lookups that just need "is `x` a
-    # property name?" use the `prop_names` set built from it.
+    # names — e.g. a future `@get foo()` + `@include foo(x::String)` pair).
+    # Index positions so named and bulk reads share the declaration records.
     properties = Vector{Pair}(oproperties)
-    prop_names = Set{Symbol}(first.(oproperties))
+    first_positions = Dict{Symbol,Int}()
+    for (i, (name, _)) in enumerate(oproperties)
+        get!(first_positions, name, i)
+    end
+    prop_names = keys(first_positions)
     # Bare-ref resolution set: user property names PLUS the injected magic
     # dunders, so a body may reference `__hash__`/`__cache_path__`/… bare and
     # have `walk_rhs` resolve them to `__self__.…` just like a sibling. Keep
@@ -1067,6 +1070,8 @@ dynamicstruct(expr; docstring=nothing, child_handler=nothing, is_child=false, li
                     $getorcomputeproperty(__self__, name)
             $Base.setproperty!(__self__::$type, name::Symbol, value) = $_reject_setproperty(__self__, name)
             $DynamicObjects.meta(::Type{$type_dispatch}) = $properties
+            $DynamicObjects._first_declaration_positions(::Type{$type_dispatch}, entries) =
+                entries === $properties ? $first_positions : nothing
             $(option_declaration_defs...)
             $carry_plan_expr
             $DynamicObjects._remount_opaque_properties(::Type{$type_dispatch}) = $(Tuple(sort!(collect(opaque_props))))
